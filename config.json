@@ -12,7 +12,7 @@
     "pwm_frequency_hz": 1000
   },
   "lidar": {
-    "serial_port": "/dev/ttyUSB0",
+    "serial_port": "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
     "baud_rate": 230400,
     "publish_hz": 10
   },
