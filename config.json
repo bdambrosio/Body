@@ -1,0 +1,35 @@
+{
+  "zenoh": {
+    "connect_endpoints": ["tcp/127.0.0.1:7447"]
+  },
+  "motor": {
+    "wheel_base_m": 0.0,
+    "wheel_radius_m": 0.0,
+    "ticks_per_rev": 1920,
+    "max_wheel_vel_ms": 0.0,
+    "loop_hz": 50,
+    "cmd_timeout_ms": 500,
+    "pwm_frequency_hz": 1000
+  },
+  "lidar": {
+    "serial_port": "/dev/ttyUSB0",
+    "baud_rate": 230400,
+    "publish_hz": 10
+  },
+  "oakd": {
+    "depth_resolution": "400p",
+    "depth_fps": 15,
+    "imu_enabled": true,
+    "rgb_enabled": false
+  },
+  "watchdog": {
+    "heartbeat_timeout_ms": 2000,
+    "process_timeout_ms": 5000,
+    "status_publish_hz": 1,
+    "monitored_topics": [
+      "body/odom",
+      "body/lidar/scan",
+      "body/oakd/imu"
+    ]
+  }
+}
