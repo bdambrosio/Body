@@ -6,6 +6,7 @@ Onboard software for a differential-drive robot chassis: independent Python proc
 
 - Python 3.11+
 - `eclipse-zenoh` and, for `oakd_driver`, `depthai` (see [requirements.txt](requirements.txt)); Linux udev rules for Movidius (`03e7`) are required to open the OAK from a non-root user.
+- **OAK-D-Lite IMU:** retail units usually include a BNO IMU; DepthAI may require `oakd.imu_enable_firmware_update: true` (default in [config.json](config.json)) on first use. Some **Kickstarter OAK-D-Lite** boards have **no IMU** ([Luxonis docs](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/imu/)) — set **`imu_hardware_present`: false** to run `oakd_driver` with synthetic `body/oakd/imu` so the launcher does not crash.
 - A Zenoh **router** (`zenohd`) reachable by every Body process and every client (teleop or Jill). On the robot, run the router on the Pi and listen on TCP **7447** (see [Configuration](#configuration)).
 
 ## Install (once per machine)

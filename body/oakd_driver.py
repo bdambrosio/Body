@@ -28,6 +28,11 @@ def _depthai_is_v3() -> bool:
 
 
 def _configure_imu_node(imu: Any, oakd_cfg: dict[str, Any]) -> None:
+    # BNO08x sometimes needs a one-time IMU firmware path; Luxonis recommends True if you see
+    # "IMU not detected" / "Set imu.enableFirmwareUpdate(True) explicitly".
+    if oakd_cfg.get("imu_enable_firmware_update", True):
+        imu.enableFirmwareUpdate(True)
+
     accel_hz = int(oakd_cfg.get("imu_accel_hz", 500))
     gyro_hz = int(oakd_cfg.get("imu_gyro_hz", 400))
     rot_hz = int(oakd_cfg.get("imu_rotation_vector_hz", 400))
@@ -128,6 +133,30 @@ def _run_imu_loop(
             time.sleep(0.001)
 
 
+def _run_stub_imu_publisher(
+    session: Any,
+    oakd_cfg: dict[str, Any],
+    interval_s: float,
+    depth_period: float,
+    stop_ref: list[bool],
+) -> None:
+    """No DepthAI IMU (e.g. OAK-D-Lite Kickstarter boards without IMU): synthetic Zenoh traffic."""
+    next_imu = time.monotonic()
+    next_depth = time.monotonic()
+    while not stop_ref[0]:
+        now = time.monotonic()
+        if now >= next_imu:
+            zenoh_helpers.publish_json(session, "body/oakd/imu", schemas.oakd_imu())
+            print("[oakd] synthetic IMU (imu_hardware_present=false in config)", flush=True)
+            next_imu += interval_s
+        if now >= next_depth:
+            zenoh_helpers.publish_json(
+                session, "body/oakd/depth", schemas.oakd_depth_placeholder()
+            )
+            next_depth += depth_period
+        time.sleep(0.02)
+
+
 def _run_depthai_v2(
     oakd_cfg: dict[str, Any],
     dev_info: dai.DeviceInfo,
@@ -169,7 +198,21 @@ def _run_depthai_v3(
     def _continue() -> bool:
         return pipeline.isRunning() and not stop_ref[0]
 
-    pipeline.start()
+    try:
+        pipeline.start()
+    except RuntimeError as e:
+        err = str(e)
+        if "IMU not detected" in err or "IMU invalid settings" in err:
+            print(
+                "[oakd] DepthAI IMU error:\n"
+                f"  {err}\n"
+                "  Try: set oakd.imu_enable_firmware_update to true in config.json (default), "
+                "run once with USB stable; or if your OAK-D-Lite has no IMU chip "
+                "(e.g. some Kickstarter units), set oakd.imu_hardware_present to false.",
+                file=sys.stderr,
+                flush=True,
+            )
+        raise
     with pipeline:
         _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
 
@@ -195,22 +238,29 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
-    if dev_info is None:
-        print(
-            "oakd_driver: no DepthAI device found (connect OAK-D-Lite, check udev / USB)",
-            file=sys.stderr,
-        )
-        session.close()
-        sys.exit(1)
-
     try:
-        api = "v3 (no XLinkOut)" if _depthai_is_v3() else "v2 (XLinkOut)"
-        print(f"[oakd] depthai API: {api}; library {getattr(dai, '__version__', '?')}", flush=True)
-        if _depthai_is_v3():
-            _run_depthai_v3(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
+        if not oakd_cfg.get("imu_hardware_present", True):
+            print(
+                "[oakd] imu_hardware_present=false — no DepthAI IMU node; "
+                "Luxonis notes some OAK-D-Lite (e.g. Kickstarter) have no IMU chip.",
+                flush=True,
+            )
+            _run_stub_imu_publisher(session, oakd_cfg, interval_s, depth_period, stop_ref)
         else:
-            _run_depthai_v2(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
+            dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
+            if dev_info is None:
+                print(
+                    "oakd_driver: no DepthAI device found (connect OAK-D-Lite, check udev / USB)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            api = "v3 (no XLinkOut)" if _depthai_is_v3() else "v2 (XLinkOut)"
+            print(f"[oakd] depthai API: {api}; library {getattr(dai, '__version__', '?')}", flush=True)
+            if _depthai_is_v3():
+                _run_depthai_v3(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
+            else:
+                _run_depthai_v2(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
     finally:
         session.close()
 
