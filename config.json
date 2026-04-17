@@ -26,7 +26,7 @@
     "imu_gyro_hz": 400,
     "imu_rotation_vector_hz": 400,
     "rotation_vector_enabled": true,
-    "imu_enable_firmware_update": true,
+    "imu_enable_firmware_update": false,
     "imu_hardware_present": true,
     "device_id": null
   },

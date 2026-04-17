@@ -27,10 +27,13 @@ def _depthai_is_v3() -> bool:
     return not hasattr(dai.node, "XLinkOut")
 
 
-def _configure_imu_node(imu: Any, oakd_cfg: dict[str, Any]) -> None:
-    # BNO08x sometimes needs a one-time IMU firmware path; Luxonis recommends True if you see
-    # "IMU not detected" / "Set imu.enableFirmwareUpdate(True) explicitly".
-    if oakd_cfg.get("imu_enable_firmware_update", True):
+def _configure_imu_node(imu: Any, oakd_cfg: dict[str, Any], *, depthai_v3: bool) -> None:
+    # DepthAI v2: optional IMU node firmware flag (deprecated on v3 — use Device.startIMUFirmwareUpdate).
+    if (
+        not depthai_v3
+        and oakd_cfg.get("imu_enable_firmware_update", False)
+        and hasattr(imu, "enableFirmwareUpdate")
+    ):
         imu.enableFirmwareUpdate(True)
 
     accel_hz = int(oakd_cfg.get("imu_accel_hz", 500))
@@ -157,6 +160,35 @@ def _run_stub_imu_publisher(
         time.sleep(0.02)
 
 
+def _v3_imu_firmware_update(device: dai.Device, oakd_cfg: dict[str, Any], timeout_s: float = 120.0) -> None:
+    """DepthAI v3: optional BNO IMU flash via Device API. No-op if disabled in config."""
+    if not oakd_cfg.get("imu_enable_firmware_update", False):
+        return
+    print("[oakd] IMU firmware update: starting (keep USB connected; may take ~1–2 min)…", flush=True)
+    device.startIMUFirmwareUpdate(False)
+    deadline = time.monotonic() + timeout_s
+    last_pct = -1.0
+    while time.monotonic() < deadline:
+        done, progress = device.getIMUFirmwareUpdateStatus()
+        if int(progress) != int(last_pct):
+            print(f"[oakd] IMU firmware update: {progress:.0f}%", flush=True)
+            last_pct = progress
+        if not done:
+            time.sleep(0.15)
+            continue
+        if progress >= 99.99:
+            print("[oakd] IMU firmware update: complete.", flush=True)
+            return
+        print(
+            f"[oakd] IMU firmware update failed (device reported done with progress={progress}). "
+            "If this OAK-D-Lite has no IMU chip, set oakd.imu_hardware_present to false.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError("IMU firmware update failed")
+    raise TimeoutError("IMU firmware update timed out")
+
+
 def _run_depthai_v2(
     oakd_cfg: dict[str, Any],
     dev_info: dai.DeviceInfo,
@@ -172,7 +204,7 @@ def _run_depthai_v2(
     imu = pipeline.create(dai.node.IMU)
     xlink = pipeline.create(dai.node.XLinkOut)
     xlink.setStreamName("imu")
-    _configure_imu_node(imu, oakd_cfg)
+    _configure_imu_node(imu, oakd_cfg, depthai_v3=False)
     imu.out.link(xlink.input)
 
     with dai.Device(pipeline, dev_info) as device:
@@ -190,9 +222,10 @@ def _run_depthai_v3(
 ) -> None:
     # v3: bind an opened Device to the Pipeline, attach queues to node outputs, then start().
     device = dai.Device(dev_info)
+    _v3_imu_firmware_update(device, oakd_cfg)
     pipeline = dai.Pipeline(device)
     imu = pipeline.create(dai.node.IMU)
-    _configure_imu_node(imu, oakd_cfg)
+    _configure_imu_node(imu, oakd_cfg, depthai_v3=True)
     imu_queue = imu.out.createOutputQueue(maxSize=50, blocking=False)
 
     def _continue() -> bool:
@@ -206,9 +239,10 @@ def _run_depthai_v3(
             print(
                 "[oakd] DepthAI IMU error:\n"
                 f"  {err}\n"
-                "  Try: set oakd.imu_enable_firmware_update to true in config.json (default), "
-                "run once with USB stable; or if your OAK-D-Lite has no IMU chip "
-                "(e.g. some Kickstarter units), set oakd.imu_hardware_present to false.",
+                "  If you have a BNO IMU: set oakd.imu_enable_firmware_update to true (DepthAI v3 "
+                "uses device.startIMUFirmwareUpdate), USB stable, wait for 100%. "
+                "If your OAK-D-Lite has no IMU (e.g. some Kickstarter units), set "
+                "oakd.imu_hardware_present to false.",
                 file=sys.stderr,
                 flush=True,
             )
