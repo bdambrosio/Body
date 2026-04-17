@@ -27,6 +27,39 @@ def _depthai_is_v3() -> bool:
     return not hasattr(dai.node, "XLinkOut")
 
 
+def _is_depthai_imu_missing_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return "IMU not detected" in msg or "IMU invalid settings" in msg
+
+
+def _log_imu_missing_fallback(exc: RuntimeError) -> None:
+    err = str(exc)
+    print(
+        "[oakd] DepthAI IMU error:\n"
+        f"  {err}\n"
+        "  Falling back to synthetic IMU on Zenoh. To skip opening the OAK for IMU entirely, "
+        "set oakd.imu_hardware_present to false. If you have a BNO IMU that needs flashing, set "
+        "oakd.imu_enable_firmware_update to true (DepthAI v3 uses device.startIMUFirmwareUpdate), "
+        "keep USB stable, wait for 100%.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _cleanup_v3_after_failed_pipeline_start(device: Any, pipeline: Any) -> None:
+    try:
+        if getattr(pipeline, "isRunning", lambda: False)():
+            pipeline.stop()
+    except Exception:
+        pass
+    try:
+        close = getattr(device, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
 def _configure_imu_node(imu: Any, oakd_cfg: dict[str, Any], *, depthai_v3: bool) -> None:
     # DepthAI v2: optional IMU node firmware flag (deprecated on v3 — use Device.startIMUFirmwareUpdate).
     if (
@@ -207,9 +240,15 @@ def _run_depthai_v2(
     _configure_imu_node(imu, oakd_cfg, depthai_v3=False)
     imu.out.link(xlink.input)
 
-    with dai.Device(pipeline, dev_info) as device:
-        imu_queue = device.getOutputQueue("imu", maxSize=50, blocking=False)
-        _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
+    try:
+        with dai.Device(pipeline, dev_info) as device:
+            imu_queue = device.getOutputQueue("imu", maxSize=50, blocking=False)
+            _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
+    except RuntimeError as e:
+        if not _is_depthai_imu_missing_error(e):
+            raise
+        _log_imu_missing_fallback(e)
+        _run_stub_imu_publisher(session, oakd_cfg, interval_s, depth_period, stop_ref)
 
 
 def _run_depthai_v3(
@@ -234,19 +273,12 @@ def _run_depthai_v3(
     try:
         pipeline.start()
     except RuntimeError as e:
-        err = str(e)
-        if "IMU not detected" in err or "IMU invalid settings" in err:
-            print(
-                "[oakd] DepthAI IMU error:\n"
-                f"  {err}\n"
-                "  If you have a BNO IMU: set oakd.imu_enable_firmware_update to true (DepthAI v3 "
-                "uses device.startIMUFirmwareUpdate), USB stable, wait for 100%. "
-                "If your OAK-D-Lite has no IMU (e.g. some Kickstarter units), set "
-                "oakd.imu_hardware_present to false.",
-                file=sys.stderr,
-                flush=True,
-            )
-        raise
+        if not _is_depthai_imu_missing_error(e):
+            raise
+        _log_imu_missing_fallback(e)
+        _cleanup_v3_after_failed_pipeline_start(device, pipeline)
+        _run_stub_imu_publisher(session, oakd_cfg, interval_s, depth_period, stop_ref)
+        return
     with pipeline:
         _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
 
