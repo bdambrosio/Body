@@ -121,6 +121,65 @@ def oakd_depth_placeholder(ts: float | None = None) -> dict[str, Any]:
     return {"ts": now_ts() if ts is None else ts, "format": "placeholder", "note": "TBD per body_project_spec.md §5.7"}
 
 
+def oakd_depth_stream_frame(
+    width: int,
+    height: int,
+    data_base64: str,
+    *,
+    ts: float | None = None,
+    dtype: str = "uint16",
+    units: str = "mm",
+    layout: str = "row_major",
+) -> dict[str, Any]:
+    """body/oakd/depth — streamed depth from StereoDepth (host-resized), raw uint16 row-major."""
+    return {
+        "ts": now_ts() if ts is None else ts,
+        "format": "depth_uint16_mm",
+        "width": width,
+        "height": height,
+        "dtype": dtype,
+        "units": units,
+        "layout": layout,
+        "encoding": "base64",
+        "data": data_base64,
+    }
+
+
+def oakd_config_capture_rgb(request_id: str) -> dict[str, Any]:
+    """body/oakd/config — request a single RGB frame (handled by oakd_driver)."""
+    return {"action": "capture_rgb", "request_id": request_id}
+
+
+def oakd_rgb_capture_ok(
+    request_id: str,
+    jpeg_base64: str,
+    width: int,
+    height: int,
+    ts: float | None = None,
+) -> dict[str, Any]:
+    """body/oakd/rgb — successful on-request JPEG (base64)."""
+    return {
+        "ts": now_ts() if ts is None else ts,
+        "request_id": request_id,
+        "ok": True,
+        "format": "jpeg",
+        "encoding": "base64",
+        "data": jpeg_base64,
+        "width": width,
+        "height": height,
+    }
+
+
+def oakd_rgb_capture_error(request_id: str, error: str, ts: float | None = None) -> dict[str, Any]:
+    """body/oakd/rgb — capture failed (e.g. rgb disabled or no frame)."""
+    return {
+        "ts": now_ts() if ts is None else ts,
+        "request_id": request_id,
+        "ok": False,
+        "error": error,
+    }
+
+
 def heartbeat(ts: float | None = None, seq: int = 0) -> dict[str, Any]:
     return {"ts": now_ts() if ts is None else ts, "seq": seq}
 

@@ -12,13 +12,17 @@ no XLink).
 
 from __future__ import annotations
 
+import base64
+import queue
 import signal
 import sys
 import time
 from collections.abc import Callable
 from typing import Any
 
+import cv2
 import depthai as dai
+import numpy as np
 
 from body.lib import schemas, zenoh_helpers
 
@@ -95,6 +99,141 @@ def _pick_device(device_id: str | None) -> dai.DeviceInfo | None:
     return None
 
 
+def _rgb_preview_dims(oakd_cfg: dict[str, Any]) -> tuple[int, int]:
+    w = int(oakd_cfg.get("rgb_preview_width", 640))
+    h = int(oakd_cfg.get("rgb_preview_height", 400))
+    return max(16, w), max(16, h)
+
+
+def _depth_output_dims(oakd_cfg: dict[str, Any]) -> tuple[int, int]:
+    w = int(oakd_cfg.get("depth_out_width", 80))
+    h = int(oakd_cfg.get("depth_out_height", 60))
+    return max(2, w), max(2, h)
+
+
+def _depth_drain_latest(depth_queue: Any) -> Any | None:
+    last: Any | None = None
+    while True:
+        f = depth_queue.tryGet()
+        if f is None:
+            break
+        last = f
+    return last
+
+
+def _depth_frame_to_stream_msg(frame: Any, out_w: int, out_h: int) -> dict[str, Any]:
+    h0 = int(frame.getHeight())
+    w0 = int(frame.getWidth())
+    arr = frame.getFrame()
+    if arr is None or (isinstance(arr, np.ndarray) and arr.size == 0):
+        buf = frame.getData()
+        arr = np.frombuffer(bytes(buf), dtype=np.uint16).reshape((h0, w0))
+    else:
+        arr = np.ascontiguousarray(arr, dtype=np.uint16)
+    small = cv2.resize(arr, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+    b64 = base64.standard_b64encode(small.tobytes()).decode("ascii")
+    return schemas.oakd_depth_stream_frame(out_w, out_h, b64)
+
+
+def _create_v3_stereo_depth_queue(pipeline: Any, oakd_cfg: dict[str, Any]) -> Any:
+    mono_left = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+    mono_right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+    stereo = pipeline.create(dai.node.StereoDepth)
+    mono_left.requestFullResolutionOutput().link(stereo.left)
+    mono_right.requestFullResolutionOutput().link(stereo.right)
+    stereo.setRectification(bool(oakd_cfg.get("stereo_rectification", True)))
+    stereo.setExtendedDisparity(bool(oakd_cfg.get("stereo_extended_disparity", True)))
+    stereo.setLeftRightCheck(bool(oakd_cfg.get("stereo_left_right_check", True)))
+    return stereo.depth.createOutputQueue(maxSize=4, blocking=False)
+
+
+def _create_v3_rgb_queue(pipeline: Any, oakd_cfg: dict[str, Any]) -> Any | None:
+    if not oakd_cfg.get("rgb_enabled", False):
+        return None
+    rw, rh = _rgb_preview_dims(oakd_cfg)
+    rgb_cam = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+    return rgb_cam.requestOutput((rw, rh)).createOutputQueue(maxSize=4, blocking=False)
+
+
+def _rgb_drain_latest(rgb_queue: Any) -> Any | None:
+    last: Any | None = None
+    while True:
+        f = rgb_queue.tryGet()
+        if f is None:
+            break
+        last = f
+    return last
+
+
+def _wait_rgb_frame(rgb_queue: Any, timeout_s: float = 3.0) -> Any | None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        f = _rgb_drain_latest(rgb_queue)
+        if f is not None:
+            return f
+        time.sleep(0.005)
+    return _rgb_drain_latest(rgb_queue)
+
+
+def _jpeg_b64_from_imgframe(frame: Any) -> tuple[str, int, int]:
+    bgr = frame.getCvFrame()
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok or buf is None:
+        raise RuntimeError("cv2.imencode failed for RGB frame")
+    w = int(frame.getWidth())
+    h = int(frame.getHeight())
+    b64 = base64.standard_b64encode(buf.tobytes()).decode("ascii")
+    return b64, w, h
+
+
+def _process_oakd_config_queue(
+    session: Any,
+    config_pending: queue.Queue[dict[str, Any]],
+    rgb_queue: Any | None,
+) -> None:
+    while True:
+        try:
+            req = config_pending.get_nowait()
+        except queue.Empty:
+            break
+        action = req.get("action")
+        rid = str(req.get("request_id", ""))
+        if action != "capture_rgb":
+            continue
+        if rgb_queue is None:
+            zenoh_helpers.publish_json(
+                session,
+                "body/oakd/rgb",
+                schemas.oakd_rgb_capture_error(
+                    rid,
+                    "no_rgb_pipeline_set_oakd_rgb_enabled_true_or_fix_imu_rgb_fallback",
+                ),
+            )
+            continue
+        frame = _wait_rgb_frame(rgb_queue)
+        if frame is None:
+            zenoh_helpers.publish_json(
+                session,
+                "body/oakd/rgb",
+                schemas.oakd_rgb_capture_error(rid, "no_rgb_frame_timeout"),
+            )
+            continue
+        try:
+            jpeg_b64, fw, fh = _jpeg_b64_from_imgframe(frame)
+            zenoh_helpers.publish_json(
+                session,
+                "body/oakd/rgb",
+                schemas.oakd_rgb_capture_ok(rid, jpeg_b64, fw, fh),
+            )
+            print(f"[oakd] capture_rgb ok request_id={rid} {fw}x{fh}", flush=True)
+        except Exception as e:
+            zenoh_helpers.publish_json(
+                session,
+                "body/oakd/rgb",
+                schemas.oakd_rgb_capture_error(rid, f"encode_failed:{e}"),
+            )
+
+
 def _run_imu_loop(
     imu_queue: dai.MessageQueue,
     session: Any,
@@ -102,6 +241,9 @@ def _run_imu_loop(
     interval_s: float,
     depth_period: float,
     continue_fn: Callable[[], bool],
+    config_pending: queue.Queue[dict[str, Any]],
+    rgb_queue: Any | None,
+    depth_queue: Any | None = None,
 ) -> None:
     window_ax: list[float] = []
     window_ay: list[float] = []
@@ -115,6 +257,7 @@ def _run_imu_loop(
     next_depth = time.monotonic()
 
     while continue_fn():
+        _process_oakd_config_queue(session, config_pending, rgb_queue)
         imu_data = imu_queue.tryGet()
         if imu_data is not None:
             for pkt in imu_data.packets:
@@ -162,11 +305,66 @@ def _run_imu_loop(
             window_start = now
 
         if now >= next_depth:
-            zenoh_helpers.publish_json(session, "body/oakd/depth", schemas.oakd_depth_placeholder())
+            if depth_queue is not None:
+                df = _depth_drain_latest(depth_queue)
+                if df is not None:
+                    dw, dh = _depth_output_dims(oakd_cfg)
+                    try:
+                        zenoh_helpers.publish_json(
+                            session,
+                            "body/oakd/depth",
+                            _depth_frame_to_stream_msg(df, dw, dh),
+                        )
+                    except Exception as e:
+                        print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)
+            else:
+                zenoh_helpers.publish_json(
+                    session, "body/oakd/depth", schemas.oakd_depth_placeholder()
+                )
             next_depth += depth_period
 
         if imu_data is None:
             time.sleep(0.001)
+
+
+def _run_synthetic_imu_depth_config_loop(
+    session: Any,
+    oakd_cfg: dict[str, Any],
+    interval_s: float,
+    depth_period: float,
+    stop_ref: list[bool],
+    config_pending: queue.Queue[dict[str, Any]],
+    rgb_queue: Any | None,
+    depth_queue: Any | None = None,
+) -> None:
+    """Synthetic ``body/oakd/imu``; depth placeholder or StereoDepth stream; optional ``rgb_queue``."""
+    next_imu = time.monotonic()
+    next_depth = time.monotonic()
+    while not stop_ref[0]:
+        _process_oakd_config_queue(session, config_pending, rgb_queue)
+        now = time.monotonic()
+        if now >= next_imu:
+            zenoh_helpers.publish_json(session, "body/oakd/imu", schemas.oakd_imu())
+            next_imu += interval_s
+        if now >= next_depth:
+            if depth_queue is not None:
+                df = _depth_drain_latest(depth_queue)
+                if df is not None:
+                    dw, dh = _depth_output_dims(oakd_cfg)
+                    try:
+                        zenoh_helpers.publish_json(
+                            session,
+                            "body/oakd/depth",
+                            _depth_frame_to_stream_msg(df, dw, dh),
+                        )
+                    except Exception as e:
+                        print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)
+            else:
+                zenoh_helpers.publish_json(
+                    session, "body/oakd/depth", schemas.oakd_depth_placeholder()
+                )
+            next_depth += depth_period
+        time.sleep(0.02)
 
 
 def _run_stub_imu_publisher(
@@ -175,24 +373,109 @@ def _run_stub_imu_publisher(
     interval_s: float,
     depth_period: float,
     stop_ref: list[bool],
-    *,
-    stub_log_note: str = "oakd.imu_hardware_present=false",
+    config_pending: queue.Queue[dict[str, Any]],
 ) -> None:
     """No DepthAI IMU (e.g. OAK-D-Lite Kickstarter boards without IMU): synthetic Zenoh traffic."""
-    next_imu = time.monotonic()
-    next_depth = time.monotonic()
-    while not stop_ref[0]:
-        now = time.monotonic()
-        if now >= next_imu:
-            zenoh_helpers.publish_json(session, "body/oakd/imu", schemas.oakd_imu())
-            print(f"[oakd] synthetic IMU ({stub_log_note})", flush=True)
-            next_imu += interval_s
-        if now >= next_depth:
-            zenoh_helpers.publish_json(
-                session, "body/oakd/depth", schemas.oakd_depth_placeholder()
+    _run_synthetic_imu_depth_config_loop(
+        session,
+        oakd_cfg,
+        interval_s,
+        depth_period,
+        stop_ref,
+        config_pending,
+        None,
+    )
+
+
+def _run_depthai_v2_rgb_only(
+    oakd_cfg: dict[str, Any],
+    dev_info: dai.DeviceInfo,
+    session: Any,
+    interval_s: float,
+    depth_period: float,
+    stop_ref: list[bool],
+    config_pending: queue.Queue[dict[str, Any]],
+) -> None:
+    """IMU pipeline unusable: ColorCamera-only pipeline + synthetic IMU/depth on Zenoh (DepthAI v2)."""
+    rw, rh = _rgb_preview_dims(oakd_cfg)
+    pipeline = dai.Pipeline()
+    cam = pipeline.create(dai.node.ColorCamera)
+    cam.setPreviewSize(rw, rh)
+    cam.setInterleaved(False)
+    cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+    xlink_rgb = pipeline.create(dai.node.XLinkOut)
+    xlink_rgb.setStreamName("rgb")
+    cam.preview.link(xlink_rgb.input)
+    try:
+        with dai.Device(pipeline, dev_info) as device:
+            rgb_queue = device.getOutputQueue("rgb", maxSize=4, blocking=False)
+            print("[oakd] RGB-only pipeline running (synthetic IMU/depth on Zenoh)", flush=True)
+            _run_synthetic_imu_depth_config_loop(
+                session,
+                oakd_cfg,
+                interval_s,
+                depth_period,
+                stop_ref,
+                config_pending,
+                rgb_queue,
             )
-            next_depth += depth_period
-        time.sleep(0.02)
+    except Exception as e:
+        print(f"[oakd] RGB-only pipeline failed: {e}", file=sys.stderr, flush=True)
+        _run_stub_imu_publisher(
+            session,
+            oakd_cfg,
+            interval_s,
+            depth_period,
+            stop_ref,
+            config_pending,
+        )
+
+
+def _run_depthai_v3_rgb_only(
+    oakd_cfg: dict[str, Any],
+    dev_info: dai.DeviceInfo,
+    session: Any,
+    interval_s: float,
+    depth_period: float,
+    stop_ref: list[bool],
+    config_pending: queue.Queue[dict[str, Any]],
+) -> None:
+    """IMU unusable: StereoDepth + RGB + synthetic IMU; depth stream + optional capture_rgb (DepthAI v3)."""
+    device = dai.Device(dev_info)
+    pipeline = dai.Pipeline(device)
+    depth_queue = _create_v3_stereo_depth_queue(pipeline, oakd_cfg)
+    rgb_queue = _create_v3_rgb_queue(pipeline, oakd_cfg)
+
+    try:
+        pipeline.start()
+    except Exception as e:
+        print(f"[oakd] stereo+RGB pipeline start failed: {e}", file=sys.stderr, flush=True)
+        _cleanup_v3_after_failed_pipeline_start(device, pipeline)
+        _run_stub_imu_publisher(
+            session,
+            oakd_cfg,
+            interval_s,
+            depth_period,
+            stop_ref,
+            config_pending,
+        )
+        return
+
+    print(
+        "[oakd] stereo + RGB pipeline running (synthetic IMU; depth uint16 stream on body/oakd/depth)",
+        flush=True,
+    )
+    with pipeline:
+        _run_synthetic_imu_depth_config_loop(
+            session,
+            oakd_cfg,
+            interval_s,
+            depth_period,
+            stop_ref,
+            config_pending,
+            rgb_queue,
+            depth_queue,
+        )
 
 
 def _v3_imu_firmware_update(device: dai.Device, oakd_cfg: dict[str, Any], timeout_s: float = 120.0) -> None:
@@ -231,6 +514,7 @@ def _run_depthai_v2(
     interval_s: float,
     depth_period: float,
     stop_ref: list[bool],
+    config_pending: queue.Queue[dict[str, Any]],
 ) -> None:
     def _continue() -> bool:
         return not stop_ref[0]
@@ -242,22 +526,51 @@ def _run_depthai_v2(
     _configure_imu_node(imu, oakd_cfg, depthai_v3=False)
     imu.out.link(xlink.input)
 
+    rgb_wants = bool(oakd_cfg.get("rgb_enabled", False))
+    if rgb_wants:
+        rw, rh = _rgb_preview_dims(oakd_cfg)
+        cam = pipeline.create(dai.node.ColorCamera)
+        cam.setPreviewSize(rw, rh)
+        cam.setInterleaved(False)
+        cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        xlink_rgb = pipeline.create(dai.node.XLinkOut)
+        xlink_rgb.setStreamName("rgb")
+        cam.preview.link(xlink_rgb.input)
+
     try:
         with dai.Device(pipeline, dev_info) as device:
             imu_queue = device.getOutputQueue("imu", maxSize=50, blocking=False)
-            _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
+            rgb_queue = None
+            if rgb_wants:
+                rgb_queue = device.getOutputQueue("rgb", maxSize=4, blocking=False)
+            _run_imu_loop(
+                imu_queue,
+                session,
+                oakd_cfg,
+                interval_s,
+                depth_period,
+                _continue,
+                config_pending,
+                rgb_queue,
+            )
     except RuntimeError as e:
         if not _is_depthai_imu_missing_error(e):
             raise
         _log_imu_missing_fallback(e)
-        _run_stub_imu_publisher(
-            session,
-            oakd_cfg,
-            interval_s,
-            depth_period,
-            stop_ref,
-            stub_log_note="DepthAI IMU missing; placeholder (set oakd.imu_hardware_present=false to skip OAK)",
-        )
+        if oakd_cfg.get("rgb_enabled", False):
+            print("[oakd] IMU failed: trying RGB-only pipeline for capture_rgb", flush=True)
+            _run_depthai_v2_rgb_only(
+                oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref, config_pending
+            )
+        else:
+            _run_stub_imu_publisher(
+                session,
+                oakd_cfg,
+                interval_s,
+                depth_period,
+                stop_ref,
+                config_pending,
+            )
 
 
 def _run_depthai_v3(
@@ -267,6 +580,7 @@ def _run_depthai_v3(
     interval_s: float,
     depth_period: float,
     stop_ref: list[bool],
+    config_pending: queue.Queue[dict[str, Any]],
 ) -> None:
     # v3: bind an opened Device to the Pipeline, attach queues to node outputs, then start().
     device = dai.Device(dev_info)
@@ -275,6 +589,9 @@ def _run_depthai_v3(
     imu = pipeline.create(dai.node.IMU)
     _configure_imu_node(imu, oakd_cfg, depthai_v3=True)
     imu_queue = imu.out.createOutputQueue(maxSize=50, blocking=False)
+
+    depth_queue_v3 = _create_v3_stereo_depth_queue(pipeline, oakd_cfg)
+    rgb_queue_v3 = _create_v3_rgb_queue(pipeline, oakd_cfg)
 
     def _continue() -> bool:
         return pipeline.isRunning() and not stop_ref[0]
@@ -286,17 +603,26 @@ def _run_depthai_v3(
             raise
         _log_imu_missing_fallback(e)
         _cleanup_v3_after_failed_pipeline_start(device, pipeline)
-        _run_stub_imu_publisher(
+        print(
+            "[oakd] IMU failed: trying StereoDepth + optional RGB (synthetic IMU, depth stream)",
+            flush=True,
+        )
+        _run_depthai_v3_rgb_only(
+            oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref, config_pending
+        )
+        return
+    with pipeline:
+        _run_imu_loop(
+            imu_queue,
             session,
             oakd_cfg,
             interval_s,
             depth_period,
-            stop_ref,
-            stub_log_note="DepthAI IMU missing; placeholder (set oakd.imu_hardware_present=false to skip OAK)",
+            _continue,
+            config_pending,
+            rgb_queue_v3,
+            depth_queue_v3,
         )
-        return
-    with pipeline:
-        _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
 
 
 def main() -> None:
@@ -312,6 +638,12 @@ def main() -> None:
     device_id = oakd_cfg.get("device_id")
 
     session = zenoh_helpers.open_session(body_cfg)
+    config_pending: queue.Queue[dict[str, Any]] = queue.Queue()
+
+    def on_oakd_config(_key: str, msg: dict[str, Any]) -> None:
+        config_pending.put(msg)
+
+    zenoh_helpers.declare_subscriber_json(session, "body/oakd/config", on_oakd_config)
     stop_ref: list[bool] = [False]
 
     def handle_sigterm(_sig: int, _frame: Any) -> None:
@@ -327,7 +659,9 @@ def main() -> None:
                 "Luxonis notes some OAK-D-Lite (e.g. Kickstarter) have no IMU chip.",
                 flush=True,
             )
-            _run_stub_imu_publisher(session, oakd_cfg, interval_s, depth_period, stop_ref)
+            _run_stub_imu_publisher(
+                session, oakd_cfg, interval_s, depth_period, stop_ref, config_pending
+            )
         else:
             dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
             if dev_info is None:
@@ -340,9 +674,13 @@ def main() -> None:
             api = "v3 (no XLinkOut)" if _depthai_is_v3() else "v2 (XLinkOut)"
             print(f"[oakd] depthai API: {api}; library {getattr(dai, '__version__', '?')}", flush=True)
             if _depthai_is_v3():
-                _run_depthai_v3(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
+                _run_depthai_v3(
+                    oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref, config_pending
+                )
             else:
-                _run_depthai_v2(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
+                _run_depthai_v2(
+                    oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref, config_pending
+                )
     finally:
         session.close()
 
