@@ -95,6 +95,28 @@ def oakd_imu(ts: float | None = None) -> dict[str, Any]:
     }
 
 
+def oakd_imu_report(
+    ts: float,
+    accel_xyz: tuple[float, float, float],
+    gyro_xyz: tuple[float, float, float],
+    quat_wxyz: tuple[float, float, float, float] | None = None,
+) -> dict[str, Any]:
+    """Build body/oakd/imu JSON per body_project_spec.md §5.6 (sensor frame)."""
+    msg: dict[str, Any] = {
+        "ts": ts,
+        "accel": {"x": accel_xyz[0], "y": accel_xyz[1], "z": accel_xyz[2]},
+        "gyro": {"x": gyro_xyz[0], "y": gyro_xyz[1], "z": gyro_xyz[2]},
+    }
+    if quat_wxyz is not None:
+        msg["orientation"] = {
+            "w": quat_wxyz[0],
+            "x": quat_wxyz[1],
+            "y": quat_wxyz[2],
+            "z": quat_wxyz[3],
+        }
+    return msg
+
+
 def oakd_depth_placeholder(ts: float | None = None) -> dict[str, Any]:
     return {"ts": now_ts() if ts is None else ts, "format": "placeholder", "note": "TBD per body_project_spec.md §5.7"}
 

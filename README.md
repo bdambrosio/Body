@@ -5,7 +5,7 @@ Onboard software for a differential-drive robot chassis: independent Python proc
 ## Requirements
 
 - Python 3.11+
-- `eclipse-zenoh` (see [requirements.txt](requirements.txt))
+- `eclipse-zenoh` and, for `oakd_driver`, `depthai` (see [requirements.txt](requirements.txt)); Linux udev rules for Movidius (`03e7`) are required to open the OAK from a non-root user.
 - A Zenoh **router** (`zenohd`) reachable by every Body process and every client (teleop or Jill). On the robot, run the router on the Pi and listen on TCP **7447** (see [Configuration](#configuration)).
 
 ## Install (once per machine)
@@ -38,6 +38,26 @@ Router on the Pi (matches the spec): listen on `0.0.0.0:7447` so peers on the LA
 ```
 
 Processes on the Pi should connect to **`tcp/127.0.0.1:7447`** (default in `config.json`). A laptop running teleop uses **`tcp/<pi-ip>:7447`** via `ZENOH_CONNECT` or edited `connect_endpoints`.
+
+### Starting `zenohd` (router)
+
+Body expects a **router** already running before you start `body.launcher` or `teleop`.
+
+1. **Install the Zenoh router binary** (`zenohd`) on the machine that will host the router (usually the Pi). Options:
+   - Follow the official [Zenoh installation](https://zenoh.io/docs/getting-started/installation/) guide (packages or archive).
+   - Or download a release for your platform from [eclipse-zenoh/zenoh releases](https://github.com/eclipse-zenoh/zenoh/releases) (e.g. **aarch64** for Raspberry Pi 5), unpack, and run the included `zenohd`.
+
+2. **Config:** This repo includes a minimal router config: [deploy/zenohd-router.json](deploy/zenohd-router.json) — listens on **TCP `0.0.0.0:7447`** so local peers use `127.0.0.1` and LAN clients use the Pi’s IP.
+
+3. **Run** (foreground example; use `tmux`, `systemd`, or similar for production):
+
+```bash
+zenohd -c /path/to/Body/deploy/zenohd-router.json
+```
+
+If your installed `zenohd` only accepts JSON5, rename or duplicate the file with a `.json5` extension and pass that path.
+
+4. **Check:** With `zenohd` running, start `body.launcher` on the Pi; processes should connect to `tcp/127.0.0.1:7447` per [config.json](config.json).
 
 ## Operation overview
 
@@ -139,6 +159,7 @@ With the stack running, subscribe to `body/**` with Zenoh tooling (e.g. `zenoh-p
 ## Layout
 
 - [body/](body/) — package: `launcher`, drivers, `teleop`, `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`).
+- [deploy/](deploy/) — optional ops files (e.g. `zenohd-router.json`).
 
 ## License
 

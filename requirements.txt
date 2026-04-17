@@ -1,1 +1,2 @@
 eclipse-zenoh~=1.9.0
+depthai>=2.24,<3
