@@ -112,6 +112,10 @@ Startup order: `watchdog` → `motor_controller` → `lidar_driver` → `oakd_dr
 
 **Restarts:** If a child exits unexpectedly, the launcher restarts it with exponential backoff (capped at 30 s).
 
+**Deploy tip:** If errors reference old line numbers or missing symbols (e.g. `XLinkOut` on DepthAI v3), the Pi’s `~/Body` tree is behind your main repo—`git pull` or rsync the updated `body/` tree, then restart the launcher.
+
+**Watchdog:** Until something publishes **`body/heartbeat`** (e.g. `body.teleop`), the watchdog may emit **`body/emergency_stop`** (`heartbeat_timeout`). That is expected; start teleop or another client when you want the stack to see a live operator.
+
 ## Standalone mode (no Jill)
 
 **Standalone** means: Body processes on the Pi, and **you** provide heartbeat and velocity commands using the repo’s teleop client—Cognitive Workbench does not need to run.

@@ -5,6 +5,9 @@ publishes ``body/oakd/imu`` at that rate. **Mean gyro ≠ integrated angle** and
 velocity change over the window; for strapdown-equivalent dead reckoning you would integrate
 at full sensor rate on the Pi (or use fused orientation only as a slow state estimate).
 See module docstring in body_project_spec.md §5.6.
+
+Supports **DepthAI v2** (``dai.node.XLinkOut``) and **v3** (output queues on node outputs;
+no XLink).
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
+from collections.abc import Callable
 from typing import Any
 
 import depthai as dai
@@ -19,16 +23,15 @@ import depthai as dai
 from body.lib import schemas, zenoh_helpers
 
 
-def _build_imu_pipeline(oakd_cfg: dict[str, Any]) -> dai.Pipeline:
+def _depthai_is_v3() -> bool:
+    return not hasattr(dai.node, "XLinkOut")
+
+
+def _configure_imu_node(imu: Any, oakd_cfg: dict[str, Any]) -> None:
     accel_hz = int(oakd_cfg.get("imu_accel_hz", 500))
     gyro_hz = int(oakd_cfg.get("imu_gyro_hz", 400))
     rot_hz = int(oakd_cfg.get("imu_rotation_vector_hz", 400))
     use_rot = bool(oakd_cfg.get("rotation_vector_enabled", True))
-
-    pipeline = dai.Pipeline()
-    imu = pipeline.create(dai.node.IMU)
-    xlink = pipeline.create(dai.node.XLinkOut)
-    xlink.setStreamName("imu")
 
     imu.enableIMUSensor(dai.IMUSensor.ACCELEROMETER_RAW, accel_hz)
     imu.enableIMUSensor(dai.IMUSensor.GYROSCOPE_RAW, gyro_hz)
@@ -37,8 +40,6 @@ def _build_imu_pipeline(oakd_cfg: dict[str, Any]) -> dai.Pipeline:
 
     imu.setBatchReportThreshold(1)
     imu.setMaxBatchReports(10)
-    imu.out.link(xlink.input)
-    return pipeline
 
 
 def _pick_device(device_id: str | None) -> dai.DeviceInfo | None:
@@ -51,6 +52,126 @@ def _pick_device(device_id: str | None) -> dai.DeviceInfo | None:
         if device_id in d.deviceId or device_id == d.name:
             return d
     return None
+
+
+def _run_imu_loop(
+    imu_queue: dai.MessageQueue,
+    session: Any,
+    oakd_cfg: dict[str, Any],
+    interval_s: float,
+    depth_period: float,
+    continue_fn: Callable[[], bool],
+) -> None:
+    window_ax: list[float] = []
+    window_ay: list[float] = []
+    window_az: list[float] = []
+    window_gx: list[float] = []
+    window_gy: list[float] = []
+    window_gz: list[float] = []
+    last_quat: tuple[float, float, float, float] | None = None
+
+    window_start = time.monotonic()
+    next_depth = time.monotonic()
+
+    while continue_fn():
+        imu_data = imu_queue.tryGet()
+        if imu_data is not None:
+            for pkt in imu_data.packets:
+                a = pkt.acceleroMeter
+                g = pkt.gyroscope
+                window_ax.append(float(a.x))
+                window_ay.append(float(a.y))
+                window_az.append(float(a.z))
+                window_gx.append(float(g.x))
+                window_gy.append(float(g.y))
+                window_gz.append(float(g.z))
+                rv = pkt.rotationVector
+                if rv is not None:
+                    last_quat = (float(rv.real), float(rv.i), float(rv.j), float(rv.k))
+
+        now = time.monotonic()
+
+        if now >= window_start + interval_s and window_ax:
+            n = len(window_ax)
+            ax = sum(window_ax) / n
+            ay = sum(window_ay) / n
+            az = sum(window_az) / n
+            gx = sum(window_gx) / n
+            gy = sum(window_gy) / n
+            gz = sum(window_gz) / n
+            ts = time.time()
+            quat = last_quat if oakd_cfg.get("rotation_vector_enabled", True) else None
+            msg = schemas.oakd_imu_report(ts, (ax, ay, az), (gx, gy, gz), quat_wxyz=quat)
+            zenoh_helpers.publish_json(session, "body/oakd/imu", msg)
+            q_str = (
+                f" quat=({quat[0]:.3f},{quat[1]:.3f},{quat[2]:.3f},{quat[3]:.3f})" if quat else ""
+            )
+            print(
+                f"[oakd] imu mean over {interval_s:.2f}s: n={n} "
+                f"accel=({ax:.3f},{ay:.3f},{az:.3f}) m/s² "
+                f"gyro=({gx:.4f},{gy:.4f},{gz:.4f}) rad/s{q_str}",
+                flush=True,
+            )
+            window_ax.clear()
+            window_ay.clear()
+            window_az.clear()
+            window_gx.clear()
+            window_gy.clear()
+            window_gz.clear()
+            window_start = now
+
+        if now >= next_depth:
+            zenoh_helpers.publish_json(session, "body/oakd/depth", schemas.oakd_depth_placeholder())
+            next_depth += depth_period
+
+        if imu_data is None:
+            time.sleep(0.001)
+
+
+def _run_depthai_v2(
+    oakd_cfg: dict[str, Any],
+    dev_info: dai.DeviceInfo,
+    session: Any,
+    interval_s: float,
+    depth_period: float,
+    stop_ref: list[bool],
+) -> None:
+    def _continue() -> bool:
+        return not stop_ref[0]
+
+    pipeline = dai.Pipeline()
+    imu = pipeline.create(dai.node.IMU)
+    xlink = pipeline.create(dai.node.XLinkOut)
+    xlink.setStreamName("imu")
+    _configure_imu_node(imu, oakd_cfg)
+    imu.out.link(xlink.input)
+
+    with dai.Device(pipeline, dev_info) as device:
+        imu_queue = device.getOutputQueue("imu", maxSize=50, blocking=False)
+        _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
+
+
+def _run_depthai_v3(
+    oakd_cfg: dict[str, Any],
+    dev_info: dai.DeviceInfo,
+    session: Any,
+    interval_s: float,
+    depth_period: float,
+    stop_ref: list[bool],
+) -> None:
+    # v3: bind an opened Device to the Pipeline, attach queues to node outputs, then start().
+    device = dai.Device(dev_info)
+    pipeline = dai.Pipeline(device)
+    imu = pipeline.create(dai.node.IMU)
+    _configure_imu_node(imu, oakd_cfg)
+    imu_queue = imu.out.createOutputQueue(maxSize=50, blocking=False)
+
+    def _continue() -> bool:
+        return pipeline.isRunning() and not stop_ref[0]
+
+    pipeline.start()
+    with pipeline:
+        _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
 
 
 def main() -> None:
@@ -66,16 +187,14 @@ def main() -> None:
     device_id = oakd_cfg.get("device_id")
 
     session = zenoh_helpers.open_session(body_cfg)
-    stop = False
+    stop_ref: list[bool] = [False]
 
     def handle_sigterm(_sig: int, _frame: Any) -> None:
-        nonlocal stop
-        stop = True
+        stop_ref[0] = True
 
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    pipeline = _build_imu_pipeline(oakd_cfg)
     dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
     if dev_info is None:
         print(
@@ -85,75 +204,16 @@ def main() -> None:
         session.close()
         sys.exit(1)
 
-    window_ax: list[float] = []
-    window_ay: list[float] = []
-    window_az: list[float] = []
-    window_gx: list[float] = []
-    window_gy: list[float] = []
-    window_gz: list[float] = []
-    last_quat: tuple[float, float, float, float] | None = None
+    try:
+        api = "v3 (no XLinkOut)" if _depthai_is_v3() else "v2 (XLinkOut)"
+        print(f"[oakd] depthai API: {api}; library {getattr(dai, '__version__', '?')}", flush=True)
+        if _depthai_is_v3():
+            _run_depthai_v3(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
+        else:
+            _run_depthai_v2(oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref)
+    finally:
+        session.close()
 
-    window_start = time.monotonic()
-    next_depth = time.monotonic()
-
-    with dai.Device(pipeline, dev_info) as device:
-        imu_queue = device.getOutputQueue("imu", maxSize=50, blocking=False)
-
-        while not stop:
-            imu_data = imu_queue.tryGet()
-            if imu_data is not None:
-                for pkt in imu_data.packets:
-                    a = pkt.acceleroMeter
-                    g = pkt.gyroscope
-                    window_ax.append(float(a.x))
-                    window_ay.append(float(a.y))
-                    window_az.append(float(a.z))
-                    window_gx.append(float(g.x))
-                    window_gy.append(float(g.y))
-                    window_gz.append(float(g.z))
-                    rv = pkt.rotationVector
-                    if rv is not None:
-                        last_quat = (float(rv.real), float(rv.i), float(rv.j), float(rv.k))
-
-            now = time.monotonic()
-
-            if now >= window_start + interval_s and window_ax:
-                n = len(window_ax)
-                ax = sum(window_ax) / n
-                ay = sum(window_ay) / n
-                az = sum(window_az) / n
-                gx = sum(window_gx) / n
-                gy = sum(window_gy) / n
-                gz = sum(window_gz) / n
-                ts = time.time()
-                quat = last_quat if oakd_cfg.get("rotation_vector_enabled", True) else None
-                msg = schemas.oakd_imu_report(ts, (ax, ay, az), (gx, gy, gz), quat_wxyz=quat)
-                zenoh_helpers.publish_json(session, "body/oakd/imu", msg)
-                q_str = f" quat=({quat[0]:.3f},{quat[1]:.3f},{quat[2]:.3f},{quat[3]:.3f})" if quat else ""
-                print(
-                    f"[oakd] imu mean over {interval_s:.2f}s: n={n} "
-                    f"accel=({ax:.3f},{ay:.3f},{az:.3f}) m/s² "
-                    f"gyro=({gx:.4f},{gy:.4f},{gz:.4f}) rad/s{q_str}",
-                    flush=True,
-                )
-                window_ax.clear()
-                window_ay.clear()
-                window_az.clear()
-                window_gx.clear()
-                window_gy.clear()
-                window_gz.clear()
-                window_start = now
-
-            if now >= next_depth:
-                zenoh_helpers.publish_json(
-                    session, "body/oakd/depth", schemas.oakd_depth_placeholder()
-                )
-                next_depth += depth_period
-
-            if imu_data is None:
-                time.sleep(0.001)
-
-    session.close()
     sys.exit(0)
 
 
