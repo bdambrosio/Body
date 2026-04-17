@@ -175,6 +175,8 @@ def _run_stub_imu_publisher(
     interval_s: float,
     depth_period: float,
     stop_ref: list[bool],
+    *,
+    stub_log_note: str = "oakd.imu_hardware_present=false",
 ) -> None:
     """No DepthAI IMU (e.g. OAK-D-Lite Kickstarter boards without IMU): synthetic Zenoh traffic."""
     next_imu = time.monotonic()
@@ -183,7 +185,7 @@ def _run_stub_imu_publisher(
         now = time.monotonic()
         if now >= next_imu:
             zenoh_helpers.publish_json(session, "body/oakd/imu", schemas.oakd_imu())
-            print("[oakd] synthetic IMU (imu_hardware_present=false in config)", flush=True)
+            print(f"[oakd] synthetic IMU ({stub_log_note})", flush=True)
             next_imu += interval_s
         if now >= next_depth:
             zenoh_helpers.publish_json(
@@ -248,7 +250,14 @@ def _run_depthai_v2(
         if not _is_depthai_imu_missing_error(e):
             raise
         _log_imu_missing_fallback(e)
-        _run_stub_imu_publisher(session, oakd_cfg, interval_s, depth_period, stop_ref)
+        _run_stub_imu_publisher(
+            session,
+            oakd_cfg,
+            interval_s,
+            depth_period,
+            stop_ref,
+            stub_log_note="DepthAI IMU missing; placeholder (set oakd.imu_hardware_present=false to skip OAK)",
+        )
 
 
 def _run_depthai_v3(
@@ -277,7 +286,14 @@ def _run_depthai_v3(
             raise
         _log_imu_missing_fallback(e)
         _cleanup_v3_after_failed_pipeline_start(device, pipeline)
-        _run_stub_imu_publisher(session, oakd_cfg, interval_s, depth_period, stop_ref)
+        _run_stub_imu_publisher(
+            session,
+            oakd_cfg,
+            interval_s,
+            depth_period,
+            stop_ref,
+            stub_log_note="DepthAI IMU missing; placeholder (set oakd.imu_hardware_present=false to skip OAK)",
+        )
         return
     with pipeline:
         _run_imu_loop(imu_queue, session, oakd_cfg, interval_s, depth_period, _continue)
