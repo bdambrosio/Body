@@ -117,6 +117,10 @@ For `format == "placeholder"`: textual state only (“Pi not streaming depth yet
 
 **v1:** polar render of `ranges` (invalid entries as gaps or max-range), plus scan metadata (count, `scan_time_ms`, last update).
 
+**Angle convention (normative, matches [body_project_spec.md](../body_project_spec.md) §5.5):** `angle_min` / `angle_increment` define beam directions in radians with **0 = robot forward** and **increasing CCW** when viewed from above (same as robot frame: +x forward, +y left).
+
+**Polar plot / matplotlib (implementation note):** By default, `matplotlib` polar axes put **θ = 0 at the right** (3 o’clock), not at the top. If the UI caption says **“forward is up”** but forward (index 0 / angle 0) appears **to the right**, that is a **pure UI bug**: either call **`ax.set_theta_zero_location('N')`** so θ = 0 is at the **top**, or equivalently offset angles by **+π/2** relative to matplotlib’s default zero, and verify **`set_theta_direction`** so CCW matches the spec. The STL-19P housing arrow and Body’s scan angles are aligned; fix the console, not `lidar_driver`.
+
 ---
 
 ## 6. Commands, E-Stop Semantics & Operator Actions
