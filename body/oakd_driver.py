@@ -121,7 +121,21 @@ def _depth_drain_latest(depth_queue: Any) -> Any | None:
     return last
 
 
-def _depth_frame_to_stream_msg(frame: Any, out_w: int, out_h: int) -> dict[str, Any]:
+def _apply_oakd_image_rotate(arr: np.ndarray, oakd_cfg: dict[str, Any]) -> np.ndarray:
+    """Shared mount correction for RGB and depth (``oakd.rgb_rotate_deg``: 0, 90, 180, 270)."""
+    deg = int(oakd_cfg.get("rgb_rotate_deg", 0)) % 360
+    if deg == 90:
+        return cv2.rotate(arr, cv2.ROTATE_90_CLOCKWISE)
+    if deg == 180:
+        return cv2.rotate(arr, cv2.ROTATE_180)
+    if deg == 270:
+        return cv2.rotate(arr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return arr
+
+
+def _depth_frame_to_stream_msg(
+    frame: Any, out_w: int, out_h: int, oakd_cfg: dict[str, Any]
+) -> dict[str, Any]:
     h0 = int(frame.getHeight())
     w0 = int(frame.getWidth())
     arr = frame.getFrame()
@@ -130,6 +144,7 @@ def _depth_frame_to_stream_msg(frame: Any, out_w: int, out_h: int) -> dict[str, 
         arr = np.frombuffer(bytes(buf), dtype=np.uint16).reshape((h0, w0))
     else:
         arr = np.ascontiguousarray(arr, dtype=np.uint16)
+    arr = _apply_oakd_image_rotate(arr, oakd_cfg)
     small = cv2.resize(arr, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
     b64 = base64.standard_b64encode(small.tobytes()).decode("ascii")
     return schemas.oakd_depth_stream_frame(out_w, out_h, b64)
@@ -175,13 +190,12 @@ def _wait_rgb_frame(rgb_queue: Any, timeout_s: float = 3.0) -> Any | None:
     return _rgb_drain_latest(rgb_queue)
 
 
-def _jpeg_b64_from_imgframe(frame: Any) -> tuple[str, int, int]:
-    bgr = frame.getCvFrame()
+def _jpeg_b64_from_imgframe(frame: Any, oakd_cfg: dict[str, Any]) -> tuple[str, int, int]:
+    bgr = _apply_oakd_image_rotate(frame.getCvFrame(), oakd_cfg)
     ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok or buf is None:
         raise RuntimeError("cv2.imencode failed for RGB frame")
-    w = int(frame.getWidth())
-    h = int(frame.getHeight())
+    h, w = bgr.shape[:2]
     b64 = base64.standard_b64encode(buf.tobytes()).decode("ascii")
     return b64, w, h
 
@@ -190,6 +204,7 @@ def _process_oakd_config_queue(
     session: Any,
     config_pending: queue.Queue[dict[str, Any]],
     rgb_queue: Any | None,
+    oakd_cfg: dict[str, Any],
 ) -> None:
     while True:
         try:
@@ -219,7 +234,7 @@ def _process_oakd_config_queue(
             )
             continue
         try:
-            jpeg_b64, fw, fh = _jpeg_b64_from_imgframe(frame)
+            jpeg_b64, fw, fh = _jpeg_b64_from_imgframe(frame, oakd_cfg)
             zenoh_helpers.publish_json(
                 session,
                 "body/oakd/rgb",
@@ -257,7 +272,7 @@ def _run_imu_loop(
     next_depth = time.monotonic()
 
     while continue_fn():
-        _process_oakd_config_queue(session, config_pending, rgb_queue)
+        _process_oakd_config_queue(session, config_pending, rgb_queue, oakd_cfg)
         imu_data = imu_queue.tryGet()
         if imu_data is not None:
             for pkt in imu_data.packets:
@@ -313,7 +328,7 @@ def _run_imu_loop(
                         zenoh_helpers.publish_json(
                             session,
                             "body/oakd/depth",
-                            _depth_frame_to_stream_msg(df, dw, dh),
+                            _depth_frame_to_stream_msg(df, dw, dh, oakd_cfg),
                         )
                     except Exception as e:
                         print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)
@@ -341,7 +356,7 @@ def _run_synthetic_imu_depth_config_loop(
     next_imu = time.monotonic()
     next_depth = time.monotonic()
     while not stop_ref[0]:
-        _process_oakd_config_queue(session, config_pending, rgb_queue)
+        _process_oakd_config_queue(session, config_pending, rgb_queue, oakd_cfg)
         now = time.monotonic()
         if now >= next_imu:
             zenoh_helpers.publish_json(session, "body/oakd/imu", schemas.oakd_imu())
@@ -355,7 +370,7 @@ def _run_synthetic_imu_depth_config_loop(
                         zenoh_helpers.publish_json(
                             session,
                             "body/oakd/depth",
-                            _depth_frame_to_stream_msg(df, dw, dh),
+                            _depth_frame_to_stream_msg(df, dw, dh, oakd_cfg),
                         )
                     except Exception as e:
                         print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)

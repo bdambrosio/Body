@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any
 
-from body.lib import schemas, zenoh_helpers
+from body.lib import host_metrics, schemas, zenoh_helpers
 
 TOPIC_TO_PROCESS: dict[str, str] = {
     "body/odom": "motor_controller",
@@ -24,6 +24,7 @@ def main() -> None:
     proc_timeout_ms = float(wd_cfg.get("process_timeout_ms", 5000))
     status_hz = float(wd_cfg.get("status_publish_hz", 1))
     monitored: list[str] = list(wd_cfg.get("monitored_topics", []))
+    host_metrics_enabled = bool(wd_cfg.get("host_metrics", True))
 
     last_hb = 0.0
     last_seen: dict[str, float] = {t: 0.0 for t in monitored}
@@ -93,12 +94,14 @@ def main() -> None:
                     processes[proc_name] = "ok" if age_ms <= proc_timeout_ms else "missing"
 
             uptime_s = now - start
+            host = host_metrics.read_host_metrics_dict() if host_metrics_enabled else None
             status_msg = schemas.status(
                 processes=processes,
                 heartbeat_ok=hb_ok,
                 e_stop_active=e_stop_active,
                 uptime_s=uptime_s,
                 ts=now,
+                host=host,
             )
 
         if emergency is not None:

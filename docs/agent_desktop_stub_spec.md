@@ -79,7 +79,7 @@ The operator must **explicitly** enable **“Live command”** (or equivalent) t
 
 | Topic | Use |
 |-------|-----|
-| `body/status` | Processes, `heartbeat_ok`, `e_stop_active`, `uptime_s` |
+| `body/status` | Processes, `heartbeat_ok`, `e_stop_active`, `uptime_s`; optional **`host`** — see [body_status_host_spec.md](body_status_host_spec.md) |
 | `body/emergency_stop` | Prominent alert + `reason` |
 | `body/odom` | Pose / velocity readout |
 | `body/motor_state` | PWM, dirs, flags |

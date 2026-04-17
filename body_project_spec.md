@@ -270,12 +270,21 @@ Jill publishes at 2 Hz minimum. Watchdog triggers safety stop if no heartbeat re
   },
   "heartbeat_ok": true,
   "e_stop_active": false,
-  "uptime_s": 123.4
+  "uptime_s": 123.4,
+  "host": {
+    "ts": 1713264000.123456,
+    "cpu_temp_c": 52.3,
+    "core_volts": 0.8563,
+    "throttled": "0x0",
+    "under_voltage_now": false,
+    "throttled_now": false
+  }
 }
 ```
 
 - Process state: `"ok"`, `"missing"`, `"restarting"`.
 - Published at 1 Hz.
+- **`host`** (optional): Raspberry Pi–oriented telemetry when enabled in watchdog config. Includes **`cpu_temp_c`** (°C) from thermal sysfs when available; **`core_volts`** (SoC core rail ~0.8–0.95 V, **not** the 5 V input—see [docs/body_status_host_spec.md](docs/body_status_host_spec.md)); **`throttled`** (hex) and boolean flags from `vcgencmd get_throttled`. **5 V input problems** are indicated by **`under_voltage_*`** flags, not by `core_volts`. Omitted entirely if `watchdog.host_metrics` is false.
 
 ### 5.10 `body/emergency_stop` (watchdog → motor_controller)
 

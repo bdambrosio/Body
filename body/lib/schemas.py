@@ -85,6 +85,33 @@ def lidar_scan(
     }
 
 
+def lidar_scan_from_bins(
+    ranges_m: list[float | None],
+    *,
+    intensities: list[int] | None = None,
+    range_min_m: float = 0.05,
+    range_max_m: float = 12.0,
+    scan_time_ms: int = 100,
+    ts: float | None = None,
+) -> dict[str, Any]:
+    """Build ``body/lidar/scan`` from fixed angular bins (see body_project_spec.md §5.5)."""
+    n = len(ranges_m)
+    angle_increment = (2.0 * math.pi) / max(1, n)
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "angle_min": 0.0,
+        "angle_max": 2.0 * math.pi,
+        "angle_increment": angle_increment,
+        "range_min": range_min_m,
+        "range_max": range_max_m,
+        "ranges": ranges_m,
+        "scan_time_ms": scan_time_ms,
+    }
+    if intensities is not None:
+        msg["intensities"] = intensities
+    return msg
+
+
 def oakd_imu(ts: float | None = None) -> dict[str, Any]:
     t = now_ts() if ts is None else ts
     return {
@@ -190,14 +217,18 @@ def status(
     e_stop_active: bool,
     uptime_s: float,
     ts: float | None = None,
+    host: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
         "processes": processes,
         "heartbeat_ok": heartbeat_ok,
         "e_stop_active": e_stop_active,
         "uptime_s": uptime_s,
     }
+    if host is not None:
+        msg["host"] = host
+    return msg
 
 
 def emergency_stop(reason: str, source: str = "watchdog", ts: float | None = None) -> dict[str, Any]:

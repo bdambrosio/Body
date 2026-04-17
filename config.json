@@ -12,9 +12,14 @@
     "pwm_frequency_hz": 1000
   },
   "lidar": {
+    "stub_only": false,
     "serial_port": "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
     "baud_rate": 230400,
-    "publish_hz": 10
+    "publish_hz": 10,
+    "num_points": 360,
+    "range_min_m": 0.05,
+    "range_max_m": 12.0,
+    "include_intensities": true
   },
   "oakd": {
     "depth_resolution": "400p",
@@ -28,6 +33,7 @@
     "rgb_enabled": true,
     "rgb_preview_width": 640,
     "rgb_preview_height": 400,
+    "rgb_rotate_deg": 0,
     "imu_aggregate_interval_s": 1.0,
     "imu_accel_hz": 500,
     "imu_gyro_hz": 400,
@@ -41,6 +47,7 @@
     "heartbeat_timeout_ms": 2000,
     "process_timeout_ms": 5000,
     "status_publish_hz": 1,
+    "host_metrics": true,
     "monitored_topics": [
       "body/odom",
       "body/lidar/scan",

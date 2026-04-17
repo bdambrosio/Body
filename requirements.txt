@@ -1,3 +1,4 @@
 eclipse-zenoh~=1.9.0
 depthai>=2.24,<4
 opencv-python-headless>=4.8,<5
+pyserial>=3.5,<4
