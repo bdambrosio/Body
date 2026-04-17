@@ -43,19 +43,35 @@ Processes on the Pi should connect to **`tcp/127.0.0.1:7447`** (default in `conf
 
 Body expects a **router** already running before you start `body.launcher` or `teleop`.
 
-1. **Install the Zenoh router binary** (`zenohd`) on the machine that will host the router (usually the Pi). Options:
-   - Follow the official [Zenoh installation](https://zenoh.io/docs/getting-started/installation/) guide (packages or archive).
-   - Or download a release for your platform from [eclipse-zenoh/zenoh releases](https://github.com/eclipse-zenoh/zenoh/releases) (e.g. **aarch64** for Raspberry Pi 5), unpack, and run the included `zenohd`.
+**`zenohd` is not installed by `pip` or your `.venv`.** The Python package `eclipse-zenoh` is only the client library. If the shell says `zenohd: command not found`, install the router binary below (or add it to your `PATH`).
 
-2. **Config:** This repo includes a minimal router config: [deploy/zenohd-router.json](deploy/zenohd-router.json) — listens on **TCP `0.0.0.0:7447`** so local peers use `127.0.0.1` and LAN clients use the Pi’s IP.
-
-3. **Run** (foreground example; use `tmux`, `systemd`, or similar for production):
+1. **Install the router binary** on the machine that runs the router (usually the Pi). Pick one:
+   - Official options: [Zenoh installation](https://zenoh.io/docs/getting-started/installation/).
+   - **Raspberry Pi 5 (64-bit):** use the **aarch64 Linux standalone** archive from [eclipse-zenoh/zenoh releases](https://github.com/eclipse-zenoh/zenoh/releases). Unpack so `zenohd` and the bundled `*.so` plugins stay in the **same directory** (the archive layout is flat). Example (adjust `ZV` to match your `eclipse-zenoh` major.minor, e.g. `1.9.0`):
 
 ```bash
-zenohd -c /path/to/Body/deploy/zenohd-router.json
+ZV=1.9.0
+curl -sLO "https://github.com/eclipse-zenoh/zenoh/releases/download/${ZV}/zenoh-${ZV}-aarch64-unknown-linux-gnu-standalone.zip"
+mkdir -p "$HOME/zenoh/${ZV}"
+unzip -o "zenoh-${ZV}-aarch64-unknown-linux-gnu-standalone.zip" -d "$HOME/zenoh/${ZV}"
 ```
 
-If your installed `zenohd` only accepts JSON5, rename or duplicate the file with a `.json5` extension and pass that path.
+2. **Config:** This repo includes [deploy/zenohd-router.json](deploy/zenohd-router.json) — listens on **TCP `0.0.0.0:7447`**.
+
+3. **Run** from the directory that contains `zenohd` (foreground; use `tmux` / `systemd` for production). Example if Body lives at `~/Body`:
+
+```bash
+"$HOME/zenoh/1.9.0/zenohd" -c "$HOME/Body/deploy/zenohd-router.json"
+```
+
+To put `zenohd` on your `PATH`, copy **both** `zenohd` and the `libzenoh_plugin_*.so` files into the same target directory (e.g. `$HOME/zenoh/1.9.0` already does), then:
+
+```bash
+export PATH="$HOME/zenoh/1.9.0:$PATH"
+zenohd -c "$HOME/Body/deploy/zenohd-router.json"
+```
+
+If your `zenohd` build only accepts JSON5 configs, copy `zenohd-router.json` to `zenohd-router.json5` and pass that path.
 
 4. **Check:** With `zenohd` running, start `body.launcher` on the Pi; processes should connect to `tcp/127.0.0.1:7447` per [config.json](config.json).
 
