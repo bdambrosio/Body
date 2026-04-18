@@ -233,3 +233,32 @@ def status(
 
 def emergency_stop(reason: str, source: str = "watchdog", ts: float | None = None) -> dict[str, Any]:
     return {"ts": now_ts() if ts is None else ts, "reason": reason, "source": source}
+
+
+def local_map_2p5d(
+    *,
+    ts: float,
+    resolution_m: float,
+    origin_x_m: float,
+    origin_y_m: float,
+    nx: int,
+    ny: int,
+    max_height_m: list[list[float | None]],
+    frame: str = "body",
+    sources: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """body/map/local_2p5d — egocentric max-height-above-ground grid (see docs/local_map_spec.md)."""
+    msg: dict[str, Any] = {
+        "ts": ts,
+        "frame": frame,
+        "kind": "max_height_grid",
+        "resolution_m": resolution_m,
+        "origin_x_m": origin_x_m,
+        "origin_y_m": origin_y_m,
+        "nx": nx,
+        "ny": ny,
+        "max_height_m": max_height_m,
+    }
+    if sources is not None:
+        msg["sources"] = sources
+    return msg

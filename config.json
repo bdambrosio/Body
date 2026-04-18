@@ -19,7 +19,8 @@
     "num_points": 360,
     "range_min_m": 0.05,
     "range_max_m": 12.0,
-    "include_intensities": true
+    "include_intensities": true,
+    "height_above_ground_m": 0.1778
   },
   "oakd": {
     "depth_resolution": "400p",
@@ -34,6 +35,7 @@
     "rgb_preview_width": 640,
     "rgb_preview_height": 400,
     "rgb_rotate_deg": 180,
+    "depth_camera_height_above_ground_m": 0.1016,
     "imu_aggregate_interval_s": 1.0,
     "imu_accel_hz": 500,
     "imu_gyro_hz": 400,
@@ -42,6 +44,26 @@
     "imu_enable_firmware_update": false,
     "imu_hardware_present": true,
     "device_id": null
+  },
+  "local_map": {
+    "enabled": true,
+    "publish_hz": 2,
+    "resolution_m": 0.08,
+    "extent_forward_m": 4.0,
+    "extent_back_m": 0.25,
+    "extent_left_m": 2.5,
+    "extent_right_m": 2.5,
+    "ground_z_body_m": 0.0,
+    "lidar_x_body_m": 0.0,
+    "lidar_y_body_m": 0.0,
+    "lidar_yaw_rad": 0.0,
+    "depth_x_body_m": 0.0,
+    "depth_y_body_m": 0.0,
+    "depth_yaw_rad": 0.0,
+    "depth_pitch_rad": 0.0,
+    "depth_roll_rad": 0.0,
+    "depth_hfov_deg": 73.0,
+    "depth_vfov_deg": 58.0
   },
   "watchdog": {
     "heartbeat_timeout_ms": 2000,

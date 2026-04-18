@@ -87,6 +87,7 @@ The operator must **explicitly** enable **“Live command”** (or equivalent) t
 | `body/oakd/imu` | Compact numeric / JSON |
 | `body/oakd/depth` | False-color view (§5.1) |
 | `body/oakd/rgb` | JPEG from capture responses |
+| `body/map/local_2p5d` | Optional: fused **max-height** 2.5D grid for navigation debug — see [desktop_change_spec_local_map.md](desktop_change_spec_local_map.md) |
 
 **Optional (recommended):** subscribe to **`body/cmd_vel`** in monitor-only (and when live) to show **last twist seen on the bus**—useful when another process is driving (should not happen per §4.0, but invaluable when debugging mistaken double-client setups).
 
