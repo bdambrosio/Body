@@ -58,6 +58,27 @@ def _decode_depth_mm(msg: dict[str, Any]) -> tuple[np.ndarray, int, int] | None:
     return arr, w, h
 
 
+def _median_filter_depth_mm(arr: np.ndarray, kernel: int) -> np.ndarray:
+    """Reduce stereo speckle before unprojection: per-pixel median over valid neighbors only.
+
+    Pixels with value ``0`` are treated as invalid (DepthAI convention) and omitted from the
+    median; if no valid samples exist in the window, output is ``0``. Kernel must be odd and >= 3.
+    """
+    if kernel <= 1 or kernel % 2 == 0:
+        return arr
+    half = kernel // 2
+    h, w = arr.shape
+    out = np.zeros_like(arr)
+    for v in range(h):
+        for u in range(w):
+            patch = arr[max(0, v - half) : min(h, v + half + 1), max(0, u - half) : min(w, u + half + 1)]
+            valid = patch[patch > 0]
+            if valid.size == 0:
+                continue
+            out[v, u] = np.uint16(np.median(valid))
+    return out
+
+
 def main() -> None:
     body_cfg = zenoh_helpers.load_body_config()
     lm = body_cfg.get("local_map", {})
@@ -104,6 +125,7 @@ def main() -> None:
     depth_roll = float(lm.get("depth_roll_rad", 0.0))
     hfov = math.radians(float(lm.get("depth_hfov_deg", 73.0)))
     vfov = math.radians(float(lm.get("depth_vfov_deg", 58.0)))
+    depth_median_kernel = int(lm.get("depth_median_kernel", 3))
 
     # OpenCV cam: x right, y down, z forward  ->  body: x forward, y left, z up
     R_fix = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float64)
@@ -183,6 +205,8 @@ def main() -> None:
             dec = _decode_depth_mm(dmsg)
             if dec is not None:
                 arr, w, h = dec
+                if depth_median_kernel > 1:
+                    arr = _median_filter_depth_mm(arr, depth_median_kernel)
                 fx = (w - 1) / (2.0 * math.tan(hfov / 2.0)) if w > 1 else 1.0
                 fy = (h - 1) / (2.0 * math.tan(vfov / 2.0)) if h > 1 else 1.0
                 cx = (w - 1) * 0.5

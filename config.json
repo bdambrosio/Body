@@ -11,7 +11,13 @@
     "cmd_timeout_ms": 500,
     "pwm_frequency_hz": 1000,
     "stall_detect_enabled": false,
-    "stall_detect_ms": 1000
+    "stall_detect_ms": 1000,
+    "gpio_enabled": false,
+    "gpio_chip": 0,
+    "gpio_left_pwm": 12,
+    "gpio_right_pwm": 13,
+    "gpio_left_dir": 5,
+    "gpio_right_dir": 6
   },
   "lidar": {
     "stub_only": false,
@@ -65,7 +71,8 @@
     "depth_pitch_rad": 0.0,
     "depth_roll_rad": 0.0,
     "depth_hfov_deg": 73.0,
-    "depth_vfov_deg": 58.0
+    "depth_vfov_deg": 58.0,
+    "depth_median_kernel": 3
   },
   "watchdog": {
     "heartbeat_timeout_ms": 2000,

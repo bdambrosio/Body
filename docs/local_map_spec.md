@@ -11,6 +11,8 @@ Egocentric **max height above ground** grid in the **body frame** (+x forward, +
 
 This matches the navigation intent: lidar sees a **torso-height ring**; depth fills **near-ground** structure in the camera wedge. Fusion rule is **per-cell maximum** of valid samples (v1; no temporal decay).
 
+**Depth presmoothing:** Before unprojection, the depth image can be passed through a **median filter** over valid pixels only (`depth_median_kernel`, default **3**; set **0** or **1** to disable). That cuts stereo speckle with modest cost; like any spatial filter it slightly softens depth discontinuities. If that blur is noticeable at your current `oakd.depth_out_width` / `depth_out_height`, raising resolution (more pixels per radian) shrinks the **angular** size of a fixed \(k \times k\) kernel, so the same median hurts fine detail less—at the cost of larger Zenoh payloads and more projection work. Trade bandwidth/CPU against noise.
+
 ## Configuration (`config.json` → `local_map`)
 
 | Key | Meaning |
@@ -25,6 +27,7 @@ This matches the navigation intent: lidar sees a **torso-height ring**; depth fi
 | `depth_x_body_m`, `depth_y_body_m`, `depth_z_body_m` | Camera optical center in body; z defaults to `oakd.depth_camera_height_above_ground_m`. |
 | `depth_yaw_rad`, `depth_pitch_rad`, `depth_roll_rad` | Euler (Z–Y–X) after fixed OpenCV→body axis fix (see code). |
 | `depth_hfov_deg`, `depth_vfov_deg` | Approximate pinhole FOV for resized depth (`oakd.depth_out_width` × `height`). |
+| `depth_median_kernel` | Odd kernel size (e.g. **3**) for median filter on depth **before** unprojection; invalid pixels (`0` mm) skipped. **0** or **1** = off. |
 
 Tune **`lidar_yaw_rad`** / **`depth_*`** to match your CAD mount; defaults assume sensors on the body origin.
 

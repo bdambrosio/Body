@@ -1,4 +1,8 @@
-"""Motor controller: stub publishes synthetic odom/motor_state; subscribes to motion and safety topics."""
+"""Motor controller: Zenoh cmd_vel/cmd_direct → PWM+DIR on MDD10A (optional GPIO) + odom/motor_state.
+
+When ``motor.gpio_enabled`` is false, duty values are published only (no Pi GPIO). When true, the Pi
+drives BCM pins per docs/motor_controller_spec.md (lgpio). Set ``max_wheel_vel_ms`` > 0 for nonzero duty.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from body.lib import diff_drive, schemas, zenoh_helpers
+from body.lib import diff_drive, motor_gpio, schemas, zenoh_helpers
 
 STALL_PWM_THRESHOLD = 0.1
 STALL_VELOCITY_EPS_MS = 0.01
@@ -49,6 +53,21 @@ def main() -> None:
     max_wheel_vel_ms = float(motor_cfg.get("max_wheel_vel_ms", 0.0))
     stall_detect_enabled = bool(motor_cfg.get("stall_detect_enabled", False))
     stall_detect_ms = int(motor_cfg.get("stall_detect_ms", 1000))
+    gpio_enabled = bool(motor_cfg.get("gpio_enabled", False))
+
+    gpio_h: Any = None
+    gpio_pins: dict[str, Any] | None = None
+    if gpio_enabled:
+        gpio_h, gpio_pins = motor_gpio.open_mdd10a(motor_cfg)
+        print(
+            "motor_controller: GPIO enabled — MDD10A PWM+DIR on Pi (see motor.gpio_* in config)",
+            flush=True,
+        )
+    if gpio_enabled and max_wheel_vel_ms <= 0.0:
+        print(
+            "motor_controller: warning: max_wheel_vel_ms is 0 — commanded duty will stay 0; set a positive value to move.",
+            flush=True,
+        )
 
     state = MotionState()
     session = zenoh_helpers.open_session(body_cfg)
@@ -110,126 +129,133 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_sigterm)
 
     next_tick = time.monotonic()
-    while not stop.is_set():
-        now_wall = time.time()
-        # Phase 2 stub: no GPIO; Phase 5: replace with encoder delta reads.
-        delta_left_ticks = 0
-        delta_right_ticks = 0
+    try:
+        while not stop.is_set():
+            now_wall = time.time()
+            # Encoder deltas: wire quadrature when implemented; open-loop if zero.
+            delta_left_ticks = 0
+            delta_right_ticks = 0
 
-        with state.lock:
-            twist = state.last_twist
-            direct = state.last_direct
-            cmd_wall = state.last_cmd_wall_s
-            e_stop = state.e_stop_latched or state.status_e_stop
-            direct_ts = float(direct["ts"]) if direct else 0.0
-            use_direct = direct is not None and (twist is None or (twist is not None and direct_ts >= float(twist["ts"])))
-            active = direct if use_direct else twist
-            timeout_ms = int(active.get("timeout_ms", 500)) if active else 500
-            cmd_stale = active is None or (now_wall - cmd_wall) * 1000.0 > timeout_ms
-            cmd_timeout_active = not e_stop and cmd_stale
+            with state.lock:
+                twist = state.last_twist
+                direct = state.last_direct
+                cmd_wall = state.last_cmd_wall_s
+                e_stop = state.e_stop_latched or state.status_e_stop
+                direct_ts = float(direct["ts"]) if direct else 0.0
+                use_direct = direct is not None and (twist is None or (twist is not None and direct_ts >= float(twist["ts"])))
+                active = direct if use_direct else twist
+                timeout_ms = int(active.get("timeout_ms", 500)) if active else 500
+                cmd_stale = active is None or (now_wall - cmd_wall) * 1000.0 > timeout_ms
+                cmd_timeout_active = not e_stop and cmd_stale
 
-            left_pwm = right_pwm = 0.0
-            left_dir = right_dir = "fwd"
-            vx_cmd = vtheta_cmd = 0.0
+                left_pwm = right_pwm = 0.0
+                left_dir = right_dir = "fwd"
+                vx_cmd = vtheta_cmd = 0.0
 
-            if not e_stop and not cmd_stale and active is not None:
-                if use_direct and direct is not None:
-                    lv = float(direct["left"])
-                    rv = float(direct["right"])
-                    left_pwm, left_dir = diff_drive.pwm_from_velocity(lv, max_wheel_vel_ms)
-                    right_pwm, right_dir = diff_drive.pwm_from_velocity(rv, max_wheel_vel_ms)
-                    vx_cmd = (lv + rv) / 2.0
-                    vtheta_cmd = (rv - lv) / wheel_base_m if wheel_base_m > 0 else 0.0
-                elif twist is not None:
-                    lin = float(twist["linear"])
-                    ang = float(twist["angular"])
-                    vl, vr = diff_drive.twist_to_wheel_velocities(lin, ang, wheel_base_m)
-                    left_pwm, left_dir = diff_drive.pwm_from_velocity(vl, max_wheel_vel_ms)
-                    right_pwm, right_dir = diff_drive.pwm_from_velocity(vr, max_wheel_vel_ms)
-                    vx_cmd = lin
-                    vtheta_cmd = ang
+                if not e_stop and not cmd_stale and active is not None:
+                    if use_direct and direct is not None:
+                        lv = float(direct["left"])
+                        rv = float(direct["right"])
+                        left_pwm, left_dir = diff_drive.pwm_from_velocity(lv, max_wheel_vel_ms)
+                        right_pwm, right_dir = diff_drive.pwm_from_velocity(rv, max_wheel_vel_ms)
+                        vx_cmd = (lv + rv) / 2.0
+                        vtheta_cmd = (rv - lv) / wheel_base_m if wheel_base_m > 0 else 0.0
+                    elif twist is not None:
+                        lin = float(twist["linear"])
+                        ang = float(twist["angular"])
+                        vl, vr = diff_drive.twist_to_wheel_velocities(lin, ang, wheel_base_m)
+                        left_pwm, left_dir = diff_drive.pwm_from_velocity(vl, max_wheel_vel_ms)
+                        right_pwm, right_dir = diff_drive.pwm_from_velocity(vr, max_wheel_vel_ms)
+                        vx_cmd = lin
+                        vtheta_cmd = ang
 
-            max_cmd_pwm = max(left_pwm, right_pwm)
-            dl_m = diff_drive.ticks_to_delta_m(delta_left_ticks, wheel_radius_m, ticks_per_rev)
-            dr_m = diff_drive.ticks_to_delta_m(delta_right_ticks, wheel_radius_m, ticks_per_rev)
-            v_left_enc = dl_m / period if period > 0 else 0.0
-            v_right_enc = dr_m / period if period > 0 else 0.0
+                max_cmd_pwm = max(left_pwm, right_pwm)
+                dl_m = diff_drive.ticks_to_delta_m(delta_left_ticks, wheel_radius_m, ticks_per_rev)
+                dr_m = diff_drive.ticks_to_delta_m(delta_right_ticks, wheel_radius_m, ticks_per_rev)
+                v_left_enc = dl_m / period if period > 0 else 0.0
+                v_right_enc = dr_m / period if period > 0 else 0.0
 
-            if stall_detect_enabled and not state.stall_latched and not e_stop and not cmd_stale and active is not None:
-                if max_cmd_pwm > STALL_PWM_THRESHOLD:
-                    if max(abs(v_left_enc), abs(v_right_enc)) < STALL_VELOCITY_EPS_MS:
-                        if stall_begin_wall is None:
-                            stall_begin_wall = now_wall
-                        elif (now_wall - stall_begin_wall) * 1000.0 >= float(stall_detect_ms):
-                            state.stall_latched = True
+                if stall_detect_enabled and not state.stall_latched and not e_stop and not cmd_stale and active is not None:
+                    if max_cmd_pwm > STALL_PWM_THRESHOLD:
+                        if max(abs(v_left_enc), abs(v_right_enc)) < STALL_VELOCITY_EPS_MS:
+                            if stall_begin_wall is None:
+                                stall_begin_wall = now_wall
+                            elif (now_wall - stall_begin_wall) * 1000.0 >= float(stall_detect_ms):
+                                state.stall_latched = True
+                                stall_begin_wall = None
+                        else:
                             stall_begin_wall = None
                     else:
                         stall_begin_wall = None
                 else:
                     stall_begin_wall = None
+
+                stall_active = state.stall_latched
+                if stall_active:
+                    left_pwm = right_pwm = 0.0
+                    left_dir = right_dir = "fwd"
+
+                if dl_m != 0.0 or dr_m != 0.0:
+                    vx = (v_left_enc + v_right_enc) / 2.0
+                    vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
+                else:
+                    vx = vx_cmd
+                    vtheta = vtheta_cmd
+
+                if e_stop or cmd_stale or stall_active:
+                    vx = 0.0
+                    vtheta = 0.0
+
+            if gpio_h is not None and gpio_pins is not None:
+                motor_gpio.apply_outputs(gpio_h, gpio_pins, left_pwm, right_pwm, left_dir, right_dir)
+
+            left_ticks_total += delta_left_ticks
+            right_ticks_total += delta_right_ticks
+
+            dt_ms = int(round(period * 1000))
+            pose = diff_drive.integrate_odometry(pose, dl_m, dr_m, wheel_base_m)
+            ts = schemas.now_ts()
+            zenoh_helpers.publish_json(
+                session,
+                "body/odom",
+                schemas.odom(
+                    ts=ts,
+                    x=pose.x,
+                    y=pose.y,
+                    theta=pose.theta,
+                    vx=vx,
+                    vtheta=vtheta,
+                    left_ticks=left_ticks_total,
+                    right_ticks=right_ticks_total,
+                    dt_ms=dt_ms,
+                ),
+            )
+            zenoh_helpers.publish_json(
+                session,
+                "body/motor_state",
+                schemas.motor_state(
+                    ts=ts,
+                    left_pwm=left_pwm,
+                    right_pwm=right_pwm,
+                    left_dir=left_dir,
+                    right_dir=right_dir,
+                    e_stop_active=e_stop,
+                    cmd_timeout_active=cmd_timeout_active,
+                    stall_detected=stall_active,
+                ),
+            )
+
+            next_tick += period
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
             else:
-                stall_begin_wall = None
+                next_tick = time.monotonic()
+    finally:
+        session.close()
+        if gpio_h is not None and gpio_pins is not None:
+            motor_gpio.shutdown(gpio_h, gpio_pins)
 
-            stall_active = state.stall_latched
-            if stall_active:
-                left_pwm = right_pwm = 0.0
-                left_dir = right_dir = "fwd"
-
-            if dl_m != 0.0 or dr_m != 0.0:
-                vx = (v_left_enc + v_right_enc) / 2.0
-                vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
-            else:
-                vx = vx_cmd
-                vtheta = vtheta_cmd
-
-            if e_stop or cmd_stale or stall_active:
-                vx = 0.0
-                vtheta = 0.0
-
-        left_ticks_total += delta_left_ticks
-        right_ticks_total += delta_right_ticks
-
-        dt_ms = int(round(period * 1000))
-        pose = diff_drive.integrate_odometry(pose, dl_m, dr_m, wheel_base_m)
-        ts = schemas.now_ts()
-        zenoh_helpers.publish_json(
-            session,
-            "body/odom",
-            schemas.odom(
-                ts=ts,
-                x=pose.x,
-                y=pose.y,
-                theta=pose.theta,
-                vx=vx,
-                vtheta=vtheta,
-                left_ticks=left_ticks_total,
-                right_ticks=right_ticks_total,
-                dt_ms=dt_ms,
-            ),
-        )
-        zenoh_helpers.publish_json(
-            session,
-            "body/motor_state",
-            schemas.motor_state(
-                ts=ts,
-                left_pwm=left_pwm,
-                right_pwm=right_pwm,
-                left_dir=left_dir,
-                right_dir=right_dir,
-                e_stop_active=e_stop,
-                cmd_timeout_active=cmd_timeout_active,
-                stall_detected=stall_active,
-            ),
-        )
-
-        next_tick += period
-        sleep_for = next_tick - time.monotonic()
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-        else:
-            next_tick = time.monotonic()
-
-    session.close()
     sys.exit(0)
 
 
