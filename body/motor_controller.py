@@ -11,6 +11,9 @@ from typing import Any
 
 from body.lib import diff_drive, schemas, zenoh_helpers
 
+STALL_PWM_THRESHOLD = 0.1
+STALL_VELOCITY_EPS_MS = 0.01
+
 
 @dataclass
 class MotionState:
@@ -21,10 +24,18 @@ class MotionState:
     status_e_stop: bool = False
     e_stop_latched: bool = False
     awaiting_cmd_vel_after_clear: bool = False
+    stall_latched: bool = False
 
 
 def _print_cmd(kind: str, msg: dict[str, Any]) -> None:
     print(f"motor_controller: {kind} {msg}", flush=True)
+
+
+def _command_is_all_stop(msg: dict[str, Any], *, direct: bool) -> bool:
+    """True if the message commands no motion (clears software stall latch)."""
+    if direct:
+        return abs(float(msg.get("left", 0.0))) < 1e-6 and abs(float(msg.get("right", 0.0))) < 1e-6
+    return abs(float(msg.get("linear", 0.0))) < 1e-6 and abs(float(msg.get("angular", 0.0))) < 1e-6
 
 
 def main() -> None:
@@ -36,14 +47,21 @@ def main() -> None:
     wheel_radius_m = float(motor_cfg.get("wheel_radius_m", 0.0))
     ticks_per_rev = int(motor_cfg.get("ticks_per_rev", 1920))
     max_wheel_vel_ms = float(motor_cfg.get("max_wheel_vel_ms", 0.0))
+    stall_detect_enabled = bool(motor_cfg.get("stall_detect_enabled", False))
+    stall_detect_ms = int(motor_cfg.get("stall_detect_ms", 1000))
 
     state = MotionState()
     session = zenoh_helpers.open_session(body_cfg)
     stop = threading.Event()
+    stall_begin_wall: float | None = None
+    left_ticks_total = 0
+    right_ticks_total = 0
 
     def on_cmd_vel(_key: str, msg: dict[str, Any]) -> None:
         _print_cmd("cmd_vel", msg)
         with state.lock:
+            if state.stall_latched and _command_is_all_stop(msg, direct=False):
+                state.stall_latched = False
             state.last_twist = msg
             state.last_cmd_wall_s = time.time()
             if state.awaiting_cmd_vel_after_clear:
@@ -53,8 +71,13 @@ def main() -> None:
     def on_cmd_direct(_key: str, msg: dict[str, Any]) -> None:
         _print_cmd("cmd_direct", msg)
         with state.lock:
+            if state.stall_latched and _command_is_all_stop(msg, direct=True):
+                state.stall_latched = False
             state.last_direct = msg
             state.last_cmd_wall_s = time.time()
+            if state.awaiting_cmd_vel_after_clear:
+                state.e_stop_latched = False
+                state.awaiting_cmd_vel_after_clear = False
 
     def on_emergency_stop(_key: str, msg: dict[str, Any]) -> None:
         print(f"motor_controller: emergency_stop {msg}", flush=True)
@@ -89,6 +112,10 @@ def main() -> None:
     next_tick = time.monotonic()
     while not stop.is_set():
         now_wall = time.time()
+        # Phase 2 stub: no GPIO; Phase 5: replace with encoder delta reads.
+        delta_left_ticks = 0
+        delta_right_ticks = 0
+
         with state.lock:
             twist = state.last_twist
             direct = state.last_direct
@@ -103,7 +130,7 @@ def main() -> None:
 
             left_pwm = right_pwm = 0.0
             left_dir = right_dir = "fwd"
-            vx = vtheta = 0.0
+            vx_cmd = vtheta_cmd = 0.0
 
             if not e_stop and not cmd_stale and active is not None:
                 if use_direct and direct is not None:
@@ -111,29 +138,74 @@ def main() -> None:
                     rv = float(direct["right"])
                     left_pwm, left_dir = diff_drive.pwm_from_velocity(lv, max_wheel_vel_ms)
                     right_pwm, right_dir = diff_drive.pwm_from_velocity(rv, max_wheel_vel_ms)
-                    vx = (lv + rv) / 2.0
-                    vtheta = (rv - lv) / wheel_base_m if wheel_base_m > 0 else 0.0
+                    vx_cmd = (lv + rv) / 2.0
+                    vtheta_cmd = (rv - lv) / wheel_base_m if wheel_base_m > 0 else 0.0
                 elif twist is not None:
                     lin = float(twist["linear"])
                     ang = float(twist["angular"])
                     vl, vr = diff_drive.twist_to_wheel_velocities(lin, ang, wheel_base_m)
                     left_pwm, left_dir = diff_drive.pwm_from_velocity(vl, max_wheel_vel_ms)
                     right_pwm, right_dir = diff_drive.pwm_from_velocity(vr, max_wheel_vel_ms)
-                    vx = lin
-                    vtheta = ang
+                    vx_cmd = lin
+                    vtheta_cmd = ang
+
+            max_cmd_pwm = max(left_pwm, right_pwm)
+            dl_m = diff_drive.ticks_to_delta_m(delta_left_ticks, wheel_radius_m, ticks_per_rev)
+            dr_m = diff_drive.ticks_to_delta_m(delta_right_ticks, wheel_radius_m, ticks_per_rev)
+            v_left_enc = dl_m / period if period > 0 else 0.0
+            v_right_enc = dr_m / period if period > 0 else 0.0
+
+            if stall_detect_enabled and not state.stall_latched and not e_stop and not cmd_stale and active is not None:
+                if max_cmd_pwm > STALL_PWM_THRESHOLD:
+                    if max(abs(v_left_enc), abs(v_right_enc)) < STALL_VELOCITY_EPS_MS:
+                        if stall_begin_wall is None:
+                            stall_begin_wall = now_wall
+                        elif (now_wall - stall_begin_wall) * 1000.0 >= float(stall_detect_ms):
+                            state.stall_latched = True
+                            stall_begin_wall = None
+                    else:
+                        stall_begin_wall = None
+                else:
+                    stall_begin_wall = None
+            else:
+                stall_begin_wall = None
+
+            stall_active = state.stall_latched
+            if stall_active:
+                left_pwm = right_pwm = 0.0
+                left_dir = right_dir = "fwd"
+
+            if dl_m != 0.0 or dr_m != 0.0:
+                vx = (v_left_enc + v_right_enc) / 2.0
+                vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
+            else:
+                vx = vx_cmd
+                vtheta = vtheta_cmd
+
+            if e_stop or cmd_stale or stall_active:
+                vx = 0.0
+                vtheta = 0.0
+
+        left_ticks_total += delta_left_ticks
+        right_ticks_total += delta_right_ticks
 
         dt_ms = int(round(period * 1000))
-        pose = diff_drive.integrate_odometry(
-            pose,
-            diff_drive.ticks_to_delta_m(0, wheel_radius_m, ticks_per_rev),
-            diff_drive.ticks_to_delta_m(0, wheel_radius_m, ticks_per_rev),
-            wheel_base_m,
-        )
+        pose = diff_drive.integrate_odometry(pose, dl_m, dr_m, wheel_base_m)
         ts = schemas.now_ts()
         zenoh_helpers.publish_json(
             session,
             "body/odom",
-            schemas.odom(ts=ts, x=pose.x, y=pose.y, theta=pose.theta, vx=vx, vtheta=vtheta, dt_ms=dt_ms),
+            schemas.odom(
+                ts=ts,
+                x=pose.x,
+                y=pose.y,
+                theta=pose.theta,
+                vx=vx,
+                vtheta=vtheta,
+                left_ticks=left_ticks_total,
+                right_ticks=right_ticks_total,
+                dt_ms=dt_ms,
+            ),
         )
         zenoh_helpers.publish_json(
             session,
@@ -146,6 +218,7 @@ def main() -> None:
                 right_dir=right_dir,
                 e_stop_active=e_stop,
                 cmd_timeout_active=cmd_timeout_active,
+                stall_detected=stall_active,
             ),
         )
 

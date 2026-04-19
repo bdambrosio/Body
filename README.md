@@ -1,6 +1,6 @@
 # Body
 
-Onboard software for a differential-drive robot chassis: independent Python processes on a Raspberry Pi (target) communicate over [Zenoh](https://zenoh.io/) using JSON messages. The contract with the desktop agent (Jill / Cognitive Workbench) is defined in [body_project_spec.md](body_project_spec.md).
+Onboard software for a differential-drive robot chassis: independent Python processes on a Raspberry Pi (target) communicate over [Zenoh](https://zenoh.io/) using JSON messages. The contract with the desktop agent (Jill / Cognitive Workbench) is defined in [docs/body_project_spec.md](docs/body_project_spec.md).
 
 ## Requirements
 
@@ -171,7 +171,7 @@ Any desktop agent that embodies this robot should:
 - Publish **`body/cmd_vel`** often enough to satisfy the message **`timeout_ms`** (default **500 ms** in the spec) while moving or holding speed.
 - Subscribe to `body/odom`, `body/lidar/scan`, `body/oakd/*`, `body/status`, `body/motor_state`, etc., as needed.
 
-After a heartbeat fault, recovery follows **§5.10** in [body_project_spec.md](body_project_spec.md) (heartbeat back and a new `cmd_vel` path as implemented on the Pi).
+After a heartbeat fault, recovery follows **§5.10** in [docs/body_project_spec.md](docs/body_project_spec.md) (heartbeat back and a new `cmd_vel` path as implemented on the Pi).
 
 ## Smoke check (optional)
 

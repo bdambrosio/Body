@@ -63,7 +63,7 @@ def _cmd_oakd_capture(args: argparse.Namespace) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Body stack — local Zenoh tools (see body_project_spec.md topics).",
+        description="Body stack — local Zenoh tools (see docs/body_project_spec.md topics).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

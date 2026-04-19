@@ -9,7 +9,9 @@
     "max_wheel_vel_ms": 0.0,
     "loop_hz": 50,
     "cmd_timeout_ms": 500,
-    "pwm_frequency_hz": 1000
+    "pwm_frequency_hz": 1000,
+    "stall_detect_enabled": false,
+    "stall_detect_ms": 1000
   },
   "lidar": {
     "stub_only": false,

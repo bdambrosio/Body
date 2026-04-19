@@ -1,7 +1,7 @@
 # `body/status` — optional `host` object (desktop consumer spec)
 
 **Audience:** Body operator / desktop dev console implementers.  
-**Normative wire:** [body_project_spec.md §5.9](../body_project_spec.md) (status message); this document only details the **`host`** extension.
+**Normative wire:** [body_project_spec.md §5.9](body_project_spec.md) (status message); this document only details the **`host`** extension.
 
 ---
 
@@ -89,5 +89,5 @@ On non-Pi Linux or when `vcgencmd` is missing, `host` may contain only `ts` and 
 
 ## References
 
-- [body_project_spec.md §5.9](../body_project_spec.md) — full `body/status` schema.
+- [body_project_spec.md §5.9](body_project_spec.md) — full `body/status` schema.
 - Implementation: `body/lib/host_metrics.py`, `body/watchdog.py`, `watchdog.host_metrics` in `config.json`.

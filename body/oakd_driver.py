@@ -4,7 +4,7 @@ Aggregates high-rate accel/gyro into **arithmetic means** over ``imu_aggregate_i
 publishes ``body/oakd/imu`` at that rate. **Mean gyro ≠ integrated angle** and mean accel ≠
 velocity change over the window; for strapdown-equivalent dead reckoning you would integrate
 at full sensor rate on the Pi (or use fused orientation only as a slow state estimate).
-See module docstring in body_project_spec.md §5.6.
+See module docstring in docs/body_project_spec.md §5.6.
 
 Supports **DepthAI v2** (``dai.node.XLinkOut``) and **v3** (output queues on node outputs;
 no XLink).

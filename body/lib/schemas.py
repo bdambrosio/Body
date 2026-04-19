@@ -1,4 +1,4 @@
-"""JSON message helpers for Body Zenoh topics (see body_project_spec.md)."""
+"""JSON message helpers for Body Zenoh topics (see docs/body_project_spec.md)."""
 
 from __future__ import annotations
 
@@ -53,6 +53,7 @@ def motor_state(
     right_dir: str = "fwd",
     e_stop_active: bool = False,
     cmd_timeout_active: bool = False,
+    stall_detected: bool = False,
 ) -> dict[str, Any]:
     return {
         "ts": now_ts() if ts is None else ts,
@@ -62,6 +63,7 @@ def motor_state(
         "right_dir": right_dir,
         "e_stop_active": e_stop_active,
         "cmd_timeout_active": cmd_timeout_active,
+        "stall_detected": stall_detected,
     }
 
 
@@ -94,7 +96,7 @@ def lidar_scan_from_bins(
     scan_time_ms: int = 100,
     ts: float | None = None,
 ) -> dict[str, Any]:
-    """Build ``body/lidar/scan`` from fixed angular bins (see body_project_spec.md §5.5)."""
+    """Build ``body/lidar/scan`` from fixed angular bins (see docs/body_project_spec.md §5.5)."""
     n = len(ranges_m)
     angle_increment = (2.0 * math.pi) / max(1, n)
     msg: dict[str, Any] = {
@@ -128,7 +130,7 @@ def oakd_imu_report(
     gyro_xyz: tuple[float, float, float],
     quat_wxyz: tuple[float, float, float, float] | None = None,
 ) -> dict[str, Any]:
-    """Build body/oakd/imu JSON per body_project_spec.md §5.6 (sensor frame)."""
+    """Build body/oakd/imu JSON per docs/body_project_spec.md §5.6 (sensor frame)."""
     msg: dict[str, Any] = {
         "ts": ts,
         "accel": {"x": accel_xyz[0], "y": accel_xyz[1], "z": accel_xyz[2]},
@@ -145,7 +147,7 @@ def oakd_imu_report(
 
 
 def oakd_depth_placeholder(ts: float | None = None) -> dict[str, Any]:
-    return {"ts": now_ts() if ts is None else ts, "format": "placeholder", "note": "TBD per body_project_spec.md §5.7"}
+    return {"ts": now_ts() if ts is None else ts, "format": "placeholder", "note": "TBD per docs/body_project_spec.md §5.7"}
 
 
 def oakd_depth_stream_frame(

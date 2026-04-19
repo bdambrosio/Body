@@ -71,7 +71,7 @@ All inter-process communication, both local (Pi-to-Pi) and remote (Pi-to-desktop
 
 | Process | Owns | Publishes | Subscribes |
 |---|---|---|---|
-| `motor_controller` | MDD10A GPIO, encoder GPIO | `body/odom`, `body/motor_state` | `body/cmd_vel`, `body/cmd_direct` |
+| `motor_controller` | MDD10A GPIO, encoder GPIO | `body/odom`, `body/motor_state` | `body/cmd_vel`, `body/cmd_direct`, `body/emergency_stop`, `body/status` |
 | `lidar_driver` | STL-19P USB | `body/lidar/scan` | — |
 | `oakd_driver` | OAK-D-Lite USB | `body/oakd/depth`, `body/oakd/imu`, `body/oakd/rgb` (optional) | `body/oakd/config` (optional) |
 | `watchdog` | safety authority | `body/status` | `body/heartbeat`, all `body/*` for monitoring |
@@ -184,7 +184,7 @@ Dead-reckoned pose from encoder integration. Frame: robot starting position at o
 
 - `x`, `y`: meters from origin.
 - `theta`: radians, normalized to [-π, π].
-- `vx`, `vtheta`: instantaneous velocity estimates.
+- `vx`, `vtheta`: instantaneous velocity estimates. When encoder motion is present for the cycle (non-zero tick deltas), these are derived from wheel motion; otherwise the stub reports commanded velocities from the active `cmd_vel` / `cmd_direct`. They are zero when e-stop, command timeout, or software stall applies.
 - `left_ticks`, `right_ticks`: raw cumulative encoder counts. Allows Jill to do her own integration if desired.
 - `dt_ms`: time since last odom publication.
 
@@ -198,13 +198,15 @@ Dead-reckoned pose from encoder integration. Frame: robot starting position at o
   "left_dir": "fwd",
   "right_dir": "fwd",
   "e_stop_active": false,
-  "cmd_timeout_active": false
+  "cmd_timeout_active": false,
+  "stall_detected": false
 }
 ```
 
 - PWM values are duty cycle 0.0–1.0.
-- `e_stop_active`: true if watchdog has triggered emergency stop.
+- `e_stop_active`: true if the motor controller is holding motion for e-stop (watchdog `body/status` `e_stop_active` and/or latched `body/emergency_stop`).
 - `cmd_timeout_active`: true if no `cmd_vel`/`cmd_direct` received within timeout window.
+- `stall_detected`: true when software stall protection has tripped (commanded PWM above threshold but encoder-indicated wheel velocity near zero for a sustained interval; see [motor_controller_spec.md](motor_controller_spec.md) §4.9). Cleared after an all-stop command (`linear`/`angular` or `left`/`right` all zero), then motion may be retried. Disabled when `motor.stall_detect_enabled` is false in config (default for stub / no encoders).
 
 ### 5.5 `body/lidar/scan` (lidar_driver → Jill)
 
@@ -284,7 +286,7 @@ Jill publishes at 2 Hz minimum. Watchdog triggers safety stop if no heartbeat re
 
 - Process state: `"ok"`, `"missing"`, `"restarting"`.
 - Published at 1 Hz.
-- **`host`** (optional): Raspberry Pi–oriented telemetry when enabled in watchdog config. Includes **`cpu_temp_c`** (°C) from thermal sysfs when available; **`core_volts`** (SoC core rail ~0.8–0.95 V, **not** the 5 V input—see [docs/body_status_host_spec.md](docs/body_status_host_spec.md)); **`throttled`** (hex) and boolean flags from `vcgencmd get_throttled`. **5 V input problems** are indicated by **`under_voltage_*`** flags, not by `core_volts`. Omitted entirely if `watchdog.host_metrics` is false.
+- **`host`** (optional): Raspberry Pi–oriented telemetry when enabled in watchdog config. Includes **`cpu_temp_c`** (°C) from thermal sysfs when available; **`core_volts`** (SoC core rail ~0.8–0.95 V, **not** the 5 V input—see [body_status_host_spec.md](body_status_host_spec.md)); **`throttled`** (hex) and boolean flags from `vcgencmd get_throttled`. **5 V input problems** are indicated by **`under_voltage_*`** flags, not by `core_volts`. Omitted entirely if `watchdog.host_metrics` is false.
 
 ### 5.10 `body/emergency_stop` (watchdog → motor_controller)
 
@@ -296,7 +298,7 @@ Jill publishes at 2 Hz minimum. Watchdog triggers safety stop if no heartbeat re
 }
 ```
 
-Motor controller immediately sets PWM to zero on receipt. Latched: motor output stays at zero until a new `cmd_vel` is received AND `e_stop_active` is cleared by the watchdog (which requires heartbeat recovery).
+Motor controller immediately sets PWM to zero on receipt. Latched: motor output stays at zero until a new `cmd_vel` or `cmd_direct` is received AND `e_stop_active` is cleared by the watchdog (which requires heartbeat recovery).
 
 ## 6. Process Specifications
 
@@ -308,8 +310,8 @@ Motor controller immediately sets PWM to zero on receipt. Latched: motor output 
 
 **Loop structure:**
 - Main loop at 50 Hz (20ms cycle).
-- Each cycle: read encoders → compute odometry → check for cmd timeout → compute PWM from latest command → write GPIO → publish odom and motor_state.
-- Zenoh subscription callback for `cmd_vel`, `cmd_direct`, `emergency_stop` sets shared state variables (protected by a simple lock since callbacks run on Zenoh's internal thread).
+- Each cycle: read encoders → compute odometry → check for cmd timeout → check software stall (when enabled) → compute PWM from latest command → write GPIO → publish odom and motor_state.
+- Zenoh: subscribe to `body/cmd_vel`, `body/cmd_direct`, `body/emergency_stop`, and `body/status` (for `e_stop_active`). Callbacks set shared state (protected by a lock since they run on Zenoh's internal thread).
 
 **Differential drive math:**
 ```
@@ -339,15 +341,16 @@ From encoder ticks since last cycle:
   theta += d_theta
 ```
 
-**Configuration (constants at top of file, move to config file later):**
+**Configuration (`config.json` → `motor` and env overrides):**
 ```
-WHEEL_BASE_M = 0.0         # measure during build
-WHEEL_RADIUS_M = 0.0       # measure during build
-TICKS_PER_REV = 1920        # Pololu 4752: 64 CPR × 30:1 gear ratio
-MAX_WHEEL_VEL_MS = 0.0     # determine experimentally (330 RPM no-load × wheel circumference)
-LOOP_HZ = 50
-CMD_TIMEOUT_MS = 500
-PWM_FREQUENCY_HZ = 1000
+wheel_base_m, wheel_radius_m   # measure during build
+ticks_per_rev = 1920           # Pololu 4752: 64 CPR × 30:1 gear ratio
+max_wheel_vel_ms               # determine experimentally
+loop_hz = 50
+cmd_timeout_ms = 500
+pwm_frequency_hz = 1000
+stall_detect_enabled = false   # true when encoders + stall logic are active
+stall_detect_ms = 1000
 ```
 
 **Encoder counting (software, initial implementation):**
@@ -355,7 +358,7 @@ Uses `lgpio` edge callbacks on both A and B channels per motor for quadrature de
 
 **Known upgrade path:** If software counting proves lossy, add a Raspberry Pi Pico as a dedicated encoder counter (and optionally PWM driver). The Pico communicates cumulative tick counts to the Pi over USB serial. The motor_controller process swaps GPIO reads for serial reads; the Zenoh interface does not change. Chassis design should reserve physical space for a Pico on the compute layer.
 
-**Stub deliverable:** A Python script that connects to Zenoh, subscribes to `cmd_vel` and `cmd_direct`, prints received commands, publishes synthetic odom at 50 Hz with incrementing timestamps and zero motion, publishes motor_state. No GPIO access.
+**Stub deliverable:** A Python script that connects to Zenoh, subscribes to `body/cmd_vel`, `body/cmd_direct`, `body/emergency_stop`, and `body/status`, prints received commands, publishes synthetic odom at 50 Hz with incrementing timestamps and zero motion (or encoder-derived when present), publishes `motor_state`. No GPIO access.
 
 ### 6.2 `lidar_driver`
 
@@ -406,7 +409,7 @@ RGB_ENABLED = False           # keep off unless needed, saves bandwidth
 **Behavior:**
 - Subscribes to `body/heartbeat`. If no message received within `HEARTBEAT_TIMEOUT_MS`, publishes `body/emergency_stop` with reason `heartbeat_timeout`.
 - Periodically checks that all expected Zenoh topics are being published. If a process appears dead (no publications for `PROCESS_TIMEOUT_MS`), updates `body/status` accordingly.
-- On emergency stop: publishes `body/emergency_stop`. Clears stop condition only when heartbeat resumes AND Jill sends a new `cmd_vel` (explicit re-engagement, not automatic).
+- On emergency stop: publishes `body/emergency_stop`. Clears stop condition only when heartbeat resumes AND Jill sends a new `cmd_vel` or `cmd_direct` (explicit re-engagement, not automatic).
 - Publishes `body/status` at 1 Hz.
 
 **Configuration:**
@@ -482,7 +485,7 @@ The following assumptions apply to the desktop agent (Jill / CW) and are **out o
 
 6. **No guaranteed delivery.** Zenoh pub/sub is best-effort. Messages can be lost, especially over wifi. Jill should not depend on receiving every scan or odom update. The `cmd_vel` timeout mechanism handles the inverse case (lost commands → robot stops).
 
-7. **Emergency stop acknowledgment.** When `body/emergency_stop` fires, the robot will not move until heartbeat recovers AND a new `cmd_vel` is received. Jill should treat emergency stop as a state requiring explicit re-engagement, not automatic recovery.
+7. **Emergency stop acknowledgment.** When `body/emergency_stop` fires, the robot will not move until heartbeat recovers AND a new `cmd_vel` or `cmd_direct` is received. Jill should treat emergency stop as a state requiring explicit re-engagement, not automatic recovery.
 
 ## 9. Implementation Sequence
 

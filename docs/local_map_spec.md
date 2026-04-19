@@ -43,4 +43,4 @@ Horizontal **offsets** (lidar vs body origin, camera vs body), **yaw** alignment
 
 ## Related
 
-- [body_project_spec.md](../body_project_spec.md) — `body/lidar/scan`, `body/oakd/depth`.
+- [body_project_spec.md](body_project_spec.md) — `body/lidar/scan`, `body/oakd/depth`.

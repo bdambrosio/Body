@@ -14,11 +14,11 @@ Goals:
 
 - **Publish** `body/heartbeat` and `body/cmd_vel` when the operator explicitly takes control (see §4).
 - **Subscribe** to Body outputs for situational awareness and **visualize** OAK-D depth (false-color) and on-request RGB.
-- Stay aligned with [body_project_spec.md](../body_project_spec.md) for wire semantics and safety (e.g. heartbeat timeout, `cmd_vel` re-engagement after e-stop).
+- Stay aligned with [body_project_spec.md](body_project_spec.md) for wire semantics and safety (e.g. heartbeat timeout, `cmd_vel` re-engagement after e-stop).
 
 Non-goals: mapping, planning, LLM / “cognitive” behavior, or replacing Jill.
 
-**Normative contract:** [body_project_spec.md](../body_project_spec.md). This document adds UI/UX and desktop wiring only.
+**Normative contract:** [body_project_spec.md](body_project_spec.md). This document adds UI/UX and desktop wiring only.
 
 ---
 
@@ -118,7 +118,7 @@ For `format == "placeholder"`: textual state only (“Pi not streaming depth yet
 
 **v1:** polar render of `ranges` (invalid entries as gaps or max-range), plus scan metadata (count, `scan_time_ms`, last update).
 
-**Angle convention (normative, matches [body_project_spec.md](../body_project_spec.md) §5.5):** `angle_min` / `angle_increment` define beam directions in radians with **0 = robot forward** and **increasing CCW** when viewed from above (same as robot frame: +x forward, +y left).
+**Angle convention (normative, matches [body_project_spec.md](body_project_spec.md) §5.5):** `angle_min` / `angle_increment` define beam directions in radians with **0 = robot forward** and **increasing CCW** when viewed from above (same as robot frame: +x forward, +y left).
 
 **Polar plot / matplotlib (implementation note):** By default, `matplotlib` polar axes put **θ = 0 at the right** (3 o’clock), not at the top. If the UI caption says **“forward is up”** but forward (index 0 / angle 0) appears **to the right**, that is a **pure UI bug**: either call **`ax.set_theta_zero_location('N')`** so θ = 0 is at the **top**, or equivalently offset angles by **+π/2** relative to matplotlib’s default zero, and verify **`set_theta_direction`** so CCW matches the spec. The STL-19P housing arrow and Body’s scan angles are aligned; fix the console, not `lidar_driver`.
 
@@ -165,6 +165,6 @@ Stretch: rolling log of raw JSON samples for debug.
 
 ## 9. References
 
-- [body_project_spec.md](../body_project_spec.md)
+- [body_project_spec.md](body_project_spec.md)
 - [body/lib/schemas.py](../body/lib/schemas.py)
 - [body/teleop.py](../body/teleop.py)
