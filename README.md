@@ -15,10 +15,12 @@ Use the **repository root** (the directory that contains `config.json` and the `
 
 ```bash
 cd /path/to/Body
-python3 -m venv .venv
+python3 -m venv .venv --system-site-packages
 .venv/bin/pip install -r requirements.txt
 export PYTHONPATH="$(pwd)"
 ```
+
+**Raspberry Pi + `motor.gpio_enabled`:** install **`python3-lgpio`** with apt (`sudo apt install python3-lgpio`). That package lives under the system interpreter’s `dist-packages`. A venv created **without** `--system-site-packages` cannot import `lgpio`, and `motor_controller` will fail at startup. Use **`--system-site-packages`** as above, or edit `.venv/pyvenv.cfg` and set `include-system-site-packages = true`, then retry.
 
 Use the same `PYTHONPATH` for `launcher`, `teleop`, and any `python -m body.*` command. The launcher also sets `PYTHONPATH` for child processes.
 

@@ -40,7 +40,8 @@ def main() -> None:
         with lock:
             last_hb = time.time()
 
-    def on_cmd_vel(_key: str, _msg: dict[str, Any]) -> None:
+    def on_motion_command(_key: str, _msg: dict[str, Any]) -> None:
+        """Clear latched e-stop after heartbeat recovery when a new cmd_vel or cmd_direct arrives (body_project_spec §5.10)."""
         nonlocal e_stop_active
         with lock:
             hb_ok = (time.time() - last_hb) * 1000.0 < hb_timeout_ms if last_hb > 0.0 else False
@@ -55,7 +56,8 @@ def main() -> None:
         return _on
 
     zenoh_helpers.declare_subscriber_json(session, "body/heartbeat", on_heartbeat)
-    zenoh_helpers.declare_subscriber_json(session, "body/cmd_vel", on_cmd_vel)
+    zenoh_helpers.declare_subscriber_json(session, "body/cmd_vel", on_motion_command)
+    zenoh_helpers.declare_subscriber_json(session, "body/cmd_direct", on_motion_command)
     for topic in monitored:
         zenoh_helpers.declare_subscriber_json(session, topic, make_topic_handler(topic))
 

@@ -3,21 +3,22 @@
     "connect_endpoints": ["tcp/127.0.0.1:7447"]
   },
   "motor": {
-    "wheel_base_m": 0.0,
-    "wheel_radius_m": 0.0,
+    "wheel_base_m": 0.190,
+    "wheel_radius_m": 0.0325,
     "ticks_per_rev": 1920,
-    "max_wheel_vel_ms": 0.0,
+    "max_wheel_vel_ms": 0.9,
     "loop_hz": 50,
     "cmd_timeout_ms": 500,
     "pwm_frequency_hz": 1000,
     "stall_detect_enabled": false,
     "stall_detect_ms": 1000,
-    "gpio_enabled": false,
+    "gpio_enabled": true,
     "gpio_chip": 0,
     "gpio_left_pwm": 12,
     "gpio_right_pwm": 13,
     "gpio_left_dir": 5,
-    "gpio_right_dir": 6
+    "gpio_right_dir": 6,
+    "invert_left_dir": true
   },
   "lidar": {
     "stub_only": false,
