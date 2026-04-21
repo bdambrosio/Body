@@ -106,8 +106,8 @@ def _rgb_preview_dims(oakd_cfg: dict[str, Any]) -> tuple[int, int]:
 
 
 def _depth_output_dims(oakd_cfg: dict[str, Any]) -> tuple[int, int]:
-    w = int(oakd_cfg.get("depth_out_width", 80))
-    h = int(oakd_cfg.get("depth_out_height", 60))
+    w = int(oakd_cfg.get("depth_out_width", 120))
+    h = int(oakd_cfg.get("depth_out_height", 90))
     return max(2, w), max(2, h)
 
 
@@ -134,8 +134,18 @@ def _apply_oakd_image_rotate(arr: np.ndarray, oakd_cfg: dict[str, Any]) -> np.nd
 
 
 def _depth_frame_to_stream_msg(
-    frame: Any, out_w: int, out_h: int, oakd_cfg: dict[str, Any]
+    frame: Any,
+    out_w: int,
+    out_h: int,
+    oakd_cfg: dict[str, Any],
+    smooth_prev_holder: list[np.ndarray | None],
 ) -> dict[str, Any]:
+    """Resize (and optionally rotate) depth to ``out_w``×``out_h``, apply temporal IIR smoothing.
+
+    Smoothing: where the new sample ``D`` is valid (``D>0``), ``S = (1/3)*S_prev + (2/3)*D`` (mm).
+    Where ``D`` is invalid (0) but ``S_prev > 0``, **hold** ``S = S_prev``. Where both are invalid,
+    ``S = 0``. ``smooth_prev_holder[0]`` holds float64 ``S`` (same shape as output).
+    """
     h0 = int(frame.getHeight())
     w0 = int(frame.getWidth())
     arr = frame.getFrame()
@@ -146,7 +156,23 @@ def _depth_frame_to_stream_msg(
         arr = np.ascontiguousarray(arr, dtype=np.uint16)
     arr = _apply_oakd_image_rotate(arr, oakd_cfg)
     small = cv2.resize(arr, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
-    b64 = base64.standard_b64encode(small.tobytes()).decode("ascii")
+    curr = small.astype(np.float64)
+    prev = smooth_prev_holder[0]
+    if prev is None or prev.shape != curr.shape:
+        prev = np.zeros_like(curr)
+        smooth_prev_holder[0] = prev
+    valid_c = curr > 0.0
+    valid_p = prev > 0.0
+    out = np.zeros_like(curr)
+    both = valid_c & valid_p
+    w_old, w_new = 1.0 / 3.0, 2.0 / 3.0
+    out[both] = w_old * prev[both] + w_new * curr[both]
+    out[valid_c & ~valid_p] = curr[valid_c & ~valid_p]
+    hold = ~valid_c & valid_p
+    out[hold] = prev[hold]
+    np.copyto(prev, out)
+    small_out = np.clip(np.round(out), 0, 65535).astype(np.uint16)
+    b64 = base64.standard_b64encode(small_out.tobytes()).decode("ascii")
     return schemas.oakd_depth_stream_frame(out_w, out_h, b64)
 
 
@@ -267,6 +293,7 @@ def _run_imu_loop(
     window_gy: list[float] = []
     window_gz: list[float] = []
     last_quat: tuple[float, float, float, float] | None = None
+    depth_smooth_prev: list[np.ndarray | None] = [None]
 
     window_start = time.monotonic()
     next_depth = time.monotonic()
@@ -328,7 +355,9 @@ def _run_imu_loop(
                         zenoh_helpers.publish_json(
                             session,
                             "body/oakd/depth",
-                            _depth_frame_to_stream_msg(df, dw, dh, oakd_cfg),
+                            _depth_frame_to_stream_msg(
+                                df, dw, dh, oakd_cfg, depth_smooth_prev
+                            ),
                         )
                     except Exception as e:
                         print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)
@@ -355,6 +384,7 @@ def _run_synthetic_imu_depth_config_loop(
     """Synthetic ``body/oakd/imu``; depth placeholder or StereoDepth stream; optional ``rgb_queue``."""
     next_imu = time.monotonic()
     next_depth = time.monotonic()
+    depth_smooth_prev: list[np.ndarray | None] = [None]
     while not stop_ref[0]:
         _process_oakd_config_queue(session, config_pending, rgb_queue, oakd_cfg)
         now = time.monotonic()
@@ -370,7 +400,9 @@ def _run_synthetic_imu_depth_config_loop(
                         zenoh_helpers.publish_json(
                             session,
                             "body/oakd/depth",
-                            _depth_frame_to_stream_msg(df, dw, dh, oakd_cfg),
+                            _depth_frame_to_stream_msg(
+                                df, dw, dh, oakd_cfg, depth_smooth_prev
+                            ),
                         )
                     except Exception as e:
                         print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)

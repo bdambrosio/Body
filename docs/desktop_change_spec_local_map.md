@@ -68,7 +68,7 @@ Large grids (fine `resolution_m`) can be **big JSON**; if the UI stutters, allow
 
 1. **Pi:** `local_map.enabled: true` in `config.json`; `zenohd` + launcher running; **`lidar_driver`** and **`oakd_driver`** publishing real (or stub) data.  
 2. **Subscribe** on desktop to `body/map/local_2p5d`; confirm JSON parses and **`kind`** is `max_height_grid`.  
-3. **Sanity:** with robot facing a wall, cells in front should show **non-null** heights roughly consistent with **lidar height** (~0.18 m) and **depth** hits (variable by range).  
+3. **Sanity:** with robot facing a wall, cells in front should show **non-null** heights roughly consistent with **lidar height** (~0.10 m; see `lidar.height_above_ground_m`) and **depth** hits (variable by range).  
 4. **Disabled:** `local_map.enabled: false` — topic may **not** update (no publishes); UI should tolerate **missing** topic.
 
 ---

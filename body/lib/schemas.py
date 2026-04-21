@@ -248,6 +248,8 @@ def local_map_2p5d(
     max_height_m: list[list[float | None]],
     frame: str = "body",
     sources: dict[str, Any] | None = None,
+    driveable: list[list[bool | None]] | None = None,
+    driveable_clearance_height_m: float | None = None,
 ) -> dict[str, Any]:
     """body/map/local_2p5d — egocentric max-height-above-ground grid (see docs/local_map_spec.md)."""
     msg: dict[str, Any] = {
@@ -261,6 +263,10 @@ def local_map_2p5d(
         "ny": ny,
         "max_height_m": max_height_m,
     }
+    if driveable is not None:
+        msg["driveable"] = driveable
+    if driveable_clearance_height_m is not None:
+        msg["driveable_clearance_height_m"] = driveable_clearance_height_m
     if sources is not None:
         msg["sources"] = sources
     return msg
