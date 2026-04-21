@@ -39,7 +39,9 @@ All keys below are **stable for v1**; ignore unknown future keys.
 | `origin_y_m` | number | World **y** of grid corner (minimum y, smallest left index). |
 | `nx` | int | Cells along **+x** (forward). |
 | `ny` | int | Cells along **+y** (left). |
-| `max_height_m` | array | Length `nx`; each element is length `ny`. Values are **meters above ground** (`ground_z_body_m` on Pi, usually 0) or JSON **`null`** (no sample). |
+| `max_height_m` | array | Length `nx`; each element is length `ny`. Values are **body-frame** \(z\) (m) of the **max** fused sample per cell, or JSON **`null`** (no sample). See [local_map_spec.md](local_map_spec.md). |
+| `driveable` | array? | Same shape as `max_height_m` when Pi has `driveable_enabled`: **`true`** / **`false`** / **`null`** per cell. |
+| `driveable_clearance_height_m` | number? | Slab top (m) when `driveable` is published. |
 | `sources` | object? | Optional: `lidar_ts`, `depth_ts` — timestamps of inputs fused into this frame (may differ). |
 
 **Indexing:** `max_height_m[i][j]` = cell at body position approximately  
@@ -52,7 +54,7 @@ Robot origin **(0,0)** is the body-frame reference used on the Pi (typically bet
 
 ## Visualization (recommended)
 
-- **Top-down 2D:** color = `max_height_m[i][j]`; treat **`null`** as transparent or “unknown” (distinct from height 0 if you ever use ground at 0).
+- **Top-down 2D:** color = `max_height_m[i][j]`; treat **`null`** as transparent or “unknown” (distinct from height 0 if you ever use ground at 0). Optional second layer for **`driveable`** (`true` / `false` / `null`).
 - **Scale:** fixed color range e.g. **0–2.2 m** for quick sanity, or auto per frame with a “dynamic scale” badge.
 - **Robot:** mark **(0,0)** and draw **+x forward** arrow; align with lidar “forward up” convention after your polar plot fix.
 - **Metadata line:** `nx×ny @ resolution_m`, age since `ts`, optional `sources` ages.

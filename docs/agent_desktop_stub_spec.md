@@ -1,7 +1,7 @@
 # Body Operator Console — Zenoh Client & Visualizer
 
-**Version:** 0.2 draft  
-**Date:** 2026-04-17  
+**Version:** 0.3 draft  
+**Date:** 2026-04-21  
 **Status:** Specification only (not yet implemented in this repo)
 
 This document specifies a **desktop operator / dev tool** for the Body stack. It is **not** the Cognitive Workbench agent (Jill) and **not** bound to product agent design gates (e.g. D1); it exists to drive and visualize the same **Zenoh topics** as a real agent would, for integration testing and field debugging.
@@ -28,7 +28,7 @@ The console exercises **two** OAK-D paths implemented on the Pi:
 
 | Capability | Direction | Topics | Notes |
 |------------|-----------|--------|--------|
-| **Depth stream** | Pi → desktop | `body/oakd/depth` | **`format: "depth_uint16_mm"`** is **owned and shipped by Body** (`oakd_driver` on the Pi). Payload: base64 **uint16** depth in **mm**, row-major, `width`×`height` (e.g. 80×60). If the Pi still publishes `format: "placeholder"`, the console shows a textual placeholder only—**readiness of `depth_uint16_mm` is a Body-side deliverable**; the console is the consumer that assumes it once available. |
+| **Depth stream** | Pi → desktop | `body/oakd/depth` | **`format: "depth_uint16_mm"`** is **owned and shipped by Body** (`oakd_driver` on the Pi). Payload: base64 **uint16** depth in **mm**, row-major; **`width` and `height` are always taken from the message** (sample Pi config uses **120×90**). If the Pi still publishes `format: "placeholder"`, the console shows a textual placeholder only—**readiness of `depth_uint16_mm` is a Body-side deliverable**; the console is the consumer that assumes it once available. |
 | **RGB snapshot (on-request)** | Desktop → Pi → desktop | `body/oakd/config` → `body/oakd/rgb` | `{"action": "capture_rgb", "request_id": "<uuid>"}`; JPEG in `body/oakd/rgb`. |
 
 Other OAK topics (`body/oakd/imu`): subscribe; **text / compact numeric** panel, not image tiles.
@@ -87,7 +87,7 @@ The operator must **explicitly** enable **“Live command”** (or equivalent) t
 | `body/oakd/imu` | Compact numeric / JSON |
 | `body/oakd/depth` | False-color view (§5.1) |
 | `body/oakd/rgb` | JPEG from capture responses |
-| `body/map/local_2p5d` | Optional: fused **max-height** 2.5D grid for navigation debug — see [desktop_change_spec_local_map.md](desktop_change_spec_local_map.md) |
+| `body/map/local_2p5d` | Optional: fused **2.5D** grid for navigation debug — `max_height_m` plus optional **`driveable`** / **`driveable_clearance_height_m`** when enabled on the Pi — see [desktop_change_spec_local_map.md](desktop_change_spec_local_map.md) and [local_map_spec.md](local_map_spec.md) |
 
 **Optional (recommended):** subscribe to **`body/cmd_vel`** in monitor-only (and when live) to show **last twist seen on the bus**—useful when another process is driving (should not happen per §4.0, but invaluable when debugging mistaken double-client setups).
 
@@ -121,6 +121,15 @@ For `format == "placeholder"`: textual state only (“Pi not streaming depth yet
 **Angle convention (normative, matches [body_project_spec.md](body_project_spec.md) §5.5):** `angle_min` / `angle_increment` define beam directions in radians with **0 = robot forward** and **increasing CCW** when viewed from above (same as robot frame: +x forward, +y left).
 
 **Polar plot / matplotlib (implementation note):** By default, `matplotlib` polar axes put **θ = 0 at the right** (3 o’clock), not at the top. If the UI caption says **“forward is up”** but forward (index 0 / angle 0) appears **to the right**, that is a **pure UI bug**: either call **`ax.set_theta_zero_location('N')`** so θ = 0 is at the **top**, or equivalently offset angles by **+π/2** relative to matplotlib’s default zero, and verify **`set_theta_direction`** so CCW matches the spec. The STL-19P housing arrow and Body’s scan angles are aligned; fix the console, not `lidar_driver`.
+
+### 5.4 Local 2.5D map (`body/map/local_2p5d`)
+
+Normative JSON shape and indexing: [desktop_change_spec_local_map.md](desktop_change_spec_local_map.md). Pi behavior and tuning: [local_map_spec.md](local_map_spec.md).
+
+- **`max_height_m`:** top-down colormap of stored values; treat **`null`** as unknown. Values are **body-frame** \(z\) of the **highest** fused sample per cell (not plane-relative height).
+- **`driveable` (optional):** when present, same `nx`×`ny` layout as `max_height_m`; entries are **`true`**, **`false`**, or **`null`**. **`false`** means the Pi judged the cell **not** passable for the configured clearance slab; **`null`** means unknown or held state—**do not** treat as free space. Recommended: second layer (outline, tint, or toggle) so operators can see **driveable** vs **height** without conflating the two.
+- **`driveable_clearance_height_m` (optional):** scalar; top of the obstacle slab used on the Pi (meters, plane-relative). Show in the map metadata when present so the console matches robot config.
+- **Ignore unknown keys** in the message for forward compatibility.
 
 ---
 
@@ -158,6 +167,7 @@ Stretch: rolling log of raw JSON samples for debug.
 - [ ] Depth: false-color for `depth_uint16_mm`; placeholder text otherwise. **Assumes Pi eventually publishes `depth_uint16_mm`** (Body owns that publisher).
 - [ ] RGB: request + display JPEG; **3 s client timeout** with clear error.
 - [ ] Lidar: **v1 polar** render + metadata.
+- [ ] **Optional:** `body/map/local_2p5d` — height grid; if **`driveable`** is present, visualize it (e.g. overlay) and show **`driveable_clearance_height_m`** when present.
 - [ ] E-stop: visible alert; **no fake wire ack**; UI text explains cmd_vel re-engagement.
 - [ ] **Stale data:** if no `body/status` (or chosen liveness sample) within **~2 s** of wall clock, or Zenoh session loss, mark depth/status/sensor panels **stale** (do not silently show frozen frames as fresh). Exact heuristic implementation-defined but must avoid indefinite silent freeze after Pi reboot or network drop.
 
@@ -168,3 +178,5 @@ Stretch: rolling log of raw JSON samples for debug.
 - [body_project_spec.md](body_project_spec.md)
 - [body/lib/schemas.py](../body/lib/schemas.py)
 - [body/teleop.py](../body/teleop.py)
+- [local_map_spec.md](local_map_spec.md)
+- [desktop_change_spec_local_map.md](desktop_change_spec_local_map.md)
