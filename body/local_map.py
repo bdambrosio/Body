@@ -16,6 +16,7 @@ import signal
 import sys
 import threading
 import time
+import warnings
 from typing import Any
 
 import numpy as np
@@ -45,6 +46,23 @@ def _rot_z(y: float) -> np.ndarray:
 def _R_body_from_cam_euler(yaw: float, pitch: float, roll: float) -> np.ndarray:
     """R such that p_body = R @ R_fix @ p_cam + t (camera OpenCV frame)."""
     return _rot_z(yaw) @ _rot_y(pitch) @ _rot_x(roll)
+
+
+def _intrinsics_for_depth(
+    msg: dict[str, Any], w: int, h: int, hfov: float, vfov: float
+) -> tuple[float, float, float, float]:
+    """Prefer device-true fx/fy/cx/cy from the depth message; fall back to hfov/vfov-derived."""
+    k = msg.get("intrinsics")
+    if isinstance(k, dict):
+        try:
+            return float(k["fx"]), float(k["fy"]), float(k["cx"]), float(k["cy"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    fx = (w - 1) / (2.0 * math.tan(hfov / 2.0)) if w > 1 else 1.0
+    fy = (h - 1) / (2.0 * math.tan(vfov / 2.0)) if h > 1 else 1.0
+    cx = (w - 1) * 0.5
+    cy = (h - 1) * 0.5
+    return fx, fy, cx, cy
 
 
 def _decode_depth_mm(msg: dict[str, Any]) -> tuple[np.ndarray, int, int] | None:
@@ -111,7 +129,7 @@ def _fit_floor_plane_ransac(
     inlier_m: float,
     min_inliers: int,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, float] | None:
+) -> tuple[np.ndarray, float, int] | None:
     npts = int(pts.shape[0])
     if npts < 3:
         return None
@@ -132,7 +150,8 @@ def _fit_floor_plane_ransac(
     if best_inl is None or best_count < min_inliers:
         return None
     refined = pts[best_inl]
-    return _refit_plane_svd(refined)
+    n, d = _refit_plane_svd(refined)
+    return n, d, int(best_count)
 
 
 def _collect_body_points_depth_roi(
@@ -200,16 +219,14 @@ def _median_filter_depth_mm(arr: np.ndarray, kernel: int) -> np.ndarray:
     if kernel <= 1 or kernel % 2 == 0:
         return arr
     half = kernel // 2
-    h, w = arr.shape
-    out = np.zeros_like(arr)
-    for v in range(h):
-        for u in range(w):
-            patch = arr[max(0, v - half) : min(h, v + half + 1), max(0, u - half) : min(w, u + half + 1)]
-            valid = patch[patch > 0]
-            if valid.size == 0:
-                continue
-            out[v, u] = np.uint16(np.median(valid))
-    return out
+    padded = np.pad(arr, half, mode="constant", constant_values=0)
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (kernel, kernel))
+    wf = np.where(windows > 0, windows.astype(np.float32), np.float32(np.nan))
+    flat = wf.reshape(arr.shape[0], arr.shape[1], -1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        med = np.nanmedian(flat, axis=-1)
+    return np.where(np.isnan(med), 0, med).astype(np.uint16)
 
 
 def main() -> None:
@@ -353,10 +370,7 @@ def main() -> None:
                 arr_f, wf, hf = dec_fit
                 if depth_median_kernel > 1:
                     arr_f = _median_filter_depth_mm(arr_f, depth_median_kernel)
-                fx_f = (wf - 1) / (2.0 * math.tan(hfov / 2.0)) if wf > 1 else 1.0
-                fy_f = (hf - 1) / (2.0 * math.tan(vfov / 2.0)) if hf > 1 else 1.0
-                cx_f = (wf - 1) * 0.5
-                cy_f = (hf - 1) * 0.5
+                fx_f, fy_f, cx_f, cy_f = _intrinsics_for_depth(dmsg, wf, hf, hfov, vfov)
                 ui0 = int(np.clip(min(floor_u0, floor_u1) * wf, 0, max(0, wf - 1)))
                 ui1 = int(np.clip(max(floor_u0, floor_u1) * wf, 0, wf))
                 vi0 = int(np.clip(min(floor_v0, floor_v1) * hf, 0, max(0, hf - 1)))
@@ -385,19 +399,19 @@ def main() -> None:
                         rng=rng,
                     )
                     if fit is not None:
-                        floor_n, floor_d = fit
+                        fit_n, fit_d, fit_inliers = fit
                         if floor_log_interval_s > 0.0 and (now - last_floor_log) >= floor_log_interval_s:
                             last_floor_log = now
-                            nx_, ny_, nz_ = float(floor_n[0]), float(floor_n[1]), float(floor_n[2])
+                            nx_, ny_, nz_ = float(fit_n[0]), float(fit_n[1]), float(fit_n[2])
                             pitch_implied = math.atan2(nx_, nz_) if nz_ != 0.0 else 0.0
                             roll_implied = math.atan2(-ny_, nz_) if nz_ != 0.0 else 0.0
-                            h_origin = float(floor_d)
+                            h_origin = float(fit_d)
                             print(
                                 f"[local_map] floor_fit n=({nx_:+.3f},{ny_:+.3f},{nz_:+.3f}) "
                                 f"d={h_origin:+.3f}m pitch≈{math.degrees(pitch_implied):+.2f}° "
-                                f"roll≈{math.degrees(roll_implied):+.2f}° inliers={int(roi_pts.shape[0])} "
-                                f"(set depth_pitch_rad≈{pitch_implied:+.4f}, "
-                                f"depth_roll_rad≈{roll_implied:+.4f} to neutralize)",
+                                f"roll≈{math.degrees(roll_implied):+.2f}° inliers={fit_inliers}/{int(roi_pts.shape[0])} "
+                                f"(set depth_pitch_rad≈{depth_pitch - pitch_implied:+.4f}, "
+                                f"depth_roll_rad≈{depth_roll - roll_implied:+.4f} to neutralize)",
                                 flush=True,
                             )
 
@@ -446,10 +460,7 @@ def main() -> None:
                 arr_roi = np.zeros_like(arr)
                 if du1 > du0 and dv1 > dv0:
                     arr_roi[dv0:dv1, du0:du1] = arr[dv0:dv1, du0:du1]
-                fx = (w - 1) / (2.0 * math.tan(hfov / 2.0)) if w > 1 else 1.0
-                fy = (h - 1) / (2.0 * math.tan(vfov / 2.0)) if h > 1 else 1.0
-                cx = (w - 1) * 0.5
-                cy = (h - 1) * 0.5
+                fx, fy, cx, cy = _intrinsics_for_depth(dmsg, w, h, hfov, vfov)
                 pb, _, _ = _depth_points_body_vectorized(arr_roi, fx, fy, cx, cy, R_bc, t_bc)
                 if pb.shape[0] > 0:
                     px = pb[:, 0]

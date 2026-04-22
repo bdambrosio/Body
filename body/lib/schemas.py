@@ -159,9 +159,15 @@ def oakd_depth_stream_frame(
     dtype: str = "uint16",
     units: str = "mm",
     layout: str = "row_major",
+    intrinsics: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """body/oakd/depth — streamed depth from StereoDepth (host-resized), raw uint16 row-major."""
-    return {
+    """body/oakd/depth — streamed depth from StereoDepth (host-resized), raw uint16 row-major.
+
+    If ``intrinsics`` is provided (``fx``, ``fy``, ``cx``, ``cy`` for the published ``width``×``height``
+    depth image, post-rotation), include it so consumers can unproject without re-deriving from an
+    assumed HFOV.
+    """
+    msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
         "format": "depth_uint16_mm",
         "width": width,
@@ -172,6 +178,9 @@ def oakd_depth_stream_frame(
         "encoding": "base64",
         "data": data_base64,
     }
+    if intrinsics is not None:
+        msg["intrinsics"] = intrinsics
+    return msg
 
 
 def oakd_config_capture_rgb(request_id: str) -> dict[str, Any]:

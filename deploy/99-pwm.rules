@@ -1,0 +1,5 @@
+# Pi 5 / RP1 hardware PWM: make /sys/class/pwm writable by the `gpio` group so
+# body.motor_controller can run as a non-root user. Fires on every pwm* event
+# (pwmchip add, channel export, etc.). `%p` is the device path relative to /sys.
+# `g+rwX` gives group rw on files and (capital X) +x only on directories.
+SUBSYSTEM=="pwm*", PROGRAM="/bin/sh -c 'chown -R root:gpio /sys%p && chmod -R g+rwX /sys%p'"

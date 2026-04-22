@@ -202,19 +202,15 @@ Standard quadrature lookup table handles all 16 transitions (4 valid forward, 4 
 
 ### 4.6 GPIO Setup
 
-Motor PWM on BCM 12 and 13 uses **RP1 hardware PWM** through the Linux **sysfs** interface (`/sys/class/pwm/...`), not `lgpio.tx_pwm` (on Pi 5 that call is **software** PWM). The flow matches `scripts/pwm13_hdwr_test.py`: use **`pinctrl`** to select the PWM alternate function on each pin (e.g. `pinctrl set 12 a0 pn` and `pinctrl set 13 a0 pn`), then export the correct channels on the RP1 controller (typically `pwmchip2`: channel **0** for GPIO 12, channel **1** for GPIO 13), set `period` and `duty_cycle` in nanoseconds, and `enable`. Each control tick updates `duty_cycle` only; frequency stays fixed. Implementation: `body/lib/motor_gpio.py`.
-
-Direction pins (BCM 5, 6) and encoder pins still use **`lgpio`** (`gpio_claim_output` / `gpio_claim_input` / callbacks).
-
-Optional `motor` config keys: `sysfs_pwm_chip`, `pwm_sysfs_left_channel`, `pwm_sysfs_right_channel`, `pwm_skip_pinmux` (set `true` if something else has already muxed the pins), `invert_left_dir` (swap only the left DIR pin vs kinematic fwd/rev when the left gearbox is mounted 180° from the right).
-
 ```python
 import lgpio
 
-# --- Hardware PWM (BCM 12, 13): sysfs + pinctrl; see motor_gpio.open_mdd10a ---
-# Not: lgpio.tx_pwm(...)  # that is software PWM on Pi 5
-
 h = lgpio.gpiochip_open(0)
+
+# Motor PWM outputs (hardware PWM on BCM 12, 13)
+# lgpio hardware PWM: lgpio.tx_pwm(handle, gpio, freq_hz, duty_percent)
+lgpio.tx_pwm(h, 12, PWM_FREQ_HZ, 0)   # left motor, start stopped
+lgpio.tx_pwm(h, 13, PWM_FREQ_HZ, 0)   # right motor, start stopped
 
 # Motor DIR outputs
 lgpio.gpio_claim_output(h, 5, 0)   # left DIR, default LOW (forward)
@@ -256,19 +252,19 @@ Not a substitute for current sensing, but prevents prolonged stalls from burning
 ### 4.10 Startup and Shutdown
 
 **Startup:**
-1. Open lgpio handle; mux PWM pins and bring up sysfs PWM at 0% duty (`motor_gpio.open_mdd10a`)
-2. Configure remaining GPIO (DIR LOW, encoder inputs with callbacks when used)
+1. Open lgpio handle
+2. Configure all GPIO (PWM at 0%, DIR LOW, encoder inputs with callbacks)
 3. Open Zenoh session, subscribe to cmd topics
 4. Enter main loop
 
 **Shutdown (SIGTERM):**
-1. Disable both sysfs PWM channels (0% duty); unexport channels this process exported
+1. Set both PWM to 0%
 2. Close Zenoh session
-3. Release lgpio-claimed pins (DIR, encoders)
+3. Release all GPIO
 4. Close lgpio handle
 5. Exit
 
-Motors are always safe-off by default on clean shutdown. If the process crashes, lgpio releases its claimed pins; sysfs PWM state depends on the kernel and prior configuration.
+Motors are always safe-off by default. If the process crashes, lgpio releases the pins and PWM output stops.
 
 ### 4.11 Configuration Constants
 
@@ -308,13 +304,11 @@ ZENOH_CONNECT = "tcp/localhost:7447"
 
 ### 4.12 Dependencies
 
-- `lgpio` — GPIO access on Pi 5 for DIR and encoders (pre-installed on Raspberry Pi OS)
-- Linux sysfs PWM — `/sys/class/pwm` on the RP1 controller (no extra Python package)
-- `pinctrl` — from **raspi-utils** (mux BCM 12/13 to PWM); motor GPIO setup runs it unless `pwm_skip_pinmux` is set
+- `lgpio` — GPIO access on Pi 5 (pre-installed on Raspberry Pi OS)
 - `zenoh` — pip install eclipse-zenoh
 - Python 3.11+ standard library (threading, signal, time, json, math)
 
-No ROS. No frameworks.
+No other dependencies. No ROS. No frameworks. One file.
 
 ---
 

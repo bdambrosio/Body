@@ -22,6 +22,16 @@ export PYTHONPATH="$(pwd)"
 
 **Raspberry Pi + `motor.gpio_enabled`:** install **`python3-lgpio`** with apt (`sudo apt install python3-lgpio`). That package lives under the system interpreter’s `dist-packages`. A venv created **without** `--system-site-packages` cannot import `lgpio`, and `motor_controller` will fail at startup. Use **`--system-site-packages`** as above, or edit `.venv/pyvenv.cfg` and set `include-system-site-packages = true`, then retry.
 
+**Raspberry Pi 5 PWM sysfs (non-root):** `motor_controller` uses RP1 hardware PWM via `/sys/class/pwm/...` (see [docs/motor_controller_spec.md](docs/motor_controller_spec.md) §4.6). Those attribute files are `root:root 0644` by default, so the launcher fails with `PermissionError` on `pwmchipN/pwmK/period` when run as a regular user. Install the shipped udev rule so members of `gpio` can write them:
+
+```bash
+sudo cp deploy/99-pwm.rules /etc/udev/rules.d/99-pwm.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=pwm
+```
+
+No reboot required. Verify with `ls -l /sys/class/pwm/pwmchip0/` — group should be `gpio`, mode `g+rw`. Ensure the launch user is in `gpio` (`groups`; add with `sudo usermod -aG gpio $USER` and re-login if not).
+
 Use the same `PYTHONPATH` for `launcher`, `teleop`, and any `python -m body.*` command. The launcher also sets `PYTHONPATH` for child processes.
 
 ## Configuration

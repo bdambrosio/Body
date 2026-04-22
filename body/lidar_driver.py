@@ -52,7 +52,7 @@ def _bin_revolution(
     for deg, dist_m, inte in points:
         if dist_m <= 0.0 or dist_m < range_min_m or dist_m > range_max_m:
             continue
-        bi = int((deg / 360.0) * num_bins) % num_bins
+        bi = int(((360.0 - deg) / 360.0) * num_bins) % num_bins
         prev = ranges[bi]
         if prev is None or dist_m < prev:
             ranges[bi] = dist_m

@@ -26,6 +26,11 @@ import numpy as np
 
 from body.lib import schemas, zenoh_helpers
 
+# Populated once per device open by ``_log_oakd_calibration`` (stereo-L intrinsics at the configured
+# depth output resolution, adjusted for ``rgb_rotate_deg``). Consumed by ``_depth_frame_to_stream_msg``
+# so downstream readers (e.g. local_map) can unproject with device-true fx/fy/cx/cy.
+_DEPTH_INTRINSICS: dict[str, float] | None = None
+
 
 def _depthai_is_v3() -> bool:
     return not hasattr(dai.node, "XLinkOut")
@@ -46,6 +51,70 @@ def _log_imu_missing_fallback(exc: RuntimeError) -> None:
         "oakd.imu_enable_firmware_update to true (DepthAI v3 uses device.startIMUFirmwareUpdate), "
         "keep USB stable, wait for 100%.",
         file=sys.stderr,
+        flush=True,
+    )
+
+
+def _log_oakd_calibration(device: Any, oakd_cfg: dict[str, Any]) -> None:
+    """Print factory calibration per camera and cache stereo-L intrinsics for the depth stream.
+
+    The OAK-D depth stream is aligned to stereo-L (CAM_B). We store rotation-corrected intrinsics at
+    the published ``(out_w, out_h)`` resolution in ``_DEPTH_INTRINSICS`` so depth messages can carry
+    device-true ``fx``/``fy``/``cx``/``cy`` to consumers (avoids HFOV-based approximations).
+    """
+    global _DEPTH_INTRINSICS
+    try:
+        calib = device.readCalibration()
+    except Exception as e:
+        print(f"[oakd] readCalibration failed: {e}", flush=True)
+        return
+    rw = int(oakd_cfg.get("rgb_preview_width", 640))
+    rh = int(oakd_cfg.get("rgb_preview_height", 400))
+    dw = int(oakd_cfg.get("depth_out_width", 120))
+    dh = int(oakd_cfg.get("depth_out_height", 90))
+    for name, sock, w, h in (
+        ("RGB(CAM_A)", dai.CameraBoardSocket.CAM_A, rw, rh),
+        ("stereo_L(CAM_B)", dai.CameraBoardSocket.CAM_B, dw, dh),
+        ("stereo_R(CAM_C)", dai.CameraBoardSocket.CAM_C, dw, dh),
+    ):
+        try:
+            hfov = float(calib.getFov(sock))
+            K = calib.getCameraIntrinsics(sock, w, h)
+            fx, fy = float(K[0][0]), float(K[1][1])
+            cx, cy = float(K[0][2]), float(K[1][2])
+            print(
+                f"[oakd] calib {name} @ {w}x{h}: hfov={hfov:.2f}° "
+                f"fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}",
+                flush=True,
+            )
+        except Exception:
+            continue
+
+    try:
+        K = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_B, dw, dh)
+        fx, fy = float(K[0][0]), float(K[1][1])
+        cx, cy = float(K[0][2]), float(K[1][2])
+    except Exception as e:
+        print(f"[oakd] depth intrinsics unavailable (falling back to hfov-derived): {e}", flush=True)
+        _DEPTH_INTRINSICS = None
+        return
+    deg = int(oakd_cfg.get("rgb_rotate_deg", 0)) % 360
+    # ``_apply_oakd_image_rotate`` runs before the cv2.resize that finalizes (dw, dh). For 0° and
+    # 180° the output aspect matches getCameraIntrinsics'; for 90°/270° aspect flips so cx/cy swap
+    # and fx/fy swap (reported values are approximate in that case due to the subsequent resize).
+    if deg == 90:
+        fx, fy = fy, fx
+        cx, cy = cy, (dw - 1) - cx
+    elif deg == 180:
+        cx = (dw - 1) - cx
+        cy = (dh - 1) - cy
+    elif deg == 270:
+        fx, fy = fy, fx
+        cx, cy = (dh - 1) - cy, cx
+    _DEPTH_INTRINSICS = {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
+    print(
+        f"[oakd] depth msg intrinsics (CAM_B @ {dw}x{dh}, rotate={deg}°): "
+        f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}",
         flush=True,
     )
 
@@ -173,7 +242,7 @@ def _depth_frame_to_stream_msg(
     np.copyto(prev, out)
     small_out = np.clip(np.round(out), 0, 65535).astype(np.uint16)
     b64 = base64.standard_b64encode(small_out.tobytes()).decode("ascii")
-    return schemas.oakd_depth_stream_frame(out_w, out_h, b64)
+    return schemas.oakd_depth_stream_frame(out_w, out_h, b64, intrinsics=_DEPTH_INTRINSICS)
 
 
 def _create_v3_stereo_depth_queue(pipeline: Any, oakd_cfg: dict[str, Any]) -> Any:
@@ -455,6 +524,7 @@ def _run_depthai_v2_rgb_only(
     cam.preview.link(xlink_rgb.input)
     try:
         with dai.Device(pipeline, dev_info) as device:
+            _log_oakd_calibration(device, oakd_cfg)
             rgb_queue = device.getOutputQueue("rgb", maxSize=4, blocking=False)
             print("[oakd] RGB-only pipeline running (synthetic IMU/depth on Zenoh)", flush=True)
             _run_synthetic_imu_depth_config_loop(
@@ -489,6 +559,7 @@ def _run_depthai_v3_rgb_only(
 ) -> None:
     """IMU unusable: StereoDepth + RGB + synthetic IMU; depth stream + optional capture_rgb (DepthAI v3)."""
     device = dai.Device(dev_info)
+    _log_oakd_calibration(device, oakd_cfg)
     pipeline = dai.Pipeline(device)
     depth_queue = _create_v3_stereo_depth_queue(pipeline, oakd_cfg)
     rgb_queue = _create_v3_rgb_queue(pipeline, oakd_cfg)
@@ -586,6 +657,7 @@ def _run_depthai_v2(
 
     try:
         with dai.Device(pipeline, dev_info) as device:
+            _log_oakd_calibration(device, oakd_cfg)
             imu_queue = device.getOutputQueue("imu", maxSize=50, blocking=False)
             rgb_queue = None
             if rgb_wants:
@@ -631,6 +703,7 @@ def _run_depthai_v3(
 ) -> None:
     # v3: bind an opened Device to the Pipeline, attach queues to node outputs, then start().
     device = dai.Device(dev_info)
+    _log_oakd_calibration(device, oakd_cfg)
     _v3_imu_firmware_update(device, oakd_cfg)
     pipeline = dai.Pipeline(device)
     imu = pipeline.create(dai.node.IMU)
@@ -706,9 +779,30 @@ def main() -> None:
                 "Luxonis notes some OAK-D-Lite (e.g. Kickstarter) have no IMU chip.",
                 flush=True,
             )
-            _run_stub_imu_publisher(
-                session, oakd_cfg, interval_s, depth_period, stop_ref, config_pending
-            )
+            dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
+            if dev_info is None:
+                print(
+                    "[oakd] no DepthAI device found; running synthetic IMU/depth stub.",
+                    flush=True,
+                )
+                _run_stub_imu_publisher(
+                    session, oakd_cfg, interval_s, depth_period, stop_ref, config_pending
+                )
+            else:
+                api = "v3 (no XLinkOut)" if _depthai_is_v3() else "v2 (XLinkOut)"
+                print(
+                    f"[oakd] depthai API: {api}; library {getattr(dai, '__version__', '?')} "
+                    "(RGB + depth pipeline, synthetic IMU)",
+                    flush=True,
+                )
+                if _depthai_is_v3():
+                    _run_depthai_v3_rgb_only(
+                        oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref, config_pending
+                    )
+                else:
+                    _run_depthai_v2_rgb_only(
+                        oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref, config_pending
+                    )
         else:
             dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
             if dev_info is None:
