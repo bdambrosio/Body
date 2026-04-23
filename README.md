@@ -13,7 +13,7 @@ The contract between the two halves — and with any external agent (Jill / Cogn
 - `eclipse-zenoh` and, for `oakd_driver`, `depthai` (see [requirements.txt](requirements.txt)); Linux udev rules for Movidius (`03e7`) are required to open the OAK from a non-root user.
 - **OAK-D-Lite IMU:** retail units usually include a BNO IMU; DepthAI may require `oakd.imu_enable_firmware_update: true` (default in [config.json](config.json)) on first use. Some **Kickstarter OAK-D-Lite** boards have **no IMU** ([Luxonis docs](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/imu/)) — set **`imu_hardware_present`: false** to run `oakd_driver` with synthetic `body/oakd/imu` so the launcher does not crash.
 - A Zenoh **router** (`zenohd`) reachable by every Body process and every client (`desktop.chassis`, `desktop.world_map`, or Jill). On the robot, run the router on the Pi and listen on TCP **7447** (see [Configuration](#configuration)).
-- Desktop side (`desktop/`) needs `PyQt6` + `requests`; see [desktop-requirements.txt](desktop-requirements.txt). Install only on machines that will run the operator UI — no need on the Pi.
+- Desktop side (`desktop/`) needs `PyQt6` + `requests`; see [desktop/requirements.txt](desktop/requirements.txt). Install only on machines that will run the operator UI — no need on the Pi.
 
 ## Install (once per machine)
 
@@ -42,14 +42,16 @@ Use the same `PYTHONPATH` for `launcher` and any `python -m body.*` command. The
 
 **Desktop install (laptop / workstation only):**
 
+Use a separate venv from the Pi-side `.venv`. Pi and desktop have non-overlapping needs (depthai/lgpio are Pi-only; PyQt6 is desktop-only), and the Pi venv typically uses `--system-site-packages` for lgpio while the desktop one does not.
+
 ```bash
 cd /path/to/Body
-python3 -m venv .venv
-.venv/bin/pip install -r desktop-requirements.txt
+python3 -m venv desktop/.venv
+desktop/.venv/bin/pip install -r desktop/requirements.txt
 export PYTHONPATH="$(pwd)"
 ```
 
-`PYTHONPATH` must point at the repo root so both `body.*` and `desktop.*` packages import. No `--system-site-packages` needed on the desktop side.
+`PYTHONPATH` must point at the **repo root** (not `desktop/`) so both `body.*` and `desktop.*` packages import. No `--system-site-packages` needed on the desktop side.
 
 ## Configuration
 
@@ -164,7 +166,7 @@ Startup order: `watchdog` → `motor_controller` → `lidar_driver` → `oakd_dr
 cd /path/to/Body
 export PYTHONPATH="$(pwd)"
 export ZENOH_CONNECT=tcp/192.168.1.50:7447
-.venv/bin/python -m desktop.chassis
+desktop/.venv/bin/python -m desktop.chassis
 ```
 
 (Replace the address with your Pi’s IP or hostname; flags `--router`, `--heartbeat-hz`, `--map-stale-s`, `-v` are available — see `python -m desktop.chassis --help`.)
@@ -174,7 +176,7 @@ export ZENOH_CONNECT=tcp/192.168.1.50:7447
 ### Optional: world_map fuser
 
 ```bash
-.venv/bin/python -m desktop.world_map
+desktop/.venv/bin/python -m desktop.world_map
 ```
 
 Consumer-only — does not publish heartbeat or cmd_vel. Safe to run alongside `chassis`. See [docs/world_map_spec.md](docs/world_map_spec.md).
