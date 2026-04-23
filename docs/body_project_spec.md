@@ -20,7 +20,8 @@ Body is the onboard software stack for a differential-drive robot chassis. It pr
 | Cytron MDD10A dual 10A motor driver | GPIO: 2x PWM + 2x DIR | Channel A = left motor, Channel B = right motor |
 | Pololu #4752 30:1 gearmotor w/ encoder (x2) | GPIO: 2x quadrature (A/B per motor) | 64 CPR motor shaft, 1920 CPR output shaft. 330 RPM no-load @ 12V. Stall: 14 kg·cm / 5.5A |
 | LDROBOT STL-19P lidar | USB serial | 360° 2D scan, ~10Hz typical |
-| OAK-D-Lite | USB3 (DepthAI) | Stereo depth, RGB, onboard IMU (BNO086) |
+| OAK-D-Lite | USB3 (DepthAI) | Stereo depth, RGB. IMU is NOT present on this unit (early-Kickstarter hardware). |
+| BNO085 IMU | Pi i2c | 9-DOF with on-chip SH-2 fusion. Primary orientation source. See `imu_integration_spec.md`. |
 | Raspberry Pi 5 | — | 4-core, 8GB assumed. Runs all Body processes |
 
 ### GPIO Pin Assignments (provisional, confirm during wiring)
@@ -233,22 +234,30 @@ Dead-reckoned pose from encoder integration. Frame: robot starting position at o
 - Invalid/out-of-range readings: `null` in the array.
 - `intensities`: included if the STL-19P provides them, omit field otherwise.
 
-### 5.6 `body/oakd/imu` (oakd_driver → Jill)
+### 5.6 `body/imu` (imu_driver → Jill)
+
+See `imu_integration_spec.md` for the full contract. Summary:
 
 ```json
 {
   "ts": 1713264000.123456,
-  "accel": {"x": 0.0, "y": 0.0, "z": 9.81},
-  "gyro": {"x": 0.0, "y": 0.0, "z": 0.0},
-  "mag": {"x": 0.0, "y": 0.0, "z": 0.0},
-  "orientation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+  "accel":        {"x": 0.0, "y": 0.0, "z": 9.81},
+  "gyro":         {"x": 0.0, "y": 0.0, "z": 0.0},
+  "linear_accel": {"x": 0.0, "y": 0.0, "z": 0.0},
+  "orientation":  {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
+  "fusion": {
+    "mode": "rotation_vector",
+    "accuracy_rad": 0.035
+  }
 }
 ```
 
-- `accel`: m/s², sensor frame.
-- `gyro`: rad/s.
-- `mag`: if available from BNO086, omit if not configured.
-- `orientation`: quaternion from BNO086 onboard fusion, if available.
+- Frame: body frame, x-forward / y-left / z-up. Any sensor-mount rotation is applied on the Pi side before publishing.
+- `orientation`: quaternion (wxyz) from the BNO085's on-chip fusion.
+- `fusion.mode`: `rotation_vector` (with magnetometer, absolute yaw) or `game_rotation_vector` (no magnetometer, relative yaw — used when motor current contaminates the mag).
+- `fusion.accuracy_rad`: BNO085's per-report accuracy; consumers use this as orientation σ.
+
+The old `body/oakd/imu` topic is deprecated once `body/imu` ships — the OAK-D-Lite on this unit does not expose an IMU (see §1 hardware notes).
 
 ### 5.7 `body/oakd/depth` (oakd_driver → Jill)
 
