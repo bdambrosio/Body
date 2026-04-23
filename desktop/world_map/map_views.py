@@ -5,6 +5,7 @@ If a third consumer ever appears, promote these to dev/shared/widgets/.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Optional
 
@@ -12,6 +13,41 @@ import numpy as np
 from PyQt6.QtCore import Qt, QPointF
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PyQt6.QtWidgets import QSizePolicy, QWidget
+
+
+def _fit_rect(
+    widget_w: int, widget_h: int, nx: int, ny: int, margin: int,
+) -> tuple[int, int, int, int]:
+    """Pick a pixel-aligned (draw_w, draw_h, ox, oy) for rendering an
+    (nx × ny) cell grid into the widget rect, inset by `margin`.
+
+    Stabilizes against ±1 px jitter: quantizes per-cell pixel size to
+    integer `pixels_per_cell` (ppc >= 1) or integer `cells_per_pixel`
+    (ppc < 1). Small drifts of the widget size no longer flip draw_w
+    by ±1 every repaint; size only steps when the widget crosses a
+    whole cell-quantum boundary.
+
+    Returns (0, 0, 0, 0) for degenerate inputs so callers can bail out.
+    """
+    avail_w = widget_w - 2 * margin
+    avail_h = widget_h - 2 * margin
+    if avail_w <= 0 or avail_h <= 0 or nx <= 0 or ny <= 0:
+        return 0, 0, 0, 0
+    ppc = min(avail_w / ny, avail_h / nx)  # pixels per cell (float)
+    if ppc >= 1.0:
+        q = max(1, int(ppc))  # floor ensures draw fits avail by construction
+        draw_w = ny * q
+        draw_h = nx * q
+    else:
+        # 1 pixel covers multiple cells. Ceil cells-per-pixel so the
+        # rounded dims don't exceed avail; ceil on ny/cpp because the
+        # last pixel column may cover a partial cell.
+        cpp = max(1, int(math.ceil(1.0 / ppc)))
+        draw_w = min(avail_w, max(1, (ny + cpp - 1) // cpp))
+        draw_h = min(avail_h, max(1, (nx + cpp - 1) // cpp))
+    ox = margin + (avail_w - draw_w) // 2
+    oy = margin + (avail_h - draw_h) // 2
+    return draw_w, draw_h, ox, oy
 
 
 def _turbo_rgb(x: np.ndarray) -> np.ndarray:
@@ -42,7 +78,7 @@ class WorldHeightView(QWidget):
         max_height_m: float = DEFAULT_MAX_HEIGHT_M,
     ):
         super().__init__(parent)
-        self.setMinimumSize(280, 280)
+        self.setMinimumSize(160, 160)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
         )
@@ -97,16 +133,10 @@ class WorldHeightView(QWidget):
             qimg = QImage(rgb.data, ny, nx, 3 * ny,
                           QImage.Format.Format_RGB888).copy()
 
-            map_w_m = ny * res
-            map_h_m = nx * res
             margin = 6
-            avail_w = max(1, w - 2 * margin)
-            avail_h = max(1, h - 2 * margin)
-            scale = min(avail_w / map_w_m, avail_h / map_h_m)
-            draw_w = max(1, int(map_w_m * scale))
-            draw_h = max(1, int(map_h_m * scale))
-            ox = margin + (avail_w - draw_w) // 2
-            oy = margin + (avail_h - draw_h) // 2
+            draw_w, draw_h, ox, oy = _fit_rect(w, h, nx, ny, margin)
+            if draw_w == 0:
+                return
             scaled = qimg.scaled(
                 draw_w, draw_h,
                 Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -210,7 +240,7 @@ class WorldDriveableView(QWidget):
         stale_s: float = 2.0,
     ):
         super().__init__(parent)
-        self.setMinimumSize(280, 280)
+        self.setMinimumSize(160, 160)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
         )
@@ -262,16 +292,10 @@ class WorldDriveableView(QWidget):
             qimg = QImage(rgb.data, ny, nx, 3 * ny,
                           QImage.Format.Format_RGB888).copy()
 
-            map_w_m = ny * res
-            map_h_m = nx * res
             margin = 6
-            avail_w = max(1, w - 2 * margin)
-            avail_h = max(1, h - 2 * margin)
-            scale = min(avail_w / map_w_m, avail_h / map_h_m)
-            draw_w = max(1, int(map_w_m * scale))
-            draw_h = max(1, int(map_h_m * scale))
-            ox = margin + (avail_w - draw_w) // 2
-            oy = margin + (avail_h - draw_h) // 2
+            draw_w, draw_h, ox, oy = _fit_rect(w, h, nx, ny, margin)
+            if draw_w == 0:
+                return
             scaled = qimg.scaled(
                 draw_w, draw_h,
                 Qt.AspectRatioMode.IgnoreAspectRatio,
