@@ -1,0 +1,8 @@
+# Desktop-side requirements (operator station: chassis + world_map).
+# Pi-side requirements live in requirements.txt. Install both on a
+# laptop only if you need the OAK-D drivers locally.
+
+eclipse-zenoh~=1.9.0
+PyQt6>=6.5,<7
+numpy>=1.24,<3
+requests>=2.31,<3

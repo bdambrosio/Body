@@ -1,13 +1,19 @@
 # Body
 
-Onboard software for a differential-drive robot chassis: independent Python processes on a Raspberry Pi (target) communicate over [Zenoh](https://zenoh.io/) using JSON messages. The contract with the desktop agent (Jill / Cognitive Workbench) is defined in [docs/body_project_spec.md](docs/body_project_spec.md).
+Differential-drive robot software in two halves that share one repo:
+
+- **`body/`** — Pi-side runtime. Independent Python processes on a Raspberry Pi (target) communicate over [Zenoh](https://zenoh.io/) using JSON messages.
+- **`desktop/`** — Operator-side stack (laptop / workstation). `chassis` is a low-level monitoring + manual command UI; `world_map` is a continuous world-frame fuser. Both connect to the Pi over the same Zenoh router.
+
+The contract between the two halves — and with any external agent (Jill / Cognitive Workbench) — is defined in [docs/body_project_spec.md](docs/body_project_spec.md).
 
 ## Requirements
 
 - Python 3.11+
 - `eclipse-zenoh` and, for `oakd_driver`, `depthai` (see [requirements.txt](requirements.txt)); Linux udev rules for Movidius (`03e7`) are required to open the OAK from a non-root user.
 - **OAK-D-Lite IMU:** retail units usually include a BNO IMU; DepthAI may require `oakd.imu_enable_firmware_update: true` (default in [config.json](config.json)) on first use. Some **Kickstarter OAK-D-Lite** boards have **no IMU** ([Luxonis docs](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/imu/)) — set **`imu_hardware_present`: false** to run `oakd_driver` with synthetic `body/oakd/imu` so the launcher does not crash.
-- A Zenoh **router** (`zenohd`) reachable by every Body process and every client (teleop or Jill). On the robot, run the router on the Pi and listen on TCP **7447** (see [Configuration](#configuration)).
+- A Zenoh **router** (`zenohd`) reachable by every Body process and every client (`desktop.chassis`, `desktop.world_map`, or Jill). On the robot, run the router on the Pi and listen on TCP **7447** (see [Configuration](#configuration)).
+- Desktop side (`desktop/`) needs `PyQt6` + `requests`; see [desktop-requirements.txt](desktop-requirements.txt). Install only on machines that will run the operator UI — no need on the Pi.
 
 ## Install (once per machine)
 
@@ -32,7 +38,18 @@ sudo udevadm trigger --subsystem-match=pwm
 
 No reboot required. Verify with `ls -l /sys/class/pwm/pwmchip0/` — group should be `gpio`, mode `g+rw`. Ensure the launch user is in `gpio` (`groups`; add with `sudo usermod -aG gpio $USER` and re-login if not).
 
-Use the same `PYTHONPATH` for `launcher`, `teleop`, and any `python -m body.*` command. The launcher also sets `PYTHONPATH` for child processes.
+Use the same `PYTHONPATH` for `launcher` and any `python -m body.*` command. The launcher also sets `PYTHONPATH` for child processes.
+
+**Desktop install (laptop / workstation only):**
+
+```bash
+cd /path/to/Body
+python3 -m venv .venv
+.venv/bin/pip install -r desktop-requirements.txt
+export PYTHONPATH="$(pwd)"
+```
+
+`PYTHONPATH` must point at the repo root so both `body.*` and `desktop.*` packages import. No `--system-site-packages` needed on the desktop side.
 
 ## Configuration
 
@@ -50,11 +67,11 @@ Router on the Pi (matches the spec): listen on `0.0.0.0:7447` so peers on the LA
 }
 ```
 
-Processes on the Pi should connect to **`tcp/127.0.0.1:7447`** (default in `config.json`). A laptop running teleop uses **`tcp/<pi-ip>:7447`** via `ZENOH_CONNECT` or edited `connect_endpoints`.
+Processes on the Pi should connect to **`tcp/127.0.0.1:7447`** (default in `config.json`). A laptop running `desktop.chassis` or `desktop.world_map` uses **`tcp/<pi-ip>:7447`** via `ZENOH_CONNECT` or edited `connect_endpoints`.
 
 ### Starting `zenohd` (router)
 
-Body expects a **router** already running before you start `body.launcher` or `teleop`.
+Body expects a **router** already running before you start `body.launcher` or any desktop client.
 
 **`zenohd` is not installed by `pip` or your `.venv`.** The Python package `eclipse-zenoh` is only the client library. If the shell says `zenohd: command not found`, install the router binary below (or add it to your `PATH`).
 
@@ -97,17 +114,20 @@ flowchart LR
     L[body.launcher]
     R --- L
   end
-  subgraph clients [Clients optional]
-    T[body.teleop]
+  subgraph clients [Desktop clients optional]
+    C[desktop.chassis]
+    W[desktop.world_map]
     J[Jill bridge]
   end
-  T --> R
+  C --> R
+  W --> R
   J --> R
 ```
 
 1. Start **`zenohd`** on the Pi (or your dev box for all-local tests).
 2. Start **`body.launcher`** on the Pi (motor, lidar, oakd, watchdog processes).
-3. Optionally start **`body.teleop`** or a Jill-side bridge so **`body/heartbeat`** and **`body/cmd_vel`** are published. Without heartbeats, the watchdog will treat the robot as not under command and can trigger **`body/emergency_stop`**.
+3. Optionally start **`desktop.chassis`** (or a Jill-side bridge) on a laptop so **`body/heartbeat`** and **`body/cmd_vel`** are published. Without heartbeats, the watchdog will treat the robot as not under command and can trigger **`body/emergency_stop`**.
+4. Optionally start **`desktop.world_map`** on the same or another laptop to fuse `body/map/local_2p5d` + `body/odom` into a continuous world map (see [docs/world_map_spec.md](docs/world_map_spec.md)). Consumer-only; safe to run alongside `chassis`.
 
 ## Running the stack (`body.launcher`)
 
@@ -127,53 +147,39 @@ Startup order: `watchdog` → `motor_controller` → `lidar_driver` → `oakd_dr
 
 **Deploy tip:** If errors reference old line numbers or missing symbols (e.g. `XLinkOut` on DepthAI v3), the Pi’s `~/Body` tree is behind your main repo—`git pull` or rsync the updated `body/` tree, then restart the launcher.
 
-**Watchdog:** Until something publishes **`body/heartbeat`** (e.g. `body.teleop`), the watchdog may emit **`body/emergency_stop`** (`heartbeat_timeout`). That is expected; start teleop or another client when you want the stack to see a live operator.
+**Watchdog:** Until something publishes **`body/heartbeat`** (e.g. `desktop.chassis` with Live cmd enabled), the watchdog may emit **`body/emergency_stop`** (`heartbeat_timeout`). That is expected; start a desktop client when you want the stack to see a live operator.
 
 ## Standalone mode (no Jill)
 
-**Standalone** means: Body processes on the Pi, and **you** provide heartbeat and velocity commands using the repo’s teleop client—Cognitive Workbench does not need to run.
+**Standalone** means: Body processes on the Pi, and **you** provide heartbeat and velocity commands using `desktop.chassis` — no Cognitive Workbench / agent needs to run.
 
 ### On the Pi
 
 1. Start `zenohd`.
 2. Start `body.launcher` as above.
 
-### On the same Pi (keyboard / SSH session on robot)
-
-```bash
-cd /path/to/Body
-export PYTHONPATH="$(pwd)"
-.venv/bin/python -m body.teleop
-```
-
-Default `config.json` uses `tcp/127.0.0.1:7447`, which matches a local router.
-
 ### On a laptop / workstation (robot’s router on LAN)
-
-Point Zenoh at the Pi:
 
 ```bash
 cd /path/to/Body
 export PYTHONPATH="$(pwd)"
 export ZENOH_CONNECT=tcp/192.168.1.50:7447
-.venv/bin/python -m body.teleop
+.venv/bin/python -m desktop.chassis
 ```
 
-(Replace the address with your Pi’s IP or hostname.)
+(Replace the address with your Pi’s IP or hostname; flags `--router`, `--heartbeat-hz`, `--map-stale-s`, `-v` are available — see `python -m desktop.chassis --help`.)
 
-### Teleop REPL
+`chassis` opens a PyQt6 window with docks for camera, lidar, local map, motor test, vision, and a sweep-360 calibration mission. Heartbeat + `cmd_vel` are published while the **Live cmd** checkbox is on; toggle off to release motion authority without quitting.
 
-| Command | Meaning |
-|---------|---------|
-| `vel LINEAR [ANGULAR]` | Latch `body/cmd_vel`: linear m/s, angular rad/s (CCW positive). Angular defaults to `0`. |
-| `stop` | Latch zero velocity. |
-| `status` | Print last `body/status` JSON (if any). |
-| `help` | Short help. |
-| `quit` / `q` | Exit teleop (heartbeat and cmd_vel stop; robot may e-stop if nothing else publishes heartbeat). |
+### Optional: world_map fuser
 
-Optional flags: `--heartbeat-hz` (default 2), `--cmd-vel-hz` (default 20), `--timeout-ms` (default 500), `--verbose` (print every `body/status`).
+```bash
+.venv/bin/python -m desktop.world_map
+```
 
-**Motion authority:** Do **not** run teleop and another publisher (e.g. Jill) both commanding `body/cmd_vel` at the same time; the motor side effectively sees interleaved commands.
+Consumer-only — does not publish heartbeat or cmd_vel. Safe to run alongside `chassis`. See [docs/world_map_spec.md](docs/world_map_spec.md).
+
+**Motion authority:** Do **not** run `chassis` (with Live cmd on) and another publisher (e.g. Jill) both commanding `body/cmd_vel` at the same time; the motor side effectively sees interleaved commands.
 
 ## Integration expectations (Jill / other agents)
 
@@ -187,11 +193,12 @@ After a heartbeat fault, recovery follows **§5.10** in [docs/body_project_spec.
 
 ## Smoke check (optional)
 
-With the stack running, subscribe to `body/**` with Zenoh tooling (e.g. `zenoh-python` examples) and confirm traffic: `body/odom`, `body/lidar/scan`, `body/oakd/imu`, `body/status`, and—when teleop or Jill is active—`body/heartbeat` and `body/cmd_vel`.
+With the stack running, subscribe to `body/**` with Zenoh tooling (e.g. `zenoh-python` examples) and confirm traffic: `body/odom`, `body/lidar/scan`, `body/oakd/imu`, `body/status`, and—when `chassis` or Jill is active—`body/heartbeat` and `body/cmd_vel`.
 
 ## Layout
 
-- [body/](body/) — package: `launcher`, drivers, `teleop`, `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`).
+- [body/](body/) — Pi-side package: `launcher`, drivers (`motor_controller`, `lidar_driver`, `oakd_driver`, `watchdog`), `local_map`, `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`).
+- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis) (low-level monitoring + manual command UI), [`world_map`](desktop/world_map) (world-frame fuser), `vision_service.py` (VLM client), `utils/` (shared helpers). A higher-level navigation UI (`nav`) is planned but not yet present.
 - [deploy/](deploy/) — optional ops files (e.g. `zenohd-router.json`).
 
 ## License
