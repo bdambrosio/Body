@@ -29,7 +29,18 @@ def odom(
     left_ticks: int = 0,
     right_ticks: int = 0,
     dt_ms: int = 20,
+    source: str = "commanded_vel_playback",
 ) -> dict[str, Any]:
+    """body/odom — dead-reckoned pose + raw encoder ticks.
+
+    ``source`` identifies the origin of the pose integration so consumers can decide how much to
+    trust it as a prior. Defined values:
+
+    - ``"wheel_encoders"`` — integrated from real GPIO encoder ticks (best prior when available).
+    - ``"commanded_vel_playback"`` — integrated from the last commanded velocity (no encoders
+      configured or encoder read failed); usable as a coarse sanity check only.
+    - ``"stub"`` — synthetic zero-motion publisher (stub mode, no motion being commanded).
+    """
     ts_val = now_ts() if ts is None else ts
     th = math.atan2(math.sin(theta), math.cos(theta))
     return {
@@ -42,6 +53,7 @@ def odom(
         "left_ticks": left_ticks,
         "right_ticks": right_ticks,
         "dt_ms": dt_ms,
+        "source": source,
     }
 
 
@@ -259,8 +271,15 @@ def local_map_2p5d(
     sources: dict[str, Any] | None = None,
     driveable: list[list[bool | None]] | None = None,
     driveable_clearance_height_m: float | None = None,
+    anchor_pose: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """body/map/local_2p5d — egocentric max-height-above-ground grid (see docs/local_map_spec.md)."""
+    """body/map/local_2p5d — egocentric max-height-above-ground grid (see docs/local_map_spec.md).
+
+    ``anchor_pose`` (optional) carries the latest ``body/odom`` pose cached at publish time so
+    consumers can fuse into a world frame without interpolating odom to ``ts``. Shape:
+    ``{odom_ts, x, y, theta, source}`` where ``source`` mirrors ``odom.source``. Omitted if no
+    odom has been received yet.
+    """
     msg: dict[str, Any] = {
         "ts": ts,
         "frame": frame,
@@ -278,4 +297,6 @@ def local_map_2p5d(
         msg["driveable_clearance_height_m"] = driveable_clearance_height_m
     if sources is not None:
         msg["sources"] = sources
+    if anchor_pose is not None:
+        msg["anchor_pose"] = anchor_pose
     return msg

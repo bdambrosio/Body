@@ -55,6 +55,17 @@ Tune **`lidar_yaw_rad`** / **`depth_*`** to match your CAD mount; defaults assum
 - `driveable`: optional same shape; `true` / `false` / `null` if enabled.
 - `driveable_clearance_height_m`: optional scalar matching config slab top.
 - `sources`: optional `lidar_ts`, `depth_ts` of inputs used.
+- `anchor_pose`: optional `{odom_ts, x, y, theta, source}` captured from the latest `body/odom` sample at publish time. Lets consumers transform the grid into the odometry/world frame without interpolating `body/odom` to `ts`. Omitted until the first `body/odom` message is received. `source` mirrors `odom.source` (see [body_project_spec.md §5.3](body_project_spec.md)).
+
+## Grid geometry stability
+
+The grid parameters — `resolution_m`, `nx`, `ny`, `origin_x_m`, `origin_y_m` — are **immutable for the lifetime of the `local_map` process**. They are read once from `config.json` at startup and never changed at runtime. Consumers may:
+
+- Allocate fixed-size accumulator / raster buffers on first message receipt.
+- Assume identical geometry on every subsequent message until the publish stream gaps and resumes.
+- Detect restart by a gap in publish timestamps (≫ `1 / publish_hz`) followed by a fresh message; on resume, **re-validate** the five parameters and reallocate if any changed (operator may have edited `config.json`).
+
+No runtime resize/reshape is emitted, and no in-stream signal distinguishes "same config" from "restarted with same config" — consumers should rely on the timestamp-gap heuristic if they want to distinguish.
 
 ## Extrinsics you still owe the stack
 

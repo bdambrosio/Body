@@ -178,7 +178,8 @@ Dead-reckoned pose from encoder integration. Frame: robot starting position at o
   "vtheta": 0.0,
   "left_ticks": 0,
   "right_ticks": 0,
-  "dt_ms": 20
+  "dt_ms": 20,
+  "source": "commanded_vel_playback"
 }
 ```
 
@@ -187,6 +188,10 @@ Dead-reckoned pose from encoder integration. Frame: robot starting position at o
 - `vx`, `vtheta`: instantaneous velocity estimates. When encoder motion is present for the cycle (non-zero tick deltas), these are derived from wheel motion; otherwise the stub reports commanded velocities from the active `cmd_vel` / `cmd_direct`. They are zero when e-stop, command timeout, or software stall applies.
 - `left_ticks`, `right_ticks`: raw cumulative encoder counts. Allows Jill to do her own integration if desired.
 - `dt_ms`: time since last odom publication.
+- `source`: string identifying where the integrated pose came from. Lets consumers decide how much to trust `x`/`y`/`theta` as a prior (e.g. scan-matching weight, SLAM translation anchor). Defined values:
+  - `"wheel_encoders"` — integrated from real GPIO quadrature encoder ticks. Best available prior. Published only once the encoder read path is live.
+  - `"commanded_vel_playback"` — integrated from the last commanded velocity via the diff-drive kinematic model. No physical feedback. Current default while encoders are not yet wired; usable as a coarse sanity check only.
+  - `"stub"` — synthetic zero-motion publisher (reserved for future test harnesses; not currently emitted by `motor_controller`).
 
 ### 5.4 `body/motor_state` (motor_controller → all)
 

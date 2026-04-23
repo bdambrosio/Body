@@ -215,6 +215,10 @@ def main() -> None:
             dt_ms = int(round(period * 1000))
             pose = diff_drive.integrate_odometry(pose, dl_m, dr_m, wheel_base_m)
             ts = schemas.now_ts()
+            # Deltas are hardcoded to 0 above until GPIO quadrature encoders are wired; pose is
+            # therefore integrated from commanded velocity. When real encoder reads populate
+            # delta_*_ticks, change ``odom_source`` to ``"wheel_encoders"`` at that site.
+            odom_source = "commanded_vel_playback"
             zenoh_helpers.publish_json(
                 session,
                 "body/odom",
@@ -228,6 +232,7 @@ def main() -> None:
                     left_ticks=left_ticks_total,
                     right_ticks=right_ticks_total,
                     dt_ms=dt_ms,
+                    source=odom_source,
                 ),
             )
             zenoh_helpers.publish_json(

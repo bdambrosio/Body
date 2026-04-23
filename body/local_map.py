@@ -326,6 +326,7 @@ def main() -> None:
     lock = threading.Lock()
     last_lidar: dict[str, Any] | None = None
     last_depth: dict[str, Any] | None = None
+    last_odom: dict[str, Any] | None = None
 
     session = zenoh_helpers.open_session(body_cfg)
     stop = threading.Event()
@@ -340,8 +341,14 @@ def main() -> None:
         with lock:
             last_depth = msg
 
+    def on_odom(_k: str, msg: dict[str, Any]) -> None:
+        nonlocal last_odom
+        with lock:
+            last_odom = msg
+
     zenoh_helpers.declare_subscriber_json(session, "body/lidar/scan", on_lidar)
     zenoh_helpers.declare_subscriber_json(session, "body/oakd/depth", on_depth)
+    zenoh_helpers.declare_subscriber_json(session, "body/odom", on_odom)
 
     def handle_sigterm(_sig: int, _frame: object) -> None:
         stop.set()
@@ -361,6 +368,7 @@ def main() -> None:
         with lock:
             lmsg = last_lidar
             dmsg = last_depth
+            omsg = last_odom
 
         now = time.monotonic()
         if driveable_on and now >= next_floor_fit and dmsg is not None:
@@ -566,6 +574,19 @@ def main() -> None:
         if depth_ts is not None:
             src["depth_ts"] = depth_ts
 
+        anchor_pose: dict[str, Any] | None = None
+        if omsg is not None:
+            try:
+                anchor_pose = {
+                    "odom_ts": float(omsg["ts"]),
+                    "x": float(omsg["x"]),
+                    "y": float(omsg["y"]),
+                    "theta": float(omsg["theta"]),
+                    "source": str(omsg.get("source", "commanded_vel_playback")),
+                }
+            except (KeyError, TypeError, ValueError):
+                anchor_pose = None
+
         zenoh_helpers.publish_json(
             session,
             "body/map/local_2p5d",
@@ -580,6 +601,7 @@ def main() -> None:
                 sources=src or None,
                 driveable=driveable_rows,
                 driveable_clearance_height_m=clearance_m if driveable_on else None,
+                anchor_pose=anchor_pose,
             ),
         )
 
