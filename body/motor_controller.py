@@ -54,15 +54,52 @@ def main() -> None:
     stall_detect_enabled = bool(motor_cfg.get("stall_detect_enabled", False))
     stall_detect_ms = int(motor_cfg.get("stall_detect_ms", 1000))
     gpio_enabled = bool(motor_cfg.get("gpio_enabled", False))
+    encoders_wanted = bool(motor_cfg.get("encoders_enabled", False))
+    encoder_log_interval_s = float(motor_cfg.get("encoder_log_interval_s", 0.0))
+    if encoders_wanted and not gpio_enabled:
+        print(
+            "motor_controller: encoders_enabled requires gpio_enabled — encoder GPIO skipped.",
+            flush=True,
+        )
 
     gpio_h: Any = None
     gpio_pins: dict[str, Any] | None = None
+    encoders: dict[str, Any] | None = None
+    both_encoders_live = False
     if gpio_enabled:
         gpio_h, gpio_pins = motor_gpio.open_mdd10a(motor_cfg)
         print(
             "motor_controller: GPIO enabled — MDD10A PWM+DIR on Pi (see motor.gpio_* in config)",
             flush=True,
         )
+        if encoders_wanted:
+            encoders = motor_gpio.setup_quadrature_encoders(gpio_h, motor_cfg)
+            if encoders is not None:
+                for side in ("left", "right"):
+                    port = encoders.get(side)
+                    if port is not None:
+                        a, b = port.pins()
+                        st = port.initial_state()
+                        print(
+                            f"motor_controller: {side} encoder on BCM A={a} B={b}; "
+                            f"initial A/B={(st >> 1) & 1}/{st & 1}",
+                            flush=True,
+                        )
+                both_encoders_live = (
+                    encoders.get("left") is not None and encoders.get("right") is not None
+                )
+                if not both_encoders_live:
+                    print(
+                        "motor_controller: only one encoder enabled — odom.source stays "
+                        "'commanded_vel_playback' (see docs/encoder_integration_spec.md §6).",
+                        flush=True,
+                    )
+            else:
+                print(
+                    "motor_controller: no encoder device opened — check encoders_enabled and "
+                    "encoder_left_enabled / encoder_right_enabled.",
+                    flush=True,
+                )
     if gpio_enabled and max_wheel_vel_ms <= 0.0:
         print(
             "motor_controller: warning: max_wheel_vel_ms is 0 — commanded duty will stay 0; set a positive value to move.",
@@ -75,6 +112,7 @@ def main() -> None:
     stall_begin_wall: float | None = None
     left_ticks_total = 0
     right_ticks_total = 0
+    encoder_log_last_mono = 0.0
 
     def on_cmd_vel(_key: str, msg: dict[str, Any]) -> None:
         _print_cmd("cmd_vel", msg)
@@ -132,9 +170,13 @@ def main() -> None:
     try:
         while not stop.is_set():
             now_wall = time.time()
-            # Encoder deltas: wire quadrature when implemented; open-loop if zero.
             delta_left_ticks = 0
             delta_right_ticks = 0
+            if encoders is not None:
+                if encoders.get("left") is not None:
+                    delta_left_ticks = int(encoders["left"].drain())
+                if encoders.get("right") is not None:
+                    delta_right_ticks = int(encoders["right"].drain())
 
             with state.lock:
                 twist = state.last_twist
@@ -195,7 +237,10 @@ def main() -> None:
                     left_pwm = right_pwm = 0.0
                     left_dir = right_dir = "fwd"
 
-                if dl_m != 0.0 or dr_m != 0.0:
+                if both_encoders_live:
+                    vx = (v_left_enc + v_right_enc) / 2.0
+                    vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
+                elif dl_m != 0.0 or dr_m != 0.0:
                     vx = (v_left_enc + v_right_enc) / 2.0
                     vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
                 else:
@@ -215,10 +260,9 @@ def main() -> None:
             dt_ms = int(round(period * 1000))
             pose = diff_drive.integrate_odometry(pose, dl_m, dr_m, wheel_base_m)
             ts = schemas.now_ts()
-            # Deltas are hardcoded to 0 above until GPIO quadrature encoders are wired; pose is
-            # therefore integrated from commanded velocity. When real encoder reads populate
-            # delta_*_ticks, change ``odom_source`` to ``"wheel_encoders"`` at that site.
-            odom_source = "commanded_vel_playback"
+            odom_source = (
+                "wheel_encoders" if both_encoders_live else "commanded_vel_playback"
+            )
             zenoh_helpers.publish_json(
                 session,
                 "body/odom",
@@ -250,6 +294,23 @@ def main() -> None:
                 ),
             )
 
+            if encoders is not None and encoder_log_interval_s > 0.0:
+                now_mono = time.monotonic()
+                if now_mono - encoder_log_last_mono >= encoder_log_interval_s:
+                    lp_port = encoders.get("left")
+                    rp_port = encoders.get("right")
+                    l_edges = lp_port.edge_count() if lp_port is not None else 0
+                    r_edges = rp_port.edge_count() if rp_port is not None else 0
+                    l_state = lp_port.current_state() if lp_port is not None else -1
+                    r_state = rp_port.current_state() if rp_port is not None else -1
+                    print(
+                        "motor_controller: encoders "
+                        f"left ticks={left_ticks_total} (Δ{delta_left_ticks}) edges={l_edges} A/B={(l_state >> 1) & 1 if l_state >= 0 else '-'}/{l_state & 1 if l_state >= 0 else '-'} | "
+                        f"right ticks={right_ticks_total} (Δ{delta_right_ticks}) edges={r_edges} A/B={(r_state >> 1) & 1 if r_state >= 0 else '-'}/{r_state & 1 if r_state >= 0 else '-'}",
+                        flush=True,
+                    )
+                    encoder_log_last_mono = now_mono
+
             next_tick += period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -258,6 +319,8 @@ def main() -> None:
                 next_tick = time.monotonic()
     finally:
         session.close()
+        if encoders is not None:
+            motor_gpio.close_quadrature_encoders(encoders)
         if gpio_h is not None and gpio_pins is not None:
             motor_gpio.shutdown(gpio_h, gpio_pins)
 

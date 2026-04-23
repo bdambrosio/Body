@@ -216,9 +216,11 @@ lgpio.tx_pwm(h, 13, PWM_FREQ_HZ, 0)   # right motor, start stopped
 lgpio.gpio_claim_output(h, 5, 0)   # left DIR, default LOW (forward)
 lgpio.gpio_claim_output(h, 6, 0)   # right DIR, default LOW (forward)
 
-# Encoder inputs with pull-ups
+# Encoder inputs with pull-ups claimed for edge alerts.
+# NOTE: lgpio.callback() fires only for pins claimed via gpio_claim_alert.
+# gpio_claim_input does NOT deliver edge events.
 for pin in [23, 24, 27, 22]:
-    lgpio.gpio_claim_input(h, pin, lgpio.SET_PULL_UP)
+    lgpio.gpio_claim_alert(h, pin, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP)
 
 # Encoder edge callbacks
 lgpio.callback(h, 23, lgpio.BOTH_EDGES, left_encoder_callback)

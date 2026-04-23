@@ -3,9 +3,30 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+# 4x quadrature: state index = (A<<1)|B for old/new; from standard gray/neighbor table.
+_QUAD_TABLE: tuple[int, ...] = (
+    0,
+    1,
+    -1,
+    0,
+    -1,
+    0,
+    0,
+    1,
+    1,
+    0,
+    0,
+    -1,
+    0,
+    -1,
+    1,
+    0,
+)
 
 
 def _err(name: str, ret: int) -> None:
@@ -114,6 +135,136 @@ def _dir_pin_level(rev: bool, invert: bool) -> int:
     """MDD10A: LOW=fwd, HIGH=rev. If invert, swap levels (e.g. left motor mounted 180°)."""
     level = 1 if rev else 0
     return 1 - level if invert else level
+
+
+_lgpio_mod: Any = None
+
+
+def _require_lgpio() -> Any:
+    global _lgpio_mod
+    if _lgpio_mod is None:
+        try:
+            import lgpio
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "lgpio is required for encoders. On Raspberry Pi OS: sudo apt install python3-lgpio. "
+                "Venv: use --system-site-packages. See README.md Install."
+            ) from e
+        _lgpio_mod = lgpio
+    return _lgpio_mod
+
+
+class _QuadraturePort:
+    """One motor: GPIO A/B, BOTH_EDGES → signed tick delta (drain in main loop)."""
+
+    def __init__(self, h: Any, a: int, b: int) -> None:
+        self._h = h
+        self._a = a
+        self._b = b
+        self._lock = threading.Lock()
+        self._state = self._read_state_nolock()
+        self._delta = 0
+        self._edges = 0
+        self._initial_state = self._state
+
+    def _read_state_nolock(self) -> int:
+        lgpio = _require_lgpio()
+        a = lgpio.gpio_read(self._h, self._a) & 1
+        b = lgpio.gpio_read(self._h, self._b) & 1
+        return (a << 1) | b
+
+    def _on_edge_cb(
+        self, _handle: int, _gpio: int, _level: int, _tick: int
+    ) -> None:
+        new = self._read_state_nolock()
+        with self._lock:
+            self._edges += 1
+            idx = (self._state << 2) | new
+            d = int(_QUAD_TABLE[idx & 0x0F])
+            self._state = new
+            if d:
+                self._delta += d
+
+    def drain(self) -> int:
+        with self._lock:
+            d = self._delta
+            self._delta = 0
+            return d
+
+    def edge_count(self) -> int:
+        with self._lock:
+            return self._edges
+
+    def current_state(self) -> int:
+        with self._lock:
+            return self._state
+
+    def initial_state(self) -> int:
+        return self._initial_state
+
+    def pins(self) -> tuple[int, int]:
+        return (self._a, self._b)
+
+
+def setup_quadrature_encoders(
+    h: Any, motor_cfg: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Claim encoder inputs, register lgpio edge callbacks. Returns handle dict or None if disabled.
+
+    Config (under ``motor``):
+    - ``encoders_enabled`` (bool) — must be true.
+    - ``encoder_left_enabled``, ``encoder_right_enabled`` (bool, default true) — one side for partial wiring.
+    - ``gpio_left_enc_a``, ``gpio_left_enc_b``, ``gpio_right_enc_a``, ``gpio_right_enc_b`` — BCM pins
+      default 23, 24, 27, 22.
+    """
+    if not bool(motor_cfg.get("encoders_enabled", False)):
+        return None
+
+    lgpio = _require_lgpio()
+    left_en = bool(motor_cfg.get("encoder_left_enabled", True))
+    right_en = bool(motor_cfg.get("encoder_right_enabled", True))
+    if not left_en and not right_en:
+        return None
+
+    la = int(motor_cfg.get("gpio_left_enc_a", 23))
+    lb = int(motor_cfg.get("gpio_left_enc_b", 24))
+    ra = int(motor_cfg.get("gpio_right_enc_a", 27))
+    rb = int(motor_cfg.get("gpio_right_enc_b", 22))
+
+    cbs: list[Any] = []
+    left: _QuadraturePort | None = None
+    right: _QuadraturePort | None = None
+
+    if left_en:
+        for pin in (la, lb):
+            _err(
+                f"gpio_claim_alert left enc {pin}",
+                lgpio.gpio_claim_alert(h, pin, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP),
+            )
+        left = _QuadraturePort(h, la, lb)
+        cbs.append(lgpio.callback(h, la, lgpio.BOTH_EDGES, left._on_edge_cb))
+        cbs.append(lgpio.callback(h, lb, lgpio.BOTH_EDGES, left._on_edge_cb))
+    if right_en:
+        for pin in (ra, rb):
+            _err(
+                f"gpio_claim_alert right enc {pin}",
+                lgpio.gpio_claim_alert(h, pin, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP),
+            )
+        right = _QuadraturePort(h, ra, rb)
+        cbs.append(lgpio.callback(h, ra, lgpio.BOTH_EDGES, right._on_edge_cb))
+        cbs.append(lgpio.callback(h, rb, lgpio.BOTH_EDGES, right._on_edge_cb))
+
+    return {"left": left, "right": right, "cbs": cbs}
+
+
+def close_quadrature_encoders(handle: dict[str, Any] | None) -> None:
+    if not handle:
+        return
+    for c in list(handle.get("cbs", [])):
+        try:
+            c.cancel()
+        except Exception:
+            pass
 
 
 def open_mdd10a(motor_cfg: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
