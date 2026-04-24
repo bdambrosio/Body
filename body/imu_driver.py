@@ -10,12 +10,15 @@ See docs/imu_driver_spec.md (producer spec) and docs/imu_integration_spec.md
 
 from __future__ import annotations
 
+import queue
 import signal
 import sys
 import time
 from typing import Any
 
 from body.lib import schemas, zenoh_helpers
+
+_VALID_CAL_ACTIONS = ("start", "save", "status")
 
 
 def _pulse_reset(gpio: int, chip_idx: int) -> None:
@@ -90,14 +93,35 @@ def _import_bno() -> tuple[Any, Any, Any, dict[str, int]]:
         "game_rotation_vector": BNO_REPORT_GAME_ROTATION_VECTOR,
     }
     from struct import unpack_from
+    from adafruit_bno08x import _AVAIL_SENSOR_REPORTS, _separate_batch
 
     class Bno085WithAccuracy(BNO08X_I2C):
+        """BNO08X subclass that captures rotation-vector accuracy and survives
+        SH-2 reports the upstream Adafruit driver doesn't know about.
+
+        SH-2 emits high-rate auxiliary reports (e.g. 0xDE Gyro Integrated RV)
+        after reset that Adafruit's ``_separate_batch`` cannot parse, turning
+        into ``KeyError`` that kill the whole packet. We catch that on our side
+        and drop only the offending packet so fusion keeps ticking.
+        """
+
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self._status_by_report: dict[int, int] = {}
             self._rv_accuracy_rad: float | None = None
             super().__init__(*args, **kwargs)
 
+        def _handle_packet(self, packet: Any) -> None:
+            try:
+                _separate_batch(packet, self._packet_slices)
+            except (KeyError, RuntimeError):
+                self._packet_slices.clear()
+                return
+            while self._packet_slices:
+                self._process_report(*self._packet_slices.pop())
+
         def _process_report(self, report_id: int, report_bytes: bytearray) -> None:
+            if report_id < 0xF0 and report_id not in _AVAIL_SENSOR_REPORTS:
+                return
             if report_id < 0xF0 and len(report_bytes) >= 3:
                 self._status_by_report[report_id] = report_bytes[2] & 0b11
                 if report_id == BNO_REPORT_ROTATION_VECTOR and len(report_bytes) >= 14:
@@ -148,6 +172,44 @@ def _read_report_status(bno: Any, report_id: int) -> int | None:
         return int(val)
     except (TypeError, ValueError):
         return None
+
+
+def _run_cal_action(bno: Any, action: str) -> None:
+    """Execute a single BNO085 calibration command on the main thread.
+
+    ``start`` begins mag+accel+gyro self-calibration; ``save`` writes the current
+    DCD (dynamic calibration data) to the sensor's flash so it survives reboot;
+    ``status`` polls the magnetometer accuracy (0=unreliable, 3=high) via a
+    synchronous ME_GET_CAL command. Each action blocks the publish loop for one
+    or more i2c round-trips — typically a few ms.
+    """
+    try:
+        if action == "start":
+            bno.begin_calibration()
+            print(
+                "imu_driver: calibration started (move the robot in a figure-8 for "
+                "~10 s, then publish {\"action\":\"save\"} on body/imu/calibrate).",
+                flush=True,
+            )
+        elif action == "save":
+            bno.save_calibration_data()
+            print(
+                "imu_driver: calibration DCD saved to BNO085 flash. Survives power cycle.",
+                flush=True,
+            )
+        elif action == "status":
+            status = bno.calibration_status
+            labels = {0: "unreliable", 1: "low", 2: "medium", 3: "high"}
+            print(
+                f"imu_driver: mag calibration_status={status} ({labels.get(int(status), '?')}).",
+                flush=True,
+            )
+    except Exception as e:
+        print(
+            f"imu_driver: calibrate action {action!r} failed: {type(e).__name__}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _enable(bno: Any, feature_id: int, label: str) -> None:
@@ -235,6 +297,22 @@ def main() -> None:
     )
 
     session = zenoh_helpers.open_session(body_cfg)
+    cal_actions: queue.Queue[str] = queue.Queue()
+
+    def on_calibrate(_key: str, msg: dict[str, Any]) -> None:
+        action = str(msg.get("action", "")).strip().lower()
+        if action not in _VALID_CAL_ACTIONS:
+            print(
+                f"imu_driver: body/imu/calibrate ignored, unknown action {action!r}. "
+                f"Expected one of {_VALID_CAL_ACTIONS}.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        cal_actions.put(action)
+
+    zenoh_helpers.declare_subscriber_json(session, "body/imu/calibrate", on_calibrate)
+
     stop = False
 
     def handle_sigterm(_sig: int, _frame: Any) -> None:
@@ -253,6 +331,13 @@ def main() -> None:
 
     try:
         while not stop:
+            try:
+                while True:
+                    action = cal_actions.get_nowait()
+                    _run_cal_action(bno, action)
+            except queue.Empty:
+                pass
+
             try:
                 accel = bno.acceleration
                 gyro = bno.gyro

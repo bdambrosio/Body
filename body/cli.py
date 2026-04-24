@@ -61,6 +61,21 @@ def _cmd_oakd_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_imu_calibrate(args: argparse.Namespace) -> int:
+    action = str(args.action).strip().lower()
+    if action not in ("start", "save", "status"):
+        print(f"imu calibrate: unknown action {action!r}", file=sys.stderr)
+        return 2
+    body_cfg = zenoh_helpers.load_body_config()
+    session = zenoh_helpers.open_session(body_cfg)
+    try:
+        zenoh_helpers.publish_json(session, "body/imu/calibrate", {"action": action})
+    finally:
+        session.close()
+    print(f"imu calibrate: sent {{'action': {action!r}}} on body/imu/calibrate")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Body stack — local Zenoh tools (see docs/body_project_spec.md topics).",
@@ -87,6 +102,19 @@ def main() -> None:
         help="Seconds to wait for body/oakd/rgb (default: 15)",
     )
     cap_p.set_defaults(_handler=_cmd_oakd_capture)
+
+    imu_p = sub.add_parser("imu", help="BNO085 IMU on-demand actions via Zenoh")
+    imu_sub = imu_p.add_subparsers(dest="imu_action", required=True)
+    cal_p = imu_sub.add_parser(
+        "calibrate",
+        help="Trigger BNO085 calibration on imu_driver (start / save / status)",
+    )
+    cal_p.add_argument(
+        "action",
+        choices=["start", "save", "status"],
+        help="start = begin mag+accel+gyro calibration; save = persist DCD to flash; status = print mag accuracy level",
+    )
+    cal_p.set_defaults(_handler=_cmd_imu_calibrate)
 
     args = parser.parse_args()
     handler = getattr(args, "_handler", None)

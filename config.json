@@ -39,7 +39,7 @@
     "enabled": true,
     "i2c_address": 75,
     "publish_hz": 100,
-    "fusion_mode": "rotation_vector",
+    "fusion_mode": "game_rotation_vector",
     "fusion_fallback": "game_rotation_vector",
     "mag_accuracy_fallback_rad": 0.087,
     "mag_accuracy_fallback_count": 20,

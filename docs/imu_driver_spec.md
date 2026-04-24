@@ -141,7 +141,12 @@ Sole owner of the BNO085 i²c transaction. Reads SH-2 FIFO reports, assembles a 
 **Publishes:**
 - `body/imu` — fused IMU report. Schema per `imu_integration_spec.md` §2.
 
-**Subscribes:** none (driver is read-only relative to the robot).
+**Subscribes:**
+- `body/imu/calibrate` — on-demand SH-2 calibration control (one shot per message). JSON payload `{"action": "start" | "save" | "status"}`:
+  - `start`: enables mag+accel+gyro self-calibration (`bno.begin_calibration()`). Follow with a figure-8 motion for ≥ 10 s (see §8).
+  - `save`: writes the current DCD (dynamic calibration data) to BNO085 flash. Survives power cycle.
+  - `status`: polls mag accuracy level (0 = unreliable, 3 = high) via `ME_GET_CAL`; prints the result.
+  - Unknown actions are logged and ignored. Each action is executed on the main publish loop between reports, so a burst of commands stalls publishing for a few milliseconds.
 
 ### 6.3 Loop
 
