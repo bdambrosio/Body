@@ -14,8 +14,8 @@ import time
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QMainWindow, QToolBar,
-    QVBoxLayout, QWidget,
+    QApplication, QHBoxLayout, QLabel, QMainWindow, QSplitter,
+    QToolBar, QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QAction
 
@@ -85,12 +85,37 @@ class NavMainWindow(QMainWindow):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
 
-        maps = QHBoxLayout()
+        # The left column is a single vertical splitter: maps row on
+        # top, camera feeds row in the middle, vision chat at the
+        # bottom. Putting all four image cells under one splitter —
+        # rather than splitting maps (central) from cameras (bottom
+        # dock) as before — means all four share the same width
+        # allotment and their heights are resized together by dragging
+        # the splitter handles. Each image widget aspect-preserves its
+        # own render internally.
+        self._main_splitter = QSplitter(Qt.Orientation.Vertical, central)
+        self._main_splitter.setChildrenCollapsible(True)
+
+        maps_widget = QWidget()
+        maps = QHBoxLayout(maps_widget)
+        maps.setContentsMargins(0, 0, 0, 0)
         self._height_view = WorldHeightView(stale_s=self.fuser_config.map_stale_s)
         self._drive_view = WorldDriveableView(stale_s=self.fuser_config.map_stale_s)
         maps.addWidget(self._height_view, stretch=1)
         maps.addWidget(self._drive_view, stretch=1)
-        outer.addLayout(maps, stretch=1)
+        self._main_splitter.addWidget(maps_widget)
+
+        self._cameras = CameraPanels(self.chassis)
+        self._cameras.attach_to_splitter(self._main_splitter)
+
+        # Apply initial distribution post-show (see showEvent); here we
+        # just give equal stretch so later drags behave predictably.
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 1)
+        self._main_splitter.setStretchFactor(2, 1)
+        self._splitter_balanced = False
+
+        outer.addWidget(self._main_splitter, stretch=1)
 
         # Bottom status strip: fuser (pose + rates + cells + session) on
         # the left, chassis text summary on the right. The safety pills
@@ -112,24 +137,13 @@ class NavMainWindow(QMainWindow):
         outer.addLayout(bot)
 
         self.setCentralWidget(central)
-        self.resize(1000, 600)
+        self.resize(1400, 900)
 
     def _build_docks(self) -> None:
-        # By default QMainWindow gives the bottom corners to the Bottom
-        # dock area, which would let the Cameras dock span the full
-        # width and squeeze Teleop out of the lower-right. Hand the
-        # right corners to the Right area so Teleop occupies the entire
-        # right column regardless of what's docked at the bottom.
-        self.setCorner(
-            Qt.Corner.TopRightCorner, Qt.DockWidgetArea.RightDockWidgetArea,
-        )
-        self.setCorner(
-            Qt.Corner.BottomRightCorner, Qt.DockWidgetArea.RightDockWidgetArea,
-        )
+        # Cameras + vision live in the central splitter (built in
+        # _build_ui); only teleop remains a dock-area panel.
         self._teleop = TeleopPanels(self.chassis, self.chassis_config)
         self._teleop.attach_to(self)
-        self._cameras = CameraPanels(self.chassis)
-        self._cameras.attach_to(self)
 
     def _build_menu(self) -> None:
         view_menu = self.menuBar().addMenu("&View")
@@ -242,6 +256,29 @@ class NavMainWindow(QMainWindow):
         self._chassis_lbl.setStyleSheet("color: #ccc;")
 
     # ── Lifecycle ────────────────────────────────────────────────────
+
+    def _balance_splitter_once(self) -> None:
+        # Applied via QTimer.singleShot(0, …) from showEvent: by the
+        # time this fires, the splitter has its real height from the
+        # first layout pass. 40/40/20 — maps and cameras rows get
+        # equal image area; vision chat takes the rest. Idempotent so
+        # spurious re-fires don't stomp on a user's drag.
+        if self._splitter_balanced:
+            return
+        total = self._main_splitter.height()
+        if total <= 0:
+            return
+        self._main_splitter.setSizes([
+            int(total * 0.40),
+            int(total * 0.40),
+            int(total * 0.20),
+        ])
+        self._splitter_balanced = True
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._splitter_balanced:
+            QTimer.singleShot(0, self._balance_splitter_once)
 
     def closeEvent(self, event) -> None:
         try:

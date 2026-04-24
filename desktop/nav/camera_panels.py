@@ -21,8 +21,8 @@ from typing import Any, Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QDockWidget, QHBoxLayout, QLabel, QMainWindow, QPushButton,
-    QVBoxLayout, QWidget,
+    QDockWidget, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from desktop.chassis.controller import StubController
@@ -57,7 +57,13 @@ class CameraFeedsDock(QDockWidget):
         rgb_col.addWidget(QLabel("OAK-D RGB (on request)"))
         self.rgb_label = QLabel("no image")
         self.rgb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.rgb_label.setMinimumSize(240, 180)
+        self.rgb_label.setMinimumSize(160, 80)
+        # Labels must expand with the splitter pane; render_rgb rescales
+        # the pixmap to the current label size each tick, so growing the
+        # label grows the displayed image. Same for depth.
+        self.rgb_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
         self.rgb_label.setStyleSheet("background-color:#111;color:#aaa;")
         rgb_col.addWidget(self.rgb_label, stretch=1)
         self.rgb_meta = QLabel("—")
@@ -68,7 +74,10 @@ class CameraFeedsDock(QDockWidget):
         depth_col.addWidget(QLabel("OAK-D depth"))
         self.depth_label = QLabel("no depth")
         self.depth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.depth_label.setMinimumSize(240, 180)
+        self.depth_label.setMinimumSize(160, 80)
+        self.depth_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
         self.depth_label.setStyleSheet("background-color:#111;color:#aaa;")
         depth_col.addWidget(self.depth_label, stretch=1)
         self.depth_meta = QLabel("—")
@@ -109,8 +118,8 @@ class CameraFeedsDock(QDockWidget):
                 self.rgb_label.setText("jpeg decode failed")
             else:
                 scaled = pm.scaled(
-                    max(320, self.rgb_label.width()),
-                    max(240, self.rgb_label.height()),
+                    max(1, self.rgb_label.width()),
+                    max(1, self.rgb_label.height()),
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
@@ -141,14 +150,20 @@ class CameraFeedsDock(QDockWidget):
             self.depth_meta.setText("—")
             return
         try:
-            pm = depth_to_pixmap(
-                img, target_w=max(320, self.depth_label.width()),
-            )
+            pm = depth_to_pixmap(img)
         except Exception as e:
             logger.exception("depth render failed")
             self.depth_label.setText(f"render error: {e}")
             return
-        self.depth_label.setPixmap(pm)
+        # Fit current label size in both dimensions, preserve aspect —
+        # letterbox rather than stretch. render_rgb does the same.
+        scaled = pm.scaled(
+            max(1, self.depth_label.width()),
+            max(1, self.depth_label.height()),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.depth_label.setPixmap(scaled)
         age_s = time.time() - snap["depth_ts"] if snap["depth_ts"] else 0.0
         valid_frac = float((img > 0).mean()) if img.size else 0.0
         self.depth_meta.setText(
@@ -273,60 +288,91 @@ class VisionDriver:
             worker.deleteLater()
 
 
-class CameraPanels:
-    """Coordinator for the camera dock group.
+def _wrap_with_header(inner: QWidget, title: str) -> QWidget:
+    """Prepend a small bold title above `inner` so the section is
+    labeled once we strip the QDockWidget titlebar.
+    """
+    wrapper = QWidget()
+    v = QVBoxLayout(wrapper)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(2)
+    label = QLabel(title)
+    label.setStyleSheet("color:#888; font-weight:bold;")
+    v.addWidget(label)
+    v.addWidget(inner, stretch=1)
+    return wrapper
 
-    Mirrors TeleopPanels: two docks tabified on bottom, single
-    set_visible/is_visible, single per-tick update entry point.
+
+class CameraPanels:
+    """Coordinator for the camera + vision group.
+
+    Maps + cameras + chat all need to live in the same vertically
+    resizable column so the four image cells (two maps, two camera
+    feeds) share the same width and can grow/shrink together. To get
+    that, we build the existing CameraFeedsDock / VisionDock as usual
+    but never dock them — instead we pull out their .widget() bodies
+    (which hold all the rendering state) and hand them to the main
+    window's QSplitter via `attach_to_splitter`.
+
+    The dock objects stay alive because CameraFeedsDock owns the
+    request_rgb signal and the render_rgb / render_depth methods;
+    VisionDock owns append_turn / set_busy / speak / TTS. Only the
+    titlebar and dock-area behavior is dropped.
     """
 
     def __init__(self, chassis: StubController) -> None:
         self.chassis = chassis
-        self.feeds_dock = CameraFeedsDock()
-        self.vision_dock = VisionDock()
-        self.vision_driver = VisionDriver(chassis, self.vision_dock)
-        self._installed = False
+        self._feeds_dock = CameraFeedsDock()
+        self._vision_dock = VisionDock()
+        self.vision_driver = VisionDriver(chassis, self._vision_dock)
 
-        self.feeds_dock.request_rgb_clicked.connect(self._on_request_rgb)
+        self.feeds_widget = _wrap_with_header(
+            self._feeds_dock.widget(), "Cameras",
+        )
+        self.vision_widget = _wrap_with_header(
+            self._vision_dock.widget(), "Vision",
+        )
 
-    def attach_to(self, window: QMainWindow) -> None:
-        area = Qt.DockWidgetArea.BottomDockWidgetArea
-        window.addDockWidget(area, self.feeds_dock)
-        window.addDockWidget(area, self.vision_dock)
-        window.tabifyDockWidget(self.feeds_dock, self.vision_dock)
-        self.set_visible(False)
-        self.feeds_dock.raise_()
-        self._installed = True
+        self._feeds_dock.request_rgb_clicked.connect(self._on_request_rgb)
+
+    def attach_to_splitter(self, splitter: QSplitter) -> None:
+        """Insert the feeds + vision panes below whatever's already in
+        the splitter (typically the maps row). Caller owns stretch
+        factors / initial sizes. Visible by default — cameras are now
+        part of the primary left-panel view, not an optional sidepanel;
+        hidden-at-construction breaks the splitter's setSizes hint
+        since hidden children don't participate in it.
+        """
+        splitter.addWidget(self.feeds_widget)
+        splitter.addWidget(self.vision_widget)
 
     def set_visible(self, visible: bool) -> None:
-        for d in (self.feeds_dock, self.vision_dock):
-            d.setVisible(visible)
+        self.feeds_widget.setVisible(visible)
+        self.vision_widget.setVisible(visible)
 
     def is_visible(self) -> bool:
-        return any(
-            d.isVisible() for d in (self.feeds_dock, self.vision_dock)
+        return (
+            self.feeds_widget.isVisible()
+            or self.vision_widget.isVisible()
         )
 
     def update_state(self, snap: dict) -> None:
-        """Render feeds only while the feeds dock itself is visible.
-
-        Vision dock has no render — its contents are user-driven.
-        """
-        if not self.feeds_dock.isVisible():
+        """Render feeds only while the feeds pane is visible."""
+        if not self.feeds_widget.isVisible():
             return
-        self.feeds_dock.render_rgb(
+        self._feeds_dock.render_rgb(
             snap, self.vision_driver.boxes, self.vision_driver.boxes_for_ts,
         )
-        self.feeds_dock.render_depth(snap)
+        self._feeds_dock.render_depth(snap)
 
     def _on_request_rgb(self) -> None:
         req = self.chassis.request_rgb()
         if req is None:
-            self.feeds_dock.rgb_meta.setText(
+            self._feeds_dock.rgb_meta.setText(
                 "request failed (not connected?)"
             )
         else:
-            self.feeds_dock.rgb_meta.setText(
+            self._feeds_dock.rgb_meta.setText(
                 f"request_id {req[:8]}… pending"
             )
 
