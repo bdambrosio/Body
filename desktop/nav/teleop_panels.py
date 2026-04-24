@@ -19,13 +19,13 @@ from typing import Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QDockWidget, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QMainWindow, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
 from desktop.chassis.sweep_dock import SweepDock
-from desktop.chassis.ui_qt import MotorTestDock
+from desktop.chassis.ui_qt import DifferentialPad, MotorTestDock
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +47,69 @@ def _make_scrollable(dock: QDockWidget) -> None:
     dock.setWidget(scroll)
 
 
-class CmdVelDock(QDockWidget):
-    """Twist input: linear (m/s) + angular (rad/s) + Apply.
+class TwistPad(DifferentialPad):
+    """Skidpad that emits cmd_vel twist instead of per-wheel velocities.
 
-    Apply writes into controller.last_cmd_vel; the chassis publisher
-    thread emits that value at cmd_vel_hz iff Live command is on.
+    Pad ny → linear m/s (up = forward). Pad nx → -angular rad/s so
+    pushing right on the pad turns the robot right (ROS REP 103 has
+    angular.z positive = CCW, i.e. left turn). Release-to-zero and
+    expo curve are inherited from DifferentialPad.
     """
 
-    apply_requested = pyqtSignal(float, float)  # (linear, angular)
+    twist_changed = pyqtSignal(float, float)  # (linear, angular)
+
+    def __init__(
+        self,
+        max_linear: float,
+        max_angular: float,
+        parent: Optional[QWidget] = None,
+    ):
+        # Parent stores max_wheel; we don't use it, but pass a sane
+        # number so inherited paint code has a value if it ever runs
+        # before our subclass is fully initialized.
+        super().__init__(max_linear, parent)
+        self._max_linear = float(max_linear)
+        self._max_angular = float(max_angular)
+
+    def set_max_linear(self, v: float) -> None:
+        self._max_linear = float(v)
+        self._emit()
+
+    def set_max_angular(self, v: float) -> None:
+        self._max_angular = float(v)
+        self._emit()
+
+    def current_twist(self) -> tuple[float, float]:
+        nx, ny = self._curved()
+        linear = ny * self._max_linear
+        angular = -nx * self._max_angular
+        return linear, angular
+
+    def _emit(self) -> None:
+        linear, angular = self.current_twist()
+        self.twist_changed.emit(linear, angular)
+
+    def _readout_text(self) -> str:
+        lin, ang = self.current_twist()
+        return f"lin {lin:+.2f} m/s   ang {ang:+.2f} rad/s"
+
+
+class CmdVelDock(QDockWidget):
+    """Twist drive surface: skidpad → body/cmd_vel.
+
+    Release-to-zero (dead-man style). The pad's twist_changed signal
+    writes into controller.last_cmd_vel on every position change; the
+    chassis publisher thread emits that value at cmd_vel_hz iff Live
+    cmd is on. Use this for normal driving and SLAM mapping runs —
+    cmd_vel keeps inputs inside the kinematic envelope that odometry
+    assumes.
+    """
+
+    # (linear_mps, angular_rps)
+    twist_changed = pyqtSignal(float, float)
+
+    DEFAULT_MAX_LINEAR = 0.3
+    DEFAULT_MAX_ANGULAR = 0.8
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__("Drive (cmd_vel)", parent)
@@ -69,52 +124,48 @@ class CmdVelDock(QDockWidget):
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(6)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("linear (m/s):"))
-        self.linear_box = QDoubleSpinBox()
-        self.linear_box.setRange(-1.0, 1.0)
-        self.linear_box.setSingleStep(0.05)
-        self.linear_box.setDecimals(2)
-        self.linear_box.setValue(0.3)
-        row1.addWidget(self.linear_box)
-        row1.addStretch(1)
-        v.addLayout(row1)
+        limits_row = QHBoxLayout()
+        limits_row.addWidget(QLabel("Max linear (m/s):"))
+        self.max_linear_box = QDoubleSpinBox()
+        self.max_linear_box.setRange(0.05, 1.0)
+        self.max_linear_box.setSingleStep(0.05)
+        self.max_linear_box.setDecimals(2)
+        self.max_linear_box.setValue(self.DEFAULT_MAX_LINEAR)
+        limits_row.addWidget(self.max_linear_box)
+        limits_row.addSpacing(12)
+        limits_row.addWidget(QLabel("Max angular (rad/s):"))
+        self.max_angular_box = QDoubleSpinBox()
+        self.max_angular_box.setRange(0.05, 3.0)
+        self.max_angular_box.setSingleStep(0.1)
+        self.max_angular_box.setDecimals(2)
+        self.max_angular_box.setValue(self.DEFAULT_MAX_ANGULAR)
+        limits_row.addWidget(self.max_angular_box)
+        limits_row.addStretch(1)
+        v.addLayout(limits_row)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("angular (rad/s):"))
-        self.angular_box = QDoubleSpinBox()
-        self.angular_box.setRange(-2.0, 2.0)
-        self.angular_box.setSingleStep(0.1)
-        self.angular_box.setDecimals(2)
-        self.angular_box.setValue(0.2)
-        row2.addWidget(self.angular_box)
-        row2.addStretch(1)
-        v.addLayout(row2)
+        self.pad = TwistPad(self.DEFAULT_MAX_LINEAR, self.DEFAULT_MAX_ANGULAR)
+        pad_row = QHBoxLayout()
+        pad_row.addStretch(1)
+        pad_row.addWidget(self.pad)
+        pad_row.addStretch(1)
+        v.addLayout(pad_row, 1)
 
-        row3 = QHBoxLayout()
-        self.apply_btn = QPushButton("Apply cmd_vel")
-        self.apply_btn.setToolTip(
-            "Set the stored cmd_vel. Values are published at cmd_vel_hz "
-            "only while Live cmd (safety toolbar) is on."
+        hint = QLabel(
+            "Hold-to-drive. Requires Live cmd (safety toolbar) to be on."
         )
-        row3.addWidget(self.apply_btn)
-        row3.addStretch(1)
-        v.addLayout(row3)
-        v.addStretch(1)
+        hint.setStyleSheet("color:#888;")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
 
         self.setWidget(body)
-        self.apply_btn.clicked.connect(self._emit_apply)
 
-    def _emit_apply(self) -> None:
-        self.apply_requested.emit(
-            float(self.linear_box.value()),
-            float(self.angular_box.value()),
-        )
+        self.pad.twist_changed.connect(self.twist_changed)
+        self.max_linear_box.valueChanged.connect(self.pad.set_max_linear)
+        self.max_angular_box.valueChanged.connect(self.pad.set_max_angular)
 
     def zero_and_disable(self) -> None:
         """Used when ALL-STOP fires or sweep mission starts."""
-        self.linear_box.setValue(0.0)
-        self.angular_box.setValue(0.0)
+        self.pad.recenter()
 
 
 class TeleopPanels:
@@ -178,7 +229,7 @@ class TeleopPanels:
     # ── Wiring ───────────────────────────────────────────────────────
 
     def _wire_signals(self) -> None:
-        self.cmd_vel_dock.apply_requested.connect(self._on_cmd_vel_apply)
+        self.cmd_vel_dock.twist_changed.connect(self._on_cmd_vel_twist)
         self.motor_dock.mode_change_requested.connect(
             self._on_motor_mode_change
         )
@@ -188,7 +239,7 @@ class TeleopPanels:
         self.motor_dock.stop_requested.connect(self._on_motor_stop)
         self.sweep_dock.mission_active.connect(self._on_sweep_active)
 
-    def _on_cmd_vel_apply(self, linear: float, angular: float) -> None:
+    def _on_cmd_vel_twist(self, linear: float, angular: float) -> None:
         self.chassis.set_cmd_vel(linear, angular)
 
     def _on_motor_mode_change(self, mode: str) -> None:
@@ -217,8 +268,13 @@ class TeleopPanels:
         Safety toolbar's ALL-STOP and Live checkbox remain live — the
         operator must always be able to panic-stop a mission.
         """
-        self.cmd_vel_dock.apply_btn.setEnabled(not active)
+        self.cmd_vel_dock.pad.setEnabled(not active)
         self.motor_dock.engage_btn.setEnabled(not active)
+        if active:
+            # Snap the pad back to zero so the stored cmd_vel doesn't
+            # retain a stale value that would fire when the sweep ends
+            # and the pad is re-enabled.
+            self.cmd_vel_dock.pad.recenter()
         if active and self.motor_dock.engage_btn.isChecked():
             # Running sweep while direct-mode engaged would race; force
             # disengage (same pattern as chassis).

@@ -22,7 +22,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QDockWidget, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
-    QSplitter, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 from desktop.chassis.controller import StubController
@@ -304,20 +304,14 @@ def _wrap_with_header(inner: QWidget, title: str) -> QWidget:
 
 
 class CameraPanels:
-    """Coordinator for the camera + vision group.
+    """Holds the camera-feed and vision widgets.
 
-    Maps + cameras + chat all need to live in the same vertically
-    resizable column so the four image cells (two maps, two camera
-    feeds) share the same width and can grow/shrink together. To get
-    that, we build the existing CameraFeedsDock / VisionDock as usual
-    but never dock them — instead we pull out their .widget() bodies
-    (which hold all the rendering state) and hand them to the main
-    window's QSplitter via `attach_to_splitter`.
-
-    The dock objects stay alive because CameraFeedsDock owns the
-    request_rgb signal and the render_rgb / render_depth methods;
-    VisionDock owns append_turn / set_busy / speak / TTS. Only the
-    titlebar and dock-area behavior is dropped.
+    Construction reuses the existing CameraFeedsDock / VisionDock
+    classes (because that's where render_rgb / render_depth / chat /
+    TTS live), but we pull out their .widget() bodies and expose them
+    as plain widgets so main_window can place them independently —
+    feeds in the vertical splitter with the maps, vision in its own
+    narrow column alongside.
     """
 
     def __init__(self, chassis: StubController) -> None:
@@ -334,17 +328,6 @@ class CameraPanels:
         )
 
         self._feeds_dock.request_rgb_clicked.connect(self._on_request_rgb)
-
-    def attach_to_splitter(self, splitter: QSplitter) -> None:
-        """Insert the feeds + vision panes below whatever's already in
-        the splitter (typically the maps row). Caller owns stretch
-        factors / initial sizes. Visible by default — cameras are now
-        part of the primary left-panel view, not an optional sidepanel;
-        hidden-at-construction breaks the splitter's setSizes hint
-        since hidden children don't participate in it.
-        """
-        splitter.addWidget(self.feeds_widget)
-        splitter.addWidget(self.vision_widget)
 
     def set_visible(self, visible: bool) -> None:
         self.feeds_widget.setVisible(visible)

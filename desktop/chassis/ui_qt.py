@@ -627,6 +627,24 @@ class _TTSWorker(QThread):
             self.error.emit(f"{type(e).__name__}: {e}")
 
 
+class _ChatInput(QPlainTextEdit):
+    """Multi-line chat input. Enter submits, Shift+Enter inserts a
+    newline. Word-wrapping + vertical scroll come free from
+    QPlainTextEdit; QLineEdit (the previous widget) couldn't do either.
+    """
+
+    submit = pyqtSignal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(event)
+            else:
+                self.submit.emit()
+            return
+        super().keyPressEvent(event)
+
+
 class VisionDock(QDockWidget):
     """Chat + detect pane talking to a local VLM via src/vision_service.py."""
 
@@ -655,12 +673,24 @@ class VisionDock(QDockWidget):
 
         self.transcript = QTextBrowser()
         self.transcript.setOpenExternalLinks(False)
-        self.transcript.setMinimumWidth(320)
+        self.transcript.setMinimumWidth(200)
+        self.transcript.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
         v.addWidget(self.transcript, 1)
 
-        self.input = QLineEdit()
+        self.input = _ChatInput()
         self.input.setPlaceholderText("Ask about the scene, or just chat…")
+        self.input.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        # Cap the input height so the transcript keeps most of the
+        # column; content scrolls vertically once it exceeds ~3 lines.
+        self.input.setMaximumHeight(72)
         v.addWidget(self.input)
+
+        # Shrink the chat fonts by one point relative to the app
+        # default — the narrow vision column needs the extra room.
+        for w in (self.transcript, self.input):
+            f = w.font()
+            f.setPointSize(max(1, f.pointSize() - 1))
+            w.setFont(f)
 
         self.attach_box = QCheckBox("attach current frame")
         v.addWidget(self.attach_box)
@@ -688,7 +718,7 @@ class VisionDock(QDockWidget):
         self.setWidget(body)
 
         self.send_btn.clicked.connect(self._emit_send)
-        self.input.returnPressed.connect(self._emit_send)
+        self.input.submit.connect(self._emit_send)
         self.detect_btn.clicked.connect(self.run_detect)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self._on_mode_changed()
@@ -697,7 +727,7 @@ class VisionDock(QDockWidget):
         return self.mode_combo.currentData() or "direct"
 
     def _emit_send(self) -> None:
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
         if not text:
             return
         self.send_chat.emit(text, self.attach_box.isChecked())
@@ -994,14 +1024,17 @@ class DifferentialPad(QWidget):
                 p.setBrush(QColor(255, 220, 100))
                 p.drawEllipse(QPointF(hx, hy), 7, 7)
 
-            # Readout text (L/R in m/s)
-            L, R = self.current_mps()
-            txt = f"L {L:+.2f}   R {R:+.2f}  m/s"
+            # Readout text — delegated so subclasses (TwistPad) can
+            # show their own units without redoing the whole paint.
             p.setPen(QColor(220, 220, 220) if enabled else QColor(100, 100, 100))
             p.setFont(QFont("Monospace", 10, QFont.Weight.Bold))
-            p.drawText(8, h - 10, txt)
+            p.drawText(8, h - 10, self._readout_text())
         finally:
             p.end()
+
+    def _readout_text(self) -> str:
+        L, R = self.current_mps()
+        return f"L {L:+.2f}   R {R:+.2f}  m/s"
 
 
 class _Pill(QLabel):

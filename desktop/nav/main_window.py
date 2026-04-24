@@ -85,16 +85,17 @@ class NavMainWindow(QMainWindow):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
 
-        # The left column is a single vertical splitter: maps row on
-        # top, camera feeds row in the middle, vision chat at the
-        # bottom. Putting all four image cells under one splitter —
-        # rather than splitting maps (central) from cameras (bottom
-        # dock) as before — means all four share the same width
-        # allotment and their heights are resized together by dragging
-        # the splitter handles. Each image widget aspect-preserves its
-        # own render internally.
-        self._main_splitter = QSplitter(Qt.Orientation.Vertical, central)
-        self._main_splitter.setChildrenCollapsible(True)
+        # Horizontal split: [ left column (maps + camera feeds stacked)
+        # | vision column ]. The left column is itself a vertical
+        # splitter so maps and feeds can rebalance without stealing
+        # height from the chat. The vision column is narrow by default
+        # but resizable — grabbing a wide transcript is a click-drag
+        # away. Each image widget aspect-preserves its own render.
+        self._h_splitter = QSplitter(Qt.Orientation.Horizontal, central)
+        self._h_splitter.setChildrenCollapsible(True)
+
+        self._left_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._left_splitter.setChildrenCollapsible(True)
 
         maps_widget = QWidget()
         maps = QHBoxLayout(maps_widget)
@@ -103,19 +104,25 @@ class NavMainWindow(QMainWindow):
         self._drive_view = WorldDriveableView(stale_s=self.fuser_config.map_stale_s)
         maps.addWidget(self._height_view, stretch=1)
         maps.addWidget(self._drive_view, stretch=1)
-        self._main_splitter.addWidget(maps_widget)
+        self._left_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
-        self._cameras.attach_to_splitter(self._main_splitter)
+        self._left_splitter.addWidget(self._cameras.feeds_widget)
 
-        # Apply initial distribution post-show (see showEvent); here we
-        # just give equal stretch so later drags behave predictably.
-        self._main_splitter.setStretchFactor(0, 1)
-        self._main_splitter.setStretchFactor(1, 1)
-        self._main_splitter.setStretchFactor(2, 1)
+        # Maps and feeds share the left column 50/50 by default.
+        self._left_splitter.setStretchFactor(0, 1)
+        self._left_splitter.setStretchFactor(1, 1)
+
+        self._h_splitter.addWidget(self._left_splitter)
+        self._h_splitter.addWidget(self._cameras.vision_widget)
+
+        # Left column dominates horizontally; vision column is narrow
+        # but user-resizable.
+        self._h_splitter.setStretchFactor(0, 4)
+        self._h_splitter.setStretchFactor(1, 1)
         self._splitter_balanced = False
 
-        outer.addWidget(self._main_splitter, stretch=1)
+        outer.addWidget(self._h_splitter, stretch=1)
 
         # Bottom status strip: fuser (pose + rates + cells + session) on
         # the left, chassis text summary on the right. The safety pills
@@ -259,20 +266,22 @@ class NavMainWindow(QMainWindow):
 
     def _balance_splitter_once(self) -> None:
         # Applied via QTimer.singleShot(0, …) from showEvent: by the
-        # time this fires, the splitter has its real height from the
-        # first layout pass. 40/40/20 — maps and cameras rows get
-        # equal image area; vision chat takes the rest. Idempotent so
-        # spurious re-fires don't stomp on a user's drag.
+        # time this fires, the splitters have real sizes from the
+        # first layout pass. Idempotent so spurious re-fires don't
+        # stomp on a user's drag.
         if self._splitter_balanced:
             return
-        total = self._main_splitter.height()
-        if total <= 0:
+        h_total = self._h_splitter.width()
+        v_total = self._left_splitter.height()
+        if h_total <= 0 or v_total <= 0:
             return
-        self._main_splitter.setSizes([
-            int(total * 0.40),
-            int(total * 0.40),
-            int(total * 0.20),
-        ])
+        # Vision column defaults to ~320 px; left column takes the
+        # rest. Narrow enough to keep the images wide, wide enough
+        # for a readable chat.
+        vision_w = min(360, max(260, h_total // 5))
+        self._h_splitter.setSizes([h_total - vision_w, vision_w])
+        # Maps ≈ feeds in the left column.
+        self._left_splitter.setSizes([v_total // 2, v_total // 2])
         self._splitter_balanced = True
 
     def showEvent(self, event) -> None:
