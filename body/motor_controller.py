@@ -73,11 +73,6 @@ class MotionState:
     awaiting_cmd_vel_after_clear: bool = False
     stall_latched: bool = False
 
-
-def _print_cmd(kind: str, msg: dict[str, Any]) -> None:
-    print(f"motor_controller: {kind} {msg}", flush=True)
-
-
 def _command_is_all_stop(msg: dict[str, Any], *, direct: bool) -> bool:
     """True if the message commands no motion (clears software stall latch)."""
     if direct:
@@ -98,7 +93,6 @@ def main() -> None:
     stall_detect_ms = int(motor_cfg.get("stall_detect_ms", 1000))
     gpio_enabled = bool(motor_cfg.get("gpio_enabled", False))
     encoders_wanted = bool(motor_cfg.get("encoders_enabled", False))
-    encoder_log_interval_s = float(motor_cfg.get("encoder_log_interval_s", 0.0))
     velocity_loop_enabled = bool(motor_cfg.get("velocity_loop_enabled", False))
     velocity_kp = float(motor_cfg.get("velocity_kp", 0.5))
     velocity_ki = float(motor_cfg.get("velocity_ki", 2.0))
@@ -162,10 +156,8 @@ def main() -> None:
     stall_begin_wall: float | None = None
     left_ticks_total = 0
     right_ticks_total = 0
-    encoder_log_last_mono = 0.0
 
     def on_cmd_vel(_key: str, msg: dict[str, Any]) -> None:
-        _print_cmd("cmd_vel", msg)
         with state.lock:
             if state.stall_latched and _command_is_all_stop(msg, direct=False):
                 state.stall_latched = False
@@ -176,7 +168,6 @@ def main() -> None:
                 state.awaiting_cmd_vel_after_clear = False
 
     def on_cmd_direct(_key: str, msg: dict[str, Any]) -> None:
-        _print_cmd("cmd_direct", msg)
         with state.lock:
             if state.stall_latched and _command_is_all_stop(msg, direct=True):
                 state.stall_latched = False
@@ -352,23 +343,6 @@ def main() -> None:
                     stall_detected=stall_active,
                 ),
             )
-
-            if encoders is not None and encoder_log_interval_s > 0.0:
-                now_mono = time.monotonic()
-                if now_mono - encoder_log_last_mono >= encoder_log_interval_s:
-                    lp_port = encoders.get("left")
-                    rp_port = encoders.get("right")
-                    l_edges = lp_port.edge_count() if lp_port is not None else 0
-                    r_edges = rp_port.edge_count() if rp_port is not None else 0
-                    l_state = lp_port.current_state() if lp_port is not None else -1
-                    r_state = rp_port.current_state() if rp_port is not None else -1
-                    print(
-                        "motor_controller: encoders "
-                        f"left ticks={left_ticks_total} (Δ{delta_left_ticks}) edges={l_edges} A/B={(l_state >> 1) & 1 if l_state >= 0 else '-'}/{l_state & 1 if l_state >= 0 else '-'} | "
-                        f"right ticks={right_ticks_total} (Δ{delta_right_ticks}) edges={r_edges} A/B={(r_state >> 1) & 1 if r_state >= 0 else '-'}/{r_state & 1 if r_state >= 0 else '-'}",
-                        flush=True,
-                    )
-                    encoder_log_last_mono = now_mono
 
             next_tick += period
             sleep_for = next_tick - time.monotonic()
