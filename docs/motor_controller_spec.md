@@ -326,7 +326,7 @@ No other dependencies. No ROS. No frameworks. One file.
 
 ## 6. What This Spec Does NOT Cover
 
-- PID velocity control (cmd_vel asks for m/s, we map linearly to PWM — no feedback loop yet). Add later if odometry shows the linear mapping is too coarse.
+- Closed-loop velocity control is now implemented per wheel as a PI on commanded-vs-measured velocity (see `WheelPI` in `motor_controller.py`, config keys `motor.velocity_loop_enabled`, `motor.velocity_kp`, `motor.velocity_ki`, `motor.velocity_integ_limit`, `motor.min_drive_pwm`). Feed-forward remains `v_cmd / max_wheel_vel_ms`; the integrator absorbs the residual; `min_drive_pwm` snaps past static friction. When the loop is disabled or encoders aren't live, the controller falls back to the original open-loop mapping. Further refinement (derivative term, per-side asymmetric gains, deceleration feed-forward) is still deferred.
 - Acceleration limiting / ramp-up. Currently jumps to commanded velocity instantly. Add if mechanical shock is a problem.
 - Pico-based encoder counting (upgrade path documented in Body spec).
 - Zenoh session configuration details (see Body spec §4).

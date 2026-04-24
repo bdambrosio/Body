@@ -6,6 +6,7 @@ drives BCM pins per docs/motor_controller_spec.md (lgpio). Set ``max_wheel_vel_m
 
 from __future__ import annotations
 
+import math
 import signal
 import sys
 import threading
@@ -17,6 +18,48 @@ from body.lib import diff_drive, motor_gpio, schemas, zenoh_helpers
 
 STALL_PWM_THRESHOLD = 0.1
 STALL_VELOCITY_EPS_MS = 0.01
+
+
+@dataclass
+class WheelPI:
+    """Per-wheel velocity PI with feed-forward and dead-zone snap.
+
+    ``ff = v_cmd / max_v`` (the prior open-loop mapping) is the starting duty; the
+    integrator absorbs the residual so commanded wheel velocity matches measured.
+    ``min_drive_pwm`` snaps any nonzero output past the static-friction threshold
+    so the loop doesn't spend its first ticks waiting for the integrator to wind up.
+    """
+
+    kp: float
+    ki: float
+    integ_limit: float
+    min_drive_pwm: float
+    integ: float = 0.0
+
+    def reset(self) -> None:
+        self.integ = 0.0
+
+    def step(
+        self, v_cmd: float, v_meas: float, dt: float, max_v: float
+    ) -> tuple[float, str]:
+        if max_v <= 0.0 or abs(v_cmd) < 1e-6:
+            self.integ = 0.0
+            return 0.0, "fwd"
+        ff = v_cmd / max_v
+        err = v_cmd - v_meas
+        self.integ += err * dt
+        if self.integ > self.integ_limit:
+            self.integ = self.integ_limit
+        elif self.integ < -self.integ_limit:
+            self.integ = -self.integ_limit
+        pwm = ff + self.kp * err + self.ki * self.integ
+        if self.min_drive_pwm > 0.0 and abs(pwm) < self.min_drive_pwm:
+            pwm = math.copysign(self.min_drive_pwm, v_cmd)
+        if pwm > 1.0:
+            pwm = 1.0
+        elif pwm < -1.0:
+            pwm = -1.0
+        return abs(pwm), "fwd" if pwm >= 0 else "rev"
 
 
 @dataclass
@@ -56,6 +99,13 @@ def main() -> None:
     gpio_enabled = bool(motor_cfg.get("gpio_enabled", False))
     encoders_wanted = bool(motor_cfg.get("encoders_enabled", False))
     encoder_log_interval_s = float(motor_cfg.get("encoder_log_interval_s", 0.0))
+    velocity_loop_enabled = bool(motor_cfg.get("velocity_loop_enabled", False))
+    velocity_kp = float(motor_cfg.get("velocity_kp", 0.5))
+    velocity_ki = float(motor_cfg.get("velocity_ki", 2.0))
+    velocity_integ_limit = float(motor_cfg.get("velocity_integ_limit", 0.5))
+    min_drive_pwm = float(motor_cfg.get("min_drive_pwm", 0.0))
+    pi_left = WheelPI(velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm)
+    pi_right = WheelPI(velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm)
     if encoders_wanted and not gpio_enabled:
         print(
             "motor_controller: encoders_enabled requires gpio_enabled — encoder GPIO skipped.",
@@ -193,29 +243,36 @@ def main() -> None:
                 left_pwm = right_pwm = 0.0
                 left_dir = right_dir = "fwd"
                 vx_cmd = vtheta_cmd = 0.0
+                vl_cmd = vr_cmd = 0.0
 
-                if not e_stop and not cmd_stale and active is not None:
-                    if use_direct and direct is not None:
-                        lv = float(direct["left"])
-                        rv = float(direct["right"])
-                        left_pwm, left_dir = diff_drive.pwm_from_velocity(lv, max_wheel_vel_ms)
-                        right_pwm, right_dir = diff_drive.pwm_from_velocity(rv, max_wheel_vel_ms)
-                        vx_cmd = (lv + rv) / 2.0
-                        vtheta_cmd = (rv - lv) / wheel_base_m if wheel_base_m > 0 else 0.0
-                    elif twist is not None:
-                        lin = float(twist["linear"])
-                        ang = float(twist["angular"])
-                        vl, vr = diff_drive.twist_to_wheel_velocities(lin, ang, wheel_base_m)
-                        left_pwm, left_dir = diff_drive.pwm_from_velocity(vl, max_wheel_vel_ms)
-                        right_pwm, right_dir = diff_drive.pwm_from_velocity(vr, max_wheel_vel_ms)
-                        vx_cmd = lin
-                        vtheta_cmd = ang
-
-                max_cmd_pwm = max(left_pwm, right_pwm)
                 dl_m = diff_drive.ticks_to_delta_m(delta_left_ticks, wheel_radius_m, ticks_per_rev)
                 dr_m = diff_drive.ticks_to_delta_m(delta_right_ticks, wheel_radius_m, ticks_per_rev)
                 v_left_enc = dl_m / period if period > 0 else 0.0
                 v_right_enc = dr_m / period if period > 0 else 0.0
+
+                if not e_stop and not cmd_stale and active is not None:
+                    if use_direct and direct is not None:
+                        vl_cmd = float(direct["left"])
+                        vr_cmd = float(direct["right"])
+                        vx_cmd = (vl_cmd + vr_cmd) / 2.0
+                        vtheta_cmd = (vr_cmd - vl_cmd) / wheel_base_m if wheel_base_m > 0 else 0.0
+                    elif twist is not None:
+                        lin = float(twist["linear"])
+                        ang = float(twist["angular"])
+                        vl_cmd, vr_cmd = diff_drive.twist_to_wheel_velocities(lin, ang, wheel_base_m)
+                        vx_cmd = lin
+                        vtheta_cmd = ang
+                    if velocity_loop_enabled and both_encoders_live:
+                        left_pwm, left_dir = pi_left.step(vl_cmd, v_left_enc, period, max_wheel_vel_ms)
+                        right_pwm, right_dir = pi_right.step(vr_cmd, v_right_enc, period, max_wheel_vel_ms)
+                    else:
+                        left_pwm, left_dir = diff_drive.pwm_from_velocity(vl_cmd, max_wheel_vel_ms)
+                        right_pwm, right_dir = diff_drive.pwm_from_velocity(vr_cmd, max_wheel_vel_ms)
+                else:
+                    pi_left.reset()
+                    pi_right.reset()
+
+                max_cmd_pwm = max(left_pwm, right_pwm)
 
                 if stall_detect_enabled and not state.stall_latched and not e_stop and not cmd_stale and active is not None:
                     if max_cmd_pwm > STALL_PWM_THRESHOLD:
@@ -236,6 +293,8 @@ def main() -> None:
                 if stall_active:
                     left_pwm = right_pwm = 0.0
                     left_dir = right_dir = "fwd"
+                    pi_left.reset()
+                    pi_right.reset()
 
                 if both_encoders_live:
                     vx = (v_left_enc + v_right_enc) / 2.0
