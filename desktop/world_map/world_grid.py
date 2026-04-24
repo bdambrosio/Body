@@ -117,6 +117,26 @@ class WorldGrid:
     def n_cells(self) -> int:
         return self._n
 
+    @property
+    def origin_x_m(self) -> float:
+        return self._origin_x_m
+
+    @property
+    def origin_y_m(self) -> float:
+        return self._origin_y_m
+
+    def snapshot_block_votes(self) -> np.ndarray:
+        """Return a copy of block_votes under the grid lock.
+
+        Fusion writes block_votes concurrently via np.add.at; a reader
+        sampling the live array can see partial/stale values mid-write.
+        Consumers that need a consistent snapshot (e.g. scan-matching)
+        should use this method rather than reading self.block_votes
+        directly.
+        """
+        with self._lock:
+            return self.block_votes.copy()
+
     def world_to_cell(
         self, x_w: float, y_w: float,
     ) -> Tuple[int, int]:

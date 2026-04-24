@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from typing import Optional
 
 from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
@@ -18,6 +19,7 @@ from desktop.world_map.config import ENV_VAR, FuserConfig, resolve_router
 from desktop.world_map.controller import FuserController
 
 from .main_window import run_app
+from .slam.shadow_driver import ShadowSlamDriver
 
 
 def _parse_args(argv):
@@ -54,6 +56,12 @@ def _parse_args(argv):
     p.add_argument(
         "--no-autoconnect", action="store_true",
         help="Don't connect on startup; wait for the user to click Connect.",
+    )
+    p.add_argument(
+        "--shadow-slam", action="store_true",
+        help="Enable the shadow SLAM driver: subscribes to body/imu + "
+             "body/lidar/scan and logs candidate pose corrections. Does "
+             "not write to the fuser's pose — purely observational.",
     )
     p.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
@@ -93,9 +101,39 @@ def main(argv=None) -> int:
             if not ok:
                 log.warning(f"{name} autoconnect failed ({err}); retry via UI")
 
+    # Shadow SLAM: only wires if the fuser already has a live session
+    # (i.e. autoconnect succeeded). Post-launch reconnects via the
+    # safety toolbar don't re-install the driver; restart nav if the
+    # fuser was reconnected and you want shadow SLAM going again.
+    shadow: Optional[ShadowSlamDriver] = None
+    if args.shadow_slam:
+        if fuser.connected:
+            shadow = ShadowSlamDriver(
+                session=fuser.session,
+                grid=fuser.grid,
+                pose_source=fuser.pose_source,
+            )
+            try:
+                shadow.connect()
+            except Exception:
+                log.exception("shadow_slam connect failed; continuing without it")
+                shadow = None
+        else:
+            log.warning(
+                "shadow_slam requested but fuser not connected; "
+                "driver not installed. Launch with --router pointing at a "
+                "live Pi, or restart after connecting via the UI.",
+            )
+
     try:
         return run_app(fuser, fuser_config, chassis, chassis_config)
     finally:
+        # Shadow first — its subscribers live on the fuser's session.
+        if shadow is not None:
+            try:
+                shadow.disconnect()
+            except Exception:
+                log.exception("shadow_slam disconnect raised")
         # Order matters: chassis publishes zero commands on disconnect,
         # fuser doesn't touch motors, so tear chassis down first.
         try:
