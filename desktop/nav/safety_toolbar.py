@@ -179,9 +179,7 @@ class SafetyToolbar(QToolBar):
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _fuser_connected(self) -> bool:
-        # FuserController exposes no public flag; session presence is
-        # the best proxy without adding API surface.
-        return getattr(self.fuser, "_session", None) is not None
+        return self.fuser.connected
 
     def _both_connected(self) -> bool:
         with self.chassis.state.lock:

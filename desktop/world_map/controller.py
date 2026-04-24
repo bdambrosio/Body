@@ -206,6 +206,22 @@ class FuserController:
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
+    # ── Public accessors ─────────────────────────────────────────────
+
+    @property
+    def session(self) -> Optional[Any]:
+        """The live Zenoh session, or None when disconnected. Exposed so
+        peer components (e.g. the shadow SLAM driver) can declare their
+        own subscribers on the same session the fuser uses.
+        """
+        return self._session
+
+    @property
+    def connected(self) -> bool:
+        return self._session is not None
+
+    # ── Connection lifecycle ─────────────────────────────────────────
+
     def connect(self) -> Tuple[bool, Optional[str]]:
         if self._session is not None:
             return True, None
