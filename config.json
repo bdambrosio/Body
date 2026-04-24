@@ -22,6 +22,8 @@
     "gpio_right_pwm": 13,
     "gpio_left_dir": 5,
     "gpio_right_dir": 6,
+    "gpio_right_enc_a": 22,
+    "gpio_right_enc_b": 27,
     "invert_left_dir": true,
     "velocity_loop_enabled": true,
     "velocity_kp": 0.8,
