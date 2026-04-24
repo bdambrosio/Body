@@ -21,10 +21,26 @@ The Pi does **not** need to fuse IMU into odom. `body/odom.theta` stays encoder-
 ### 2.1 BNO085 calibrated and in `rotation_vector` mode
 
 - `body/imu.fusion.mode == "rotation_vector"` — absolute yaw. Bounded drift relative to magnetic north.
-- `body/imu.fusion.accuracy_rad` stable and small — `< ~0.06` rad (3.4°) once warm. The desktop `ImuYawTracker` already refuses to answer queries until `min_settle_samples` consecutive readings fall below `settle_accuracy_rad`, so startup transients are handled; steady-state accuracy is what matters for map quality.
-- `body/imu.fusion.mag_status == "calibrated"` during normal driving. If the magnetometer gets disturbed by motor current and drops to `uncalibrated`, the scan-matcher has to close more drift but won't fail.
+- `body/imu.fusion.accuracy_rad` stable and small — `< ~0.06` rad (3.4°) once warm. The desktop `ImuYawTracker` refuses to answer queries until `min_settle_samples` consecutive readings fall below `settle_accuracy_rad` (default `0.06`), so startup transients are handled; steady-state accuracy is what matters for map quality.
+- `body/imu.fusion.calibration_status` — integer `0..3` per the SH-2 spec (0 = unreliable, 3 = high). Published when available. Desktop consumes it only as a diagnostic today; a `< 3` value during driving predicts slower correction and more noise, but is not a hard gate.
 
-`game_rotation_vector` mode still works — yaw is relative (starts at zero at boot, drifts ~0.5–1°/min) — but the absolute-heading advantage is gone. Fine for testing, less good for multi-room or long-run mapping.
+#### Threshold coupling — important
+
+Three thresholds on Pi and desktop interact. They must be ordered so Pi doesn't declare "settled" at an accuracy it will then flap away from:
+
+```
+  imu.calibration_stable_threshold_rad    ≤    imu.mag_accuracy_fallback_rad    ≤    desktop settle_accuracy_rad
+```
+
+Concretely, for SLAM promotion:
+
+- `imu.calibration_stable_threshold_rad` ≤ `0.06` (matches desktop settle).
+- `imu.mag_accuracy_fallback_rad` ≤ `0.087` (Pi's existing default) is OK but should be ≥ the stable threshold, or Pi will settle and fall back on the very next sample.
+- `imu.mag_accuracy_fallback_count` of `20` at `100 Hz` = 0.2 s before flap — acceptable.
+
+Current `config.json` has `calibration_stable_threshold_rad: 0.175`, which is too loose for SLAM: Pi will start publishing at accuracy well above the fallback threshold and drop out of `rotation_vector` within 20 samples. **Tighten this to `0.06`** before relying on `--slam`.
+
+`game_rotation_vector` mode still works — yaw is relative (starts at zero at boot, drifts ~0.5–1°/min) — but the absolute-heading advantage is gone. Fine for testing, less good for multi-room or long-run mapping. Desktop handles both modes the same way; only the *meaning* of yaw differs.
 
 ### 2.2 `body/odom.source == "wheel_encoders"`
 
@@ -71,14 +87,19 @@ These are deliberately **not** Pi-side work, to keep the contract minimal:
 
 Before the user flips `--slam` on nav:
 
-1. Drive a short loop with `python -m desktop.nav --shadow-slam --router tcp/<pi>:7447`.
-2. Grep the shadow log for these numbers per scan-match attempt:
+1. **Pi config audit.** Confirm `config.json` has:
+   - `imu.fusion_mode: "rotation_vector"`
+   - `imu.calibration_stable_threshold_rad ≤ 0.06` (see §2.1 threshold coupling — this is the one most likely wrong today).
+   - `imu.mag_accuracy_fallback_rad` ≥ `calibration_stable_threshold_rad`, ≤ `0.087`.
+   - BNO085 DCD saved after a successful figure-8 — `body/imu/calibrate` with `action: "save"`.
+2. **Shadow drive.** `python -m desktop.nav --shadow-slam --router tcp/<pi>:7447`, run a short loop.
+3. Grep the shadow log for these numbers per scan-match attempt:
    - `accepted` rate > ~50% of non-`search_exhausted` attempts
    - median `improvement` > `min_improvement` threshold by at least 2×
    - `search_exhausted` rate < ~20%
    - `imu_settled == true` for ≥ 95% of the post-warmup window
-3. If `mag_status` flaps during the drive, consider re-calibrating or using `game_rotation_vector` and budgeting for slower-loop drift.
-4. If all four numbers look right, the `ImuPlusScanMatchPose` promotion PR can merge with the feature flag on by default.
+4. Watch `body/imu.fusion.mode` during the drive. If it flaps from `rotation_vector` to `game_rotation_vector` at any point, fix thresholds first — SLAM promotion can still go in, but you'll be operating in relative-yaw mode and should budget for slower correction of accumulated drift.
+5. If Pi config is clean and all four log numbers look right, the `ImuPlusScanMatchPose` promotion PR can merge with the feature flag on by default.
 
 ## 6. Roll-back
 
