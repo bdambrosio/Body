@@ -13,7 +13,7 @@ from body.lib import host_metrics, schemas, zenoh_helpers
 TOPIC_TO_PROCESS: dict[str, str] = {
     "body/odom": "motor_controller",
     "body/lidar/scan": "lidar_driver",
-    "body/oakd/imu": "oakd_driver",
+    "body/imu": "imu_driver",
 }
 
 

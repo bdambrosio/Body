@@ -51,7 +51,7 @@ class Topics:
     odom: str = "body/odom"
     motor_state: str = "body/motor_state"
     lidar_scan: str = "body/lidar/scan"
-    oakd_imu: str = "body/oakd/imu"
+    oakd_imu: str = "body/imu"
     oakd_depth: str = "body/oakd/depth"
     oakd_rgb: str = "body/oakd/rgb"
     local_map: str = "body/map/local_2p5d"

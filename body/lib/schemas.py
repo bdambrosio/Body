@@ -158,6 +158,49 @@ def oakd_imu_report(
     return msg
 
 
+def imu_report(
+    ts: float,
+    accel_xyz: tuple[float, float, float],
+    gyro_xyz: tuple[float, float, float],
+    quat_wxyz: tuple[float, float, float, float],
+    fusion_mode: str,
+    fusion_accuracy_rad: float,
+    linear_accel_xyz: tuple[float, float, float] | None = None,
+    calibration_status: int | None = None,
+) -> dict[str, Any]:
+    """Build body/imu JSON per docs/imu_integration_spec.md §2 (body frame).
+
+    ``fusion_mode`` is one of ``"rotation_vector"``, ``"game_rotation_vector"``, or ``"raw"``.
+    ``fusion_accuracy_rad`` is the BNO085 per-report accuracy estimate (consumer σ).
+    ``linear_accel_xyz`` is the gravity-removed accel when the driver enables that report.
+    ``calibration_status`` (0–3) is the SH-2 system calibration level when available.
+    """
+    msg: dict[str, Any] = {
+        "ts": ts,
+        "accel": {"x": accel_xyz[0], "y": accel_xyz[1], "z": accel_xyz[2]},
+        "gyro": {"x": gyro_xyz[0], "y": gyro_xyz[1], "z": gyro_xyz[2]},
+        "orientation": {
+            "w": quat_wxyz[0],
+            "x": quat_wxyz[1],
+            "y": quat_wxyz[2],
+            "z": quat_wxyz[3],
+        },
+        "fusion": {
+            "mode": fusion_mode,
+            "accuracy_rad": float(fusion_accuracy_rad),
+        },
+    }
+    if linear_accel_xyz is not None:
+        msg["linear_accel"] = {
+            "x": linear_accel_xyz[0],
+            "y": linear_accel_xyz[1],
+            "z": linear_accel_xyz[2],
+        }
+    if calibration_status is not None:
+        msg["fusion"]["calibration_status"] = int(calibration_status)
+    return msg
+
+
 def oakd_depth_placeholder(ts: float | None = None) -> dict[str, Any]:
     return {"ts": now_ts() if ts is None else ts, "format": "placeholder", "note": "TBD per docs/body_project_spec.md §5.7"}
 

@@ -1,10 +1,9 @@
-"""OAK-D Lite driver: DepthAI IMU pipeline, Zenoh publish, optional depth placeholder.
+"""OAK-D Lite driver: DepthAI depth/RGB pipeline and diagnostic IMU aggregation.
 
-Aggregates high-rate accel/gyro into **arithmetic means** over ``imu_aggregate_interval_s`` and
-publishes ``body/oakd/imu`` at that rate. **Mean gyro ≠ integrated angle** and mean accel ≠
-velocity change over the window; for strapdown-equivalent dead reckoning you would integrate
-at full sensor rate on the Pi (or use fused orientation only as a slow state estimate).
-See module docstring in docs/body_project_spec.md §5.6.
+The IMU publish path was retired when the external BNO085 took over ``body/imu`` (see
+``body/imu_driver.py`` and docs/imu_driver_spec.md). The OAK-D IMU loop here is kept only
+to exercise the DepthAI IMU pipeline during bring-up (log lines over
+``imu_aggregate_interval_s``); nothing is published on Zenoh.
 
 Supports **DepthAI v2** (``dai.node.XLinkOut``) and **v3** (output queues on node outputs;
 no XLink).
@@ -396,8 +395,9 @@ def _run_imu_loop(
             gz = sum(window_gz) / n
             ts = time.time()
             quat = last_quat if oakd_cfg.get("rotation_vector_enabled", True) else None
-            msg = schemas.oakd_imu_report(ts, (ax, ay, az), (gx, gy, gz), quat_wxyz=quat)
-            zenoh_helpers.publish_json(session, "body/oakd/imu", msg)
+            # body/imu is published by body/imu_driver.py (BNO085). OAK-D IMU is retained
+            # here only as a redundant diagnostic log; no Zenoh publish.
+            _ = (ts, ax, ay, az, gx, gy, gz, quat)
             q_str = (
                 f" quat=({quat[0]:.3f},{quat[1]:.3f},{quat[2]:.3f},{quat[3]:.3f})" if quat else ""
             )
@@ -458,7 +458,7 @@ def _run_synthetic_imu_depth_config_loop(
         _process_oakd_config_queue(session, config_pending, rgb_queue, oakd_cfg)
         now = time.monotonic()
         if now >= next_imu:
-            zenoh_helpers.publish_json(session, "body/oakd/imu", schemas.oakd_imu())
+            # body/imu comes from body/imu_driver.py now; no synthetic publish here.
             next_imu += interval_s
         if now >= next_depth:
             if depth_queue is not None:

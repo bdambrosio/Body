@@ -74,7 +74,8 @@ All inter-process communication, both local (Pi-to-Pi) and remote (Pi-to-desktop
 |---|---|---|---|
 | `motor_controller` | MDD10A GPIO, encoder GPIO | `body/odom`, `body/motor_state` | `body/cmd_vel`, `body/cmd_direct`, `body/emergency_stop`, `body/status` |
 | `lidar_driver` | STL-19P USB | `body/lidar/scan` | — |
-| `oakd_driver` | OAK-D-Lite USB | `body/oakd/depth`, `body/oakd/imu`, `body/oakd/rgb` (optional) | `body/oakd/config` (optional) |
+| `oakd_driver` | OAK-D-Lite USB | `body/oakd/depth`, `body/oakd/rgb` (optional) | `body/oakd/config` (optional) |
+| `imu_driver` | BNO085 i2c + RST GPIO | `body/imu` | — |
 | `watchdog` | safety authority | `body/status` | `body/heartbeat`, all `body/*` for monitoring |
 | `launcher` | process lifecycle | — | — |
 
@@ -257,7 +258,7 @@ See `imu_integration_spec.md` for the full contract. Summary:
 - `fusion.mode`: `rotation_vector` (with magnetometer, absolute yaw) or `game_rotation_vector` (no magnetometer, relative yaw — used when motor current contaminates the mag).
 - `fusion.accuracy_rad`: BNO085's per-report accuracy; consumers use this as orientation σ.
 
-The old `body/oakd/imu` topic is deprecated once `body/imu` ships — the OAK-D-Lite on this unit does not expose an IMU (see §1 hardware notes).
+The old `body/oakd/imu` topic is retired — `body/imu` is now the sole IMU source, produced by `body/imu_driver.py` from the BNO085 (see docs/imu_driver_spec.md and §1 hardware notes).
 
 ### 5.7 `body/oakd/depth` (oakd_driver → Jill)
 
@@ -434,7 +435,7 @@ STATUS_PUBLISH_HZ = 1
 MONITORED_TOPICS = [
     "body/odom",
     "body/lidar/scan",
-    "body/oakd/imu"
+    "body/imu"
 ]
 ```
 
@@ -493,7 +494,7 @@ The following assumptions apply to the desktop agent (Jill / CW) and are **out o
 
 3. **Command publication.** Jill publishes `body/cmd_vel` to drive the robot. She is responsible for rate-limiting her own commands sensibly (10–20 Hz is reasonable). She must respect the timeout semantics — if she wants the robot to keep moving, she must keep publishing.
 
-4. **Subscription and interpretation.** Jill subscribes to `body/odom`, `body/lidar/scan`, `body/oakd/imu`, `body/oakd/depth`, `body/status`, and `body/motor_state` as needed. She is responsible for interpreting these in her OODA loop.
+4. **Subscription and interpretation.** Jill subscribes to `body/odom`, `body/lidar/scan`, `body/imu`, `body/oakd/depth`, `body/status`, and `body/motor_state` as needed. She is responsible for interpreting these in her OODA loop.
 
 5. **Coordinate frame.** The robot's coordinate frame is: x-forward, y-left, z-up, angles CCW from x-axis. Odometry origin is the robot's position at boot time. Jill must manage any world-frame transforms on her side.
 

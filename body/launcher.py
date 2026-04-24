@@ -17,6 +17,7 @@ PROCESSES: list[dict[str, Any]] = [
     {"name": "watchdog", "cmd": [sys.executable, "-m", "body.watchdog"]},
     {"name": "motor_controller", "cmd": [sys.executable, "-m", "body.motor_controller"]},
     {"name": "lidar_driver", "cmd": [sys.executable, "-m", "body.lidar_driver"]},
+    {"name": "imu_driver", "cmd": [sys.executable, "-m", "body.imu_driver"]},
     {"name": "oakd_driver", "cmd": [sys.executable, "-m", "body.oakd_driver"]},
     {"name": "local_map", "cmd": [sys.executable, "-m", "body.local_map"]},
 ]

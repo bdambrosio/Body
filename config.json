@@ -35,6 +35,21 @@
     "include_intensities": true,
     "height_above_ground_m": 0.10
   },
+  "imu": {
+    "enabled": true,
+    "i2c_address": 75,
+    "publish_hz": 100,
+    "fusion_mode": "rotation_vector",
+    "fusion_fallback": "game_rotation_vector",
+    "mag_accuracy_fallback_rad": 0.087,
+    "mag_accuracy_fallback_count": 20,
+    "calibration_stable_threshold_rad": 0.175,
+    "game_rotation_vector_accuracy_rad": 0.175,
+    "settle_time_s": 2.0,
+    "linear_accel_enabled": false,
+    "reset_gpio": 25,
+    "gpio_chip": 0
+  },
   "oakd": {
     "depth_resolution": "400p",
     "depth_fps": 10,
@@ -111,7 +126,7 @@
     "monitored_topics": [
       "body/odom",
       "body/lidar/scan",
-      "body/oakd/imu"
+      "body/imu"
     ]
   }
 }
