@@ -851,8 +851,12 @@ class DifferentialPad(QWidget):
         self._ny: float = 0.0
         self._dragging: bool = False
         self.setMinimumSize(240, 240)
+        # Cap horizontal growth so the pad stays roughly square — the
+        # drawn circle is sized to min(w,h), so an Expanding-wide pad
+        # just yields big blank side margins.
+        self.setMaximumWidth(320)
         self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding,
         )
         self.setMouseTracking(False)  # only update while button is down
 
@@ -1101,7 +1105,11 @@ class MotorTestDock(QDockWidget):
 
         # --- differential pad (replaces left/right sliders) ---
         self.pad = DifferentialPad(self._max_wheel)
-        v.addWidget(self.pad, 1)
+        pad_row = QHBoxLayout()
+        pad_row.addStretch(1)
+        pad_row.addWidget(self.pad)
+        pad_row.addStretch(1)
+        v.addLayout(pad_row, 1)
 
         # --- stop ---
         btn_row = QHBoxLayout()

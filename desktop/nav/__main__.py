@@ -11,7 +11,21 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 from typing import Optional
+
+# Support both `python -m desktop.nav` (from Body/) and `python -m nav`
+# (from Body/desktop/, where the .venv lives). The second form puts
+# Body/desktop/ on sys.path but not Body/, so `from desktop.*` would
+# fail. Also make sure desktop/ itself is on sys.path so bare imports
+# like `import vision_service` (used from chassis.ui_qt._VisionWorker)
+# resolve — chassis.__main__ does the same.
+_NAV_DIR = Path(__file__).resolve().parent
+_DESKTOP = _NAV_DIR.parent
+_BODY_ROOT = _DESKTOP.parent
+for _p in (_BODY_ROOT, _DESKTOP):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
