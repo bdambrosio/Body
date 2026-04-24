@@ -18,6 +18,13 @@ Run:
 
 Make sure the robot has room to move or put it on blocks — forward/reverse
 tests command 0.2 m/s for 2 s each by default.
+
+Pass ``--sweep`` to add a per-wheel PWM/velocity sweep at the end. That's a
+low-speed dead-zone characterization (each wheel alone at
+|v| ∈ {0.02…0.20} m/s, fwd and rev). Intended for diagnosing the asymmetric
+stiction that makes low-speed nav uneven. Best run with the robot on blocks
+and ``motor.velocity_loop_enabled = false`` so the integrator can't wind
+up past breakaway.
 """
 
 from __future__ import annotations
@@ -36,6 +43,8 @@ LEFT_RIGHT_BALANCE_FRAC = 0.20
 PID_TRACKING_FRAC = 0.30
 OFF_WHEEL_ABS_VEL_MS = 0.03
 SETTLE_S = 0.5
+SWEEP_BREAKAWAY_EPS_MS = 0.02
+SWEEP_DEFAULT_SPEEDS = (0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20)
 
 
 @dataclass
@@ -363,6 +372,119 @@ def _test_directional(
     return ok
 
 
+def _test_pwm_sweep(
+    collector: Collector,
+    session: Any,
+    status_ref: dict[str, Any],
+    wheel_radius_m: float,
+    ticks_per_rev: int,
+    velocity_loop_enabled: bool,
+    sweep_speeds: tuple[float, ...],
+    dwell_s: float,
+    measure_s: float,
+    rest_s: float,
+) -> bool:
+    """Per-wheel dead-zone / low-speed tracking characterization.
+
+    For each wheel (the other wheel held at 0) and each ``|v_cmd|`` in
+    ``sweep_speeds``, command forward then reverse for ``dwell_s`` seconds each
+    and compute mean measured wheel velocity over the last ``measure_s`` of
+    that window. A ``rest_s`` pause between steps lets the wheels coast to
+    rest so each step starts from static friction.
+
+    Meant to be run with the robot **on blocks** (diagnostic #2 in one go) and
+    with ``motor.velocity_loop_enabled = false`` for a clean open-loop
+    breakaway measurement (diagnostic #1). With the loop enabled the PI
+    integrator winds up past dead-zone, so the reported breakaway under-reads
+    the true open-loop value — the harness warns when that's the case.
+    """
+    loop_note = (
+        "\nWARNING: motor.velocity_loop_enabled = true — PI integrator will\n"
+        "wind up past dead-zone, so reported breakaway under-reads the true\n"
+        "open-loop value. For clean characterization, set\n"
+        "velocity_loop_enabled=false in config.json and restart motor_controller.\n"
+        if velocity_loop_enabled else ""
+    )
+    _prompt(
+        f"TEST 6 — Per-wheel PWM/velocity sweep (dead-zone characterization).\n"
+        f"Drives each wheel alone at |v| ∈ "
+        f"{[f'{v:.2f}' for v in sweep_speeds]} m/s, forward and reverse.\n"
+        f"Each step: {dwell_s:.1f} s drive, {measure_s:.1f} s measurement window,\n"
+        f"{rest_s:.1f} s rest. RECOMMENDED: robot on blocks (wheels free)."
+        + loop_note
+    )
+    if not _wait_estop_clear(session, status_ref, timeout_s=5.0):
+        print("  FAIL — watchdog still latched.")
+        return False
+
+    results: dict[str, dict[str, list[tuple[float, float]]]] = {
+        "left": {"fwd": [], "rev": []},
+        "right": {"fwd": [], "rev": []},
+    }
+
+    def _step(left_cmd: float, right_cmd: float, active_side: str) -> float:
+        t_start = _drive(session, left_cmd, right_cmd, dwell_s)
+        samples = collector.odom_since(t_start)
+        measure_start = t_start + max(0.0, dwell_s - measure_s)
+        vl, vr, _, _ = _per_wheel_mean_velocity(
+            samples, wheel_radius_m, ticks_per_rev, since_ts=measure_start
+        )
+        time.sleep(rest_s)
+        return vl if active_side == "left" else vr
+
+    for side in ("left", "right"):
+        print(f"\n  Sweeping {side} wheel (other wheel idle):", flush=True)
+        print(
+            f"    {'|cmd|':>8}  {'fwd v_meas':>12}  {'rev v_meas':>12}    m/s",
+            flush=True,
+        )
+        for v in sweep_speeds:
+            if side == "left":
+                fwd_v = _step(+v, 0.0, "left")
+                rev_v = _step(-v, 0.0, "left")
+            else:
+                fwd_v = _step(0.0, +v, "right")
+                rev_v = _step(0.0, -v, "right")
+            results[side]["fwd"].append((v, fwd_v))
+            results[side]["rev"].append((v, rev_v))
+            print(f"    {v:>8.3f}  {fwd_v:+12.3f}  {rev_v:+12.3f}", flush=True)
+
+    def _breakaway(pairs: list[tuple[float, float]]) -> float | None:
+        for v_cmd, v_meas in sorted(pairs, key=lambda p: p[0]):
+            if abs(v_meas) >= SWEEP_BREAKAWAY_EPS_MS:
+                return v_cmd
+        return None
+
+    print()
+    print(f"  Breakaway (smallest |v_cmd| where |v_meas| ≥ {SWEEP_BREAKAWAY_EPS_MS} m/s):")
+    breakaways: dict[tuple[str, str], float | None] = {}
+    for side in ("left", "right"):
+        for direction in ("fwd", "rev"):
+            bk = _breakaway(results[side][direction])
+            breakaways[(side, direction)] = bk
+            label = f"{side} {direction}"
+            val = f"{bk:.3f}" if bk is not None else "no movement in sweep range"
+            print(f"    {label:<11} {val}")
+
+    lf = breakaways[("left", "fwd")]
+    rf = breakaways[("right", "fwd")]
+    lr = breakaways[("left", "rev")]
+    rr = breakaways[("right", "rev")]
+    print()
+    if lf is not None and rf is not None:
+        gap_fwd = rf - lf
+        print(f"  fwd L/R breakaway gap:  right − left = {gap_fwd:+.3f} m/s")
+    if lr is not None and rr is not None:
+        gap_rev = rr - lr
+        print(f"  rev L/R breakaway gap:  right − left = {gap_rev:+.3f} m/s")
+    print(
+        "  (informational — no pass/fail. A nonzero gap is the signature of an\n"
+        "   asymmetric dead-zone; feed this into per-side min_drive_pwm tuning.)"
+    )
+    all_moved = all(v is not None for v in breakaways.values())
+    return all_moved
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Motor/encoder/PID acceptance tests (see docs/encoder_integration_spec.md §6).",
@@ -378,7 +500,33 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--skip-reverse", action="store_true")
     ap.add_argument("--skip-left-only", action="store_true")
     ap.add_argument("--skip-right-only", action="store_true")
+    ap.add_argument("--sweep", action="store_true",
+                    help="Run per-wheel PWM/velocity sweep (dead-zone characterization, "
+                         "~60 s). Best with robot on blocks and velocity_loop_enabled=false.")
+    ap.add_argument("--sweep-speeds", type=str, default=None,
+                    help="Comma-separated list of |v_cmd| magnitudes for --sweep, m/s. "
+                         f"Default: {','.join(f'{v:.2f}' for v in SWEEP_DEFAULT_SPEEDS)}")
+    ap.add_argument("--sweep-dwell-s", type=float, default=1.5,
+                    help="Drive duration per sweep step in seconds (default: 1.5).")
+    ap.add_argument("--sweep-measure-s", type=float, default=1.0,
+                    help="Measurement window (tail of dwell) per sweep step (default: 1.0).")
+    ap.add_argument("--sweep-rest-s", type=float, default=0.5,
+                    help="Rest between sweep steps so wheels coast to zero (default: 0.5).")
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.sweep_speeds is not None:
+        try:
+            sweep_speeds = tuple(
+                sorted({float(x) for x in args.sweep_speeds.split(",") if x.strip()})
+            )
+        except ValueError:
+            print(f"FAIL — bad --sweep-speeds {args.sweep_speeds!r}", file=sys.stderr)
+            return 2
+        if not sweep_speeds or any(v <= 0.0 for v in sweep_speeds):
+            print("FAIL — --sweep-speeds must be positive, nonempty.", file=sys.stderr)
+            return 2
+    else:
+        sweep_speeds = SWEEP_DEFAULT_SPEEDS
 
     body_cfg = zenoh_helpers.load_body_config()
     motor_cfg = body_cfg.get("motor", {})
@@ -491,6 +639,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             print("(skipping test 5 per --skip-right-only)")
+        if args.sweep:
+            if max_wheel_vel_ms > 0.0 and max(sweep_speeds) > max_wheel_vel_ms:
+                print(
+                    f"  [note] sweep max {max(sweep_speeds):.3f} exceeds motor.max_wheel_vel_ms "
+                    f"{max_wheel_vel_ms:.3f}; clamping.",
+                    flush=True,
+                )
+                sweep_speeds = tuple(v for v in sweep_speeds if v <= max_wheel_vel_ms)
+            results["6_pwm_sweep"] = _test_pwm_sweep(
+                collector, session, status_ref,
+                wheel_radius_m, ticks_per_rev, velocity_loop_enabled,
+                sweep_speeds,
+                args.sweep_dwell_s, args.sweep_measure_s, args.sweep_rest_s,
+            )
     except KeyboardInterrupt:
         print("\naborted by operator.", file=sys.stderr)
     finally:
