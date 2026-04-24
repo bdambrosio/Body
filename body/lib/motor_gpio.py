@@ -155,29 +155,44 @@ def _require_lgpio() -> Any:
 
 
 class _QuadraturePort:
-    """One motor: GPIO A/B, BOTH_EDGES → signed tick delta (drain in main loop)."""
+    """One motor: GPIO A/B, BOTH_EDGES → signed tick delta (drain in main loop).
+
+    ``_on_edge_cb`` derives the new A/B state from the callback's own
+    ``(gpio, level)`` arguments rather than re-reading the pins. That both
+    removes the two ``gpio_read`` syscalls from the hot path (saving ~10–30 µs
+    per edge on Pi 5) and closes the race where a later edge would fire
+    between the alert firing and us reading the pins — which made the
+    quadrature table see ``00 → 11`` double-transitions and return 0 (no
+    count), collapsing tick counts in zone 2 of the edge-rate latency curve.
+    """
 
     def __init__(self, h: Any, a: int, b: int) -> None:
         self._h = h
         self._a = a
         self._b = b
         self._lock = threading.Lock()
-        self._state = self._read_state_nolock()
+        self._a_level, self._b_level = self._read_levels()
+        self._state = (self._a_level << 1) | self._b_level
         self._delta = 0
         self._edges = 0
         self._initial_state = self._state
 
-    def _read_state_nolock(self) -> int:
+    def _read_levels(self) -> tuple[int, int]:
         lgpio = _require_lgpio()
         a = lgpio.gpio_read(self._h, self._a) & 1
         b = lgpio.gpio_read(self._h, self._b) & 1
-        return (a << 1) | b
+        return a, b
 
     def _on_edge_cb(
-        self, _handle: int, _gpio: int, _level: int, _tick: int
+        self, _handle: int, gpio: int, level: int, _tick: int
     ) -> None:
-        new = self._read_state_nolock()
+        lvl = level & 1
         with self._lock:
+            if gpio == self._a:
+                self._a_level = lvl
+            else:
+                self._b_level = lvl
+            new = (self._a_level << 1) | self._b_level
             self._edges += 1
             idx = (self._state << 2) | new
             d = int(_QUAD_TABLE[idx & 0x0F])
