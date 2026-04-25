@@ -723,6 +723,52 @@ class WorldHeightView(_WorldViewBase):
         return f"0–{self._max_height_m:.1f} m (turbo)"
 
 
+class WorldCostmapView(_WorldViewBase):
+    """Top-down render of the planner's costmap in world frame.
+
+    Inputs are a `Costmap` instance (see `desktop.world_map.costmap`).
+    The view itself owns no costmap construction logic — it only
+    renders. Building the costmap on each redraw tick is the
+    `MainWindow`'s job.
+    """
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        stale_s: float = 2.0,
+        shared: Optional[SharedMapView] = None,
+    ):
+        super().__init__(parent, stale_s=stale_s, shared=shared)
+        self._costmap = None  # Costmap | None
+
+    def update_map(
+        self,
+        costmap,
+        meta: Optional[dict],
+        ts: float,
+        pose: Optional[Tuple[float, float, float]] = None,
+        pose_history: Optional[Sequence[Tuple[float, float, float]]] = None,
+        bounds_ij: Optional[Tuple[int, int, int, int]] = None,
+    ) -> None:
+        self._costmap = costmap
+        self.update_inputs(
+            meta=meta, ts=ts, pose=pose,
+            pose_history=pose_history, bounds_ij=bounds_ij,
+        )
+
+    def _grid_to_rgb(self) -> Optional[np.ndarray]:
+        if self._costmap is None:
+            return None
+        # Lazy-import to avoid a hard module dep if costmap.py is
+        # ever swapped out at runtime.
+        from .costmap import costmap_to_rgb
+        return costmap_to_rgb(self._costmap)
+
+    def _legend_text(self) -> str:
+        return "lethal / halo / unknown / clear"
+
+
 class WorldDriveableView(_WorldViewBase):
     """Top-down render of the driveable layer in world frame."""
 

@@ -24,8 +24,9 @@ from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
 from desktop.world_map.config import FuserConfig
 from desktop.world_map.controller import FuserController
+from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
-    SharedMapView, WorldDriveableView, WorldHeightView,
+    SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
 )
 
 from .camera_panels import CameraPanels, build_camera_snapshot
@@ -132,8 +133,16 @@ class NavMainWindow(QMainWindow):
             stale_s=self.fuser_config.map_stale_s,
             shared=self._shared_view,
         )
+        self._costmap_view = WorldCostmapView(
+            stale_s=self.fuser_config.map_stale_s,
+            shared=self._shared_view,
+        )
         maps.addWidget(self._height_view, stretch=1)
         maps.addWidget(self._drive_view, stretch=1)
+        maps.addWidget(self._costmap_view, stretch=1)
+        self._costmap_config = CostmapConfig(
+            footprint_radius_m=self.fuser_config.footprint_radius_m,
+        )
         self._left_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
@@ -268,12 +277,25 @@ class NavMainWindow(QMainWindow):
                 snap["driveable"], snap["meta"], ts, pose=pose,
                 pose_history=trail, bounds_ij=snap.get("bounds_ij"),
             )
+            try:
+                cm = build_costmap(snap, self._costmap_config)
+            except Exception:
+                logger.exception("costmap build failed; skipping panel update")
+                cm = None
+            self._costmap_view.update_map(
+                cm, snap["meta"], ts, pose=pose,
+                pose_history=trail, bounds_ij=snap.get("bounds_ij"),
+            )
         else:
             self._height_view.update_map(
                 None, None, 0.0, pose=pose,
                 pose_history=trail, bounds_ij=None,
             )
             self._drive_view.update_map(
+                None, None, 0.0, pose=pose,
+                pose_history=trail, bounds_ij=None,
+            )
+            self._costmap_view.update_map(
                 None, None, 0.0, pose=pose,
                 pose_history=trail, bounds_ij=None,
             )
