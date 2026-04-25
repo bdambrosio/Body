@@ -324,6 +324,7 @@ def main() -> None:
 
     start_mono = time.monotonic()
     settled = False
+    publish_unsettled = False
     last_settle_log = 0.0
     fallback_count = 0
     fallback_done = False
@@ -335,6 +336,12 @@ def main() -> None:
                 while True:
                     action = cal_actions.get_nowait()
                     _run_cal_action(bno, action)
+                    if action == "start" and not publish_unsettled:
+                        publish_unsettled = True
+                        print(
+                            "imu_driver: publishing unsettled body/imu during calibration.",
+                            flush=True,
+                        )
             except queue.Empty:
                 pass
 
@@ -414,7 +421,7 @@ def main() -> None:
             else:
                 fallback_count = 0
 
-            if settled:
+            if settled or publish_unsettled:
                 ax, ay, az = (float(accel[0]), float(accel[1]), float(accel[2]))
                 gx, gy, gz = (float(gyro[0]), float(gyro[1]), float(gyro[2]))
                 i, j, k, real = quat
