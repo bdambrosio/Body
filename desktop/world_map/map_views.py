@@ -73,6 +73,9 @@ class SharedMapView:
         self._goal_world: Optional[Tuple[float, float]] = None
         self._planned_path_world: List[Tuple[float, float]] = []
         self._goal_callback: Optional[Callable[[float, float], None]] = None
+        # Follower visualization: the pure-pursuit lookahead point
+        # (None when no follower is active).
+        self._lookahead_world: Optional[Tuple[float, float]] = None
 
     # ── Subscriptions ───────────────────────────────────────────────
 
@@ -162,6 +165,15 @@ class SharedMapView:
     def request_goal(self, x_w: float, y_w: float) -> None:
         if self._goal_callback is not None:
             self._goal_callback(x_w, y_w)
+
+    def lookahead(self) -> Optional[Tuple[float, float]]:
+        return self._lookahead_world
+
+    def set_lookahead(self, xy: Optional[Tuple[float, float]]) -> None:
+        self._lookahead_world = (
+            (float(xy[0]), float(xy[1])) if xy is not None else None
+        )
+        self._notify()
 
 
 class _WorldViewBase(QWidget):
@@ -419,6 +431,10 @@ class _WorldViewBase(QWidget):
             # attention focus during nav).
             self._draw_goal_pin(p, ox, oy, side_px)
 
+            # Pure-pursuit lookahead (above goal pin so it stays
+            # visible even if it lands close to the goal).
+            self._draw_lookahead(p, ox, oy, side_px)
+
             # Stale dimming overlay.
             age = time.time() - self._ts if self._ts > 0 else 0.0
             if age > self._stale_s:
@@ -586,6 +602,29 @@ class _WorldViewBase(QWidget):
         p.setPen(QPen(QColor(80, 200, 255, 220), 2.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+        p.restore()
+
+    def _draw_lookahead(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+    ) -> None:
+        la = self._shared.lookahead()
+        if la is None or self._pose is None:
+            return
+        rx_la, ry_la = self._world_to_widget(la[0], la[1])
+        rx_p, ry_p = self._world_to_widget(self._pose[0], self._pose[1])
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        # Thin "aim" line from robot to lookahead, dashed magenta so
+        # it reads as "follower target" not "planned path."
+        aim_pen = QPen(QColor(220, 110, 220, 200), 1.2,
+                       Qt.PenStyle.DashLine)
+        p.setPen(aim_pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(rx_p, ry_p), QPointF(rx_la, ry_la))
+        # Solid dot at the lookahead.
+        p.setPen(QPen(QColor(220, 110, 220, 230), 1))
+        p.setBrush(QColor(220, 110, 220, 200))
+        p.drawEllipse(QPointF(rx_la, ry_la), 4.0, 4.0)
         p.restore()
 
     def _draw_goal_pin(

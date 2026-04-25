@@ -29,6 +29,10 @@ from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
 )
+from .follower import (
+    Follower, FollowerConfig, FollowerOutput,
+    STATUS_ARRIVED, STATUS_FOLLOWING, STATUS_NO_PATH, STATUS_ROTATING,
+)
 from .planner import AStarConfig, PlanResult, plan_path
 
 from .camera_panels import CameraPanels, build_camera_snapshot
@@ -157,6 +161,11 @@ class NavMainWindow(QMainWindow):
         self._last_plan: Optional[PlanResult] = None
         self._last_costmap = None  # cached for replanning when goal changes
         self._shared_view.set_goal_callback(self._on_goal_requested)
+        # Stage 4: pure-pursuit follower runs in dry-run mode — its
+        # output is rendered on the map but NOT published to chassis.
+        # Stage 5 will wire it to the heartbeat-and-cmd_vel publisher.
+        self._follower = Follower(FollowerConfig())
+        self._last_follower: Optional[FollowerOutput] = None
         self._left_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
@@ -187,6 +196,7 @@ class NavMainWindow(QMainWindow):
         self._cells_lbl = QLabel("cells: —")
         self._slam_lbl = QLabel("slam: —")
         self._plan_lbl = QLabel("plan: —")
+        self._follow_lbl = QLabel("follow: —")
         self._session_lbl = QLabel("session: —")
         self._chassis_lbl = QLabel("chassis: —")
         self._notes_lbl = QLabel("")
@@ -197,6 +207,7 @@ class NavMainWindow(QMainWindow):
         small.setPointSize(max(7, small.pointSize() - 1))
         for w in (self._pose_lbl, self._rates_lbl,
                   self._cells_lbl, self._slam_lbl, self._plan_lbl,
+                  self._follow_lbl,
                   self._session_lbl, self._chassis_lbl):
             w.setStyleSheet("color: #ccc;")
             w.setFont(small)
@@ -321,6 +332,14 @@ class NavMainWindow(QMainWindow):
                 pose_history=trail, bounds_ij=None,
             )
 
+        # Run the follower in dry-run mode whenever a path exists
+        # and we have a live pose. Output is *not* published to
+        # chassis — Stage 5 wires that.
+        path = self._shared_view.planned_path()
+        out = self._follower.update(path, pose)
+        self._last_follower = out
+        self._shared_view.set_lookahead(out.lookahead_world)
+
         st = self.fuser.status_summary()
         if pose is not None:
             self._pose_lbl.setText(
@@ -388,6 +407,32 @@ class NavMainWindow(QMainWindow):
             else:
                 self._plan_lbl.setText(f"plan: {plan.msg}")
                 self._plan_lbl.setStyleSheet("color: #e8a;")
+
+        # Follower (dry-run): cmd_vel that *would* be published, plus
+        # status. Color cue: green when arrived, blue when following,
+        # amber while rotating in place, gray idle.
+        f = self._last_follower
+        if f is None or f.status == STATUS_NO_PATH:
+            self._follow_lbl.setText("follow: —")
+            self._follow_lbl.setStyleSheet("color: #ccc;")
+        elif f.status == STATUS_ARRIVED:
+            self._follow_lbl.setText(
+                f"follow: ARRIVED  goal={f.distance_to_goal_m:.2f} m"
+            )
+            self._follow_lbl.setStyleSheet("color: #8f8;")
+        elif f.status == STATUS_ROTATING:
+            self._follow_lbl.setText(
+                f"follow: ROT  ω={f.omega_radps:+.2f}  "
+                f"α={math.degrees(f.heading_error_rad):+.0f}°  "
+                f"goal={f.distance_to_goal_m:.2f} m  (dry)"
+            )
+            self._follow_lbl.setStyleSheet("color: #ec8;")
+        else:  # FOLLOWING
+            self._follow_lbl.setText(
+                f"follow: v={f.v_mps:.2f} ω={f.omega_radps:+.2f}  "
+                f"goal={f.distance_to_goal_m:.2f} m  (dry)"
+            )
+            self._follow_lbl.setStyleSheet("color: #8cf;")
 
         self._session_lbl.setText(
             f"session: {st['session_id'][:8]}  ({st['pose_source']})"
