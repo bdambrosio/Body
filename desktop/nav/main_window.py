@@ -35,6 +35,7 @@ from .follower import (
 )
 from .mission import Mission, MissionState
 from .planner import AStarConfig, PlanResult, plan_path
+from .safety import SafetyConfig, forward_arc_blocked
 
 from .camera_panels import CameraPanels, build_camera_snapshot
 from .safety_toolbar import SafetyToolbar
@@ -186,6 +187,11 @@ class NavMainWindow(QMainWindow):
         self._follower = Follower(FollowerConfig())
         self._last_follower: Optional[FollowerOutput] = None
         self._mission = Mission()
+        # Stage 5b: forward-arc lethal-cell check overrides cmd_vel
+        # to zero when an obstacle appears between replans. Mission
+        # stays FOLLOWING so we resume when the arc clears.
+        self._safety_config = SafetyConfig()
+        self._safety_blocked: bool = False
         self._left_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
@@ -370,18 +376,37 @@ class NavMainWindow(QMainWindow):
             if not connected:
                 self.chassis.set_cmd_vel(0.0, 0.0)
                 self._mission.fail("chassis disconnect")
+                self._safety_blocked = False
             elif not live:
                 self.chassis.set_cmd_vel(0.0, 0.0)
                 self._mission.fail("Live cmd dropped")
+                self._safety_blocked = False
             elif out.status == STATUS_ARRIVED:
                 self.chassis.set_cmd_vel(0.0, 0.0)
                 self._mission.arrive()
+                self._safety_blocked = False
             elif out.status == STATUS_NO_PATH:
                 self.chassis.set_cmd_vel(0.0, 0.0)
                 self._mission.fail("path lost")
+                self._safety_blocked = False
             else:
-                # FOLLOWING or ROTATING — drive.
-                self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
+                # FOLLOWING or ROTATING — but first, check the
+                # forward arc for any lethal cell that appeared
+                # since the last replan. Override to zero if so.
+                self._safety_blocked = (
+                    self._last_costmap is not None
+                    and forward_arc_blocked(
+                        self._last_costmap, pose, self._safety_config,
+                    )
+                )
+                if self._safety_blocked:
+                    self.chassis.set_cmd_vel(0.0, 0.0)
+                else:
+                    self.chassis.set_cmd_vel(
+                        out.v_mps, out.omega_radps,
+                    )
+        else:
+            self._safety_blocked = False
 
         st = self.fuser.status_summary()
         if pose is not None:
@@ -477,6 +502,14 @@ class NavMainWindow(QMainWindow):
         elif f is None or f.status == STATUS_NO_PATH:
             self._follow_lbl.setText("follow: —")
             self._follow_lbl.setStyleSheet("color: #ccc;")
+        elif active and self._safety_blocked:
+            # Forward-arc lethal cell — driving is overridden to zero
+            # for this tick, mission stays FOLLOWING, will resume
+            # when the arc clears.
+            self._follow_lbl.setText(
+                f"follow: GO  BLOCKED ahead  goal={f.distance_to_goal_m:.2f} m"
+            )
+            self._follow_lbl.setStyleSheet("color: #e8a;")
         elif f.status == STATUS_ROTATING:
             self._follow_lbl.setText(
                 f"follow: {'GO' if active else 'dry'} ROT  "

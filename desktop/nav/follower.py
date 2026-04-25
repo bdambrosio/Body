@@ -40,6 +40,16 @@ class FollowerConfig:
     v_max: float = 0.20            # m/s — conservative for first nav
     omega_max: float = 0.60        # rad/s
 
+    # PWM deadzone workaround: below this commanded speed the
+    # differential-drive motors stutter rather than spin smoothly.
+    # If the slowdown ramp would request 0 < v < v_min, we snap up
+    # to v_min so the robot keeps moving smoothly until it hits the
+    # arrival tolerance, where v=0 takes effect cleanly. v_target=0
+    # is unaffected. Once Pi-side PWM feedforward lands (see
+    # docs/motor_controller_spec.md / project memory), v_min can
+    # safely drop back to 0.
+    v_min_mps: float = 0.08
+
     # Acceleration caps — applied symmetrically to both directions of
     # change so the robot doesn't pop a wheelie on start and doesn't
     # snap to zero on a rotate-in-place transition. Tuned for an
@@ -199,6 +209,12 @@ class Follower:
         if abs(curvature) > 1e-3:
             v_for_omega_cap = cfg.omega_max / abs(curvature)
             v_target = min(v_target, v_for_omega_cap)
+
+        # Snap small forward commands up out of the motor deadzone.
+        # Only applies while we're still FOLLOWING; the v=0 / ARRIVED
+        # path is reached separately via _stop_output().
+        if 0.0 < v_target < cfg.v_min_mps:
+            v_target = cfg.v_min_mps
 
         v, omega = self._rate_limit(v_target, omega_target, dt)
         return FollowerOutput(
