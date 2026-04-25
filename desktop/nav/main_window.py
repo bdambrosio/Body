@@ -33,6 +33,7 @@ from .follower import (
     Follower, FollowerConfig, FollowerOutput,
     STATUS_ARRIVED, STATUS_FOLLOWING, STATUS_NO_PATH, STATUS_ROTATING,
 )
+from .mission import Mission, MissionState
 from .planner import AStarConfig, PlanResult, plan_path
 
 from .camera_panels import CameraPanels, build_camera_snapshot
@@ -112,6 +113,22 @@ class NavMainWindow(QMainWindow):
         clear_goal_act.triggered.connect(self._on_clear_goal)
         self._map_toolbar.addAction(clear_goal_act)
 
+        self._go_act = QAction("Go", self)
+        self._go_act.setToolTip(
+            "Begin autonomous follow of the planned path. "
+            "Requires Live cmd ON and a successful plan."
+        )
+        self._go_act.triggered.connect(self._on_go)
+        self._map_toolbar.addAction(self._go_act)
+
+        self._cancel_act = QAction("Stop", self)
+        self._cancel_act.setToolTip(
+            "Halt the autonomous follow and zero cmd_vel. "
+            "Live cmd remains on so manual driving stays available."
+        )
+        self._cancel_act.triggered.connect(self._on_cancel)
+        self._map_toolbar.addAction(self._cancel_act)
+
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._map_toolbar)
 
@@ -161,11 +178,14 @@ class NavMainWindow(QMainWindow):
         self._last_plan: Optional[PlanResult] = None
         self._last_costmap = None  # cached for replanning when goal changes
         self._shared_view.set_goal_callback(self._on_goal_requested)
-        # Stage 4: pure-pursuit follower runs in dry-run mode — its
-        # output is rendered on the map but NOT published to chassis.
-        # Stage 5 will wire it to the heartbeat-and-cmd_vel publisher.
+        # Stage 4: pure-pursuit follower computes the cmd_vel that
+        # *would* be published. Stage 5: when self._mission is in
+        # FOLLOWING, the redraw tick pushes the follower output to
+        # chassis.set_cmd_vel() and lets chassis publish it through
+        # its existing 5 Hz publisher.
         self._follower = Follower(FollowerConfig())
         self._last_follower: Optional[FollowerOutput] = None
+        self._mission = Mission()
         self._left_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
@@ -332,13 +352,36 @@ class NavMainWindow(QMainWindow):
                 pose_history=trail, bounds_ij=None,
             )
 
-        # Run the follower in dry-run mode whenever a path exists
-        # and we have a live pose. Output is *not* published to
-        # chassis — Stage 5 wires that.
+        # Run the follower whenever a path exists and we have a
+        # live pose. The output renders on the map either way; in
+        # FOLLOWING state it also drives the chassis.
         path = self._shared_view.planned_path()
         out = self._follower.update(path, pose)
         self._last_follower = out
         self._shared_view.set_lookahead(out.lookahead_world)
+
+        if self._mission.is_active():
+            # Sanity gates: chassis must still be live for cmd_vel to
+            # actually publish. Failing fast here surfaces the cause
+            # in the strip instead of silently driving nothing.
+            with self.chassis.state.lock:
+                connected = self.chassis.state.connected
+                live = self.chassis.state.live_command
+            if not connected:
+                self.chassis.set_cmd_vel(0.0, 0.0)
+                self._mission.fail("chassis disconnect")
+            elif not live:
+                self.chassis.set_cmd_vel(0.0, 0.0)
+                self._mission.fail("Live cmd dropped")
+            elif out.status == STATUS_ARRIVED:
+                self.chassis.set_cmd_vel(0.0, 0.0)
+                self._mission.arrive()
+            elif out.status == STATUS_NO_PATH:
+                self.chassis.set_cmd_vel(0.0, 0.0)
+                self._mission.fail("path lost")
+            else:
+                # FOLLOWING or ROTATING — drive.
+                self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
 
         st = self.fuser.status_summary()
         if pose is not None:
@@ -408,31 +451,55 @@ class NavMainWindow(QMainWindow):
                 self._plan_lbl.setText(f"plan: {plan.msg}")
                 self._plan_lbl.setStyleSheet("color: #e8a;")
 
-        # Follower (dry-run): cmd_vel that *would* be published, plus
-        # status. Color cue: green when arrived, blue when following,
-        # amber while rotating in place, gray idle.
+        # Follow / mission status. Mission state is the *high-level*
+        # flag; follower output describes what the controller is
+        # currently producing. Mission terminal states (ARRIVED /
+        # CANCELED / FAILED) override the follower's own label.
         f = self._last_follower
-        if f is None or f.status == STATUS_NO_PATH:
-            self._follow_lbl.setText("follow: —")
-            self._follow_lbl.setStyleSheet("color: #ccc;")
-        elif f.status == STATUS_ARRIVED:
+        ms = self._mission.state
+        active = self._mission.is_active()
+        suffix = "" if active else "  (dry)"
+
+        if ms == MissionState.ARRIVED:
             self._follow_lbl.setText(
                 f"follow: ARRIVED  goal={f.distance_to_goal_m:.2f} m"
+                if f is not None else "follow: ARRIVED"
             )
             self._follow_lbl.setStyleSheet("color: #8f8;")
+        elif ms == MissionState.CANCELED:
+            self._follow_lbl.setText("follow: canceled")
+            self._follow_lbl.setStyleSheet("color: #cc8;")
+        elif ms == MissionState.FAILED:
+            self._follow_lbl.setText(
+                f"follow: failed: {self._mission.failure_reason}"
+            )
+            self._follow_lbl.setStyleSheet("color: #e8a;")
+        elif f is None or f.status == STATUS_NO_PATH:
+            self._follow_lbl.setText("follow: —")
+            self._follow_lbl.setStyleSheet("color: #ccc;")
         elif f.status == STATUS_ROTATING:
             self._follow_lbl.setText(
-                f"follow: ROT  ω={f.omega_radps:+.2f}  "
+                f"follow: {'GO' if active else 'dry'} ROT  "
+                f"ω={f.omega_radps:+.2f}  "
                 f"α={math.degrees(f.heading_error_rad):+.0f}°  "
-                f"goal={f.distance_to_goal_m:.2f} m  (dry)"
+                f"goal={f.distance_to_goal_m:.2f} m{suffix}"
             )
             self._follow_lbl.setStyleSheet("color: #ec8;")
-        else:  # FOLLOWING
+        else:  # FOLLOWING (follower's view)
+            tag = "GO" if active else "dry"
             self._follow_lbl.setText(
-                f"follow: v={f.v_mps:.2f} ω={f.omega_radps:+.2f}  "
-                f"goal={f.distance_to_goal_m:.2f} m  (dry)"
+                f"follow: {tag}  v={f.v_mps:.2f} ω={f.omega_radps:+.2f}  "
+                f"goal={f.distance_to_goal_m:.2f} m{suffix}"
             )
-            self._follow_lbl.setStyleSheet("color: #8cf;")
+            self._follow_lbl.setStyleSheet(
+                "color: #8f8;" if active else "color: #8cf;"
+            )
+
+        # Enable/disable Go and Stop based on mission state. Both
+        # buttons stay clickable when their action is meaningful;
+        # disabled with a tooltip otherwise.
+        self._go_act.setEnabled(self._mission.can_start())
+        self._cancel_act.setEnabled(self._mission.can_cancel())
 
         self._session_lbl.setText(
             f"session: {st['session_id'][:8]}  ({st['pose_source']})"
@@ -493,8 +560,49 @@ class NavMainWindow(QMainWindow):
             self._shared_view.set_planned_path([])
 
     def _on_clear_goal(self) -> None:
+        # Cancel any active mission first so we don't keep driving
+        # toward a goal the operator just cleared.
+        if self._mission.is_active():
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.cancel()
+        self._mission.reset()
         self._shared_view.set_goal(None)
         self._last_plan = None
+
+    def _on_go(self) -> None:
+        """Validate preconditions and transition the mission to
+        FOLLOWING. Each subsequent redraw tick pushes the follower's
+        cmd_vel to chassis until ARRIVED, CANCELED, or FAILED."""
+        if not self._mission.can_start():
+            return  # already FOLLOWING — nothing to do
+        plan = self._last_plan
+        if plan is None or not plan.ok:
+            self._mission.fail("no plan — drop a goal pin first")
+            return
+        latest = self.fuser.pose_source.latest_pose()
+        if latest is None:
+            self._mission.fail("no pose — wait for odom before starting")
+            return
+        with self.chassis.state.lock:
+            connected = self.chassis.state.connected
+            live = self.chassis.state.live_command
+        if not connected:
+            self._mission.fail("chassis disconnected")
+            return
+        if not live:
+            self._mission.fail(
+                "Live cmd is OFF — enable it on the safety toolbar first"
+            )
+            return
+        self._mission.start()
+
+    def _on_cancel(self) -> None:
+        """Operator-initiated stop. Zero cmd_vel and transition to
+        CANCELED. Live cmd is left ON so the operator can drive
+        manually without a second click."""
+        if self._mission.is_active():
+            self.chassis.set_cmd_vel(0.0, 0.0)
+        self._mission.cancel()
 
     # ── Toolbar handlers ─────────────────────────────────────────────
 
