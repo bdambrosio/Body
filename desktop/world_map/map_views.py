@@ -455,7 +455,12 @@ class _WorldViewBase(QWidget):
             # View HUD: scale + zoom indicator (only when zoomed).
             self._draw_view_hud(p, ox, oy, side_px, side_world)
         finally:
-            self._paint_geom = None
+            # Don't clear _paint_geom here — mouse handlers (right-
+            # click, drag-pan, wheel-zoom) read it between paints to
+            # convert widget coords to world coords. The next paint
+            # overwrites it. Stale geometry across a window resize is
+            # corrected on the next 5 Hz redraw tick, well before the
+            # operator's next click.
             p.end()
 
     def _draw_grid(
