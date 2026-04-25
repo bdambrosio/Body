@@ -6,7 +6,11 @@ extended in place with:
   - in-widget zoom + pan: wheel zooms anchored at cursor, middle/right-
     drag pans, double-click resets to auto-fit;
   - pose trail overlay: polyline of recent poses, transformed under the
-    same view as the grid image.
+    same view as the grid image;
+  - shared view state (SharedMapView): pan/zoom on any panel moves all
+    panels that subscribe to the same shared instance, so height,
+    driveable, and (later) costmap stay aligned;
+  - 1 m grid overlay + range rings (1/2/5 m) around the robot pose.
 
 If a third consumer ever appears, promote the shared base class to
 desktop/shared/widgets/.
@@ -15,7 +19,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, Qt
@@ -40,6 +44,83 @@ def _turbo_rgb(x: np.ndarray) -> np.ndarray:
 # (Matches the original WorldHeightView convention.)
 
 
+class SharedMapView:
+    """View state shared across one or more map panels.
+
+    Holding the view rect (pan + zoom) plus the grid/ring toggles
+    centrally means that wheel-zooming or drag-panning any panel
+    moves all attached panels in lockstep. Each subscribed view
+    delegates its rect-mutating operations here and reads the
+    current rect on each paint.
+
+    Drag-tracking state stays local to the view that received the
+    mouse-press: only one view is dragged at a time, but the
+    *result* of the drag (the new rect) is broadcast.
+    """
+
+    AUTO_MARGIN_CELLS = 4
+    MIN_VIEW_SIDE_M = 0.4   # ~5 cells at 0.08 m/cell
+    MAX_VIEW_SIDE_M = 80.0  # 2× the world extent
+
+    def __init__(self) -> None:
+        self._view_rect: Optional[Tuple[float, float, float, float]] = None
+        self._show_grid: bool = True
+        self._show_range_rings: bool = True
+        self._views: List["_WorldViewBase"] = []
+
+    # ── Subscriptions ───────────────────────────────────────────────
+
+    def attach(self, view: "_WorldViewBase") -> None:
+        if view not in self._views:
+            self._views.append(view)
+
+    def detach(self, view: "_WorldViewBase") -> None:
+        if view in self._views:
+            self._views.remove(view)
+
+    def _notify(self) -> None:
+        for v in self._views:
+            v.update()
+
+    # ── View rect ───────────────────────────────────────────────────
+
+    def view_rect(self) -> Optional[Tuple[float, float, float, float]]:
+        """Current manually-set rect, or None for auto-fit."""
+        return self._view_rect
+
+    def is_auto_fit(self) -> bool:
+        return self._view_rect is None
+
+    def reset_view(self) -> None:
+        self._view_rect = None
+        self._notify()
+
+    def set_view_rect(self, rect: Tuple[float, float, float, float]) -> None:
+        cx = 0.5 * (rect[0] + rect[1])
+        cy = 0.5 * (rect[2] + rect[3])
+        side = max(rect[1] - rect[0], self.MIN_VIEW_SIDE_M)
+        side = min(side, self.MAX_VIEW_SIDE_M)
+        self._view_rect = (cx - side / 2, cx + side / 2,
+                           cy - side / 2, cy + side / 2)
+        self._notify()
+
+    # ── Overlay toggles ─────────────────────────────────────────────
+
+    def show_grid(self) -> bool:
+        return self._show_grid
+
+    def set_show_grid(self, on: bool) -> None:
+        self._show_grid = bool(on)
+        self._notify()
+
+    def show_range_rings(self) -> bool:
+        return self._show_range_rings
+
+    def set_show_range_rings(self, on: bool) -> None:
+        self._show_range_rings = bool(on)
+        self._notify()
+
+
 class _WorldViewBase(QWidget):
     """Shared transform / zoom / pan / overlay logic for world-frame
     map widgets. Subclasses provide grid colorization via _grid_to_rgb.
@@ -52,12 +133,18 @@ class _WorldViewBase(QWidget):
     where vcx, vcy = view-rect center, px_per_m = side_px / side_world.
     """
 
-    AUTO_MARGIN_CELLS = 4
-    MIN_VIEW_SIDE_M = 0.4   # ~5 cells at 0.08 m/cell
-    MAX_VIEW_SIDE_M = 80.0  # 2× the world extent
+    AUTO_MARGIN_CELLS = SharedMapView.AUTO_MARGIN_CELLS
+    MIN_VIEW_SIDE_M = SharedMapView.MIN_VIEW_SIDE_M
+    MAX_VIEW_SIDE_M = SharedMapView.MAX_VIEW_SIDE_M
     MARGIN_PX = 6
 
-    def __init__(self, parent: Optional[QWidget] = None, *, stale_s: float = 2.0):
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        stale_s: float = 2.0,
+        shared: Optional[SharedMapView] = None,
+    ):
         super().__init__(parent)
         self.setMinimumSize(160, 160)
         self.setSizePolicy(
@@ -71,8 +158,13 @@ class _WorldViewBase(QWidget):
         self._pose_history: list[Tuple[float, float, float]] = []
         self._bounds_ij: Optional[Tuple[int, int, int, int]] = None
 
-        # View state. _view_rect is None ⇒ auto-fit.
-        self._view_rect: Optional[Tuple[float, float, float, float]] = None
+        # Shared view state (pan/zoom + overlay toggles). Default to a
+        # private instance so single-view callers continue to work.
+        self._shared: SharedMapView = shared if shared is not None else SharedMapView()
+        self._shared.attach(self)
+
+        # Drag tracking is local — only the view that captured the
+        # mouse-press updates the shared rect on subsequent moves.
         self._dragging = False
         self._drag_anchor_widget: Optional[QPointF] = None
         self._drag_anchor_view_center: Optional[Tuple[float, float]] = None
@@ -134,26 +226,23 @@ class _WorldViewBase(QWidget):
                 cy - side / 2, cy + side / 2)
 
     def _effective_view_rect(self, meta: dict) -> Tuple[float, float, float, float]:
-        if self._view_rect is not None:
-            return self._view_rect
+        manual = self._shared.view_rect()
+        if manual is not None:
+            return manual
         return self._auto_view_rect(meta)
 
     def _set_view_rect(self, rect: Tuple[float, float, float, float]) -> None:
-        # Clamp side to sane limits.
-        cx = 0.5 * (rect[0] + rect[1])
-        cy = 0.5 * (rect[2] + rect[3])
-        side = max(rect[1] - rect[0], self.MIN_VIEW_SIDE_M)
-        side = min(side, self.MAX_VIEW_SIDE_M)
-        self._view_rect = (cx - side / 2, cx + side / 2,
-                           cy - side / 2, cy + side / 2)
+        # Delegated to the shared view so all attached panels move
+        # together. Clamping is enforced by the shared.
+        self._shared.set_view_rect(rect)
 
     def reset_view(self) -> None:
-        """Drop manual zoom/pan; resume auto-fit."""
-        self._view_rect = None
-        self.update()
+        """Drop manual zoom/pan; resume auto-fit. Affects all panels
+        sharing the same view state."""
+        self._shared.reset_view()
 
     def is_auto_fit(self) -> bool:
-        return self._view_rect is None
+        return self._shared.is_auto_fit()
 
     # ── Transform helpers (paint-time geometry must be set) ──────────
 
@@ -255,6 +344,14 @@ class _WorldViewBase(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(ox, oy, side_px, side_px)
 
+            # Grid + range rings (subtle, sit between map image and
+            # markers so they're visible against both the map and the
+            # bare background outside it).
+            if self._shared.show_grid():
+                self._draw_grid(p, ox, oy, side_px, side_world)
+            if self._shared.show_range_rings() and self._pose is not None:
+                self._draw_range_rings(p, ox, oy, side_px, side_world)
+
             # Pose trail (under markers).
             self._draw_pose_trail(p, ox, oy, side_px)
 
@@ -294,6 +391,107 @@ class _WorldViewBase(QWidget):
         finally:
             self._paint_geom = None
             p.end()
+
+    def _draw_grid(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+        side_world: float,
+    ) -> None:
+        """Draw a 1 m world-aligned grid (origin at world (0, 0)).
+        Spacing scales with view side so the line density stays sane.
+        """
+        step = self._pick_grid_step_m(side_world)
+        if step <= 0.0:
+            return
+        # World extents currently visible. Snap start/end outward to
+        # the nearest grid line so we don't miss a stripe at the edge.
+        g = self._paint_geom
+        if g is None:
+            return
+        _cwx, _cwy, _side, _ppm, (vx0, vx1, vy0, vy1) = g
+
+        x_first = math.floor(vx0 / step) * step
+        x_last = math.ceil(vx1 / step) * step
+        y_first = math.floor(vy0 / step) * step
+        y_last = math.ceil(vy1 / step) * step
+
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        # World-axis lines (x=0, y=0) get a slightly stronger stroke
+        # to anchor the operator's mental model. The anchor marker
+        # sits at their intersection.
+        thin_pen = QPen(QColor(255, 255, 255, 50), 1)
+        thick_pen = QPen(QColor(255, 255, 255, 90), 1)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Vertical-in-display lines = constant world-y. World +y goes
+        # widget-left, so each y-line stretches top-to-bottom of the
+        # draw rect at x_widget = world_to_widget(_, y_w).x.
+        n_steps_x = int(round((x_last - x_first) / step))
+        n_steps_y = int(round((y_last - y_first) / step))
+        for k in range(n_steps_y + 1):
+            y_w = y_first + k * step
+            rx_top, _ = self._world_to_widget(vx1, y_w)
+            rx_bot, _ = self._world_to_widget(vx0, y_w)
+            p.setPen(thick_pen if abs(y_w) < step * 0.01 else thin_pen)
+            p.drawLine(QPointF(rx_top, oy), QPointF(rx_bot, oy + side_px))
+        # Horizontal-in-display lines = constant world-x. World +x
+        # goes widget-up.
+        for k in range(n_steps_x + 1):
+            x_w = x_first + k * step
+            _, ry_left = self._world_to_widget(x_w, vy1)
+            _, ry_right = self._world_to_widget(x_w, vy0)
+            p.setPen(thick_pen if abs(x_w) < step * 0.01 else thin_pen)
+            p.drawLine(QPointF(ox, ry_left), QPointF(ox + side_px, ry_right))
+        p.restore()
+
+    @staticmethod
+    def _pick_grid_step_m(side_world: float) -> float:
+        """Choose 1/2/5 × 10ⁿ such that the visible square shows
+        roughly 5–10 grid stripes per side."""
+        if side_world <= 0:
+            return 0.0
+        target = side_world / 8.0
+        e = math.floor(math.log10(max(target, 1e-3)))
+        base = 10.0 ** e
+        for k in (1.0, 2.0, 5.0, 10.0):
+            if k * base >= target:
+                return k * base
+        return 10.0 * base
+
+    def _draw_range_rings(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+        side_world: float,
+    ) -> None:
+        """Draw 1, 2, 5 m range rings centered on the current robot
+        pose, with a small label on each. Only the rings that fall
+        within the visible square are useful — but cheap to draw all
+        three since QPainter clips, and they're informative even when
+        partially out of view."""
+        if self._pose is None:
+            return
+        x_w, y_w, _theta = self._pose
+        cx, cy = self._world_to_widget(x_w, y_w)
+        ppm = side_px / max(side_world, 1e-6)
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for r_m in (1.0, 2.0, 5.0):
+            r_px = r_m * ppm
+            if r_px < 6.0:
+                continue  # too small to read, skip
+            color = QColor(255, 220, 120, 110)
+            p.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
+            p.drawEllipse(QPointF(cx, cy), r_px, r_px)
+            # Label NE of the ring intersection (world +x = widget up,
+            # world +y = widget left, so NE in widget = +x & −y).
+            label = f"{r_m:.0f} m"
+            label_widget_x, label_widget_y = self._world_to_widget(
+                x_w + r_m * 0.7, y_w - r_m * 0.7,
+            )
+            p.setPen(QColor(255, 220, 120, 180))
+            p.drawText(int(label_widget_x) + 2,
+                       int(label_widget_y) - 2, label)
+        p.restore()
 
     def _draw_pose_trail(
         self, p: QPainter, ox: int, oy: int, side_px: int,
@@ -376,7 +574,7 @@ class _WorldViewBase(QWidget):
         p.drawText(int(bx1) + 6, int(by) + 4, label)
 
         # Zoom badge in the top-right when not in auto-fit.
-        if self._view_rect is not None:
+        if not self._shared.is_auto_fit():
             badge = f"{side_world:.1f} m view  (dbl-click to fit)"
             p.setPen(QColor(220, 220, 120))
             fm = p.fontMetrics()
@@ -440,7 +638,7 @@ class _WorldViewBase(QWidget):
                 0.5 * (vr[0] + vr[1]), 0.5 * (vr[2] + vr[3]),
             )
             # First drag beat: pin the current rect as the manual rect.
-            if self._view_rect is None:
+            if self._shared.is_auto_fit():
                 self._set_view_rect(vr)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
@@ -489,8 +687,9 @@ class WorldHeightView(_WorldViewBase):
         *,
         stale_s: float = 2.0,
         max_height_m: float = DEFAULT_MAX_HEIGHT_M,
+        shared: Optional[SharedMapView] = None,
     ):
-        super().__init__(parent, stale_s=stale_s)
+        super().__init__(parent, stale_s=stale_s, shared=shared)
         self._max_height_m = max_height_m
         self._grid: Optional[np.ndarray] = None
 
@@ -536,8 +735,9 @@ class WorldDriveableView(_WorldViewBase):
         parent: Optional[QWidget] = None,
         *,
         stale_s: float = 2.0,
+        shared: Optional[SharedMapView] = None,
     ):
-        super().__init__(parent, stale_s=stale_s)
+        super().__init__(parent, stale_s=stale_s, shared=shared)
         self._drive: Optional[np.ndarray] = None
 
     def update_map(

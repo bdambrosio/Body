@@ -24,7 +24,9 @@ from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
 from desktop.world_map.config import FuserConfig
 from desktop.world_map.controller import FuserController
-from desktop.world_map.map_views import WorldDriveableView, WorldHeightView
+from desktop.world_map.map_views import (
+    SharedMapView, WorldDriveableView, WorldHeightView,
+)
 
 from .camera_panels import CameraPanels, build_camera_snapshot
 from .safety_toolbar import SafetyToolbar
@@ -119,8 +121,17 @@ class NavMainWindow(QMainWindow):
         maps_widget = QWidget()
         maps = QHBoxLayout(maps_widget)
         maps.setContentsMargins(0, 0, 0, 0)
-        self._height_view = WorldHeightView(stale_s=self.fuser_config.map_stale_s)
-        self._drive_view = WorldDriveableView(stale_s=self.fuser_config.map_stale_s)
+        # Shared view state so all map panels pan/zoom together and
+        # share the grid + range-ring toggles.
+        self._shared_view = SharedMapView()
+        self._height_view = WorldHeightView(
+            stale_s=self.fuser_config.map_stale_s,
+            shared=self._shared_view,
+        )
+        self._drive_view = WorldDriveableView(
+            stale_s=self.fuser_config.map_stale_s,
+            shared=self._shared_view,
+        )
         maps.addWidget(self._height_view, stretch=1)
         maps.addWidget(self._drive_view, stretch=1)
         self._left_splitter.addWidget(maps_widget)
@@ -194,6 +205,24 @@ class NavMainWindow(QMainWindow):
         self._camera_action.setShortcut("Ctrl+Shift+C")
         self._camera_action.triggered.connect(self._cameras.set_visible)
         view_menu.addAction(self._camera_action)
+
+        view_menu.addSeparator()
+
+        self._grid_action = QAction("Map grid (1 m)", self)
+        self._grid_action.setCheckable(True)
+        self._grid_action.setChecked(self._shared_view.show_grid())
+        self._grid_action.setShortcut("Ctrl+G")
+        self._grid_action.toggled.connect(self._shared_view.set_show_grid)
+        view_menu.addAction(self._grid_action)
+
+        self._rings_action = QAction("Range rings (1/2/5 m)", self)
+        self._rings_action.setCheckable(True)
+        self._rings_action.setChecked(self._shared_view.show_range_rings())
+        self._rings_action.setShortcut("Ctrl+R")
+        self._rings_action.toggled.connect(
+            self._shared_view.set_show_range_rings
+        )
+        view_menu.addAction(self._rings_action)
 
     def _build_timer(self) -> None:
         period_ms = int(1000.0 / max(1.0, self.fuser_config.ui_redraw_hz))
@@ -346,8 +375,8 @@ class NavMainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(out_dir))
 
     def _on_fit_maps(self) -> None:
-        self._height_view.reset_view()
-        self._drive_view.reset_view()
+        # Single call: shared view propagates to all attached panels.
+        self._shared_view.reset_view()
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
