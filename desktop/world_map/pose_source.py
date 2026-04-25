@@ -58,6 +58,13 @@ class PoseSource:
         """v1.1 hook for scan-match corrections. v1: no-op."""
         pass
 
+    def correction_summary(self) -> dict:
+        """Cumulative magnitudes of corrections applied since the last
+        session reset. Default: zero (sources that never correct).
+        Override in scan-match-capable sources.
+        """
+        return {"total_m": 0.0, "total_rad": 0.0, "n_applied": 0}
+
     def source_name(self) -> str:
         return "unknown"
 

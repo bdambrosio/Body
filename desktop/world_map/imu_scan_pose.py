@@ -118,6 +118,12 @@ class ImuPlusScanMatchPose(PoseSource):
         self._n_skipped_sparse_grid = 0
         self._n_skipped_no_prior = 0
         self._n_skipped_imu_unsettled = 0
+        # Cumulative correction magnitudes since last session reset.
+        # Surfaced via correction_summary() and the operator status
+        # strip; reset in rebind_world_to_current().
+        self._correction_total_m = 0.0
+        self._correction_total_rad = 0.0
+        self._correction_n_applied = 0
 
     # ── PoseSource interface ─────────────────────────────────────────
 
@@ -162,6 +168,11 @@ class ImuPlusScanMatchPose(PoseSource):
                 self._yaw_offset = yaw
             else:
                 self._yaw_offset = 0.0
+            # Reset accumulated correction so the displayed total
+            # tracks scan-match work *this* session, not all-time.
+            self._correction_total_m = 0.0
+            self._correction_total_rad = 0.0
+            self._correction_n_applied = 0
         latest = self._odom.latest_pose()
         return latest[0] if latest is not None else None
 
@@ -215,6 +226,14 @@ class ImuPlusScanMatchPose(PoseSource):
             "skipped_no_prior": self._n_skipped_no_prior,
             "skipped_imu_unsettled": self._n_skipped_imu_unsettled,
         }
+
+    def correction_summary(self) -> dict:
+        with self._lock:
+            return {
+                "total_m": float(self._correction_total_m),
+                "total_rad": float(self._correction_total_rad),
+                "n_applied": int(self._correction_n_applied),
+            }
 
     # ── Subscriber callbacks ────────────────────────────────────────
 
@@ -321,6 +340,10 @@ class ImuPlusScanMatchPose(PoseSource):
 
         self._apply_correction((best.x, best.y, best.theta), ts)
         self._n_match_accepted += 1
+        with self._lock:
+            self._correction_total_m += math.hypot(dx, dy)
+            self._correction_total_rad += abs(dth)
+            self._correction_n_applied += 1
 
     # ── Correction application ──────────────────────────────────────
 

@@ -675,6 +675,7 @@ class FuserController:
             last_lm = self._last_local_map_ts
             last_od = self._last_odom_ts
             notes = self._notes
+            pose_unavail_streak = self._last_pose_unavail_streak
         latest = self.pose_source.latest_pose()
         pose = latest[0] if latest is not None else None
         return {
@@ -692,6 +693,8 @@ class FuserController:
             "cells_traversed": self.grid.cells_traversed(),
             "notes": notes,
             "pose_source": self.pose_source.source_name(),
+            "pose_unavail_streak": pose_unavail_streak,
+            "correction_summary": self.pose_source.correction_summary(),
         }
 
 

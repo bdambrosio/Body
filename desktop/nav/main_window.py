@@ -151,14 +151,22 @@ class NavMainWindow(QMainWindow):
         self._pose_lbl = QLabel("pose: —")
         self._rates_lbl = QLabel("rates: —")
         self._cells_lbl = QLabel("cells: —")
+        self._slam_lbl = QLabel("slam: —")
         self._session_lbl = QLabel("session: —")
         self._chassis_lbl = QLabel("chassis: —")
         self._notes_lbl = QLabel("")
         self._notes_lbl.setStyleSheet("color: #e8a; font-weight: bold;")
+        # Slightly-smaller font across the strip — the line is wide
+        # enough to crowd at default size once slam_health is added.
+        small = self.font()
+        small.setPointSize(max(7, small.pointSize() - 1))
         for w in (self._pose_lbl, self._rates_lbl,
-                  self._cells_lbl, self._session_lbl, self._chassis_lbl):
+                  self._cells_lbl, self._slam_lbl,
+                  self._session_lbl, self._chassis_lbl):
             w.setStyleSheet("color: #ccc;")
+            w.setFont(small)
             bot.addWidget(w)
+        self._notes_lbl.setFont(small)
         bot.addWidget(self._notes_lbl, stretch=1)
         outer.addLayout(bot)
 
@@ -264,6 +272,29 @@ class NavMainWindow(QMainWindow):
         self._cells_lbl.setText(
             f"cells: obs={st['cells_observed']} trav={st['cells_traversed']}"
         )
+
+        # SLAM health: pose-unavailable streak (≥10 = sticky note set)
+        # plus cumulative scan-match correction since session reset.
+        # Both rise when SLAM is struggling; both reset on Reset world.
+        unavail = int(st.get("pose_unavail_streak") or 0)
+        corr = st.get("correction_summary") or {}
+        corr_m = float(corr.get("total_m") or 0.0)
+        corr_deg = math.degrees(float(corr.get("total_rad") or 0.0))
+        n_corr = int(corr.get("n_applied") or 0)
+        slam_text = (
+            f"slam: lost={unavail}  drift={corr_m:.2f} m / "
+            f"{corr_deg:.1f}°  n={n_corr}"
+        )
+        self._slam_lbl.setText(slam_text)
+        # Color cue: red when pose has been lost recently, amber when
+        # it's been lost for ≥10 frames (already sticky-noted).
+        if unavail >= 10:
+            self._slam_lbl.setStyleSheet("color: #e8a;")
+        elif unavail > 0:
+            self._slam_lbl.setStyleSheet("color: #ec8;")
+        else:
+            self._slam_lbl.setStyleSheet("color: #ccc;")
+
         self._session_lbl.setText(
             f"session: {st['session_id'][:8]}  ({st['pose_source']})"
         )
