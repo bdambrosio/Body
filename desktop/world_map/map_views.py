@@ -661,7 +661,7 @@ class _WorldViewBase(QWidget):
         p.drawLine(QPointF(rx, ry + r - 1), QPointF(rx, ry + r + 4))
         # Small "goal" label.
         p.setPen(color)
-        p.drawText(int(rx) + r + 6, int(ry) + 4, "goal")
+        p.drawText(int(rx + r + 6), int(ry + 4), "goal")
         p.restore()
 
     def _draw_world_marker(
