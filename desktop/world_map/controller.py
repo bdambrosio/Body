@@ -40,6 +40,10 @@ def _now() -> float:
     return time.time()
 
 
+def _wrap_pi(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
 # ── Helpers shared with body_stub-style decoders ────────────────────
 
 def _decode_json(payload: bytes) -> Optional[Dict[str, Any]]:
@@ -198,6 +202,12 @@ class FuserController:
         self._last_odom_ts = 0.0
         self._last_lidar_ts = 0.0
         self._last_correction = (0.0, 0.0, 0.0)
+        # Pose trail: world-frame poses (x, y, theta, ts) appended at
+        # the traversal cadence. Trimmed by age + min-displacement gate
+        # in _maybe_record_pose. Shared with UI under self._lock.
+        self._pose_trail: Deque[Tuple[float, float, float, float]] = deque(
+            maxlen=int(max(16, config.pose_trail_max_points))
+        )
         # Optional UI hooks.
         self._on_session_change: Optional[Callable[[str], None]] = None
         self._on_grid_update: Optional[Callable[[], None]] = None
@@ -268,6 +278,13 @@ class FuserController:
         with self._lock:
             self._connected = True
         return True, None
+
+    # Alias so callers that hold a (chassis, fuser) pair can use the
+    # same lifecycle name on both. StubController has disconnect() +
+    # shutdown(); FuserController kept only shutdown(), and the
+    # safety toolbar called .disconnect() on both.
+    def disconnect(self) -> None:
+        self.shutdown()
 
     def shutdown(self) -> None:
         self._stop_event.set()
@@ -415,6 +432,7 @@ class FuserController:
         with self._lock:
             self._notes = f"reset:{reason}"
             self._last_pose_unavail_streak = 0
+            self._pose_trail.clear()
         cb = self._on_session_change
         if cb is not None:
             try:
@@ -502,10 +520,36 @@ class FuserController:
                         self.grid.stamp_traversal(
                             x_w=pose[0], y_w=pose[1], ts=_now(),
                         )
+                        self._maybe_record_pose(pose, sample_ts)
             except Exception:
                 logger.exception("traversal stamp failed; continuing")
             elapsed = time.monotonic() - start
             self._stop_event.wait(max(0.0, period - elapsed))
+
+    def _maybe_record_pose(
+        self, pose: Tuple[float, float, float], sample_ts: float,
+    ) -> None:
+        """Append `pose` to the trail if it's far enough from the last
+        appended sample, or enough time has passed. Also trim by age.
+        """
+        cfg = self.config
+        with self._lock:
+            now = _now()
+            # Age-trim from the left.
+            cutoff = now - cfg.pose_trail_seconds
+            while self._pose_trail and self._pose_trail[0][3] < cutoff:
+                self._pose_trail.popleft()
+            if not self._pose_trail:
+                self._pose_trail.append((pose[0], pose[1], pose[2], now))
+                return
+            x_prev, y_prev, th_prev, t_prev = self._pose_trail[-1]
+            dxy = math.hypot(pose[0] - x_prev, pose[1] - y_prev)
+            dth = abs(_wrap_pi(pose[2] - th_prev))
+            dt = now - t_prev
+            if (dxy >= cfg.pose_trail_min_dxy_m
+                    or dth >= cfg.pose_trail_min_dtheta_rad
+                    or dt >= cfg.pose_trail_min_period_s):
+                self._pose_trail.append((pose[0], pose[1], pose[2], now))
 
     def _publish_loop(self) -> None:
         publish_period = 1.0 / max(0.1, self.config.publish_hz)
@@ -606,6 +650,23 @@ class FuserController:
 
     def snapshot_for_ui(self) -> Optional[Dict[str, Any]]:
         return self.grid.snapshot_for_ui()
+
+    def pose_trail(self) -> List[Tuple[float, float, float]]:
+        """Return the recorded pose trail as a list of (x, y, theta),
+        oldest first. Cheap copy under self._lock; safe to call on UI tick.
+        """
+        with self._lock:
+            return [(x, y, th) for (x, y, th, _t) in self._pose_trail]
+
+    def save_snapshot_bundle(
+        self, base_dir: Optional[str] = None,
+    ) -> str:
+        """Write a self-contained inspection bundle to disk and return
+        the bundle directory. Imported lazily so app startup doesn't
+        pay for PIL/QImage save support unless the operator asks.
+        """
+        from .snapshot import write_bundle
+        return write_bundle(self, base_dir=base_dir)
 
     def status_summary(self) -> Dict[str, Any]:
         with self._lock:

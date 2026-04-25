@@ -51,6 +51,15 @@ class FuserConfig:
     ui_redraw_hz: float = 5.0
     map_stale_s: float = 2.0
 
+    # Pose-trail buffer (rendered as a polyline overlay). Trimmed by
+    # both age and a min-displacement gate so a stationary robot
+    # doesn't fill the buffer with duplicate poses.
+    pose_trail_seconds: float = 60.0
+    pose_trail_min_dxy_m: float = 0.05
+    pose_trail_min_dtheta_rad: float = 0.0873  # ~5°
+    pose_trail_min_period_s: float = 1.0
+    pose_trail_max_points: int = 1024
+
     topics: Topics = field(default_factory=Topics)
 
 
