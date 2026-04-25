@@ -40,7 +40,28 @@ Concretely, for SLAM promotion:
 
 Current `config.json` has `calibration_stable_threshold_rad: 0.175`, which is too loose for SLAM: Pi will start publishing at accuracy well above the fallback threshold and drop out of `rotation_vector` within 20 samples. **Tighten this to `0.06`** before relying on `--slam`.
 
-`game_rotation_vector` mode still works — yaw is relative (starts at zero at boot, drifts ~0.5–1°/min) — but the absolute-heading advantage is gone. Fine for testing, less good for multi-room or long-run mapping. Desktop handles both modes the same way; only the *meaning* of yaw differs.
+`game_rotation_vector` mode still works — yaw is relative (starts at zero at boot, drifts ~0.5–1°/min) — but the absolute-heading advantage is gone. See §2.2 for the operating differences. Indoor magnetometer disturbance from motor current, ferrous structure, etc. often forces this mode; treat it as the normal indoor case, not the degraded one.
+
+### 2.2 Operating in `game_rotation_vector` mode
+
+When `fusion_mode: "game_rotation_vector"` (current `config.json` default after Pi-side review), several things differ from RV mode:
+
+**Pi side (no config change needed):** SH-2 firmware doesn't compute a dynamic accuracy estimate in GAME_RV. The Pi publishes `accuracy_rad` as the **constant** value of `imu.game_rotation_vector_accuracy_rad` (currently `0.175`) on every sample. The Pi-side settle gate (`calibration_stable_threshold_rad: 0.175`) matches that constant, so settling is purely time-gated by `settle_time_s: 2.0`. This is correct.
+
+**Desktop side (small change required for SLAM promotion):** `ImuYawTracker.DEFAULT_SETTLE_ACCURACY_RAD = 0.06` would reject every GAME_RV sample (`0.175 > 0.06`) and never settle. Two options for the SLAM promotion PR:
+
+1. *(preferred)* Time-based gate when `fusion_mode == "game_rotation_vector"`: require `min_settle_samples` consecutive samples received plus a small wall-clock buffer (e.g. `≥ 0.2 s`). Skip the accuracy comparison entirely — there's nothing dynamic to compare against in this mode.
+2. Bump desktop `settle_accuracy_rad` to `≥ 0.18`, document that the gate is degenerate in GAME_RV, and rely on `min_settle_samples` to keep startup transients out.
+
+**Settle-time budget — how long is too long?** The cost of waiting for settle is per *meter driven during settle*, not per second elapsed. Pi already waits 2 s before publishing; desktop adds ~0.2 s for buffer. If the user holds the robot still until they press Reset world, total cost is zero. Padding settle further is wasted time unless the user is driving during it (encoder-only yaw drift accumulates and contaminates the early map).
+
+**Reset-world yaw rebind.** GAME_RV yaw is "whatever the BNO085 happened to read at boot," not magnetic north. To pin the world frame to the user-defined orientation regardless of GAME_RV's boot heading, `ImuPlusScanMatchPose` should capture the IMU yaw at `Reset world` time and store it as an offset (analogous to how `OdomPose.rebind_world_to_current()` already does for translation). The handoff from encoder yaw to IMU yaw at settle is then seamless — no pose jump.
+
+**Drift-correction load.** In GAME_RV, scan-match against the world grid is the *only* mechanism keeping yaw bounded over the long term. RV mode had magnetometer as a safety net; GAME_RV does not. Practical implications:
+
+- Acceptance-rate target tightens: > 70% of non-`search_exhausted` attempts (vs. > 50% in RV).
+- Long featureless straight runs are the failure mode — locally the geometry is rotationally ambiguous along the corridor axis, and there's no magnetometer to anchor. Mitigation: avoid long featureless straights, or add a Manhattan-World yaw prior (~150 lines, post-promotion follow-up; uses lidar to detect dominant orthogonal wall directions).
+- Cross-session map persistence is not free: each boot defines its own arbitrary world frame. Reloading a saved map requires either (a) the user aligning the robot to a floor mark whose pose is known in the saved map (manual entry of x/y/yaw on Reset), or (b) a one-time AprilTag mounted in view of the OAK-D RGB at boot (pose-from-tag, automatic). See §7 for floor-mark options.
 
 ### 2.2 `body/odom.source == "wheel_encoders"`
 
@@ -88,19 +109,53 @@ These are deliberately **not** Pi-side work, to keep the contract minimal:
 Before the user flips `--slam` on nav:
 
 1. **Pi config audit.** Confirm `config.json` has:
-   - `imu.fusion_mode: "rotation_vector"`
-   - `imu.calibration_stable_threshold_rad ≤ 0.06` (see §2.1 threshold coupling — this is the one most likely wrong today).
-   - `imu.mag_accuracy_fallback_rad` ≥ `calibration_stable_threshold_rad`, ≤ `0.087`.
-   - BNO085 DCD saved after a successful figure-8 — `body/imu/calibrate` with `action: "save"`.
+   - `imu.fusion_mode` matches the mode SLAM will operate in (`rotation_vector` if magnetometer is reliable, `game_rotation_vector` otherwise).
+   - For RV: `imu.calibration_stable_threshold_rad ≤ 0.06`, `mag_accuracy_fallback_rad` between that and `0.087`, BNO085 DCD saved after a figure-8.
+   - For GAME_RV: `calibration_stable_threshold_rad` matches `game_rotation_vector_accuracy_rad` (both `0.175` is fine — it's a constant in this mode, settle is time-gated). No DCD save required.
 2. **Shadow drive.** `python -m desktop.nav --shadow-slam --router tcp/<pi>:7447`, run a short loop.
 3. Grep the shadow log for these numbers per scan-match attempt:
-   - `accepted` rate > ~50% of non-`search_exhausted` attempts
-   - median `improvement` > `min_improvement` threshold by at least 2×
-   - `search_exhausted` rate < ~20%
-   - `imu_settled == true` for ≥ 95% of the post-warmup window
-4. Watch `body/imu.fusion.mode` during the drive. If it flaps from `rotation_vector` to `game_rotation_vector` at any point, fix thresholds first — SLAM promotion can still go in, but you'll be operating in relative-yaw mode and should budget for slower correction of accumulated drift.
-5. If Pi config is clean and all four log numbers look right, the `ImuPlusScanMatchPose` promotion PR can merge with the feature flag on by default.
+   - `accepted` rate > ~50% (RV mode) / > ~70% (GAME_RV mode) of non-`search_exhausted` attempts.
+   - median `improvement` > `min_improvement` threshold by at least 2×.
+   - `search_exhausted` rate < ~20%.
+   - `imu_settled == true` for ≥ 95% of the post-warmup window.
+4. **For RV mode only:** watch `body/imu.fusion.mode` during the drive. If it flaps from `rotation_vector` to `game_rotation_vector` at any point, fix thresholds first or accept that you're effectively running GAME_RV. (For GAME_RV-by-config, this check doesn't apply.)
+5. If Pi config is clean and all log numbers look right, the `ImuPlusScanMatchPose` promotion PR can merge with the feature flag on by default.
 
 ## 6. Roll-back
 
 SLAM is a `FuserConfig` flag. If live mapping quality regresses vs. odom-only, nav can be relaunched without `--slam` and the fuser reverts to `OdomPose` with zero Pi-side changes.
+
+## 7. Starting-pose anchors (floor marks)
+
+Two unrelated reasons to want explicit starting-pose definition:
+
+- *Within a session:* user wants the world frame oriented to a meaningful direction (e.g. "+x = down the hallway"), not just "wherever the robot was facing at Reset."
+- *Across sessions:* if a saved map is reloaded, each boot's `OdomPose` and GAME_RV yaw start from arbitrary zero — the robot has no idea where it is in the saved map.
+
+All three options below are desktop-only; no Pi changes.
+
+### 7.1 Manual aligned-then-press (recommended starting point)
+
+Mark a known pose on the floor (e.g. tape cross with an arrow). User aligns the robot to the mark, then clicks `Reset world` with optional input fields for `(x, y, θ)` of that mark in the saved-map frame.
+
+The current `Reset world` action implicitly assumes the mark is at `(0, 0, 0)`. Adding three numeric fields (defaulted to zero, so the existing UX is unchanged) makes it work for arbitrary saved-map-relative starts.
+
+**Cost:** ~40 lines (UI + plumbing into `OdomPose.rebind_world_to_current` and the IMU yaw rebind described in §2.2). Critical for cross-session resume.
+
+### 7.2 AprilTag fiducial via OAK-D RGB
+
+Print one AprilTag, mount it on a wall the OAK-D can see at boot. Tag pose-in-image gives full `(x, y, yaw)` in the world frame the tag was originally registered against. Robot self-localizes at boot with no human alignment.
+
+**Cost:** ~200 lines using the `apriltag` Python library, plus a one-time "register this tag at this pose in the saved map" UI. Worthwhile once saved-map reload is in regular use.
+
+### 7.3 Lidar landmark alignment
+
+User clicks a known geometric feature (corner, doorway) on the loaded map view and says "the robot is here, facing that." Constrains scan-match initial guess from the click; runs a wider-than-normal search to converge.
+
+**Cost:** ~150 lines. Best when no fiducial hardware is acceptable and the environment has distinctive geometry. Lower priority than 7.1.
+
+### Which to do when
+
+- For session-anchored mapping today, no work needed — current `Reset world` is enough as long as the user accepts "+x = current heading."
+- Once map persistence (save/load grid) lands, do 7.1 same PR.
+- 7.2 and 7.3 only if the manual workflow is too cumbersome for actual use.
