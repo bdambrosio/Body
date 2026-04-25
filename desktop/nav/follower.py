@@ -54,10 +54,13 @@ class FollowerConfig:
     rotate_in_place_threshold_rad: float = math.radians(35.0)
 
     # Arrival: distance to last waypoint within which we declare done.
-    # Set above the "slow-crawl" zone so the robot makes a decisive
-    # stop instead of creeping while pose noise jiggles distance
-    # across the threshold.
-    arrival_tolerance_m: float = 0.30
+    # 0.20 m is tight for a small house. The acceleration rate limit
+    # already smooths the approach so the robot decelerates instead
+    # of overshoot-then-circle; if pose-noise jitter near goal turns
+    # out to be a problem at this tolerance, the next lever is to
+    # cap pure-pursuit curvature when dist_to_goal is small (a "final
+    # approach: aim straight" mode), not to grow this tolerance.
+    arrival_tolerance_m: float = 0.20
 
     # Slow-down ramp as we approach the goal: linear scaling on v from
     # v_max at >= (arrival + slowdown) down to ~0 at arrival.
