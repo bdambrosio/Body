@@ -43,7 +43,7 @@ class FuserConfig:
     # the zenoh session is open. See docs/slam_pi_contract.md.
     slam_enabled: bool = False
 
-    vote_margin: int = 1
+    vote_margin: int = 2
     traversal_stamp_hz: float = 10.0
     traversal_vote_weight: int = 3
     footprint_radius_m: float = 0.15
