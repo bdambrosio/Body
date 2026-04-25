@@ -364,6 +364,39 @@ class WorldGrid:
                     "driveable_clearance_height_m": self._driveable_clearance_m,
                 },
                 "session_id": self._session_id,
+                # Tight cell-index bounds of touched data, so the UI can
+                # auto-fit to the populated region instead of showing the
+                # whole 40 m × 40 m grid.
+                "bounds_ij": self._bounds_ij,
+            }
+
+    def snapshot_for_export(self) -> Optional[Dict[str, Any]]:
+        """Full layer snapshot for offline inspection. Heavier than
+        snapshot_for_ui (copies every layer); call from the snapshot
+        bundle export, not the redraw tick.
+        """
+        with self._lock:
+            return {
+                "max_height_m": self.max_height_m.copy(),
+                "clear_votes": self.clear_votes.copy(),
+                "block_votes": self.block_votes.copy(),
+                "traversed_ts": self.traversed_ts.copy(),
+                "last_observed_ts": self.last_observed_ts.copy(),
+                "observation_count": self.observation_count.copy(),
+                "driveable": self._driveable_from_votes_locked(),
+                "meta": {
+                    "resolution_m": self._res,
+                    "origin_x_m": self._origin_x_m,
+                    "origin_y_m": self._origin_y_m,
+                    "nx": self._n,
+                    "ny": self._n,
+                    "frame": "world",
+                    "vote_margin": self._vote_margin,
+                    "footprint_radius_m": self._footprint_radius_m,
+                    "driveable_clearance_height_m": self._driveable_clearance_m,
+                },
+                "session_id": self._session_id,
+                "bounds_ij": self._bounds_ij,
             }
 
     # ── Internal ─────────────────────────────────────────────────────

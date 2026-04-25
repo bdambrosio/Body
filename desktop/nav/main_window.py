@@ -14,10 +14,11 @@ import time
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QMainWindow, QSplitter,
-    QToolBar, QVBoxLayout, QWidget,
+    QApplication, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+    QSplitter, QToolBar, QVBoxLayout, QWidget,
 )
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QDesktopServices
+from PyQt6.QtCore import QUrl
 
 from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
@@ -76,6 +77,24 @@ class NavMainWindow(QMainWindow):
             lambda: self.fuser.request_reset(reason="ui_reset")
         )
         self._map_toolbar.addAction(reset_act)
+
+        save_act = QAction("Save snapshot", self)
+        save_act.setToolTip(
+            "Write a self-contained snapshot bundle (layers.npz, "
+            "PNGs, summary.json) for offline inspection. Path is "
+            "shown on completion; default ~/Body/sessions/<sid>/."
+        )
+        save_act.triggered.connect(self._on_save_snapshot)
+        self._map_toolbar.addAction(save_act)
+
+        fit_act = QAction("Fit maps", self)
+        fit_act.setToolTip(
+            "Reset map zoom/pan to auto-fit the populated region. "
+            "(Shortcut: double-click a map.)"
+        )
+        fit_act.triggered.connect(self._on_fit_maps)
+        self._map_toolbar.addAction(fit_act)
+
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._map_toolbar)
 
@@ -201,17 +220,26 @@ class NavMainWindow(QMainWindow):
         snap = self.fuser.snapshot_for_ui()
         latest = self.fuser.pose_source.latest_pose()
         pose = latest[0] if latest is not None else None
+        trail = self.fuser.pose_trail()
         ts = time.time()
         if snap is not None:
             self._height_view.update_map(
                 snap["grid"], snap["meta"], ts, pose=pose,
+                pose_history=trail, bounds_ij=snap.get("bounds_ij"),
             )
             self._drive_view.update_map(
                 snap["driveable"], snap["meta"], ts, pose=pose,
+                pose_history=trail, bounds_ij=snap.get("bounds_ij"),
             )
         else:
-            self._height_view.update_map(None, None, 0.0, pose=pose)
-            self._drive_view.update_map(None, None, 0.0, pose=pose)
+            self._height_view.update_map(
+                None, None, 0.0, pose=pose,
+                pose_history=trail, bounds_ij=None,
+            )
+            self._drive_view.update_map(
+                None, None, 0.0, pose=pose,
+                pose_history=trail, bounds_ij=None,
+            )
 
         st = self.fuser.status_summary()
         if pose is not None:
@@ -261,6 +289,34 @@ class NavMainWindow(QMainWindow):
             f"chassis: status/{age_s}  hb#{hb_seq}"
         )
         self._chassis_lbl.setStyleSheet("color: #ccc;")
+
+    # ── Toolbar handlers ─────────────────────────────────────────────
+
+    def _on_save_snapshot(self) -> None:
+        try:
+            out_dir = self.fuser.save_snapshot_bundle()
+        except Exception as e:
+            logger.exception("snapshot bundle write failed")
+            QMessageBox.warning(
+                self, "Snapshot failed",
+                f"Could not write snapshot bundle:\n{type(e).__name__}: {e}",
+            )
+            return
+        # Non-modal toast; let the operator click through to the
+        # directory if they want to inspect it.
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Snapshot saved")
+        box.setText(f"Snapshot bundle written:\n{out_dir}")
+        open_btn = box.addButton("Open folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(out_dir))
+
+    def _on_fit_maps(self) -> None:
+        self._height_view.reset_view()
+        self._drive_view.reset_view()
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
