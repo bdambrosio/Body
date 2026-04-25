@@ -14,6 +14,7 @@ heartbeat-and-cmd_vel publisher.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -35,9 +36,17 @@ class FollowerConfig:
     lookahead_t_s: float = 1.5     # lookahead = clamp(v * lookahead_t_s)
 
     # Velocity caps. Stage 4 dry-run uses these to size the rendered
-    # arc; Stage 5 will actually publish these to chassis.
+    # arc; Stage 5 actually publishes these to chassis.
     v_max: float = 0.20            # m/s — conservative for first nav
     omega_max: float = 0.60        # rad/s
+
+    # Acceleration caps — applied symmetrically to both directions of
+    # change so the robot doesn't pop a wheelie on start and doesn't
+    # snap to zero on a rotate-in-place transition. Tuned for an
+    # indoor diff-drive at v_max=0.20 m/s: full speed is reached over
+    # 2 redraw ticks (~0.4 s), ω_max over ~1.6 ticks.
+    linear_accel_max_mps2: float = 0.50
+    angular_accel_max_radps2: float = 1.50
 
     # Heading-error gate for in-place rotation. If the lookahead point
     # is more than this many radians off the robot's current heading,
@@ -45,10 +54,13 @@ class FollowerConfig:
     rotate_in_place_threshold_rad: float = math.radians(35.0)
 
     # Arrival: distance to last waypoint within which we declare done.
-    arrival_tolerance_m: float = 0.20
+    # Set above the "slow-crawl" zone so the robot makes a decisive
+    # stop instead of creeping while pose noise jiggles distance
+    # across the threshold.
+    arrival_tolerance_m: float = 0.30
 
     # Slow-down ramp as we approach the goal: linear scaling on v from
-    # v_max at >= ramp_distance_m down to ~0 at arrival_tolerance_m.
+    # v_max at >= (arrival + slowdown) down to ~0 at arrival.
     slowdown_distance_m: float = 0.50
 
 
@@ -87,7 +99,11 @@ class Follower:
 
     def __init__(self, config: Optional[FollowerConfig] = None):
         self.config = config or FollowerConfig()
-        self._last_v_mps: float = 0.0  # for adaptive-lookahead
+        # Last *commanded* values — fed forward into the next tick
+        # for adaptive lookahead and for acceleration rate-limiting.
+        self._last_v_mps: float = 0.0
+        self._last_omega_radps: float = 0.0
+        self._last_call_t: Optional[float] = None
 
     def update(
         self,
@@ -95,10 +111,20 @@ class Follower:
         pose: Optional[Pose],
     ) -> FollowerOutput:
         cfg = self.config
+        # Measured tick interval, used for the acceleration rate
+        # limiter. First call defaults to 0.20 s (the nominal 5 Hz
+        # redraw tick); subsequent calls measure for real.
+        now = time.monotonic()
+        if self._last_call_t is None:
+            dt = 0.20
+        else:
+            dt = max(0.05, min(1.0, now - self._last_call_t))
+        self._last_call_t = now
+
         if pose is None:
-            return FollowerOutput.stop(STATUS_NO_PATH, note="no pose")
+            return self._stop_output(STATUS_NO_PATH, note="no pose")
         if not path_world or len(path_world) < 2:
-            return FollowerOutput.stop(STATUS_NO_PATH, note="no path")
+            return self._stop_output(STATUS_NO_PATH, note="no path")
 
         x_w, y_w, theta_w = pose
         goal = path_world[-1]
@@ -106,12 +132,9 @@ class Follower:
 
         # Arrival check.
         if dist_to_goal <= cfg.arrival_tolerance_m:
-            return FollowerOutput(
-                status=STATUS_ARRIVED,
-                v_mps=0.0, omega_radps=0.0,
-                lookahead_world=None,
+            return self._stop_output(
+                STATUS_ARRIVED,
                 distance_to_goal_m=dist_to_goal,
-                heading_error_rad=0.0,
                 note="at goal",
             )
 
@@ -138,11 +161,11 @@ class Follower:
 
         # In-place rotation when the lookahead is too far off-axis.
         if abs(alpha) > cfg.rotate_in_place_threshold_rad:
-            omega = _clip(alpha * 2.0, -cfg.omega_max, cfg.omega_max)
-            self._last_v_mps = 0.0
+            omega_target = _clip(alpha * 2.0, -cfg.omega_max, cfg.omega_max)
+            v, omega = self._rate_limit(0.0, omega_target, dt)
             return FollowerOutput(
                 status=STATUS_ROTATING,
-                v_mps=0.0,
+                v_mps=v,
                 omega_radps=omega,
                 lookahead_world=lookahead,
                 distance_to_goal_m=dist_to_goal,
@@ -163,16 +186,18 @@ class Follower:
             / max(cfg.slowdown_distance_m, 1e-6),
             0.0, 1.0,
         )
-        v = cfg.v_max * v_factor
-        omega = _clip(v * curvature, -cfg.omega_max, cfg.omega_max)
+        v_target = cfg.v_max * v_factor
+        omega_target = _clip(
+            v_target * curvature, -cfg.omega_max, cfg.omega_max,
+        )
         # If the |omega| cap saturated and curvature is very high,
         # cap v so the arc is still well-defined (don't drive faster
         # than the angular cap can sustain on a tight turn).
         if abs(curvature) > 1e-3:
             v_for_omega_cap = cfg.omega_max / abs(curvature)
-            v = min(v, v_for_omega_cap)
+            v_target = min(v_target, v_for_omega_cap)
 
-        self._last_v_mps = v
+        v, omega = self._rate_limit(v_target, omega_target, dt)
         return FollowerOutput(
             status=STATUS_FOLLOWING,
             v_mps=v,
@@ -181,6 +206,53 @@ class Follower:
             distance_to_goal_m=dist_to_goal,
             heading_error_rad=alpha,
             note="",
+        )
+
+    # ── Rate-limit helpers ──────────────────────────────────────────
+
+    def _rate_limit(
+        self, v_target: float, omega_target: float, dt: float,
+    ) -> Tuple[float, float]:
+        """Clip the change since last command to the configured
+        accel caps. Updates the cached "last commanded" values for
+        the next tick. Returns (v, omega) actually-commanded.
+        """
+        cfg = self.config
+        v_step = cfg.linear_accel_max_mps2 * dt
+        omega_step = cfg.angular_accel_max_radps2 * dt
+        v = _clip(v_target,
+                  self._last_v_mps - v_step,
+                  self._last_v_mps + v_step)
+        omega = _clip(omega_target,
+                      self._last_omega_radps - omega_step,
+                      self._last_omega_radps + omega_step)
+        # Also enforce absolute caps (in case _last_* drifted weird).
+        v = _clip(v, 0.0, cfg.v_max)
+        omega = _clip(omega, -cfg.omega_max, cfg.omega_max)
+        self._last_v_mps = v
+        self._last_omega_radps = omega
+        return v, omega
+
+    def _stop_output(
+        self,
+        status: str,
+        *,
+        distance_to_goal_m: float = 0.0,
+        note: str = "",
+    ) -> FollowerOutput:
+        """Hard-stop output. Updates the cached last-commanded values
+        to zero so a subsequent FOLLOWING tick ramps up from rest
+        rather than from the previous cruise speed."""
+        self._last_v_mps = 0.0
+        self._last_omega_radps = 0.0
+        return FollowerOutput(
+            status=status,
+            v_mps=0.0,
+            omega_radps=0.0,
+            lookahead_world=None,
+            distance_to_goal_m=distance_to_goal_m,
+            heading_error_rad=0.0,
+            note=note,
         )
 
 
