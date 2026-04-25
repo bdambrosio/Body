@@ -1,0 +1,20 @@
+[Unit]
+Description=Body robot launcher
+After=network-online.target zenohd.service
+Wants=network-online.target zenohd.service
+
+[Service]
+Type=simple
+User=bruce
+Group=bruce
+SupplementaryGroups=gpio
+WorkingDirectory=/home/bruce/Body
+Environment=PYTHONPATH=/home/bruce/Body
+ExecStartPre=+/bin/sh /home/bruce/Body/deploy/prepare-pwm-sysfs.sh
+ExecStart=/home/bruce/Body/.venv/bin/python -m body.launcher
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

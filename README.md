@@ -151,6 +151,25 @@ Startup order: `watchdog` → `motor_controller` → `lidar_driver` → `oakd_dr
 
 **Watchdog:** Until something publishes **`body/heartbeat`** (e.g. `desktop.chassis` with Live cmd enabled), the watchdog may emit **`body/emergency_stop`** (`heartbeat_timeout`). That is expected; start a desktop client when you want the stack to see a live operator.
 
+### Running under systemd
+
+For mapping runs, install the service units so SSH drops do not stop the Pi-side runtime:
+
+```bash
+sudo cp deploy/zenohd.service deploy/body-launcher.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now zenohd.service body-launcher.service
+```
+
+Check status and logs:
+
+```bash
+systemctl status zenohd.service body-launcher.service
+journalctl -u body-launcher.service -f
+```
+
+The units assume Body lives at `/home/bruce/Body`, the launcher venv is `/home/bruce/Body/.venv`, and `zenohd` is installed at `/home/bruce/zenoh/1.9.0/zenohd`.
+
 ## Standalone mode (no Jill)
 
 **Standalone** means: Body processes on the Pi, and **you** provide heartbeat and velocity commands using `desktop.chassis` — no Cognitive Workbench / agent needs to run.
