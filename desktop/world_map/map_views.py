@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, Qt
@@ -67,6 +67,12 @@ class SharedMapView:
         self._show_grid: bool = True
         self._show_range_rings: bool = True
         self._views: List["_WorldViewBase"] = []
+        # Mission state shared across panels: a single goal pin in
+        # world frame, and the most recently planned path. Both are
+        # rendered identically in every attached view.
+        self._goal_world: Optional[Tuple[float, float]] = None
+        self._planned_path_world: List[Tuple[float, float]] = []
+        self._goal_callback: Optional[Callable[[float, float], None]] = None
 
     # ── Subscriptions ───────────────────────────────────────────────
 
@@ -119,6 +125,43 @@ class SharedMapView:
     def set_show_range_rings(self, on: bool) -> None:
         self._show_range_rings = bool(on)
         self._notify()
+
+    # ── Mission (goal pin + planned path) ───────────────────────────
+
+    def goal(self) -> Optional[Tuple[float, float]]:
+        return self._goal_world
+
+    def set_goal(self, xy: Optional[Tuple[float, float]]) -> None:
+        self._goal_world = (
+            (float(xy[0]), float(xy[1])) if xy is not None else None
+        )
+        # Clear any stale path when the goal changes; consumer will
+        # republish a fresh plan if they choose to.
+        if xy is None:
+            self._planned_path_world = []
+        self._notify()
+
+    def planned_path(self) -> List[Tuple[float, float]]:
+        return list(self._planned_path_world)
+
+    def set_planned_path(self, pts: Sequence[Tuple[float, float]]) -> None:
+        self._planned_path_world = [(float(x), float(y)) for x, y in pts]
+        self._notify()
+
+    def set_goal_callback(
+        self, cb: Optional[Callable[[float, float], None]],
+    ) -> None:
+        """Register the function called when a view detects a
+        right-click. Pass None to disable goal-on-right-click and
+        restore right-click-as-pan."""
+        self._goal_callback = cb
+
+    def has_goal_callback(self) -> bool:
+        return self._goal_callback is not None
+
+    def request_goal(self, x_w: float, y_w: float) -> None:
+        if self._goal_callback is not None:
+            self._goal_callback(x_w, y_w)
 
 
 class _WorldViewBase(QWidget):
@@ -355,6 +398,9 @@ class _WorldViewBase(QWidget):
             # Pose trail (under markers).
             self._draw_pose_trail(p, ox, oy, side_px)
 
+            # Planned path (above the trail, below pose/anchor markers).
+            self._draw_planned_path(p, ox, oy, side_px)
+
             # World origin (anchor) marker.
             self._draw_world_marker(
                 p, 0.0, 0.0, 0.0, ox, oy, side_px,
@@ -368,6 +414,10 @@ class _WorldViewBase(QWidget):
                     ox, oy, side_px,
                     color=QColor(255, 255, 255), label=None,
                 )
+
+            # Goal pin (above robot/anchor — operator's primary
+            # attention focus during nav).
+            self._draw_goal_pin(p, ox, oy, side_px)
 
             # Stale dimming overlay.
             age = time.time() - self._ts if self._ts > 0 else 0.0
@@ -514,6 +564,62 @@ class _WorldViewBase(QWidget):
         p.drawPath(path)
         p.restore()
 
+    def _draw_planned_path(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+    ) -> None:
+        pts = self._shared.planned_path()
+        if len(pts) < 2:
+            return
+        path = QPainterPath()
+        first = True
+        for x_w, y_w in pts:
+            rx, ry = self._world_to_widget(x_w, y_w)
+            if first:
+                path.moveTo(rx, ry)
+                first = False
+            else:
+                path.lineTo(rx, ry)
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        # Distinct from the amber pose-trail: cyan for "planned" vs
+        # "actual." Slightly thicker to read across all three panels.
+        p.setPen(QPen(QColor(80, 200, 255, 220), 2.0))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        p.restore()
+
+    def _draw_goal_pin(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+    ) -> None:
+        goal = self._shared.goal()
+        if goal is None:
+            return
+        x_w, y_w = goal
+        rx, ry = self._world_to_widget(x_w, y_w)
+        in_rect = (ox <= rx <= ox + side_px) and (oy <= ry <= oy + side_px)
+        # Crosshair + circle marker. Tinted differently when off-screen
+        # so the operator notices the pin is parked outside the view.
+        if in_rect:
+            color = QColor(80, 200, 255)
+        else:
+            rx = max(ox, min(ox + side_px - 1, rx))
+            ry = max(oy, min(oy + side_px - 1, ry))
+            color = QColor(255, 200, 80)
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        p.setPen(QPen(color, 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        r = 7.0
+        p.drawEllipse(QPointF(rx, ry), r, r)
+        p.drawLine(QPointF(rx - r - 4, ry), QPointF(rx - r + 1, ry))
+        p.drawLine(QPointF(rx + r - 1, ry), QPointF(rx + r + 4, ry))
+        p.drawLine(QPointF(rx, ry - r - 4), QPointF(rx, ry - r + 1))
+        p.drawLine(QPointF(rx, ry + r - 1), QPointF(rx, ry + r + 4))
+        # Small "goal" label.
+        p.setPen(color)
+        p.drawText(int(rx) + r + 6, int(ry) + 4, "goal")
+        p.restore()
+
     def _draw_world_marker(
         self, p: QPainter,
         x_w: float, y_w: float, theta_w: float,
@@ -626,6 +732,20 @@ class _WorldViewBase(QWidget):
         self.update()
 
     def mousePressEvent(self, event) -> None:
+        # Right-click reserved for "set goal" if anybody upstream
+        # registered a goal callback; otherwise it falls through to
+        # pan (preserves single-view behavior with no nav stack).
+        if (event.button() == Qt.MouseButton.RightButton
+                and self._shared.has_goal_callback()
+                and self._paint_geom is not None):
+            x_w, y_w = self._widget_to_world(
+                float(event.position().x()),
+                float(event.position().y()),
+            )
+            self._shared.request_goal(x_w, y_w)
+            event.accept()
+            return
+
         if event.button() in (Qt.MouseButton.MiddleButton,
                               Qt.MouseButton.RightButton,
                               Qt.MouseButton.LeftButton):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
@@ -28,6 +29,7 @@ from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
 )
+from .planner import AStarConfig, PlanResult, plan_path
 
 from .camera_panels import CameraPanels, build_camera_snapshot
 from .safety_toolbar import SafetyToolbar
@@ -98,6 +100,14 @@ class NavMainWindow(QMainWindow):
         fit_act.triggered.connect(self._on_fit_maps)
         self._map_toolbar.addAction(fit_act)
 
+        clear_goal_act = QAction("Clear goal", self)
+        clear_goal_act.setToolTip(
+            "Remove the current goal pin and any planned path. "
+            "Right-click a map to set a new goal."
+        )
+        clear_goal_act.triggered.connect(self._on_clear_goal)
+        self._map_toolbar.addAction(clear_goal_act)
+
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._map_toolbar)
 
@@ -143,6 +153,10 @@ class NavMainWindow(QMainWindow):
         self._costmap_config = CostmapConfig(
             footprint_radius_m=self.fuser_config.footprint_radius_m,
         )
+        self._astar_config = AStarConfig()
+        self._last_plan: Optional[PlanResult] = None
+        self._last_costmap = None  # cached for replanning when goal changes
+        self._shared_view.set_goal_callback(self._on_goal_requested)
         self._left_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
@@ -172,6 +186,7 @@ class NavMainWindow(QMainWindow):
         self._rates_lbl = QLabel("rates: —")
         self._cells_lbl = QLabel("cells: —")
         self._slam_lbl = QLabel("slam: —")
+        self._plan_lbl = QLabel("plan: —")
         self._session_lbl = QLabel("session: —")
         self._chassis_lbl = QLabel("chassis: —")
         self._notes_lbl = QLabel("")
@@ -181,7 +196,7 @@ class NavMainWindow(QMainWindow):
         small = self.font()
         small.setPointSize(max(7, small.pointSize() - 1))
         for w in (self._pose_lbl, self._rates_lbl,
-                  self._cells_lbl, self._slam_lbl,
+                  self._cells_lbl, self._slam_lbl, self._plan_lbl,
                   self._session_lbl, self._chassis_lbl):
             w.setStyleSheet("color: #ccc;")
             w.setFont(small)
@@ -286,6 +301,12 @@ class NavMainWindow(QMainWindow):
                 cm, snap["meta"], ts, pose=pose,
                 pose_history=trail, bounds_ij=snap.get("bounds_ij"),
             )
+            # Cache for replanning when goal changes; if a goal is
+            # already set, replan against the freshly-built costmap
+            # so the path keeps up as the map fills in.
+            self._last_costmap = cm
+            if cm is not None and self._shared_view.goal() is not None:
+                self._replan(cm, pose)
         else:
             self._height_view.update_map(
                 None, None, 0.0, pose=pose,
@@ -346,6 +367,28 @@ class NavMainWindow(QMainWindow):
         else:
             self._slam_lbl.setStyleSheet("color: #ccc;")
 
+        # Plan status: "—" with no goal; details when planned.
+        goal = self._shared_view.goal()
+        if goal is None:
+            self._plan_lbl.setText("plan: —")
+            self._plan_lbl.setStyleSheet("color: #ccc;")
+        else:
+            plan = self._last_plan
+            if plan is None:
+                self._plan_lbl.setText(
+                    f"plan: pending ({goal[0]:+.2f}, {goal[1]:+.2f})"
+                )
+                self._plan_lbl.setStyleSheet("color: #cc8;")
+            elif plan.ok:
+                self._plan_lbl.setText(
+                    f"plan: {plan.distance_m:.2f} m  "
+                    f"({plan.elapsed_ms:.0f} ms)"
+                )
+                self._plan_lbl.setStyleSheet("color: #8cf;")
+            else:
+                self._plan_lbl.setText(f"plan: {plan.msg}")
+                self._plan_lbl.setStyleSheet("color: #e8a;")
+
         self._session_lbl.setText(
             f"session: {st['session_id'][:8]}  ({st['pose_source']})"
         )
@@ -371,6 +414,42 @@ class NavMainWindow(QMainWindow):
             f"chassis: status/{age_s}  hb#{hb_seq}"
         )
         self._chassis_lbl.setStyleSheet("color: #ccc;")
+
+    # ── Planning ─────────────────────────────────────────────────────
+
+    def _on_goal_requested(self, x_w: float, y_w: float) -> None:
+        """Right-click in any map view → set goal here, plan now."""
+        self._shared_view.set_goal((x_w, y_w))
+        cm = self._last_costmap
+        latest = self.fuser.pose_source.latest_pose()
+        pose = latest[0] if latest is not None else None
+        if cm is None or pose is None:
+            self._shared_view.set_planned_path([])
+            self._notes_lbl.setText(
+                "goal set; waiting for map + pose before planning"
+            )
+            return
+        self._replan(cm, pose)
+
+    def _replan(self, costmap, pose) -> None:
+        goal = self._shared_view.goal()
+        if goal is None or costmap is None or pose is None:
+            return
+        result = plan_path(
+            costmap,
+            start_world=(pose[0], pose[1]),
+            goal_world=goal,
+            config=self._astar_config,
+        )
+        self._last_plan = result
+        if result.ok:
+            self._shared_view.set_planned_path(result.waypoints_world)
+        else:
+            self._shared_view.set_planned_path([])
+
+    def _on_clear_goal(self) -> None:
+        self._shared_view.set_goal(None)
+        self._last_plan = None
 
     # ── Toolbar handlers ─────────────────────────────────────────────
 
