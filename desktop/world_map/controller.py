@@ -171,9 +171,7 @@ class FuserController:
             vote_margin=config.vote_margin,
             traversal_vote_weight=config.traversal_vote_weight,
             footprint_radius_m=config.footprint_radius_m,
-            vote_saturation_cap=config.vote_saturation_cap,
-            vote_floor=config.vote_floor,
-            vote_decay_alpha=config.vote_decay_alpha,
+            vote_capacity=config.vote_capacity,
         )
 
         # Zenoh handles

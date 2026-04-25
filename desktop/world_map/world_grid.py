@@ -43,9 +43,7 @@ class WorldGrid:
         vote_margin: int,
         traversal_vote_weight: int,
         footprint_radius_m: float,
-        vote_saturation_cap: float = 10.0,
-        vote_floor: float = 3.0,
-        vote_decay_alpha: float = 0.99,
+        vote_capacity: float = 10.0,
     ):
         if resolution_m <= 0:
             raise ValueError("resolution_m must be > 0")
@@ -62,12 +60,11 @@ class WorldGrid:
         self._vote_margin = int(vote_margin)
         self._traversal_vote_weight = int(traversal_vote_weight)
         self._footprint_radius_m = float(footprint_radius_m)
-        # Vote dynamics: saturation upper bound, sticky non-zero floor
-        # for previously-confident cells, multiplicative decay per
-        # fusion. See FuserConfig docstrings for rationale.
-        self._vote_cap = float(vote_saturation_cap)
-        self._vote_floor = float(vote_floor)
-        self._vote_decay_alpha = float(vote_decay_alpha)
+        # Sum-bounded ("FIFO") evidence model: per cell, clear+block
+        # is constrained to ≤ vote_capacity. New observations on one
+        # side displace the other. No time decay; values persist
+        # forever until contradicted. See FuserConfig docstring.
+        self._vote_capacity = float(vote_capacity)
 
         # Pre-compute footprint cell offsets (square mask, then circular).
         r_cells = int(math.ceil(self._footprint_radius_m / self._res))
@@ -215,14 +212,6 @@ class WorldGrid:
             if n_in == 0:
                 return 0, n_out
 
-            # Apply per-fusion decay to ALL cells before adding this
-            # frame's evidence. The floor (sticky non-zero memory)
-            # only applies to cells that were previously confident
-            # (votes ≥ floor before decay) — newly-seen cells with
-            # weak evidence still decay all the way to zero. See
-            # FuserConfig docstring.
-            self._apply_decay_locked()
-
             iw_v = iw[in_world]
             jw_v = jw[in_world]
             src_h = grid[in_world]
@@ -254,13 +243,10 @@ class WorldGrid:
                         1.0,
                     )
 
-            # Saturation cap on both layers after this frame's
-            # additions. Without this, a cell observed N times has
-            # votes = N until decay catches up; capping makes the
-            # "13 contradicting observations override" property
-            # hold immediately.
-            np.minimum(self.clear_votes, self._vote_cap, out=self.clear_votes)
-            np.minimum(self.block_votes, self._vote_cap, out=self.block_votes)
+            # Sum-bounded constraint: clear + block ≤ vote_capacity.
+            # New observations displace existing evidence on the
+            # opposite side. No time-based decay anywhere.
+            self._apply_constraint_locked()
 
             # observation_count and last_observed_ts.
             np.add.at(self.observation_count, (iw_v, jw_v), 1)
@@ -303,12 +289,11 @@ class WorldGrid:
             )
             np.add.at(self.clear_votes, (iw_v, jw_v),
                       float(self._traversal_vote_weight))
-            # Saturation cap on the stamped subset. Decay isn't run
-            # here — decay runs per fusion (5 Hz) only, so traversal
-            # stamping at 10 Hz doesn't compound it.
-            self.clear_votes[iw_v, jw_v] = np.minimum(
-                self.clear_votes[iw_v, jw_v], self._vote_cap,
-            )
+            # Enforce the sum-bound: traversal evidence displaces
+            # any pre-existing block votes at the same cells. Apply
+            # globally — cheap on a 500×500 grid and keeps the
+            # invariant holding at all times.
+            self._apply_constraint_locked()
             np.add.at(self.observation_count, (iw_v, jw_v), 1)
             cur_obs = self.last_observed_ts[iw_v, jw_v]
             self.last_observed_ts[iw_v, jw_v] = np.where(
@@ -435,25 +420,24 @@ class WorldGrid:
 
     # ── Internal ─────────────────────────────────────────────────────
 
-    def _apply_decay_locked(self) -> None:
-        """Multiplicative decay of both vote layers, with the
-        non-zero floor enforced on cells that were previously above
-        it. Caller holds self._lock.
+    def _apply_constraint_locked(self) -> None:
+        """Enforce clear_votes + block_votes ≤ vote_capacity per cell
+        ("FIFO of length vote_capacity").
 
-        Logic per cell, per layer:
-            new = votes * alpha
-            if old >= floor and new < floor:
-                new = floor   # pin at floor — "remembered prior"
-            (no change otherwise)
-        Cells that were never above floor decay all the way to 0.
+        Where the sum exceeds the cap, scale both layers by
+        cap / total so the sum returns to the cap. Effect: a new
+        observation on one side displaces existing evidence on the
+        other side proportionally. Cells with sum already ≤ cap
+        are untouched — no time-based decay.
         """
-        a = self._vote_decay_alpha
-        f = self._vote_floor
-        for arr in (self.clear_votes, self.block_votes):
-            old = arr.copy()
-            arr *= a
-            crossed = (old >= f) & (arr < f)
-            arr[crossed] = f
+        cap = self._vote_capacity
+        total = self.clear_votes + self.block_votes
+        overflow = total > cap
+        if not np.any(overflow):
+            return
+        scale = cap / total[overflow]
+        self.clear_votes[overflow] *= scale
+        self.block_votes[overflow] *= scale
 
     def _driveable_from_votes_locked(self) -> np.ndarray:
         out = np.full((self._n, self._n), -1, dtype=np.int8)
