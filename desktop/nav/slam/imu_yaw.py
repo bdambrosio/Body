@@ -149,8 +149,12 @@ class ImuYawTracker:
             n = len(self._buf)
             first_ts = self._buf[0][0]
             last_ts = self._buf[-1][0]
-            # Grace: half the mean inter-arrival on each side.
-            grace = (last_ts - first_ts) / max(1, n - 1) * 0.5 if n >= 2 else 0.05
+            # Grace: one mean inter-arrival on each side. (Prior 0.5×
+            # was too tight — shadow-mode logs showed scan timestamps
+            # routinely landing 5–10 ms past the latest IMU sample due
+            # to publish-jitter, missing the IMU prior on ~37% of
+            # match attempts.)
+            grace = (last_ts - first_ts) / max(1, n - 1) if n >= 2 else 0.05
             if ts < first_ts - grace or ts > last_ts + grace:
                 return None
 

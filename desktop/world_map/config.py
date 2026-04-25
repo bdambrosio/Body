@@ -38,6 +38,10 @@ class FuserConfig:
     input_timeout_s: float = 2.0
 
     pose_source: str = "odom"  # v1.1: "odom+scanmatch"
+    # When True, FuserController constructs ImuPlusScanMatchPose
+    # instead of OdomPose and calls .connect(session, grid) after
+    # the zenoh session is open. See docs/slam_pi_contract.md.
+    slam_enabled: bool = False
 
     vote_margin: int = 1
     traversal_stamp_hz: float = 10.0

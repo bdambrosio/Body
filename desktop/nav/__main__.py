@@ -78,6 +78,13 @@ def _parse_args(argv):
              "not write to the fuser's pose — purely observational.",
     )
     p.add_argument(
+        "--slam", action="store_true",
+        help="Promote SLAM to the production pose source. Replaces "
+             "OdomPose with ImuPlusScanMatchPose: encoder translation "
+             "+ BNO085 yaw + lidar scan-match corrections against the "
+             "world grid. See docs/slam_pi_contract.md.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
     )
     return p.parse_args(argv)
@@ -99,6 +106,7 @@ def main(argv=None) -> int:
         world_resolution_m=args.world_resolution_m,
         publish_hz=args.publish_hz,
         map_stale_s=args.map_stale_s,
+        slam_enabled=args.slam,
     )
     chassis_config = StubConfig(
         router=router,
@@ -120,7 +128,12 @@ def main(argv=None) -> int:
     # safety toolbar don't re-install the driver; restart nav if the
     # fuser was reconnected and you want shadow SLAM going again.
     shadow: Optional[ShadowSlamDriver] = None
-    if args.shadow_slam:
+    if args.shadow_slam and args.slam:
+        log.info(
+            "--slam already promotes the SLAM pose source; "
+            "ignoring redundant --shadow-slam.",
+        )
+    elif args.shadow_slam:
         if fuser.connected:
             shadow = ShadowSlamDriver(
                 session=fuser.session,

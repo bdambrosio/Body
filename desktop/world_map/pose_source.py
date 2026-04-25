@@ -29,6 +29,26 @@ class PoseSource:
         """Return (pose, ts) of the newest sample, or None if none yet."""
         raise NotImplementedError
 
+    def update(self, ts: float, x: float, y: float, theta: float) -> None:
+        """Ingest a body/odom sample. Called from FuserController's odom
+        subscriber callback. Implementations that don't consume odom
+        directly may override as a no-op (none today; both v1 OdomPose
+        and v1.1 ImuPlusScanMatchPose route translation through odom)."""
+        raise NotImplementedError
+
+    def rebind_world_to_current(self) -> Optional[Pose]:
+        """Anchor the world frame at the current robot pose. Returns
+        the pose used as the new origin (in the source's own frame),
+        or None if no sample has arrived yet."""
+        raise NotImplementedError
+
+    def to_world(self, x_o: float, y_o: float, th_o: float) -> Pose:
+        """Transform an odom-frame pose into world frame using the
+        current offset. Used when a Pi-stamped local_map carries an
+        odom-frame anchor_pose. Default identity for sources that
+        don't manage an odom→world transform."""
+        return (x_o, y_o, th_o)
+
     def cov_at(self, ts: float) -> Optional[np.ndarray]:
         return None
 
@@ -119,16 +139,29 @@ class OdomPose(PoseSource):
             if not self._buf:
                 return None
             ts, x, y, theta = self._buf[-1]
-            return self._to_world(x, y, theta), ts
+            return self.to_world(x, y, theta), ts
 
     def pose_at(self, ts: float) -> Optional[Pose]:
+        odom = self.pose_at_in_odom_frame(ts)
+        if odom is None:
+            return None
+        return self.to_world(*odom)
+
+    def pose_at_in_odom_frame(self, ts: float) -> Optional[Pose]:
+        """Same bisection / interpolation as `pose_at`, but returns the
+        raw odom-frame pose (no world offset applied). Used by
+        `ImuPlusScanMatchPose` when applying scan-match corrections —
+        it needs to know the encoder-frame pose at the scan ts in order
+        to recompute the world offset that would map it to the
+        corrected world pose.
+        """
         with self._lock:
             n = len(self._buf)
             if n == 0:
                 return None
             if n == 1:
                 _, x, y, theta = self._buf[0]
-                return self._to_world(x, y, theta)
+                return (x, y, theta)
 
             # Clamp at ends to the nearest sample if within a small grace
             # window (half the mean inter-arrival). Outside, return None.
@@ -138,13 +171,13 @@ class OdomPose(PoseSource):
                 grace = (last_ts - first_ts) / max(1, n - 1) * 0.5
                 if first_ts - ts <= grace:
                     _, x, y, theta = self._buf[0]
-                    return self._to_world(x, y, theta)
+                    return (x, y, theta)
                 return None
             if ts > last_ts:
                 grace = (last_ts - first_ts) / max(1, n - 1) * 0.5
                 if ts - last_ts <= grace:
                     _, x, y, theta = self._buf[-1]
-                    return self._to_world(x, y, theta)
+                    return (x, y, theta)
                 return None
 
             # Binary search for bracketing pair.
@@ -158,17 +191,17 @@ class OdomPose(PoseSource):
             t0, x0, y0, th0 = self._buf[lo]
             t1, x1, y1, th1 = self._buf[hi]
             if t1 == t0:
-                return self._to_world(x1, y1, th1)
+                return (x1, y1, th1)
             alpha = (ts - t0) / (t1 - t0)
             x = x0 + alpha * (x1 - x0)
             y = y0 + alpha * (y1 - y0)
             ua, ub = _unwrap_pair(th0, th1)
             theta = _wrap(ua + alpha * (ub - ua))
-            return self._to_world(x, y, theta)
+            return (x, y, theta)
 
     # ── World frame ──────────────────────────────────────────────────
 
-    def _to_world(
+    def to_world(
         self, x_o: float, y_o: float, th_o: float,
     ) -> Pose:
         """Transform an odom-frame pose into world frame.

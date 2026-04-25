@@ -154,7 +154,13 @@ class FuserController:
 
     def __init__(self, config: FuserConfig):
         self.config = config
-        self.pose_source: PoseSource = OdomPose()
+        if config.slam_enabled:
+            # Imported lazily so OdomPose-only deployments don't pull
+            # in the slam package on startup.
+            from .imu_scan_pose import ImuPlusScanMatchPose
+            self.pose_source: PoseSource = ImuPlusScanMatchPose()
+        else:
+            self.pose_source = OdomPose()
         self.grid = WorldGrid(
             extent_m=config.world_extent_m,
             resolution_m=config.world_resolution_m,
@@ -237,6 +243,15 @@ class FuserController:
             self._teardown_zenoh()
             return False, f"{type(e).__name__}: {e}"
 
+        # SLAM pose source needs the session + grid to declare its
+        # own subscribers. OdomPose has no .connect() method.
+        connect_pose = getattr(self.pose_source, "connect", None)
+        if callable(connect_pose):
+            try:
+                connect_pose(self._session, self.grid)
+            except Exception:
+                logger.exception("pose_source.connect raised; continuing")
+
         self._stop_event.clear()
         self._fusion_thread = threading.Thread(
             target=self._fusion_loop, name="wm-fusion", daemon=True,
@@ -263,6 +278,14 @@ class FuserController:
         self._fusion_thread = None
         self._traversal_thread = None
         self._publish_thread = None
+        # Tear down SLAM subscribers (if any) before the session goes,
+        # otherwise their callbacks may fire on a closing handle.
+        disconnect_pose = getattr(self.pose_source, "disconnect", None)
+        if callable(disconnect_pose):
+            try:
+                disconnect_pose()
+            except Exception:
+                logger.exception("pose_source.disconnect raised; continuing")
         self._teardown_zenoh()
         with self._lock:
             self._connected = False
@@ -361,8 +384,7 @@ class FuserController:
             return
         ts, x, y, theta = triple
         # Use Pi-supplied ts for the pose buffer; recv ts only for rates.
-        if isinstance(self.pose_source, OdomPose):
-            self.pose_source.update(ts, x, y, theta)
+        self.pose_source.update(ts, x, y, theta)
         with self._lock:
             self._arr_odom.append(_now())
             self._last_odom_ts = _now()
@@ -389,8 +411,7 @@ class FuserController:
 
     def _do_reset(self, *, reason: str) -> None:
         new_id = self.grid.reset((0.0, 0.0, 0.0))
-        if isinstance(self.pose_source, OdomPose):
-            self.pose_source.rebind_world_to_current()
+        self.pose_source.rebind_world_to_current()
         with self._lock:
             self._notes = f"reset:{reason}"
             self._last_pose_unavail_streak = 0
@@ -429,12 +450,10 @@ class FuserController:
                         float(ap.get("y_m", 0.0)),
                         float(ap.get("theta_rad", ap.get("theta", 0.0))),
                     )
-                    if isinstance(self.pose_source, OdomPose):
-                        # Convert odom-frame anchor to world via the
-                        # current offset.
-                        pose = self.pose_source._to_world(*pose_in_odom)
-                    else:
-                        pose = pose_in_odom
+                    # Convert odom-frame anchor to world via the
+                    # source's current offset (identity if the source
+                    # doesn't manage an odom→world transform).
+                    pose = self.pose_source.to_world(*pose_in_odom)
                 else:
                     pose = self.pose_source.pose_at(cap_ts)
 
