@@ -69,11 +69,11 @@ class CostmapConfig:
 
     # Speckle filter on the blocked layer before inflation. Drops
     # blocked cells whose number of blocked 8-neighbors is below
-    # this threshold. denoise_min_neighbors=1 drops only fully-
-    # isolated cells (preserves walls); =2 also drops sparse 2-cell
-    # pairs that would otherwise inflate into ~50-cell lethal disks.
-    # Walls and definite blobs (any cell with 2+ co-line/co-blob
-    # neighbors) survive at either threshold.
+    # this threshold.
+    #   =1 → drops only fully-isolated cells
+    #   =2 → also drops sparse 2-cell pairs (DEFAULT)
+    #   =3 → eats 1-cell-thick walls (each cell only has 2 line-
+    #        direction neighbors); too aggressive for lidar maps.
     denoise: bool = True
     denoise_min_neighbors: int = 2
 
@@ -240,35 +240,45 @@ def _wavefront_distance(blocked: np.ndarray, *, max_cells: int) -> np.ndarray:
 def costmap_to_rgb(cm: Costmap) -> np.ndarray:
     """Render a Costmap as a uint8 (nx, ny, 3) RGB image.
 
-    Color choices, picked for operator legibility:
-      lethal       → bright red
-      halo (cost)  → red→orange→yellow gradient on cost magnitude
-      unknown      → medium gray
-      free (cost 0) → near-black green
+    Color choices kept distinct so the operator can tell at a glance
+    what the planner is being told:
+      lethal     → bright red (robot literally cannot enter here)
+      halo, hot  → orange-yellow at full cost (high-cost band, planner
+                   strongly avoids; previously rendered red and was
+                   indistinguishable from lethal)
+      halo, cool → green-yellow as cost falls toward 0
+      free       → dark green
+      unknown    → medium gray
+    The whole halo gradient stays in the green→yellow range so red is
+    reserved exclusively for "no go."
     """
     nx, ny = cm.cost.shape
     rgb = np.zeros((nx, ny, 3), dtype=np.uint8)
 
-    # Free baseline.
-    rgb[:] = (10, 32, 16)
+    # Free baseline (cost == 0, observed clear & not in halo).
+    rgb[:] = (10, 64, 32)
 
-    # Halo: scale cost to [0, 1] over [0, halo_max].
+    # Halo: green-yellow gradient on cost magnitude. t=0 (cost→0) is
+    # dark olive; t=1 (cost==halo_max) is saturated yellow. Crucially
+    # nothing in this gradient is red, so it can't be confused with
+    # lethal at a glance.
     halo_max = float(cm.config.halo_max)
     finite = np.isfinite(cm.cost)
     halo = finite & (cm.cost > 0) & (~cm.unknown)
     if np.any(halo):
         t = np.clip(cm.cost[halo] / max(halo_max, 1e-6), 0.0, 1.0)
-        # red rises with t; green stays moderate; blue stays low.
-        r = (60 + 195 * t).astype(np.uint8)
-        g = (90 + 110 * (1 - t)).astype(np.uint8)
-        b = np.full_like(r, 30)
-        rgb_halo = np.stack([r, g, b], axis=-1)
-        rgb[halo] = rgb_halo
+        # t=0 → (40, 110, 50) dark green
+        # t=1 → (235, 215, 60) saturated yellow
+        r = (40 + 195 * t).astype(np.uint8)
+        g = (110 + 105 * t).astype(np.uint8)
+        b = (50 + 10 * t).astype(np.uint8)
+        rgb[halo] = np.stack([r, g, b], axis=-1)
 
     # Unknown.
     rgb[cm.unknown] = (90, 90, 90)
 
-    # Lethal — last so it overwrites halo edges.
+    # Lethal last so it overwrites halo edges. Pure red — the only
+    # red anywhere in this image.
     rgb[cm.lethal] = (235, 50, 50)
 
     return rgb
