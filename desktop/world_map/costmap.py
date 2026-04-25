@@ -47,14 +47,18 @@ import numpy as np
 
 @dataclass
 class CostmapConfig:
-    # Robot footprint disk + extra safety margin. Cells whose center
-    # is within (footprint + safety) of a blocked cell are lethal.
+    # Robot footprint radius. Cells whose center is within this
+    # distance of any blocked cell are LETHAL — robot literally
+    # cannot fit. Smaller than the previous "footprint + safety"
+    # combo: safety now lives in the halo, not in lethal, so a
+    # speckle of blocked cells doesn't paint a giant no-go disk.
     footprint_radius_m: float = 0.15
+    # Beyond the footprint, a band of width safety_margin_m carries
+    # the maximum halo cost (planner strongly prefers to avoid).
+    # Past that, cost decays exponentially.
     safety_margin_m: float = 0.10
 
-    # Past the lethal radius, cost decays as cost = halo_max *
-    # exp(-(d - lethal_radius) / inflation_decay_m). Tunes how strongly
-    # the planner is biased away from walls.
+    # Exponential decay length-scale beyond the safety band.
     inflation_decay_m: float = 0.30
     halo_max: float = 100.0
 
@@ -63,11 +67,15 @@ class CostmapConfig:
     # that "go through observed clear" is preferred.
     unknown_cost: float = 25.0
 
-    # Drop blocked cells that have *zero* blocked neighbors. Kills
-    # salt-and-pepper specks before inflation balloons them into
-    # 25 cm disks. A morphological open (erode + dilate) would also
-    # work but eats 1-cell-thick walls, which lidar maps often have.
+    # Speckle filter on the blocked layer before inflation. Drops
+    # blocked cells whose number of blocked 8-neighbors is below
+    # this threshold. denoise_min_neighbors=1 drops only fully-
+    # isolated cells (preserves walls); =2 also drops sparse 2-cell
+    # pairs that would otherwise inflate into ~50-cell lethal disks.
+    # Walls and definite blobs (any cell with 2+ co-line/co-blob
+    # neighbors) survive at either threshold.
     denoise: bool = True
+    denoise_min_neighbors: int = 2
 
 
 # ── Output type ────────────────────────────────────────────────────
@@ -108,24 +116,38 @@ def build_costmap(
     unknown = (drive == -1)
 
     if cfg.denoise:
-        blocked = _drop_isolated_cells(blocked)
+        blocked = _drop_speckle(
+            blocked, min_neighbors=cfg.denoise_min_neighbors,
+        )
 
-    # Distance transform, capped at the useful radius.
-    lethal_radius_m = cfg.footprint_radius_m + cfg.safety_margin_m
-    halo_extent_m = lethal_radius_m + 5.0 * cfg.inflation_decay_m
+    # Lethal radius is footprint only — the safety margin contributes
+    # to halo cost, not to "robot cannot enter." This stops a single
+    # speckle from painting a 50-cell lethal disk.
+    lethal_radius_m = cfg.footprint_radius_m
+    safety_band_m = cfg.safety_margin_m
+    halo_extent_m = (
+        lethal_radius_m + safety_band_m + 5.0 * cfg.inflation_decay_m
+    )
     max_cells = max(2, int(math.ceil(halo_extent_m / res)))
     dist_cells = _wavefront_distance(blocked, max_cells=max_cells)
     dist_m = (dist_cells * res).astype(np.float32)
 
-    # Lethal: blocked plus inflation disk.
+    # Lethal: blocked plus footprint-radius dilation.
     lethal = blocked | (dist_m < lethal_radius_m)
 
-    # Cost field.
+    # Cost field. Inside the safety band (lethal_radius..lethal_radius
+    # + safety_margin) the halo is at full halo_max — strongly avoided
+    # but not lethal. Beyond, exponential decay.
     cost = np.zeros_like(dist_m, dtype=np.float32)
     halo = (~lethal) & (dist_m < halo_extent_m)
     if np.any(halo):
-        cost[halo] = cfg.halo_max * np.exp(
-            -(dist_m[halo] - lethal_radius_m) / cfg.inflation_decay_m,
+        d_excess = dist_m[halo] - lethal_radius_m
+        in_safety = d_excess <= safety_band_m
+        decay_d = np.maximum(0.0, d_excess - safety_band_m)
+        cost[halo] = np.where(
+            in_safety,
+            cfg.halo_max,
+            cfg.halo_max * np.exp(-decay_d / cfg.inflation_decay_m),
         )
     cost[unknown] = cfg.unknown_cost
     # Lethal cells: leave as +inf so any consumer that ignores `lethal`
@@ -159,10 +181,16 @@ def _shift(arr: np.ndarray, di: int, dj: int, fill) -> np.ndarray:
     return out
 
 
-def _drop_isolated_cells(mask: np.ndarray) -> np.ndarray:
-    """Drop True cells with zero True 8-neighbors. Preserves any
-    cell that's part of a line, corner, or larger blob (a 1-cell-thick
-    wall has at least one neighbor along the line, so it survives).
+def _drop_speckle(
+    mask: np.ndarray, *, min_neighbors: int = 2,
+) -> np.ndarray:
+    """Drop True cells whose count of True 8-neighbors is below
+    min_neighbors. With min_neighbors=1, drops only fully-isolated
+    specks (preserves 1-cell-thick walls). With min_neighbors=2,
+    also drops sparse 2-cell pairs that would each inflate to a
+    50-cell lethal disk under footprint+safety inflation. Walls
+    survive either way: each cell on a line has 2 line-direction
+    neighbors.
     """
     count = np.zeros(mask.shape, dtype=np.int8)
     src = mask.astype(np.int8)
@@ -171,7 +199,7 @@ def _drop_isolated_cells(mask: np.ndarray) -> np.ndarray:
             if di == 0 and dj == 0:
                 continue
             count += _shift(src, di, dj, fill=0)
-    return mask & (count >= 1)
+    return mask & (count >= int(min_neighbors))
 
 
 def _wavefront_distance(blocked: np.ndarray, *, max_cells: int) -> np.ndarray:
