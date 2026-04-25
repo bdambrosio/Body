@@ -3,9 +3,9 @@
 Ground plane z = 0 in body frame (+x forward, +y left, +z up). Each cell stores the maximum
 sampled body-frame z from the latest lidar slice and depth frustum.
 
-Optional **driveable** grid: no obstacle in the vertical slab (fitted floor plane +
-``driveable_floor_band_m``, up to ``driveable_clearance_height_m``) using depth-ground RANSAC
-at ``floor_fit_interval_s``. See docs/local_map_spec.md.
+Optional **driveable** grid: no obstacle in the vertical slab above the fixed horizontal
+ground plane (``driveable_floor_band_m`` up to ``driveable_clearance_height_m``). See
+docs/local_map_spec.md.
 """
 
 from __future__ import annotations
@@ -281,6 +281,7 @@ def main() -> None:
     clearance_m = float(lm.get("driveable_clearance_height_m", 0.35))
     floor_band_m = float(lm.get("driveable_floor_band_m", 0.04))
     clear_frames_need = max(1, int(lm.get("driveable_clear_frames", 4)))
+    floor_fit_enabled = bool(lm.get("floor_fit_enabled", False))
     floor_fit_interval_s = float(lm.get("floor_fit_interval_s", 0.5))
     floor_fit_iters = max(10, int(lm.get("floor_fit_ransac_iters", 100)))
     floor_fit_inlier_m = float(lm.get("floor_fit_inlier_m", 0.04))
@@ -371,7 +372,7 @@ def main() -> None:
             omsg = last_odom
 
         now = time.monotonic()
-        if driveable_on and now >= next_floor_fit and dmsg is not None:
+        if floor_fit_enabled and driveable_on and now >= next_floor_fit and dmsg is not None:
             next_floor_fit = now + max(0.05, floor_fit_interval_s)
             dec_fit = _decode_depth_mm(dmsg)
             if dec_fit is not None:
