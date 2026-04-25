@@ -42,16 +42,20 @@ class TestImuYawTracker(unittest.TestCase):
         self.assertTrue(t.is_settled())
 
     def test_settle_run_resets_on_bad_sample(self):
+        # Reset-on-bad-accuracy is RV-only behavior; GAME_RV bypasses
+        # the accuracy gate entirely (constant accuracy_rad in that
+        # mode would otherwise lock the gate forever).
         t = ImuYawTracker(min_settle_samples=3, settle_accuracy_rad=0.05)
-        t.update(_reading(ts=0.00, yaw=0.0, accuracy_rad=0.02))
-        t.update(_reading(ts=0.01, yaw=0.0, accuracy_rad=0.02))
+        rv = FusionMode.ROTATION_VECTOR
+        t.update(_reading(ts=0.00, yaw=0.0, mode=rv, accuracy_rad=0.02))
+        t.update(_reading(ts=0.01, yaw=0.0, mode=rv, accuracy_rad=0.02))
         # Bad sample: resets the run.
-        t.update(_reading(ts=0.02, yaw=0.0, accuracy_rad=0.20))
-        t.update(_reading(ts=0.03, yaw=0.0, accuracy_rad=0.02))
-        t.update(_reading(ts=0.04, yaw=0.0, accuracy_rad=0.02))
+        t.update(_reading(ts=0.02, yaw=0.0, mode=rv, accuracy_rad=0.20))
+        t.update(_reading(ts=0.03, yaw=0.0, mode=rv, accuracy_rad=0.02))
+        t.update(_reading(ts=0.04, yaw=0.0, mode=rv, accuracy_rad=0.02))
         # Only 2 good since last bad → still unsettled.
         self.assertFalse(t.is_settled())
-        t.update(_reading(ts=0.05, yaw=0.0, accuracy_rad=0.02))
+        t.update(_reading(ts=0.05, yaw=0.0, mode=rv, accuracy_rad=0.02))
         self.assertTrue(t.is_settled())
 
     def test_constant_rotation_tracks(self):
@@ -119,6 +123,40 @@ class TestImuYawTracker(unittest.TestCase):
         self.assertEqual(t.fusion_mode(), FusionMode.ROTATION_VECTOR)
         t.update(_reading(ts=0.01, yaw=0.0, mode=FusionMode.GAME_ROTATION_VECTOR))
         self.assertEqual(t.fusion_mode(), FusionMode.GAME_ROTATION_VECTOR)
+
+    def test_game_rv_settles_by_count_despite_high_accuracy(self):
+        # GAME_RV reports a constant accuracy_rad (= imu.game_rotation_vector_accuracy_rad,
+        # 0.175 by default) that would never pass the 0.06 default
+        # gate. Settle must succeed by sample count alone.
+        t = ImuYawTracker(min_settle_samples=5, settle_accuracy_rad=0.06)
+        for i in range(4):
+            t.update(_reading(
+                ts=i * 0.01, yaw=0.0,
+                mode=FusionMode.GAME_ROTATION_VECTOR,
+                accuracy_rad=0.175,
+            ))
+        self.assertFalse(t.is_settled())
+        t.update(_reading(
+            ts=4 * 0.01, yaw=0.0,
+            mode=FusionMode.GAME_ROTATION_VECTOR,
+            accuracy_rad=0.175,
+        ))
+        self.assertTrue(t.is_settled())
+        # Once settled, yaw_at returns a usable value.
+        result = t.yaw_at(0.04)
+        self.assertIsNotNone(result)
+
+    def test_rv_still_uses_accuracy_gate(self):
+        # Sanity: changing GAME_RV settle behavior must not loosen
+        # the RV gate. Bad-accuracy RV samples still reset the run.
+        t = ImuYawTracker(min_settle_samples=3, settle_accuracy_rad=0.05)
+        t.update(_reading(ts=0.00, yaw=0.0,
+                          mode=FusionMode.ROTATION_VECTOR, accuracy_rad=0.20))
+        t.update(_reading(ts=0.01, yaw=0.0,
+                          mode=FusionMode.ROTATION_VECTOR, accuracy_rad=0.20))
+        t.update(_reading(ts=0.02, yaw=0.0,
+                          mode=FusionMode.ROTATION_VECTOR, accuracy_rad=0.20))
+        self.assertFalse(t.is_settled())
 
 
 if __name__ == "__main__":

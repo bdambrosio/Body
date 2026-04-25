@@ -14,11 +14,22 @@ the yaw *means*:
 Mode propagation: consumers see fusion_mode() and decide whether
 the yaw is globally meaningful (e.g. for persistent landmarks).
 
-Boot-time settle: the BNO085's accuracy_rad shrinks over ~1–2 s as
-its gyro bias settles. ImuYawTracker refuses to answer queries
-(returns None) until `min_settle_samples` consecutive readings
-report accuracy_rad <= settle_accuracy_rad. After settle, all
-readings count.
+Boot-time settle:
+- ROTATION_VECTOR: the BNO085's accuracy_rad shrinks over ~1–2 s as
+  its gyro bias settles. The tracker refuses to answer queries
+  (returns None) until `min_settle_samples` consecutive readings
+  report accuracy_rad <= settle_accuracy_rad.
+- GAME_ROTATION_VECTOR: the SH-2 firmware does not produce a
+  dynamic accuracy estimate, so accuracy_rad is the constant
+  `imu.game_rotation_vector_accuracy_rad` from Pi config (0.175
+  by default) on every sample. The accuracy gate is therefore
+  meaningless in this mode; settle is purely a sample-count gate
+  (`min_settle_samples` of any GAME_RV samples). Pi already waits
+  `imu.settle_time_s` (2 s default) before publishing, so by the
+  time desktop sees its first sample the BNO085 startup transient
+  is already behind us.
+
+After settle, all readings count and the gate never re-arms.
 
 Thread-safety: Ingest and query may be called from different threads
 (Zenoh callback thread ingests; fuser thread queries). All public
@@ -90,8 +101,14 @@ class ImuYawTracker:
             self._buf.append((reading.ts, yaw, reading.accuracy_rad))
             self._mode = reading.fusion_mode
 
-            # Settle gate
-            if reading.accuracy_rad <= self._settle_acc:
+            # Settle gate. GAME_RV reports a constant accuracy_rad
+            # (≈ 0.175) so the accuracy comparison is degenerate;
+            # fall back to a pure sample-count gate in that mode.
+            sample_passes = (
+                reading.fusion_mode == FusionMode.GAME_ROTATION_VECTOR
+                or reading.accuracy_rad <= self._settle_acc
+            )
+            if sample_passes:
                 self._settle_run += 1
                 if not self._settled and self._settle_run >= self._min_settle:
                     self._settled = True
