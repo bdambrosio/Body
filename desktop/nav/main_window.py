@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QSplitter, QToolBar, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
+    QMessageBox, QSplitter, QToolBar, QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtCore import QUrl
@@ -97,6 +98,16 @@ class NavMainWindow(QMainWindow):
         )
         save_act.triggered.connect(self._on_save_snapshot)
         self._map_toolbar.addAction(save_act)
+
+        load_act = QAction("Load snapshot", self)
+        load_act.setToolTip(
+            "Restore a saved layers.npz into the world grid as a "
+            "prior. Vote decay continues normally — re-observed "
+            "cells stay confident, unobserved cells gradually fade "
+            "toward the floor."
+        )
+        load_act.triggered.connect(self._on_load_snapshot)
+        self._map_toolbar.addAction(load_act)
 
         fit_act = QAction("Fit maps", self)
         fit_act.setToolTip(
@@ -638,6 +649,45 @@ class NavMainWindow(QMainWindow):
         self._mission.cancel()
 
     # ── Toolbar handlers ─────────────────────────────────────────────
+
+    def _on_load_snapshot(self) -> None:
+        """Pick a layers.npz via file dialog and restore it into the
+        live world grid. Cancelling any active mission first so we
+        don't drive against a freshly-replaced map."""
+        # Default to the conventional sessions directory; fall back
+        # to home if it doesn't exist yet.
+        default_dir = os.path.expanduser("~/Body/sessions")
+        if not os.path.isdir(default_dir):
+            default_dir = os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load snapshot — pick a layers.npz",
+            default_dir,
+            "World snapshots (layers.npz)",
+        )
+        if not path:
+            return
+        # Cancel a running mission so we don't drive on stale
+        # follower state with a freshly-replaced grid underneath.
+        if self._mission.is_active():
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.cancel()
+        try:
+            summary = self.fuser.load_snapshot(path)
+        except Exception as e:
+            logger.exception("load_snapshot failed")
+            QMessageBox.warning(
+                self, "Load snapshot failed",
+                f"Could not load snapshot:\n{type(e).__name__}: {e}",
+            )
+            return
+        QMessageBox.information(
+            self, "Snapshot loaded",
+            f"Loaded {summary['cells_observed']} cells from\n"
+            f"{path}\n\n"
+            f"loaded session: {summary['loaded_session_id'][:8]}\n"
+            f"live session:   {summary['current_session_id'][:8]}"
+        )
 
     def _on_save_snapshot(self) -> None:
         try:

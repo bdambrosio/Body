@@ -277,6 +277,72 @@ def write_bundle(
     return out_dir
 
 
+def load_snapshot_into(
+    controller: "FuserController",
+    npz_path: str,
+) -> Dict[str, Any]:
+    """Restore a saved layers.npz into the live world grid in place.
+
+    The grid's resolution and extent must match the saved meta —
+    we don't try to reproject a snapshot taken at a different
+    resolution. On mismatch, raises ValueError without touching
+    state. Returns a summary dict with the loaded session_id,
+    cell counts, and bounds; the caller can surface this in the
+    UI.
+
+    Note on dynamics: votes are loaded as-is. Subsequent fusion
+    ticks apply the normal decay + floor + saturation rules, so
+    confidently-saved cells will gradually fade toward the floor
+    if not re-observed in the new session — i.e. the saved map
+    *is* the prior, but stale priors weaken over a few minutes
+    until fresh observations confirm or contradict.
+    """
+    data = np.load(npz_path, allow_pickle=False)
+    meta_str = str(data["meta_json"])
+    saved_meta = json.loads(meta_str)
+    grid = controller.grid
+
+    if abs(float(saved_meta["resolution_m"]) - grid.resolution_m) > 1e-6:
+        raise ValueError(
+            f"snapshot resolution {saved_meta['resolution_m']} m "
+            f"≠ live grid {grid.resolution_m} m"
+        )
+    if int(saved_meta["nx"]) != grid.n_cells:
+        raise ValueError(
+            f"snapshot nx {saved_meta['nx']} ≠ live grid {grid.n_cells}"
+        )
+
+    with grid._lock:
+        # Cast votes to the live dtype (saved as float, live grid is
+        # float32 — np.copyto handles silent casts).
+        np.copyto(grid.max_height_m, data["max_height_m"].astype(np.float32))
+        np.copyto(grid.clear_votes, data["clear_votes"].astype(np.float32))
+        np.copyto(grid.block_votes, data["block_votes"].astype(np.float32))
+        np.copyto(grid.traversed_ts, data["traversed_ts"].astype(np.float32))
+        np.copyto(grid.last_observed_ts,
+                  data["last_observed_ts"].astype(np.float32))
+        np.copyto(grid.observation_count,
+                  data["observation_count"].astype(np.int32))
+
+        bounds = data.get("bounds_ij")
+        if bounds is not None and bounds.size == 4:
+            grid._bounds_ij = (
+                int(bounds[0]), int(bounds[1]),
+                int(bounds[2]), int(bounds[3]),
+            )
+        # Pick up the saved driveable_clearance_height_m if any.
+        clr = saved_meta.get("driveable_clearance_height_m")
+        if isinstance(clr, (int, float)):
+            grid._driveable_clearance_m = float(clr)
+
+    return {
+        "loaded_session_id": str(data.get("session_id") or ""),
+        "current_session_id": grid.session_id,
+        "cells_observed": int(np.count_nonzero(grid.observation_count)),
+        "bounds_ij": grid._bounds_ij,
+    }
+
+
 def _empty_snap_from(controller: "FuserController") -> Dict[str, Any]:
     """Best-effort placeholder when the grid has no bounds yet — we
     still want to emit a bundle so the operator sees the click did

@@ -171,6 +171,9 @@ class FuserController:
             vote_margin=config.vote_margin,
             traversal_vote_weight=config.traversal_vote_weight,
             footprint_radius_m=config.footprint_radius_m,
+            vote_saturation_cap=config.vote_saturation_cap,
+            vote_floor=config.vote_floor,
+            vote_decay_alpha=config.vote_decay_alpha,
         )
 
         # Zenoh handles
@@ -667,6 +670,12 @@ class FuserController:
         """
         from .snapshot import write_bundle
         return write_bundle(self, base_dir=base_dir)
+
+    def load_snapshot(self, npz_path: str) -> Dict[str, Any]:
+        """Restore a saved snapshot's layers.npz into the live grid.
+        See snapshot.load_snapshot_into for semantics."""
+        from .snapshot import load_snapshot_into
+        return load_snapshot_into(self, npz_path)
 
     def status_summary(self) -> Dict[str, Any]:
         with self._lock:

@@ -44,6 +44,17 @@ class FuserConfig:
     slam_enabled: bool = False
 
     vote_margin: int = 2
+    # Vote dynamics. Implements the "fresh observations override
+    # memory" model: votes saturate (so 13 contradicting observations
+    # always flip a cell), and decay multiplicatively each fusion
+    # toward a non-zero floor (so cells we drove past stay
+    # "remembered" at the floor strength but can be overridden by
+    # ~6 fresh contradictions). Floor only applies to cells that
+    # were *previously* confident (votes ≥ floor at some point);
+    # never-confident cells decay all the way to 0.
+    vote_saturation_cap: float = 10.0
+    vote_floor: float = 3.0
+    vote_decay_alpha: float = 0.99   # per-fusion (5 Hz). Half-life ~14 s; floor reached in ~24 s.
     traversal_stamp_hz: float = 10.0
     traversal_vote_weight: int = 3
     footprint_radius_m: float = 0.15
