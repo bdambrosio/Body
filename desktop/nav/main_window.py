@@ -34,8 +34,13 @@ from .follower import (
     Follower, FollowerConfig, FollowerOutput,
     STATUS_ARRIVED, STATUS_FOLLOWING, STATUS_NO_PATH, STATUS_ROTATING,
 )
-from .mission import Mission, MissionState
+from .mission import Mission, MissionConfig, MissionState
 from .planner import AStarConfig, PlanResult, plan_path
+from .recovery import (
+    PRIM_ABORTED, PRIM_DONE, PRIM_RUNNING,
+    REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
+    classify_replan_failure,
+)
 from .safety import SafetyConfig, forward_arc_blocked
 
 from .camera_panels import CameraPanels, build_camera_snapshot
@@ -141,6 +146,17 @@ class NavMainWindow(QMainWindow):
         self._cancel_act.triggered.connect(self._on_cancel)
         self._map_toolbar.addAction(self._cancel_act)
 
+        self._stream_rgb_act = QAction("Stream RGB", self)
+        self._stream_rgb_act.setCheckable(True)
+        self._stream_rgb_act.setChecked(False)
+        self._stream_rgb_act.setToolTip(
+            "Toggle low-rate (2 Hz) streaming of OAK-D RGB into the "
+            "feed pane — useful when the robot is out of sight. "
+            "Default off; on-demand Request RGB still works."
+        )
+        self._stream_rgb_act.toggled.connect(self._on_toggle_stream_rgb)
+        self._map_toolbar.addAction(self._stream_rgb_act)
+
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._map_toolbar)
 
@@ -198,6 +214,12 @@ class NavMainWindow(QMainWindow):
         self._follower = Follower(FollowerConfig())
         self._last_follower: Optional[FollowerOutput] = None
         self._mission = Mission()
+        self._mission_config = MissionConfig()
+        # Recovery policy + currently-running primitive (None unless
+        # mission is RECOVERING). Phase 1c ships the stub policy
+        # (WaitAndResume for every reason); Phase 2c upgrades.
+        self._recovery_policy = RecoveryPolicy()
+        self._active_recovery: Optional[RecoveryPrimitive] = None
         # Stage 5b: forward-arc lethal-cell check overrides cmd_vel
         # to zero when an obstacle appears between replans. Mission
         # stays FOLLOWING so we resume when the arc clears.
@@ -303,6 +325,17 @@ class NavMainWindow(QMainWindow):
         self._redraw_timer.timeout.connect(self._on_redraw_tick)
         self._redraw_timer.start()
 
+        # Streaming-RGB timer (off by default). The toggle action
+        # starts/stops it. Rate is fixed at 2 Hz for v1; cheap to
+        # adjust later if testing reveals a different sweet spot.
+        self._stream_rgb_hz = 2.0
+        self._stream_rgb_timer = QTimer(self)
+        self._stream_rgb_timer.setInterval(
+            int(1000.0 / self._stream_rgb_hz)
+        )
+        self._stream_rgb_timer.timeout.connect(self._on_stream_rgb_tick)
+        # Not started — _on_toggle_stream_rgb starts it on demand.
+
     # ── Tick ─────────────────────────────────────────────────────────
 
     def _on_redraw_tick(self) -> None:
@@ -330,7 +363,14 @@ class NavMainWindow(QMainWindow):
         latest = self.fuser.pose_source.latest_pose()
         pose = latest[0] if latest is not None else None
         trail = self.fuser.pose_trail()
+        # Pull status_summary up here so pose_age is available for the
+        # mission tick. ages["odom"] is local-arrival-time age — what
+        # we actually want for freshness (Pi clock skew doesn't matter).
+        st = self.fuser.status_summary()
+        ages = st["ages"] or {}
+        pose_age: Optional[float] = ages.get("odom")
         ts = time.time()
+        cm = None
         if snap is not None:
             self._height_view.update_map(
                 snap["grid"], snap["meta"], ts, pose=pose,
@@ -351,9 +391,15 @@ class NavMainWindow(QMainWindow):
             )
             # Cache for replanning when goal changes; if a goal is
             # already set, replan against the freshly-built costmap
-            # so the path keeps up as the map fills in.
+            # so the path keeps up as the map fills in. Skip during
+            # RECOVERING — the active primitive owns cmd_vel and we
+            # don't want a stale path replaced under it.
             self._last_costmap = cm
-            if cm is not None and self._shared_view.goal() is not None:
+            if (
+                cm is not None
+                and self._shared_view.goal() is not None
+                and not self._mission.is_recovering()
+            ):
                 self._replan(cm, pose)
         else:
             self._height_view.update_map(
@@ -377,49 +423,14 @@ class NavMainWindow(QMainWindow):
         self._last_follower = out
         self._shared_view.set_lookahead(out.lookahead_world)
 
+        # cmd_vel decision: hard gates → pose freshness → state dispatch.
+        # Single helper so the per-state logic is readable.
         if self._mission.is_active():
-            # Sanity gates: chassis must still be live for cmd_vel to
-            # actually publish. Failing fast here surfaces the cause
-            # in the strip instead of silently driving nothing.
-            with self.chassis.state.lock:
-                connected = self.chassis.state.connected
-                live = self.chassis.state.live_command
-            if not connected:
-                self.chassis.set_cmd_vel(0.0, 0.0)
-                self._mission.fail("chassis disconnect")
-                self._safety_blocked = False
-            elif not live:
-                self.chassis.set_cmd_vel(0.0, 0.0)
-                self._mission.fail("Live cmd dropped")
-                self._safety_blocked = False
-            elif out.status == STATUS_ARRIVED:
-                self.chassis.set_cmd_vel(0.0, 0.0)
-                self._mission.arrive()
-                self._safety_blocked = False
-            elif out.status == STATUS_NO_PATH:
-                self.chassis.set_cmd_vel(0.0, 0.0)
-                self._mission.fail("path lost")
-                self._safety_blocked = False
-            else:
-                # FOLLOWING or ROTATING — but first, check the
-                # forward arc for any lethal cell that appeared
-                # since the last replan. Override to zero if so.
-                self._safety_blocked = (
-                    self._last_costmap is not None
-                    and forward_arc_blocked(
-                        self._last_costmap, pose, self._safety_config,
-                    )
-                )
-                if self._safety_blocked:
-                    self.chassis.set_cmd_vel(0.0, 0.0)
-                else:
-                    self.chassis.set_cmd_vel(
-                        out.v_mps, out.omega_radps,
-                    )
+            self._drive_mission_tick(out, cm, pose, pose_age)
         else:
             self._safety_blocked = False
+            self._active_recovery = None
 
-        st = self.fuser.status_summary()
         if pose is not None:
             self._pose_lbl.setText(
                 f"pose: x={pose[0]:+.2f} y={pose[1]:+.2f} "
@@ -510,6 +521,24 @@ class NavMainWindow(QMainWindow):
                 f"follow: failed: {self._mission.failure_reason}"
             )
             self._follow_lbl.setStyleSheet("color: #e8a;")
+        elif ms == MissionState.PAUSED:
+            grace = self._mission_config.pause_grace_s
+            elapsed = max(0.0, time.time() - self._mission.pause_started_at)
+            grace_left = max(0.0, grace - elapsed)
+            self._follow_lbl.setText(
+                f"follow: PAUSED ({self._mission.pause_reason})  "
+                f"grace={grace_left:.1f}s  "
+                f"attempts={self._mission.recovery_attempts}/"
+                f"{self._mission_config.max_recovery_attempts}"
+            )
+            self._follow_lbl.setStyleSheet("color: #ec8;")
+        elif ms == MissionState.RECOVERING:
+            self._follow_lbl.setText(
+                f"follow: RECOVERING ({self._mission.recovery_action})  "
+                f"attempt={self._mission.recovery_attempts}/"
+                f"{self._mission_config.max_recovery_attempts}"
+            )
+            self._follow_lbl.setStyleSheet("color: #ec8;")
         elif f is None or f.status == STATUS_NO_PATH:
             self._follow_lbl.setText("follow: —")
             self._follow_lbl.setStyleSheet("color: #ccc;")
@@ -549,6 +578,167 @@ class NavMainWindow(QMainWindow):
             f"session: {st['session_id'][:8]}  ({st['pose_source']})"
         )
         self._notes_lbl.setText(st.get("notes") or "")
+
+    # ── Mission tick ────────────────────────────────────────────────
+
+    def _drive_mission_tick(
+        self,
+        out: FollowerOutput,
+        cm,
+        pose,
+        pose_age: Optional[float],
+    ) -> None:
+        """Decide cmd_vel for this tick. Called only when the mission
+        is in an active state (FOLLOWING / PAUSED / RECOVERING).
+
+        Order of concerns:
+            1. Hard gates (chassis disconnect, Live cmd dropped) — both
+               are terminal; recovery doesn't help.
+            2. Pose freshness — pause if stale, resume if fresh after
+               a no_pose pause. Stale pose is treated as universal:
+               applies in any active state and overrides the others.
+            3. Per-state behavior.
+        """
+        with self.chassis.state.lock:
+            connected = self.chassis.state.connected
+            live = self.chassis.state.live_command
+        if not connected:
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.fail("chassis disconnect")
+            self._cancel_recovery()
+            self._safety_blocked = False
+            return
+        if not live:
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.fail("Live cmd dropped")
+            self._cancel_recovery()
+            self._safety_blocked = False
+            return
+
+        # Pose freshness applies regardless of current state. None pose
+        # is treated as max-stale.
+        threshold = self._mission_config.pose_age_threshold_s
+        stale = pose is None or (pose_age is not None and pose_age > threshold)
+        if stale:
+            self._cancel_recovery()
+            # pause() is idempotent for the same reason — won't reset
+            # the pause clock if we're already in no_pose pause.
+            self._mission.pause(REASON_NO_POSE)
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._safety_blocked = False
+            return
+        if (
+            self._mission.is_paused()
+            and self._mission.pause_reason == REASON_NO_POSE
+        ):
+            self._mission.resume()
+
+        # Dispatch on state.
+        if self._mission.is_following():
+            self._tick_following(out, pose)
+        elif self._mission.is_paused():
+            self._tick_paused(cm, pose)
+        elif self._mission.is_recovering():
+            self._tick_recovering(pose, cm)
+
+    def _tick_following(self, out: FollowerOutput, pose) -> None:
+        if out.status == STATUS_ARRIVED:
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.arrive()
+            self._safety_blocked = False
+            return
+        if out.status == STATUS_NO_PATH:
+            # Replan failed (or path degenerate). Classify the failure
+            # so the policy can pick an appropriate recovery action.
+            reason = classify_replan_failure(
+                self._last_costmap, pose, self._shared_view.goal(),
+            )
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.pause(reason)
+            self._safety_blocked = False
+            return
+        # FOLLOWING / ROTATING — forward-arc safety check.
+        self._safety_blocked = (
+            self._last_costmap is not None
+            and forward_arc_blocked(
+                self._last_costmap, pose, self._safety_config,
+            )
+        )
+        if self._safety_blocked:
+            self.chassis.set_cmd_vel(0.0, 0.0)
+        else:
+            self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
+
+    def _tick_paused(self, cm, pose) -> None:
+        """While paused: hold cmd_vel zero, watch for the pause
+        condition to clear, and on grace-expiry escalate to recovery
+        (or fail if the policy is exhausted).
+        """
+        self.chassis.set_cmd_vel(0.0, 0.0)
+        self._safety_blocked = False
+
+        # Auto-resume if the planner now has a path. Last tick's
+        # follower output already saw the freshly-replanned path; we
+        # consult its status to know whether the no_path condition has
+        # cleared.
+        if self._last_follower is not None:
+            follower_status = self._last_follower.status
+            if (
+                self._mission.pause_reason.startswith("no_path:")
+                and follower_status not in (STATUS_NO_PATH,)
+            ):
+                self._mission.resume()
+                return
+
+        # Grace window — give the world a moment before swinging at it.
+        elapsed = max(0.0, time.time() - self._mission.pause_started_at)
+        if elapsed < self._mission_config.pause_grace_s:
+            return
+
+        # Escalate. Reasons that recovery can't address (currently just
+        # NO_POSE — handled above) shouldn't reach here. Anything else
+        # goes through the policy.
+        action = self._recovery_policy.select(
+            reason=self._mission.pause_reason,
+            attempts=self._mission.recovery_attempts,
+            max_attempts=self._mission_config.max_recovery_attempts,
+        )
+        if action is None:
+            self._mission.fail(
+                f"recovery exhausted ({self._mission.recovery_attempts} "
+                f"attempts; last reason: {self._mission.pause_reason})"
+            )
+            return
+        self._active_recovery = action
+        self._mission.begin_recovery(action.name())
+
+    def _tick_recovering(self, pose, cm) -> None:
+        action = self._active_recovery
+        if action is None:
+            # State drift — recover by forcing back to PAUSED so the
+            # next tick selects fresh.
+            self._mission.end_recovery(success=False)
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._safety_blocked = False
+            return
+        out = action.update(pose, cm)
+        self._safety_blocked = False
+        if out.status == PRIM_RUNNING:
+            self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
+            return
+        # Primitive finished one way or another. Drop cmd_vel, clear the
+        # active handle, and notify the mission.
+        self.chassis.set_cmd_vel(0.0, 0.0)
+        self._active_recovery = None
+        self._mission.end_recovery(success=(out.status == PRIM_DONE))
+
+    def _cancel_recovery(self) -> None:
+        if self._active_recovery is not None:
+            try:
+                self._active_recovery.cancel()
+            except Exception:
+                logger.exception("recovery primitive cancel raised")
+            self._active_recovery = None
 
     def _refresh_chassis_panel(self) -> None:
         """Text summary with values the pills can't convey (status age,
@@ -609,6 +799,7 @@ class NavMainWindow(QMainWindow):
         if self._mission.is_active():
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._mission.cancel()
+        self._cancel_recovery()
         self._mission.reset()
         self._shared_view.set_goal(None)
         self._last_plan = None
@@ -646,6 +837,7 @@ class NavMainWindow(QMainWindow):
         manually without a second click."""
         if self._mission.is_active():
             self.chassis.set_cmd_vel(0.0, 0.0)
+        self._cancel_recovery()
         self._mission.cancel()
 
     # ── Toolbar handlers ─────────────────────────────────────────────
@@ -672,6 +864,7 @@ class NavMainWindow(QMainWindow):
         if self._mission.is_active():
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._mission.cancel()
+        self._cancel_recovery()
         try:
             summary = self.fuser.load_snapshot(path)
         except Exception as e:
@@ -714,6 +907,19 @@ class NavMainWindow(QMainWindow):
     def _on_fit_maps(self) -> None:
         # Single call: shared view propagates to all attached panels.
         self._shared_view.reset_view()
+
+    def _on_toggle_stream_rgb(self, checked: bool) -> None:
+        if checked:
+            self._stream_rgb_timer.start()
+        else:
+            self._stream_rgb_timer.stop()
+
+    def _on_stream_rgb_tick(self) -> None:
+        # Streaming-mode capture: in-flight gating in the controller
+        # keeps a slow Pi from accruing a backlog. If the chassis is
+        # disconnected, request_rgb_streaming() returns None and the
+        # tick is a no-op.
+        self.chassis.request_rgb_streaming()
 
     # ── Lifecycle ────────────────────────────────────────────────────
 

@@ -52,6 +52,15 @@ class StubController:
         # race.
         self._last_sent_ts: float = 0.0
 
+        # Streaming-RGB tracking. When the nav timer is calling
+        # request_rgb_streaming() at a fixed rate, we record the most
+        # recent in-flight request_id so a slow Pi doesn't accumulate
+        # a request backlog. _on_oakd_rgb clears these when a matching
+        # reply arrives. Kept as plain attributes (not in BodyState)
+        # because they're private to the streaming send-side.
+        self._streaming_in_flight: Optional[str] = None
+        self._streaming_in_flight_ts: float = 0.0
+
     # ── Connection lifecycle ─────────────────────────────────────────
 
     def connect(self) -> Tuple[bool, Optional[str]]:
@@ -264,21 +273,28 @@ class StubController:
         msg = decode_rgb(self._payload_bytes(sample))
         if msg is None:
             return
+        rid = msg.get("request_id")
         with self.state.lock:
-            # Correlate against in-flight request; ignore unknown ids.
+            # Correlate against in-flight on-demand request; ignore
+            # other on-demand ids. When `pending` is None (streaming
+            # mode, or no request in flight) we accept every reply.
             pending = self.state.pending_rgb_request_id
-            if pending and msg["request_id"] and msg["request_id"] != pending:
+            if pending and rid and rid != pending:
                 logger.debug(
-                    f"rgb reply id {msg['request_id']} != pending {pending}; dropping"
+                    f"rgb reply id {rid} != pending {pending}; dropping"
                 )
                 return
-            self.state.rgb_request_id = msg["request_id"]
+            self.state.rgb_request_id = rid
             self.state.rgb_width = msg["width"]
             self.state.rgb_height = msg["height"]
             self.state.rgb_jpeg = msg["jpeg"]
             self.state.rgb_error = msg["error"]
             self.state.rgb_ts = now_ts()
             self.state.pending_rgb_request_id = None
+        # Clear the streaming-in-flight gate if this matches.
+        if self._streaming_in_flight and rid == self._streaming_in_flight:
+            self._streaming_in_flight = None
+            self._streaming_in_flight_ts = 0.0
 
     # ── Publisher threads ────────────────────────────────────────────
 
@@ -450,4 +466,45 @@ class StubController:
         with self.state.lock:
             self.state.pending_rgb_request_id = req_id
             self.state.pending_rgb_ts = now_ts()
+        return req_id
+
+    def request_rgb_streaming(
+        self, in_flight_timeout_s: float = 2.0,
+    ) -> Optional[str]:
+        """Publish body/oakd/config capture_rgb without setting the
+        on-demand `pending_rgb_request_id` field, so:
+
+            * The "awaiting RGB reply…" placeholder text doesn't blink
+              between every streaming frame.
+            * The on-demand correlation check in `_on_oakd_rgb` lets
+              streaming replies through (pending=None ⇒ no rejection).
+
+        Skips this tick if a previous streaming request is still in
+        flight (younger than `in_flight_timeout_s` and not yet matched
+        by an `_on_oakd_rgb` reply). This keeps the Pi from accruing
+        a request backlog under a slow link.
+
+        Returns the request_id sent, or None when skipped / no session.
+        """
+        if self._session is None:
+            return None
+        now = now_ts()
+        if self._streaming_in_flight is not None:
+            if now - self._streaming_in_flight_ts < in_flight_timeout_s:
+                return None
+            # Stale in-flight — assume the reply was lost; allow a fresh send.
+            logger.debug(
+                "streaming-rgb in-flight timeout; sending fresh request"
+            )
+        req_id = str(uuid.uuid4())
+        payload = json.dumps({
+            "action": "capture_rgb", "request_id": req_id,
+        }).encode("utf-8")
+        try:
+            self._session.put(self.config.topics.oakd_config, payload)
+        except Exception:
+            logger.exception("oakd_config put failed (streaming)")
+            return None
+        self._streaming_in_flight = req_id
+        self._streaming_in_flight_ts = now
         return req_id

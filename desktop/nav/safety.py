@@ -54,8 +54,32 @@ def forward_arc_blocked(
     """Return True if any lethal cell in `costmap` is inside the
     forward wedge of `pose`. Vectorized via a bounding-box crop.
     """
+    return _arc_blocked(costmap, pose, config, direction=+1)
+
+
+def rear_arc_blocked(
+    costmap: Costmap,
+    pose: Tuple[float, float, float],
+    config: Optional[SafetyConfig] = None,
+) -> bool:
+    """Symmetric to `forward_arc_blocked`, but the wedge points
+    backward (theta_w + π). Used by the BackUp primitive to refuse to
+    reverse into a wall.
+    """
+    return _arc_blocked(costmap, pose, config, direction=-1)
+
+
+def _arc_blocked(
+    costmap: Costmap,
+    pose: Tuple[float, float, float],
+    config: Optional[SafetyConfig],
+    *,
+    direction: int,
+) -> bool:
     cfg = config or SafetyConfig()
     x_w, y_w, theta_w = pose
+    if direction < 0:
+        theta_w = theta_w + math.pi
 
     res = float(costmap.meta["resolution_m"])
     ox = float(costmap.meta["origin_x_m"])
