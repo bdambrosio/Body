@@ -72,6 +72,12 @@ class MissionConfig:
     # then call it a day.
     max_recovery_attempts: int = 3
 
+    # Hard ceiling on PAUSED("no_pose") duration. Beyond this the mission
+    # transitions to FAILED rather than waiting forever for the pose
+    # source to come back. 30 s comfortably absorbs a brief Pi-side
+    # local_map stall but won't wedge the operator on a dead Pi.
+    no_pose_timeout_s: float = 30.0
+
 
 @dataclass
 class Mission:

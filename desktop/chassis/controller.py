@@ -60,6 +60,11 @@ class StubController:
         # because they're private to the streaming send-side.
         self._streaming_in_flight: Optional[str] = None
         self._streaming_in_flight_ts: float = 0.0
+        # Consecutive missed streaming replies — incremented when an
+        # in-flight request times out (Pi never answered), reset on
+        # any matching reply. Surfaced via streaming_rgb_misses for
+        # the UI to flag a Pi-side stall.
+        self._streaming_misses: int = 0
 
     # ── Connection lifecycle ─────────────────────────────────────────
 
@@ -291,10 +296,12 @@ class StubController:
             self.state.rgb_error = msg["error"]
             self.state.rgb_ts = now_ts()
             self.state.pending_rgb_request_id = None
-        # Clear the streaming-in-flight gate if this matches.
+        # Clear the streaming-in-flight gate if this matches; any reply
+        # at all also clears the miss counter (Pi is alive again).
         if self._streaming_in_flight and rid == self._streaming_in_flight:
             self._streaming_in_flight = None
             self._streaming_in_flight_ts = 0.0
+            self._streaming_misses = 0
 
     # ── Publisher threads ────────────────────────────────────────────
 
@@ -468,6 +475,14 @@ class StubController:
             self.state.pending_rgb_ts = now_ts()
         return req_id
 
+    @property
+    def streaming_rgb_misses(self) -> int:
+        """Consecutive streaming-RGB requests that the Pi never answered.
+        Reset to 0 by any matching reply. Use as a stall indicator —
+        e.g. > 3 means the Pi-side OAK-D / capture path is stuck.
+        """
+        return self._streaming_misses
+
     def request_rgb_streaming(
         self, in_flight_timeout_s: float = 2.0,
     ) -> Optional[str]:
@@ -492,9 +507,14 @@ class StubController:
         if self._streaming_in_flight is not None:
             if now - self._streaming_in_flight_ts < in_flight_timeout_s:
                 return None
-            # Stale in-flight — assume the reply was lost; allow a fresh send.
+            # Stale in-flight — Pi never answered. Count the miss and
+            # send a fresh request. UI can read streaming_rgb_misses to
+            # surface this; we keep retrying because the stall may be
+            # transient.
+            self._streaming_misses += 1
             logger.debug(
-                "streaming-rgb in-flight timeout; sending fresh request"
+                f"streaming-rgb miss #{self._streaming_misses}; "
+                f"sending fresh request"
             )
         req_id = str(uuid.uuid4())
         payload = json.dumps({

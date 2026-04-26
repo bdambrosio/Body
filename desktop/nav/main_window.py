@@ -388,7 +388,9 @@ class NavMainWindow(QMainWindow):
                 build_chassis_snapshot(self.chassis), time.time(),
             )
         if self._cameras.is_visible():
-            self._cameras.update_state(build_camera_snapshot(self.chassis))
+            cam_snap = build_camera_snapshot(self.chassis)
+            cam_snap["streaming_on"] = self._stream_rgb_act.isChecked()
+            self._cameras.update_state(cam_snap)
         # Keep View menu checkmarks in sync if the user closed a dock
         # via its titlebar X rather than via the menu action.
         if self._teleop_action.isChecked() != self._teleop.is_visible():
@@ -669,6 +671,18 @@ class NavMainWindow(QMainWindow):
             # pause() is idempotent for the same reason — won't reset
             # the pause clock if we're already in no_pose pause.
             self._mission.pause(REASON_NO_POSE)
+            # Bail out of the wait if pose has been gone too long. This
+            # is the hard escape from PAUSED("no_pose") — the recovery
+            # policy doesn't fire for no_pose (no primitive helps a
+            # missing pose), so without this the mission would idle in
+            # PAUSED forever on a dead Pi-side local_map publisher.
+            if self._mission.is_paused() and self._mission.pause_reason == REASON_NO_POSE:
+                elapsed = time.time() - self._mission.pause_started_at
+                if elapsed > self._mission_config.no_pose_timeout_s:
+                    self._mission.fail(
+                        f"pose lost for {elapsed:.0f}s "
+                        f"(threshold {self._mission_config.no_pose_timeout_s:.0f}s)"
+                    )
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._safety_blocked = False
             return

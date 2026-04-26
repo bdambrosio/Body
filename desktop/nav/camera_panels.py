@@ -135,11 +135,23 @@ class CameraFeedsDock(QDockWidget):
             self.rgb_label.setText("no image")
         if snap["rgb_ts"] > 0 and jpeg:
             age_s = time.time() - snap["rgb_ts"]
-            self.rgb_meta.setText(
-                f"{snap['rgb_width']}×{snap['rgb_height']}  "
-                f"req={(snap['rgb_request_id'] or '')[:8]}…  "
-                f"age={age_s:4.2f}s"
-            )
+            streaming_on = bool(snap.get("streaming_on"))
+            misses = int(snap.get("streaming_misses") or 0)
+            stalled = streaming_on and misses >= 3
+            if stalled:
+                self.rgb_meta.setText(
+                    f"⚠ stalled  miss={misses}  "
+                    f"{snap['rgb_width']}×{snap['rgb_height']}  "
+                    f"age={age_s:4.2f}s"
+                )
+                self.rgb_meta.setStyleSheet("color: #e8a;")
+            else:
+                self.rgb_meta.setText(
+                    f"{snap['rgb_width']}×{snap['rgb_height']}  "
+                    f"req={(snap['rgb_request_id'] or '')[:8]}…  "
+                    f"age={age_s:4.2f}s"
+                )
+                self.rgb_meta.setStyleSheet("color: #888;")
 
     def render_depth(self, snap: dict) -> None:
         img = snap["depth_image"]
@@ -361,10 +373,16 @@ class CameraPanels:
 
 
 def build_camera_snapshot(chassis: StubController) -> dict:
-    """Pull the fields CameraFeedsDock's render methods consume."""
+    """Pull the fields CameraFeedsDock's render methods consume.
+
+    `streaming_misses` is sampled outside the state lock — it lives on
+    the controller as a plain attribute, not in the shared state object.
+    Caller is expected to add `streaming_on` before render so the stall
+    indicator only fires when streaming is actually engaged.
+    """
     s = chassis.state
     with s.lock:
-        return dict(
+        snap = dict(
             rgb_jpeg=s.rgb_jpeg, rgb_width=s.rgb_width,
             rgb_height=s.rgb_height, rgb_ts=s.rgb_ts,
             rgb_error=s.rgb_error, rgb_request_id=s.rgb_request_id,
@@ -373,3 +391,5 @@ def build_camera_snapshot(chassis: StubController) -> dict:
             depth_height=s.depth_height, depth_format=s.depth_format,
             depth_ts=s.depth_ts,
         )
+    snap["streaming_misses"] = chassis.streaming_rgb_misses
+    return snap
