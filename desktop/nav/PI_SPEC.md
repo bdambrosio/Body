@@ -39,7 +39,7 @@ Drives via the existing `chassis.set_cmd_vel(0, omega)` interface. Yaw-integrati
 
 Drives via `chassis.set_cmd_vel(-v, 0)`. **No Pi change required for v1.**
 
-**Future Pi-side ask (motor-stall detection):** A `body/odom` extension or new `body/motor_status` topic carrying per-wheel commanded vs. measured velocity, with a stall flag asserted when the divergence exceeds threshold for N samples. Today's back-up primitive will count "no progress" via desktop-side pose deltas; that's adequate for an unforced wedge, but a true motor stall (driver in current limit) is hard to disambiguate from "wheel slip on rug." A Pi-side stall signal is the right place to detect the difference. Test plan B4 calls this out.
+**Stall detection — already shipped on the Pi.** Pi note 2026-04-26: `body/motor_state` publishes at 50 Hz with `stall_detected`, `left_pwm` / `right_pwm`, `left_dir` / `right_dir`, `e_stop_active`, and `cmd_timeout_active`. Desktop already subscribes (`StubController._on_motor_state` → `state.motor_state`). For test plan B4 and stall-aware recovery, the desktop side just needs to read `state.motor_state["stall_detected"]` and act on it — no new topic, no rename. The earlier "body/motor_status" reference in this spec was wrong; no Pi change wanted on this front.
 
 ### 2c. Wire primitives into recovery
 
@@ -129,7 +129,7 @@ Phase 6 testing if the Pi cost shows up as a measurable problem.
 | 1b — replan cadence | No | — |
 | 1c — recovery scaffold | No | — |
 | 2a — 360-rotate | No | (info) Pi confirms scan-match omega ceiling |
-| 2b — back-up | No | (medium) `body/motor_status` with stall signal |
+| 2b — back-up | No | already shipped: `body/motor_state` at 50 Hz with `stall_detected` (consume on desktop side) |
 | 2c — wire to recovery | No | — |
 | 3 — streaming RGB | No | (low) `stream_rgb_start/stop` actions for log-quietness |
 

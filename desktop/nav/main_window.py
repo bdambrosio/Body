@@ -245,38 +245,76 @@ class NavMainWindow(QMainWindow):
 
         outer.addWidget(self._h_splitter, stretch=1)
 
-        # Bottom status strip: fuser (pose + rates + cells + session) on
-        # the left, chassis text summary on the right. The safety pills
-        # at the top handle *gate* state (conn/hb/estop); this strip is
-        # for values the pills can't convey (ages, counts, session id).
-        bot = QHBoxLayout()
-        self._pose_lbl = QLabel("pose: —")
-        self._rates_lbl = QLabel("rates: —")
-        self._cells_lbl = QLabel("cells: —")
-        self._slam_lbl = QLabel("slam: —")
-        self._plan_lbl = QLabel("plan: —")
-        self._follow_lbl = QLabel("follow: —")
-        self._session_lbl = QLabel("session: —")
-        self._chassis_lbl = QLabel("chassis: —")
-        self._notes_lbl = QLabel("")
-        self._notes_lbl.setStyleSheet("color: #e8a; font-weight: bold;")
-        # Slightly-smaller font across the strip — the line is wide
-        # enough to crowd at default size once slam_health is added.
+        # Bottom status block: 3 narrow rows of fixed-width labels +
+        # a notes row. Fixed widths and Ignored size policies keep the
+        # central widget's width-hint stable across redraws — without
+        # this, per-tick text variation (grace countdown, drift, plan
+        # ms, hb seq) pumps the window width and produces visible
+        # jitter under XWayland/Mutter. Any label whose CONTENT may
+        # vary in width MUST live in this block with a fixed width.
         small = self.font()
         small.setPointSize(max(7, small.pointSize() - 1))
-        for w in (self._pose_lbl, self._rates_lbl,
-                  self._cells_lbl, self._slam_lbl, self._plan_lbl,
-                  self._follow_lbl,
-                  self._session_lbl, self._chassis_lbl):
-            w.setStyleSheet("color: #ccc;")
-            w.setFont(small)
-            bot.addWidget(w)
+        self._pose_lbl = self._mk_status_label("pose: —", 220, small)
+        self._rates_lbl = self._mk_status_label("rates: —", 250, small)
+        self._cells_lbl = self._mk_status_label("cells: —", 180, small)
+        self._session_lbl = self._mk_status_label("session: —", 210, small)
+        self._slam_lbl = self._mk_status_label("slam: —", 270, small)
+        self._plan_lbl = self._mk_status_label("plan: —", 220, small)
+        self._follow_lbl = self._mk_status_label("follow: —", 360, small)
+        self._chassis_lbl = self._mk_status_label("chassis: —", 200, small)
+        self._notes_lbl = QLabel("")
+        self._notes_lbl.setStyleSheet("color: #e8a; font-weight: bold;")
         self._notes_lbl.setFont(small)
-        bot.addWidget(self._notes_lbl, stretch=1)
-        outer.addLayout(bot)
+
+        status = QVBoxLayout()
+        status.setContentsMargins(0, 0, 0, 0)
+        status.setSpacing(2)
+        # Row 1: data freshness — pose / rates / cells / session.
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(8)
+        for w in (self._pose_lbl, self._rates_lbl,
+                  self._cells_lbl, self._session_lbl):
+            row1.addWidget(w)
+        row1.addStretch(1)
+        status.addLayout(row1)
+        # Row 2: control state — slam / plan / follow / chassis.
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(8)
+        for w in (self._slam_lbl, self._plan_lbl,
+                  self._follow_lbl, self._chassis_lbl):
+            row2.addWidget(w)
+        row2.addStretch(1)
+        status.addLayout(row2)
+        # Row 3: notes — stretches to the available width.
+        row3 = QHBoxLayout()
+        row3.setContentsMargins(0, 0, 0, 0)
+        row3.addWidget(self._notes_lbl, stretch=1)
+        status.addLayout(row3)
+        outer.addLayout(status)
 
         self.setCentralWidget(central)
         self.resize(1400, 900)
+
+    def _mk_status_label(
+        self, initial_text: str, width_px: int, font,
+    ) -> QLabel:
+        """Build a status-strip label with a fixed pixel width and an
+        Ignored horizontal size policy, so per-tick text changes don't
+        pump the layout's width-hint. width_px is the maximum the label
+        will need at any point in its lifetime — see _refresh_fuser_panel
+        for the width-stable formatters that keep content within this.
+        """
+        from PyQt6.QtWidgets import QSizePolicy
+        lbl = QLabel(initial_text)
+        lbl.setStyleSheet("color: #ccc;")
+        lbl.setFont(font)
+        lbl.setFixedWidth(width_px)
+        lbl.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred,
+        )
+        return lbl
 
     def _build_docks(self) -> None:
         # Cameras + vision live in the central splitter (built in
@@ -431,44 +469,51 @@ class NavMainWindow(QMainWindow):
             self._safety_blocked = False
             self._active_recovery = None
 
+        # All status labels below use width-stable formats: every
+        # numeric field has a fixed min-width via `:>N.Mf` / `:>Nd` so
+        # 3.20 and 12.34 render the same width, and "—" placeholders
+        # are padded to the same. This is what stops the bottom block
+        # from pumping the window's preferred width every redraw.
         if pose is not None:
             self._pose_lbl.setText(
-                f"pose: x={pose[0]:+.2f} y={pose[1]:+.2f} "
-                f"θ={math.degrees(pose[2]):+.1f}°"
+                f"pose: x={pose[0]:>+6.2f} y={pose[1]:>+6.2f} "
+                f"θ={math.degrees(pose[2]):>+6.1f}°"
             )
         else:
             self._pose_lbl.setText("pose: (no odom)")
 
         rates = st["rates"]
         ages = st["ages"]
-        parts = []
-        for name, key in (("lm", "local_map"), ("od", "odom")):
-            hz = rates.get(key)
-            age = ages.get(key)
-            hz_s = f"{hz:.1f}Hz" if hz is not None else "—"
-            age_s = f"{age:.2f}s" if age is not None else "—"
-            parts.append(f"{name} {hz_s}/{age_s}")
-        self._rates_lbl.setText("rates: " + "  ".join(parts))
+
+        def _hz(v: Optional[float]) -> str:
+            return f"{v:>4.1f}" if v is not None else "  — "
+
+        def _age(v: Optional[float]) -> str:
+            return f"{v:>4.2f}" if v is not None else "  — "
+
+        self._rates_lbl.setText(
+            f"rates: lm {_hz(rates.get('local_map'))}Hz/"
+            f"{_age(ages.get('local_map'))}s  "
+            f"od {_hz(rates.get('odom'))}Hz/{_age(ages.get('odom'))}s"
+        )
 
         self._cells_lbl.setText(
-            f"cells: obs={st['cells_observed']} trav={st['cells_traversed']}"
+            f"cells: obs={st['cells_observed']:>5d} "
+            f"trav={st['cells_traversed']:>5d}"
         )
 
         # SLAM health: pose-unavailable streak (≥10 = sticky note set)
         # plus cumulative scan-match correction since session reset.
-        # Both rise when SLAM is struggling; both reset on Reset world.
         unavail = int(st.get("pose_unavail_streak") or 0)
         corr = st.get("correction_summary") or {}
         corr_m = float(corr.get("total_m") or 0.0)
         corr_deg = math.degrees(float(corr.get("total_rad") or 0.0))
         n_corr = int(corr.get("n_applied") or 0)
-        slam_text = (
-            f"slam: lost={unavail}  drift={corr_m:.2f} m / "
-            f"{corr_deg:.1f}°  n={n_corr}"
+        self._slam_lbl.setText(
+            f"slam: lost={unavail:>2d}  "
+            f"drift={corr_m:>5.2f}m/{corr_deg:>+5.0f}°  "
+            f"n={n_corr:>3d}"
         )
-        self._slam_lbl.setText(slam_text)
-        # Color cue: red when pose has been lost recently, amber when
-        # it's been lost for ≥10 frames (already sticky-noted).
         if unavail >= 10:
             self._slam_lbl.setStyleSheet("color: #e8a;")
         elif unavail > 0:
@@ -476,7 +521,7 @@ class NavMainWindow(QMainWindow):
         else:
             self._slam_lbl.setStyleSheet("color: #ccc;")
 
-        # Plan status: "—" with no goal; details when planned.
+        # Plan status: "—" with no goal; compact one-shot otherwise.
         goal = self._shared_view.goal()
         if goal is None:
             self._plan_lbl.setText("plan: —")
@@ -484,32 +529,32 @@ class NavMainWindow(QMainWindow):
         else:
             plan = self._last_plan
             if plan is None:
-                self._plan_lbl.setText(
-                    f"plan: pending ({goal[0]:+.2f}, {goal[1]:+.2f})"
-                )
+                self._plan_lbl.setText("plan: pending")
                 self._plan_lbl.setStyleSheet("color: #cc8;")
             elif plan.ok:
                 self._plan_lbl.setText(
-                    f"plan: {plan.distance_m:.2f} m  "
-                    f"({plan.elapsed_ms:.0f} ms)"
+                    f"plan: {plan.distance_m:>5.2f}m / "
+                    f"{plan.elapsed_ms:>4.0f}ms"
                 )
                 self._plan_lbl.setStyleSheet("color: #8cf;")
             else:
-                self._plan_lbl.setText(f"plan: {plan.msg}")
+                # Truncate failure msg so the label width never bursts.
+                self._plan_lbl.setText(f"plan: {plan.msg[:14]}")
                 self._plan_lbl.setStyleSheet("color: #e8a;")
 
-        # Follow / mission status. Mission state is the *high-level*
-        # flag; follower output describes what the controller is
-        # currently producing. Mission terminal states (ARRIVED /
-        # CANCELED / FAILED) override the follower's own label.
+        # Follow / mission status — kept compact so width never bursts.
         f = self._last_follower
         ms = self._mission.state
         active = self._mission.is_active()
-        suffix = "" if active else "  (dry)"
+        max_att = self._mission_config.max_recovery_attempts
+
+        def _short_reason(r: str, n: int = 18) -> str:
+            r2 = r[len("no_path:"):] if r.startswith("no_path:") else r
+            return r2[:n]
 
         if ms == MissionState.ARRIVED:
             self._follow_lbl.setText(
-                f"follow: ARRIVED  goal={f.distance_to_goal_m:.2f} m"
+                f"follow: ARRIVED  goal={f.distance_to_goal_m:>5.2f}m"
                 if f is not None else "follow: ARRIVED"
             )
             self._follow_lbl.setStyleSheet("color: #8f8;")
@@ -518,7 +563,7 @@ class NavMainWindow(QMainWindow):
             self._follow_lbl.setStyleSheet("color: #cc8;")
         elif ms == MissionState.FAILED:
             self._follow_lbl.setText(
-                f"follow: failed: {self._mission.failure_reason}"
+                f"follow: FAILED  {self._mission.failure_reason[:24]}"
             )
             self._follow_lbl.setStyleSheet("color: #e8a;")
         elif ms == MissionState.PAUSED:
@@ -526,56 +571,56 @@ class NavMainWindow(QMainWindow):
             elapsed = max(0.0, time.time() - self._mission.pause_started_at)
             grace_left = max(0.0, grace - elapsed)
             self._follow_lbl.setText(
-                f"follow: PAUSED ({self._mission.pause_reason})  "
-                f"grace={grace_left:.1f}s  "
-                f"attempts={self._mission.recovery_attempts}/"
-                f"{self._mission_config.max_recovery_attempts}"
+                f"follow: PAUSED  "
+                f"{_short_reason(self._mission.pause_reason)}  "
+                f"{grace_left:>3.1f}s  "
+                f"{self._mission.recovery_attempts}/{max_att}"
             )
             self._follow_lbl.setStyleSheet("color: #ec8;")
         elif ms == MissionState.RECOVERING:
             self._follow_lbl.setText(
-                f"follow: RECOVERING ({self._mission.recovery_action})  "
-                f"attempt={self._mission.recovery_attempts}/"
-                f"{self._mission_config.max_recovery_attempts}"
+                f"follow: REC  {self._mission.recovery_action[:20]}  "
+                f"{self._mission.recovery_attempts}/{max_att}"
             )
             self._follow_lbl.setStyleSheet("color: #ec8;")
         elif f is None or f.status == STATUS_NO_PATH:
             self._follow_lbl.setText("follow: —")
             self._follow_lbl.setStyleSheet("color: #ccc;")
         elif active and self._safety_blocked:
-            # Forward-arc lethal cell — driving is overridden to zero
-            # for this tick, mission stays FOLLOWING, will resume
-            # when the arc clears.
             self._follow_lbl.setText(
-                f"follow: GO  BLOCKED ahead  goal={f.distance_to_goal_m:.2f} m"
+                f"follow: GO BLOCKED  goal={f.distance_to_goal_m:>5.2f}m"
             )
             self._follow_lbl.setStyleSheet("color: #e8a;")
         elif f.status == STATUS_ROTATING:
+            tag = "GO " if active else "dry"
             self._follow_lbl.setText(
-                f"follow: {'GO' if active else 'dry'} ROT  "
-                f"ω={f.omega_radps:+.2f}  "
-                f"α={math.degrees(f.heading_error_rad):+.0f}°  "
-                f"goal={f.distance_to_goal_m:.2f} m{suffix}"
+                f"follow: {tag} ROT  "
+                f"α={math.degrees(f.heading_error_rad):>+4.0f}°  "
+                f"goal={f.distance_to_goal_m:>5.2f}m"
             )
             self._follow_lbl.setStyleSheet("color: #ec8;")
         else:  # FOLLOWING (follower's view)
-            tag = "GO" if active else "dry"
+            tag = "GO " if active else "dry"
             self._follow_lbl.setText(
-                f"follow: {tag}  v={f.v_mps:.2f} ω={f.omega_radps:+.2f}  "
-                f"goal={f.distance_to_goal_m:.2f} m{suffix}"
+                f"follow: {tag}  "
+                f"v={f.v_mps:>4.2f} ω={f.omega_radps:>+5.2f}  "
+                f"goal={f.distance_to_goal_m:>5.2f}m"
             )
             self._follow_lbl.setStyleSheet(
                 "color: #8f8;" if active else "color: #8cf;"
             )
 
-        # Enable/disable Go and Stop based on mission state. Both
-        # buttons stay clickable when their action is meaningful;
-        # disabled with a tooltip otherwise.
+        # Go/Stop button enable mirrors mission state.
         self._go_act.setEnabled(self._mission.can_start())
         self._cancel_act.setEnabled(self._mission.can_cancel())
 
+        # Session id is fixed-8; pose-source label can be "odom" or
+        # "imu+scan_match" — clamp so the label width is bounded.
+        src = st.get("pose_source") or "—"
+        if len(src) > 14:
+            src = src[:13] + "…"
         self._session_lbl.setText(
-            f"session: {st['session_id'][:8]}  ({st['pose_source']})"
+            f"session: {st['session_id'][:8]} ({src})"
         )
         self._notes_lbl.setText(st.get("notes") or "")
 
@@ -743,6 +788,10 @@ class NavMainWindow(QMainWindow):
     def _refresh_chassis_panel(self) -> None:
         """Text summary with values the pills can't convey (status age,
         heartbeat seq). Gate colors live on the safety toolbar.
+
+        Width-stable formatters: status age is `{:>4.1f}s` so 0.1 and
+        12.3 share width; hb seq is rendered as the last 4 digits so it
+        doesn't grow without bound across a long session.
         """
         s = self.chassis.state
         with s.lock:
@@ -753,11 +802,12 @@ class NavMainWindow(QMainWindow):
             self._chassis_lbl.setText("chassis: disconnected")
             self._chassis_lbl.setStyleSheet("color: #a88;")
             return
-        age_s = (
-            f"{time.time() - status_ts:.1f}s" if status_ts > 0 else "—"
-        )
+        if status_ts > 0:
+            age_s = f"{time.time() - status_ts:>4.1f}"
+        else:
+            age_s = "  — "
         self._chassis_lbl.setText(
-            f"chassis: status/{age_s}  hb#{hb_seq}"
+            f"chassis: {age_s}s  #{hb_seq % 10000:04d}"
         )
         self._chassis_lbl.setStyleSheet("color: #ccc;")
 
