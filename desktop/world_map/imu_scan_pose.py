@@ -79,6 +79,23 @@ class ImuScanPoseConfig:
     max_translation_correction_m: float = 0.30
     max_rotation_correction_rad: float = math.radians(8.0)
 
+    # Wide global re-localization (used by relocate()). Searches a
+    # large window with coarse steps to claw back from catastrophic
+    # drift; bypasses the slew caps above. Translation half-width is
+    # bounded enough that the result stays inside the mapped area;
+    # rotation covers the full circle.
+    relocate_xy_half_m: float = 3.0
+    relocate_xy_step_m: float = 0.10
+    relocate_theta_half_rad: float = math.pi
+    relocate_theta_step_rad: float = math.radians(5.0)
+    # Improvement gate: stricter than steady-state because the wider
+    # search has more chances to find a spurious peak. Tune up if
+    # relocate returns false positives in sparse environments.
+    relocate_min_improvement: float = 30.0
+    # Cached scan must be at most this old for relocate to use it,
+    # otherwise the pose-at-scan-ts anchor would be unreliable.
+    relocate_max_scan_age_s: float = 2.0
+
 
 class ImuPlusScanMatchPose(PoseSource):
     IMU_TOPIC = "body/imu"
@@ -124,6 +141,12 @@ class ImuPlusScanMatchPose(PoseSource):
         self._correction_total_m = 0.0
         self._correction_total_rad = 0.0
         self._correction_n_applied = 0
+
+        # Latest scan cache (updated inside _on_scan when a match runs;
+        # used by relocate()). Stored as a body-frame (N, 2) array so
+        # relocate doesn't re-do the polar→cartesian conversion.
+        self._last_scan_ts: float = 0.0
+        self._last_scan_points: Optional[np.ndarray] = None
 
     # ── PoseSource interface ─────────────────────────────────────────
 
@@ -235,6 +258,96 @@ class ImuPlusScanMatchPose(PoseSource):
                 "n_applied": int(self._correction_n_applied),
             }
 
+    def relocate(self) -> dict:
+        """Run a wide global scan-match and snap the world offset to
+        the result, bypassing per-tick slew limits. Use when the
+        steady-state matcher has diverged. Map state is untouched —
+        only the world-frame offset and yaw_offset move."""
+        if self._grid is None:
+            return {"success": False, "reason": "not_connected"}
+        with self._lock:
+            scan_ts = self._last_scan_ts
+            scan_points = self._last_scan_points
+        if scan_points is None or scan_ts <= 0.0:
+            return {"success": False, "reason": "no_scan_cached"}
+        scan_age = max(0.0, time.time() - scan_ts)
+        if scan_age > self.config.relocate_max_scan_age_s:
+            return {
+                "success": False, "reason": "scan_too_stale",
+                "scan_age_s": scan_age,
+            }
+
+        block_votes = self._grid.snapshot_block_votes()
+        evidence_count = int((block_votes > 0).sum())
+        if evidence_count < self.config.min_grid_evidence_cells:
+            return {
+                "success": False, "reason": "sparse_grid",
+                "evidence_cells": evidence_count,
+            }
+
+        prior_xytheta = self.pose_at(scan_ts)
+        if prior_xytheta is None:
+            return {"success": False, "reason": "no_prior"}
+        prior_pose = Pose2D(*prior_xytheta)
+
+        wide_cfg = ScanMatcherConfig(
+            xy_half_m=self.config.relocate_xy_half_m,
+            xy_step_m=self.config.relocate_xy_step_m,
+            theta_half_rad=self.config.relocate_theta_half_rad,
+            theta_step_rad=self.config.relocate_theta_step_rad,
+            min_improvement=self.config.relocate_min_improvement,
+        )
+        wide_matcher = ScanMatcher(wide_cfg)
+        try:
+            result = wide_matcher.search(
+                scan_points, prior_pose, block_votes,
+                self._grid.origin_x_m, self._grid.origin_y_m,
+                self._grid.resolution_m,
+            )
+        except Exception:
+            logger.exception("relocate: scan_match crashed")
+            return {"success": False, "reason": "matcher_crashed"}
+
+        if result.improvement < self.config.relocate_min_improvement:
+            return {
+                "success": False, "reason": "low_improvement",
+                "improvement": float(result.improvement),
+                "score": float(result.score),
+                "score_prior": float(result.score_prior),
+                "search_exhausted": bool(result.search_exhausted),
+                "evidence_cells": evidence_count,
+            }
+
+        best = result.pose
+        dx = best.x - prior_pose.x
+        dy = best.y - prior_pose.y
+        dth = _wrap(best.theta - prior_pose.theta)
+        # Apply directly; relocate bypasses the per-tick slew clamps
+        # in _on_scan because we explicitly asked for a large jump.
+        self._apply_correction((best.x, best.y, best.theta), scan_ts)
+        with self._lock:
+            self._correction_total_m += math.hypot(dx, dy)
+            self._correction_total_rad += abs(dth)
+            self._correction_n_applied += 1
+        logger.info(
+            f"relocate: applied dx={dx:+.2f} dy={dy:+.2f} "
+            f"dθ={math.degrees(dth):+.1f}° improvement={result.improvement:.1f} "
+            f"(score {result.score_prior:.0f}→{result.score:.0f}, "
+            f"evidence={evidence_count} cells, exhausted={result.search_exhausted})"
+        )
+        return {
+            "success": True,
+            "dx": float(dx),
+            "dy": float(dy),
+            "dtheta": float(dth),
+            "improvement": float(result.improvement),
+            "score": float(result.score),
+            "score_prior": float(result.score_prior),
+            "search_exhausted": bool(result.search_exhausted),
+            "evidence_cells": evidence_count,
+            "scan_age_s": scan_age,
+        }
+
     # ── Subscriber callbacks ────────────────────────────────────────
 
     def _on_imu(self, sample: Any) -> None:
@@ -301,6 +414,12 @@ class ImuPlusScanMatchPose(PoseSource):
             return
         if points_xy.shape[0] < 10:
             return
+
+        # Cache for relocate(); at 2 Hz the freshest available scan is
+        # at most 500 ms old, well inside relocate_max_scan_age_s.
+        with self._lock:
+            self._last_scan_ts = ts
+            self._last_scan_points = points_xy
 
         try:
             result = self._matcher.search(

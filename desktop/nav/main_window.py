@@ -95,6 +95,15 @@ class NavMainWindow(QMainWindow):
         )
         self._map_toolbar.addAction(reset_act)
 
+        relocate_act = QAction("Re-localize", self)
+        relocate_act.setToolTip(
+            "Snap the robot pose to a wide global scan-match against "
+            "the current world map. Use after the steady-state matcher "
+            "has diverged (huge SLAM drift); the map is kept."
+        )
+        relocate_act.triggered.connect(self._on_relocate)
+        self._map_toolbar.addAction(relocate_act)
+
         save_act = QAction("Save snapshot", self)
         save_act.setToolTip(
             "Write a self-contained snapshot bundle (layers.npz, "
@@ -867,6 +876,33 @@ class NavMainWindow(QMainWindow):
         self._mission.reset()
         self._shared_view.set_goal(None)
         self._last_plan = None
+
+    def _on_relocate(self) -> None:
+        # Wide global scan-match snap. Zero cmd_vel first — relocate
+        # rewrites the world offset, and the follower's last cmd_vel
+        # was computed against the pre-relocate pose.
+        if self._mission.is_active():
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.cancel()
+        result = self.fuser.request_relocate(reason="ui_relocate")
+        if result.get("success"):
+            QMessageBox.information(
+                self, "Re-localize",
+                f"Snapped pose by "
+                f"dx={result['dx']:+.2f} m, dy={result['dy']:+.2f} m, "
+                f"dθ={math.degrees(result['dtheta']):+.1f}° "
+                f"(improvement {result['improvement']:.0f} over "
+                f"{result['evidence_cells']} evidence cells).",
+            )
+        else:
+            QMessageBox.warning(
+                self, "Re-localize failed",
+                f"reason: {result.get('reason', 'unknown')}\n"
+                + "\n".join(
+                    f"{k}: {v}" for k, v in result.items()
+                    if k not in ("success", "reason")
+                ),
+            )
 
     def _on_go(self) -> None:
         """Validate preconditions and transition the mission to

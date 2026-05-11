@@ -65,6 +65,18 @@ class PoseSource:
         """
         return {"total_m": 0.0, "total_rad": 0.0, "n_applied": 0}
 
+    def relocate(self) -> dict:
+        """Wide global scan-match against the current world grid. Use
+        when steady-state scan-match has diverged and can no longer
+        recover via its bounded local search. Implementations bypass
+        the per-tick slew limits and write directly into the offset
+        state. Sources that can't scan-match return a not-supported
+        status; the world map is left untouched in that case.
+        Returns a status dict with keys: success (bool), reason (str),
+        and on success dx/dy/dtheta/improvement/evidence_cells.
+        """
+        return {"success": False, "reason": "not_supported"}
+
     def source_name(self) -> str:
         return "unknown"
 

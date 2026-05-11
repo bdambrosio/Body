@@ -421,7 +421,7 @@ class FuserController:
         if action == "reset":
             self._do_reset(reason=str(msg.get("reason") or "cmd_reset"))
         elif action == "relocate":
-            logger.info("world_cmd action=relocate is v1.1; ignoring")
+            self._do_relocate(reason=str(msg.get("reason") or "cmd_relocate"))
         else:
             logger.debug(f"world_cmd: ignoring action {action!r}")
 
@@ -445,6 +445,27 @@ class FuserController:
     def request_reset(self, *, reason: str = "ui_reset") -> None:
         """UI entry point; safe to call from any thread."""
         self._do_reset(reason=reason)
+
+    # ── Relocate ─────────────────────────────────────────────────────
+
+    def _do_relocate(self, *, reason: str) -> dict:
+        """Ask the pose source to snap to a wide global scan-match.
+        Leaves the world map untouched. Logs the result; returns the
+        status dict for callers (UI) that want to surface it."""
+        result = self.pose_source.relocate()
+        if result.get("success"):
+            with self._lock:
+                self._last_pose_unavail_streak = 0
+            logger.info(f"world relocate ok reason={reason} {result}")
+        else:
+            logger.warning(
+                f"world relocate failed reason={reason} {result}"
+            )
+        return result
+
+    def request_relocate(self, *, reason: str = "ui_relocate") -> dict:
+        """UI entry point; safe to call from any thread."""
+        return self._do_relocate(reason=reason)
 
     # ── Worker threads ───────────────────────────────────────────────
 
