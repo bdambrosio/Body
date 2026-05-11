@@ -55,6 +55,13 @@ class SafetyToolbar(QToolBar):
     # long, treat the pill as stale/red.
     HB_FRESH_S = 0.4
 
+    # body/status is published by the Pi watchdog at 1 Hz. The conn pill
+    # requires both the zenoh session being open *and* status arriving
+    # inside this window, so a silent Pi (or a wedged transport that
+    # zenoh-py never surfaces as a disconnect) shows red instead of
+    # falsely green.
+    STATUS_FRESH_S = 3.0
+
     def __init__(
         self,
         chassis: StubController,
@@ -94,6 +101,11 @@ class SafetyToolbar(QToolBar):
         row.addSpacing(16)
 
         self._pill_conn = _Pill("conn")
+        self._pill_conn.setToolTip(
+            "Green = zenoh sessions open AND body/status arrived from Pi "
+            f"within {self.STATUS_FRESH_S:.0f}s. Red while Pi watchdog is "
+            "silent even if the session object still claims connected."
+        )
         self._pill_hb = _Pill("hb")
         self._pill_estop = _Pill("no-stop")
         for p in (self._pill_conn, self._pill_hb, self._pill_estop):
@@ -196,6 +208,7 @@ class SafetyToolbar(QToolBar):
             status = s.status
             motor = s.motor_state
             hb_seq = s.heartbeat_seq
+            status_ts = s.status_ts
         fuser_connected = self._fuser_connected()
         both_connected = chassis_connected and fuser_connected
 
@@ -209,9 +222,12 @@ class SafetyToolbar(QToolBar):
             self._live_box.setChecked(live)
             self._live_box.blockSignals(blk)
 
-        self._pill_conn.set_state(both_connected)
-
         now = time.time()
+        pi_status_fresh = (
+            status_ts > 0.0 and (now - status_ts) < self.STATUS_FRESH_S
+        )
+        self._pill_conn.set_state(both_connected and pi_status_fresh)
+
         if hb_seq != self._last_hb_seq:
             self._last_hb_seq = hb_seq
             self._last_hb_change_wall = now
