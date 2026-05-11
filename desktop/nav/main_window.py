@@ -421,7 +421,7 @@ class NavMainWindow(QMainWindow):
                 pose_history=trail, bounds_ij=snap.get("bounds_ij"),
             )
             try:
-                cm = build_costmap(snap, self._costmap_config)
+                cm = build_costmap(snap, self._costmap_config, pose=pose)
             except Exception:
                 logger.exception("costmap build failed; skipping panel update")
                 cm = None

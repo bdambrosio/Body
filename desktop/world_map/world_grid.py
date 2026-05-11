@@ -373,6 +373,10 @@ class WorldGrid:
             return {
                 "grid": self.max_height_m.copy(),
                 "driveable": self._driveable_from_votes_locked(),
+                # Traversed cells are consumed by the costmap builder
+                # to apply traversal protection (drove there → known
+                # clear). One extra n×n float32 copy per UI tick.
+                "traversed_ts": self.traversed_ts.copy(),
                 "meta": {
                     "resolution_m": self._res,
                     "origin_x_m": self._origin_x_m,

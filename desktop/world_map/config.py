@@ -43,7 +43,7 @@ class FuserConfig:
     # the zenoh session is open. See docs/slam_pi_contract.md.
     slam_enabled: bool = False
 
-    vote_margin: int = 2
+    vote_margin: int = 4
     # Sum-bounded vote model ("FIFO of length vote_capacity"):
     # per cell, clear_votes + block_votes ≤ vote_capacity. New
     # observations on one side displace existing evidence on the

@@ -42,6 +42,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 
+_DEFAULT_LIVE_OVERRIDE_HALF_ANGLE_RAD = math.radians(15.0)
+
+
 # ── Config ──────────────────────────────────────────────────────────
 
 
@@ -77,6 +80,18 @@ class CostmapConfig:
     denoise: bool = True
     denoise_min_neighbors: int = 2
 
+    # Traversal protection. Cells the robot has physically driven
+    # over (traversed_ts != NaN) are forced clear (cost=0, not
+    # lethal) — they are known drivable, regardless of how the
+    # blocked-cell inflation around them tries to paint them.
+    # Override: if a traversed cell is currently within the
+    # forward-cone of regard (radius + half-angle of robot heading),
+    # the live classification stands instead. This lets a freshly
+    # observed obstacle (chair pulled into a doorway, person in the
+    # way) inflate normally even into previously-driven cells.
+    live_override_radius_m: float = 1.0
+    live_override_half_angle_rad: float = _DEFAULT_LIVE_OVERRIDE_HALF_ANGLE_RAD
+
 
 # ── Output type ────────────────────────────────────────────────────
 
@@ -98,12 +113,18 @@ class Costmap:
 def build_costmap(
     snap: Dict[str, Any],
     config: Optional[CostmapConfig] = None,
+    *,
+    pose: Optional[Tuple[float, float, float]] = None,
 ) -> Costmap:
     """Construct a Costmap from a `WorldGrid.snapshot_for_ui()` result.
 
     `snap` must carry a `driveable` int8 layer (1=clear, 0=blocked,
-    -1=unknown) and a `meta` dict with `resolution_m`. Free of side
-    effects; safe to call on the UI thread once per redraw.
+    -1=unknown) and a `meta` dict with `resolution_m`. If `snap`
+    also carries `traversed_ts`, traversal protection is applied
+    (see CostmapConfig.live_override_*); `pose` is used to build the
+    forward-cone exception. With pose=None, all traversed cells are
+    unconditionally protected. Free of side effects; safe to call on
+    the UI thread once per redraw.
     """
     cfg = config or CostmapConfig()
     drive = snap["driveable"]
@@ -154,6 +175,26 @@ def build_costmap(
     # but uses `cost` gets sane behavior.
     cost[lethal] = np.inf
 
+    # Traversal protection. Cells the robot has driven over are forced
+    # clear unless they're in the forward cone of regard right now (in
+    # which case the live observation wins — chair pulled into the
+    # doorway must inflate normally).
+    traversed_ts = snap.get("traversed_ts")
+    if traversed_ts is not None:
+        traversed = ~np.isnan(traversed_ts)
+        if pose is not None:
+            in_cone = _forward_cone_mask(
+                pose=pose, meta=meta,
+                radius_m=cfg.live_override_radius_m,
+                half_angle_rad=cfg.live_override_half_angle_rad,
+            )
+            protected = traversed & ~in_cone
+        else:
+            protected = traversed
+        if np.any(protected):
+            lethal[protected] = False
+            cost[protected] = 0.0
+
     return Costmap(
         cost=cost,
         lethal=lethal,
@@ -166,6 +207,40 @@ def build_costmap(
 
 
 # ── Numpy helpers ──────────────────────────────────────────────────
+
+
+def _forward_cone_mask(
+    *,
+    pose: Tuple[float, float, float],
+    meta: Dict[str, Any],
+    radius_m: float,
+    half_angle_rad: float,
+) -> np.ndarray:
+    """Boolean mask of cells inside a forward cone from the robot.
+
+    A cell qualifies when its center is within `radius_m` of the
+    pose (x, y) AND the bearing from pose to cell is within
+    `±half_angle_rad` of the pose heading θ.
+    """
+    nx = int(meta["nx"])
+    ny = int(meta["ny"])
+    res = float(meta["resolution_m"])
+    ox = float(meta["origin_x_m"])
+    oy = float(meta["origin_y_m"])
+    x_pose, y_pose, theta = pose
+    ii = np.arange(nx, dtype=np.float32)
+    jj = np.arange(ny, dtype=np.float32)
+    xs = ox + (ii + 0.5) * res
+    ys = oy + (jj + 0.5) * res
+    Xs, Ys = np.meshgrid(xs, ys, indexing="ij")
+    dx = Xs - np.float32(x_pose)
+    dy = Ys - np.float32(y_pose)
+    in_range = (dx * dx + dy * dy) <= np.float32(radius_m * radius_m)
+    bearing = np.arctan2(dy, dx)
+    diff = bearing - np.float32(theta)
+    diff = np.mod(diff + np.pi, 2.0 * np.pi) - np.pi
+    in_angle = np.abs(diff) <= np.float32(half_angle_rad)
+    return in_range & in_angle
 
 
 def _shift(arr: np.ndarray, di: int, dj: int, fill) -> np.ndarray:
