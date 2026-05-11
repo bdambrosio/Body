@@ -23,7 +23,7 @@ from utils.json_utils import repair_json_string
 logger = logging.getLogger(__name__)
 
 
-VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "http://localhost:5005/v1")
+VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "http://localhost:5000/v1")
 # If VISION_MODEL is set, it's an explicit override — bypasses auto-detection.
 # If unset, we query /v1/models on first use and cache whatever's served.
 VISION_MODEL_OVERRIDE = os.environ.get("VISION_MODEL")

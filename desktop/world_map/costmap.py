@@ -59,7 +59,7 @@ class CostmapConfig:
     safety_margin_m: float = 0.10
 
     # Exponential decay length-scale beyond the safety band.
-    inflation_decay_m: float = 0.30
+    inflation_decay_m: float = 0.15
     halo_max: float = 100.0
 
     # Cost assigned to cells that have never been observed. Low enough
