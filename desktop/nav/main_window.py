@@ -11,8 +11,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shutil
 import time
-from typing import Optional
+from dataclasses import asdict
+from typing import Any, Dict, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
@@ -34,20 +36,46 @@ from .follower import (
     Follower, FollowerConfig, FollowerOutput,
     STATUS_ARRIVED, STATUS_FOLLOWING, STATUS_NO_PATH, STATUS_ROTATING,
 )
+from .health import LivenessWatcher
 from .mission import Mission, MissionConfig, MissionState
+from . import patrol as patrol_mod
+from .patrol import Patrol, PatrolRunner
+from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
+from .primitives import RotateToHeading
 from .recovery import (
     PRIM_ABORTED, PRIM_DONE, PRIM_RUNNING,
     REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
     classify_replan_failure,
 )
 from .safety import SafetyConfig, forward_arc_blocked
+from .tracing import (
+    CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
+)
 
 from .camera_panels import CameraPanels, build_camera_snapshot
 from .safety_toolbar import SafetyToolbar
 from .teleop_panels import TeleopPanels, build_chassis_snapshot
 
 logger = logging.getLogger(__name__)
+
+
+# Forward-arc block must persist this long before an auto-snapshot
+# fires. Transient cross-overs (a person walking past) shouldn't burn
+# disk; a real "stuck looking at an obstacle" should.
+_SUSTAINED_BLOCK_S = 3.0
+
+# Patrol waypoint adaptation: when a saved waypoint sits in a lethal
+# cell or deep in inflation halo, snap to the nearest accessible cell
+# within this radius. Generous enough to escape inflation halo,
+# tight enough that a wall-buried wp isn't relocated halfway across
+# the room.
+_WP_SNAP_RADIUS_M = 1.0
+
+# Below this displacement, the snap is considered "no relocation" and
+# no trace event is emitted (avoids per-mission spam when the wp is
+# already in clear space and just rounds to a different sub-cell).
+_WP_SNAP_TRIVIAL_M = 0.05
 
 
 class NavMainWindow(QMainWindow):
@@ -155,6 +183,18 @@ class NavMainWindow(QMainWindow):
         self._cancel_act.triggered.connect(self._on_cancel)
         self._map_toolbar.addAction(self._cancel_act)
 
+        self._patrol_edit_act = QAction("Patrol edit", self)
+        self._patrol_edit_act.setCheckable(True)
+        self._patrol_edit_act.setChecked(False)
+        self._patrol_edit_act.setToolTip(
+            "Toggle right-click semantics: while on, right-clicking a "
+            "map appends a waypoint to the active patrol (creating one "
+            "if none is loaded). While off, right-click sets the single "
+            "goal as before."
+        )
+        self._patrol_edit_act.toggled.connect(self._on_patrol_edit_action)
+        self._map_toolbar.addAction(self._patrol_edit_act)
+
         self._stream_rgb_act = QAction("Stream RGB", self)
         self._stream_rgb_act.setCheckable(True)
         self._stream_rgb_act.setChecked(False)
@@ -234,6 +274,46 @@ class NavMainWindow(QMainWindow):
         # stays FOLLOWING so we resume when the arc clears.
         self._safety_config = SafetyConfig()
         self._safety_blocked: bool = False
+        # Tracing: one JSONL file per mission, edge-triggered emits.
+        # Pose sampler + auto-snapshot callback are attached here so
+        # the Mission and LivenessWatcher can use them as soon as the
+        # first event fires. See `tracing.py` and `health.py`.
+        self._tracer = Tracer()
+        self._tracer.attach_pose_sampler(self._sample_pose_for_trace)
+        self._tracer.attach_snapshot_cb(self._auto_snapshot_for_trace)
+        self._mission.tracer = self._tracer
+        self._liveness = LivenessWatcher(
+            self._tracer, fuser=self.fuser, chassis=self.chassis,
+        )
+        # Edge-trigger state. None = uninitialized (first observation
+        # establishes baseline without emitting).
+        self._last_plan_ok: Optional[bool] = None
+        self._last_safety_blocked: Optional[bool] = None
+        self._safety_block_started_at: Optional[float] = None
+        self._safety_block_snapped: bool = False
+        self._mission_was_active: bool = False
+        # Patrol execution state. Populated by `_on_go` when a patrol
+        # with waypoints is loaded; None for single-goal missions.
+        # `_active_rotation` is the currently-running RotateToHeading
+        # primitive (only set while ROTATING_TO_NEXT). `_pending_advance`
+        # holds (new_wp_index, new_lap_index, lap_completed) — the
+        # values committed to the mission once the primitive reports
+        # DONE.
+        self._patrol_runner: Optional[PatrolRunner] = None
+        self._active_rotation: Optional[RotateToHeading] = None
+        self._pending_advance: Optional[Tuple[int, int, bool]] = None
+        # Per-mission cache of effective (snapped) waypoint coords,
+        # keyed by wp_index. Each entry is computed once per mission
+        # when the wp first becomes the active target, emits a
+        # `patrol.waypoint_snapped` event if relocation was needed,
+        # then is reused for the leg's goal + the rotate-to-face
+        # heading. Cleared on mission terminal.
+        self._snapped_wp_xys: Dict[int, Tuple[float, float]] = {}
+        # Right-click append target for patrol-edit mode. Wired to
+        # SharedMapView in `_build_ui` (next block).
+        self._shared_view.set_patrol_append_callback(
+            self._on_patrol_append_requested
+        )
         self._left_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
@@ -330,6 +410,15 @@ class NavMainWindow(QMainWindow):
         # _build_ui); only teleop remains a dock-area panel.
         self._teleop = TeleopPanels(self.chassis, self.chassis_config)
         self._teleop.attach_to(self)
+        # Patrol dock: lives on the left dock area to avoid stealing
+        # space from the teleop column on the right.
+        self._patrol_dock = PatrolDock(
+            self._shared_view,
+            get_live_session_id=lambda: self.fuser.grid.session_id,
+            parent=self,
+        )
+        self._patrol_dock.attach_to(self)
+        self._patrol_dock.edit_mode_toggled.connect(self._on_patrol_edit_toggled)
 
     def _build_menu(self) -> None:
         view_menu = self.menuBar().addMenu("&View")
@@ -346,6 +435,13 @@ class NavMainWindow(QMainWindow):
         self._camera_action.setShortcut("Ctrl+Shift+C")
         self._camera_action.triggered.connect(self._cameras.set_visible)
         view_menu.addAction(self._camera_action)
+
+        self._patrol_action = QAction("Patrol panel", self)
+        self._patrol_action.setCheckable(True)
+        self._patrol_action.setChecked(self._patrol_dock.is_visible())
+        self._patrol_action.setShortcut("Ctrl+P")
+        self._patrol_action.triggered.connect(self._patrol_dock.set_visible)
+        view_menu.addAction(self._patrol_action)
 
         view_menu.addSeparator()
 
@@ -387,6 +483,9 @@ class NavMainWindow(QMainWindow):
 
     def _on_redraw_tick(self) -> None:
         self._safety_toolbar.refresh()
+        # Liveness watcher self-throttles to its own 1 Hz cadence;
+        # cheap to call on every redraw.
+        self._liveness.tick()
         self._refresh_fuser_panel()
         self._refresh_chassis_panel()
         # Dock groups only consume ticks when visible. Each group owns
@@ -406,6 +505,12 @@ class NavMainWindow(QMainWindow):
             self._teleop_action.setChecked(self._teleop.is_visible())
         if self._camera_action.isChecked() != self._cameras.is_visible():
             self._camera_action.setChecked(self._cameras.is_visible())
+        if self._patrol_action.isChecked() != self._patrol_dock.is_visible():
+            self._patrol_action.setChecked(self._patrol_dock.is_visible())
+        # Sync the patrol dock's widgets with the current shared-view
+        # state (session-match hint, waypoint count). Cheap.
+        if self._patrol_dock.is_visible():
+            self._patrol_dock.refresh()
 
     def _refresh_fuser_panel(self) -> None:
         snap = self.fuser.snapshot_for_ui()
@@ -478,7 +583,31 @@ class NavMainWindow(QMainWindow):
             self._drive_mission_tick(out, cm, pose, pose_age)
         else:
             self._safety_blocked = False
+            self._update_safety_block_trace(False)
             self._active_recovery = None
+        # Trace lifecycle: close the per-mission file on the
+        # active→terminal edge so each mission yields one self-
+        # contained JSONL artifact.
+        if self._mission_was_active and not self._mission.is_active():
+            self._tracer.close()
+            self._mission_was_active = False
+            # Reset edge state so a fresh mission's first events
+            # (re)establish baselines silently.
+            self._last_plan_ok = None
+            self._last_safety_blocked = None
+            self._safety_block_started_at = None
+            self._safety_block_snapped = False
+            # Patrol bookkeeping: drop runner / pending advance so a
+            # subsequent Go on the same patrol starts at wp[0] again,
+            # clear the snap cache (next mission rebuilds against the
+            # current costmap), and unlock the patrol dock for edits.
+            self._patrol_runner = None
+            self._active_rotation = None
+            self._pending_advance = None
+            self._snapped_wp_xys.clear()
+            self._patrol_dock.set_mission_active(False)
+        elif self._mission.is_active():
+            self._mission_was_active = True
 
         # All status labels below use width-stable formats: every
         # numeric field has a fixed min-width via `:>N.Mf` / `:>Nd` so
@@ -663,12 +792,14 @@ class NavMainWindow(QMainWindow):
             self._mission.fail("chassis disconnect")
             self._cancel_recovery()
             self._safety_blocked = False
+            self._update_safety_block_trace(False)
             return
         if not live:
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._mission.fail("Live cmd dropped")
             self._cancel_recovery()
             self._safety_blocked = False
+            self._update_safety_block_trace(False)
             return
 
         # Pose freshness applies regardless of current state. None pose
@@ -694,6 +825,7 @@ class NavMainWindow(QMainWindow):
                     )
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._safety_blocked = False
+            self._update_safety_block_trace(False)
             return
         if (
             self._mission.is_paused()
@@ -704,6 +836,8 @@ class NavMainWindow(QMainWindow):
         # Dispatch on state.
         if self._mission.is_following():
             self._tick_following(out, pose)
+        elif self._mission.is_rotating_to_next():
+            self._tick_rotating_to_next(pose, cm)
         elif self._mission.is_paused():
             self._tick_paused(cm, pose)
         elif self._mission.is_recovering():
@@ -712,8 +846,14 @@ class NavMainWindow(QMainWindow):
     def _tick_following(self, out: FollowerOutput, pose) -> None:
         if out.status == STATUS_ARRIVED:
             self.chassis.set_cmd_vel(0.0, 0.0)
+            self._update_safety_block_trace(False)
+            # Patrol arrival branch: advance to the next waypoint
+            # (rotating to face it first) instead of terminating, when
+            # there's another leg to drive.
+            if self._patrol_runner is not None:
+                self._handle_patrol_arrival(pose)
+                return
             self._mission.arrive()
-            self._safety_blocked = False
             return
         if out.status == STATUS_NO_PATH:
             # Replan failed (or path degenerate). Classify the failure
@@ -723,19 +863,71 @@ class NavMainWindow(QMainWindow):
             )
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._mission.pause(reason)
-            self._safety_blocked = False
+            self._update_safety_block_trace(False)
             return
         # FOLLOWING / ROTATING — forward-arc safety check.
-        self._safety_blocked = (
+        blocked = (
             self._last_costmap is not None
             and forward_arc_blocked(
                 self._last_costmap, pose, self._safety_config,
             )
         )
-        if self._safety_blocked:
+        self._safety_blocked = blocked
+        if blocked:
             self.chassis.set_cmd_vel(0.0, 0.0)
         else:
             self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
+        self._update_safety_block_trace(blocked)
+
+    def _update_safety_block_trace(self, blocked: bool) -> None:
+        """Edge-triggered safety.* emits + sustained-block auto-snap.
+
+        The forward arc flicks on/off as the robot's heading sweeps past
+        nearby lethal cells — we want one event when an episode begins
+        and one when it ends, not per-tick spam. If the same episode
+        persists past `_SUSTAINED_BLOCK_S`, fire `safety.sustained_block`
+        (in AUTO_SNAP_EVENTS) so the trace gets a costmap snapshot at
+        the moment of trouble. Snap is rate-limited per episode — one
+        bundle per stuck-stretch, not one per tick after the threshold.
+        """
+        prev = self._last_safety_blocked
+        now = time.time()
+        if prev is None:
+            self._last_safety_blocked = blocked
+            if blocked:
+                self._safety_block_started_at = now
+                self._tracer.emit(
+                    CAT_SAFETY, "forward_arc_blocked", {},
+                    level=LEVEL_WARN,
+                )
+            return
+        if blocked != prev:
+            self._last_safety_blocked = blocked
+            if blocked:
+                self._safety_block_started_at = now
+                self._safety_block_snapped = False
+                self._tracer.emit(
+                    CAT_SAFETY, "forward_arc_blocked", {},
+                    level=LEVEL_WARN,
+                )
+            else:
+                self._safety_block_started_at = None
+                self._safety_block_snapped = False
+                self._tracer.emit(CAT_SAFETY, "cleared", {})
+            return
+        # No edge — but check sustained-block threshold while blocked.
+        if (
+            blocked
+            and not self._safety_block_snapped
+            and self._safety_block_started_at is not None
+            and (now - self._safety_block_started_at) > _SUSTAINED_BLOCK_S
+        ):
+            self._safety_block_snapped = True
+            self._tracer.emit(
+                CAT_SAFETY, "sustained_block",
+                {"duration_s": now - self._safety_block_started_at},
+                level=LEVEL_WARN,
+            )
 
     def _tick_paused(self, cm, pose) -> None:
         """While paused: hold cmd_vel zero, watch for the pause
@@ -744,6 +936,7 @@ class NavMainWindow(QMainWindow):
         """
         self.chassis.set_cmd_vel(0.0, 0.0)
         self._safety_blocked = False
+        self._update_safety_block_trace(False)
 
         # Auto-resume if the planner now has a path. Last tick's
         # follower output already saw the freshly-replanned path; we
@@ -788,9 +981,11 @@ class NavMainWindow(QMainWindow):
             self._mission.end_recovery(success=False)
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._safety_blocked = False
+            self._update_safety_block_trace(False)
             return
         out = action.update(pose, cm)
         self._safety_blocked = False
+        self._update_safety_block_trace(False)
         if out.status == PRIM_RUNNING:
             self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
             return
@@ -800,6 +995,200 @@ class NavMainWindow(QMainWindow):
         self._active_recovery = None
         self._mission.end_recovery(success=(out.status == PRIM_DONE))
 
+    # ── Patrol arrival / rotation ───────────────────────────────────
+
+    def _get_effective_wp_xy(
+        self, wp, wp_index: int,
+    ) -> Tuple[float, float]:
+        """Return the (x, y) the planner/follower should aim at for
+        `wp`. Snaps the saved waypoint to the nearest accessible cell
+        (cost < halo_max/2, non-lethal) within `_WP_SNAP_RADIUS_M` if
+        the saved cell isn't itself accessible. Cached per wp_index
+        for the duration of the mission so each leg gets a consistent
+        target and the trace event fires at most once per wp per run.
+
+        Emits:
+          - `patrol.waypoint_snapped` when a relocation > trivial
+            distance was applied.
+          - `patrol.waypoint_snap_failed` when no acceptable cell
+            exists within the radius (fall back to raw xy; planner
+            relaxation will still try its own 8-cell search).
+        """
+        cached = self._snapped_wp_xys.get(wp_index)
+        if cached is not None:
+            return cached
+        raw_xy = (float(wp.x_m), float(wp.y_m))
+        cm = self._last_costmap
+        if cm is None:
+            # No costmap yet — can't snap. Use raw and don't cache
+            # (so the next call retries once a costmap arrives).
+            return raw_xy
+        try:
+            result = patrol_mod.snap_to_accessible(
+                cm, raw_xy, radius_m=_WP_SNAP_RADIUS_M,
+            )
+        except Exception:
+            logger.exception("snap_to_accessible raised")
+            self._snapped_wp_xys[wp_index] = raw_xy
+            return raw_xy
+        if result is None:
+            # No accessible cell within radius — fall back to raw.
+            # Trace the failure so a reviewer can see *why* the
+            # planner relaxation took over.
+            self._snapped_wp_xys[wp_index] = raw_xy
+            try:
+                self._tracer.emit(
+                    "patrol", "waypoint_snap_failed",
+                    {
+                        "wp_index": wp_index,
+                        "original_xy": [raw_xy[0], raw_xy[1]],
+                        "radius_m": _WP_SNAP_RADIUS_M,
+                    },
+                    level=LEVEL_WARN,
+                )
+            except Exception:
+                logger.exception("waypoint_snap_failed emit raised")
+            return raw_xy
+        eff_xy = result.snapped_xy
+        self._snapped_wp_xys[wp_index] = eff_xy
+        if result.snapped and result.distance_m >= _WP_SNAP_TRIVIAL_M:
+            try:
+                self._tracer.emit(
+                    "patrol", "waypoint_snapped",
+                    {
+                        "wp_index": wp_index,
+                        "original_xy": [
+                            result.original_xy[0], result.original_xy[1],
+                        ],
+                        "snapped_xy": [eff_xy[0], eff_xy[1]],
+                        "distance_m": result.distance_m,
+                        "cost_at_original": result.cost_at_original,
+                        "cost_at_snapped": result.cost_at_snapped,
+                    },
+                )
+            except Exception:
+                logger.exception("waypoint_snapped emit raised")
+        return eff_xy
+
+    def _handle_patrol_arrival(self, pose) -> None:
+        """Called from `_tick_following` when the follower reports
+        ARRIVED *and* a patrol is active. Compute the next leg, decide
+        terminal vs. advance, and (if advancing) kick off a
+        RotateToHeading primitive aimed at the next waypoint's bearing.
+        """
+        runner = self._patrol_runner
+        if runner is None:
+            self._mission.arrive()
+            return
+        # `face_next` is a per-waypoint flag — if the just-reached
+        # waypoint says false, skip the rotation step.
+        face_next = bool(
+            runner.patrol.waypoints[runner.wp_index].face_next
+        )
+        new_idx, lap_completed = runner.on_arrived()
+        if new_idx is None:
+            # Patrol terminal. If this terminal arrival also closed a
+            # lap (loop=True, laps=K and K-th arrival at wp[0]), emit
+            # patrol.lap_complete before mission.arrive() so the trace
+            # records the closure — complete_rotation_to_next is the
+            # usual emit site but we skip it on terminate-via-lap.
+            if lap_completed:
+                # Sync the mission's lap counter to the runner's
+                # before emitting + arriving, so the trace event and
+                # the mission state agree on lap_index.
+                self._mission.lap_index = runner.lap_index
+                try:
+                    self._tracer.emit(
+                        "patrol", "lap_complete",
+                        {"lap_index": runner.lap_index},
+                    )
+                except Exception:
+                    logger.exception("lap_complete emit raised")
+            self._patrol_runner = None
+            self._active_rotation = None
+            self._pending_advance = None
+            self._mission.arrive()
+            return
+        # Cache the values to commit when rotation completes. We don't
+        # update the goal yet — the follower keeps reporting ARRIVED
+        # against wp[i] until we advance, which is fine since cmd_vel
+        # is owned by the rotation primitive while ROTATING_TO_NEXT.
+        self._pending_advance = (new_idx, runner.lap_index, lap_completed)
+        # Snap the NEW active wp to an accessible cell ONCE per
+        # mission. Used both as the rotation target's heading and (in
+        # _commit_pending_advance) as the goal for the next leg.
+        next_wp = runner.patrol.waypoints[new_idx]
+        eff_next_xy = self._get_effective_wp_xy(next_wp, new_idx)
+        if not face_next or pose is None:
+            # Skip rotation — commit advance immediately and resume
+            # FOLLOWING in the next tick. Use 0-radian dummy target;
+            # the begin/complete pair still fires patrol.advance.
+            self._mission.begin_rotation_to_next(0.0, to_wp_index=new_idx)
+            self._commit_pending_advance()
+            return
+        target_theta = math.atan2(
+            eff_next_xy[1] - pose[1], eff_next_xy[0] - pose[0],
+        )
+        self._mission.begin_rotation_to_next(
+            target_theta, to_wp_index=new_idx,
+        )
+        self._active_rotation = RotateToHeading(target_theta)
+
+    def _tick_rotating_to_next(self, pose, cm) -> None:
+        """RotateToHeading-driven cmd_vel until the primitive reports
+        DONE (or ABORTED), then commit the pending advance and resume
+        FOLLOWING."""
+        action = self._active_rotation
+        if action is None:
+            # State drift: shouldn't happen, but recover by aborting
+            # the rotation and resuming FOLLOWING with no advance.
+            self._mission.abort_rotation_to_next()
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            return
+        out = action.update(pose, cm)
+        self._update_safety_block_trace(False)
+        if out.status == PRIM_RUNNING:
+            self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
+            return
+        # DONE or ABORTED — drop cmd_vel and commit.
+        self.chassis.set_cmd_vel(0.0, 0.0)
+        self._active_rotation = None
+        if out.status == PRIM_DONE:
+            self._commit_pending_advance()
+        else:
+            # ABORTED — fall back to FOLLOWING with no advance; the
+            # next ARRIVED tick will re-enter this path. cmd_vel
+            # already zeroed.
+            self._mission.abort_rotation_to_next()
+            self._pending_advance = None
+
+    def _commit_pending_advance(self) -> None:
+        """Apply the (wp_index, lap_index, lap_completed) cached by
+        `_handle_patrol_arrival` and shift the goal pin to the new
+        waypoint so the planner / follower target it on the next tick.
+        """
+        adv = self._pending_advance
+        runner = self._patrol_runner
+        if adv is None or runner is None:
+            self._mission.abort_rotation_to_next()
+            return
+        new_idx, new_lap, lap_completed = adv
+        self._pending_advance = None
+        self._mission.complete_rotation_to_next(
+            new_wp_index=new_idx,
+            new_lap_index=new_lap,
+            lap_completed=lap_completed,
+        )
+        # Shift the goal pin to the new active waypoint's effective
+        # (snapped) position. The planner will replan against this on
+        # the next redraw tick. The effective xy was computed in
+        # _handle_patrol_arrival and cached, so the rotation target
+        # and the new goal agree exactly.
+        wp = runner.patrol.waypoints[new_idx]
+        eff_xy = self._get_effective_wp_xy(wp, new_idx)
+        self._shared_view.set_goal(eff_xy)
+        self._shared_view.set_patrol_active_wp_index(new_idx)
+
     def _cancel_recovery(self) -> None:
         if self._active_recovery is not None:
             try:
@@ -807,6 +1196,16 @@ class NavMainWindow(QMainWindow):
             except Exception:
                 logger.exception("recovery primitive cancel raised")
             self._active_recovery = None
+        # An active rotate-to-next primitive is the patrol equivalent
+        # of a recovery primitive — same teardown story (cancel +
+        # drop the handle; mission state transitioned by the caller).
+        if self._active_rotation is not None:
+            try:
+                self._active_rotation.cancel()
+            except Exception:
+                logger.exception("rotation primitive cancel raised")
+            self._active_rotation = None
+            self._pending_advance = None
 
     def _refresh_chassis_panel(self) -> None:
         """Text summary with values the pills can't convey (status age,
@@ -865,6 +1264,36 @@ class NavMainWindow(QMainWindow):
             self._shared_view.set_planned_path(result.waypoints_world)
         else:
             self._shared_view.set_planned_path([])
+        # Edge-triggered plan tracing: emit on fail→ok and ok→fail
+        # transitions only. Every-tick plan.ok would flood the file.
+        # The first observed result establishes the baseline silently.
+        prev_ok = self._last_plan_ok
+        cur_ok = bool(result.ok)
+        if prev_ok is None:
+            self._last_plan_ok = cur_ok
+        elif cur_ok != prev_ok:
+            self._last_plan_ok = cur_ok
+            if cur_ok:
+                self._tracer.emit(
+                    CAT_PLAN, "ok",
+                    {
+                        "distance_m": result.distance_m,
+                        "expansions": result.n_expansions,
+                        "elapsed_ms": result.elapsed_ms,
+                        "goal": [goal[0], goal[1]],
+                    },
+                )
+            else:
+                self._tracer.emit(
+                    CAT_PLAN, "fail",
+                    {
+                        "msg": result.msg,
+                        "expansions": result.n_expansions,
+                        "elapsed_ms": result.elapsed_ms,
+                        "goal": [goal[0], goal[1]],
+                    },
+                    level=LEVEL_WARN,
+                )
 
     def _on_clear_goal(self) -> None:
         # Cancel any active mission first so we don't keep driving
@@ -886,13 +1315,25 @@ class NavMainWindow(QMainWindow):
             self._mission.cancel()
         result = self.fuser.request_relocate(reason="ui_relocate")
         if result.get("success"):
+            # Phase B: apply the same SE(2) transform to the patrol's
+            # waypoints + the single goal pin so they stay glued to the
+            # physical environment, not the drifting world frame. The
+            # world map cells are NOT transformed here (deferred); the
+            # sum-bounded vote model will reconcile old votes with new
+            # observations as the bot drives.
+            shift = self._apply_relocate_to_patrol(result)
+            self._snapped_wp_xys.clear()
             QMessageBox.information(
                 self, "Re-localize",
                 f"Snapped pose by "
                 f"dx={result['dx']:+.2f} m, dy={result['dy']:+.2f} m, "
                 f"dθ={math.degrees(result['dtheta']):+.1f}° "
                 f"(improvement {result['improvement']:.0f} over "
-                f"{result['evidence_cells']} evidence cells).",
+                f"{result['evidence_cells']} evidence cells)."
+                + (
+                    f"\n\nShifted {shift} waypoint(s) / goal pin to "
+                    f"match the new frame." if shift > 0 else ""
+                ),
             )
         else:
             QMessageBox.warning(
@@ -904,12 +1345,122 @@ class NavMainWindow(QMainWindow):
                 ),
             )
 
+    def _apply_relocate_to_patrol(self, result: Dict[str, Any]) -> int:
+        """Transform the active patrol's waypoints and the single goal
+        pin by the SE(2) given by `result["prior_pose"]` +
+        (dx, dy, dtheta). Saved Patrol on disk is NOT mutated — the
+        operator persists via Save if they want the new coords.
+
+        Returns the count of points transformed (waypoints + 1 for the
+        goal if present).
+        """
+        prior = result.get("prior_pose")
+        if not prior or len(prior) < 3:
+            return 0
+        dx = float(result.get("dx", 0.0))
+        dy = float(result.get("dy", 0.0))
+        dtheta = float(result.get("dtheta", 0.0))
+        bot_old = (float(prior[0]), float(prior[1]))
+        bot_new = (bot_old[0] + dx, bot_old[1] + dy)
+        cos_d = math.cos(dtheta)
+        sin_d = math.sin(dtheta)
+
+        def transform(xy):
+            rx = xy[0] - bot_old[0]
+            ry = xy[1] - bot_old[1]
+            return (
+                bot_new[0] + cos_d * rx - sin_d * ry,
+                bot_new[1] + sin_d * rx + cos_d * ry,
+            )
+
+        n_transformed = 0
+        wp_changes: list = []
+
+        patrol = self._shared_view.patrol()
+        if patrol is not None:
+            for i, wp in enumerate(patrol.waypoints):
+                old_xy = (wp.x_m, wp.y_m)
+                new_xy = transform(old_xy)
+                wp.x_m = new_xy[0]
+                wp.y_m = new_xy[1]
+                wp_changes.append({
+                    "wp_index": i,
+                    "old_xy": [old_xy[0], old_xy[1]],
+                    "new_xy": [new_xy[0], new_xy[1]],
+                })
+                n_transformed += 1
+            # Re-set on shared view to fire notify so map re-renders.
+            self._shared_view.set_patrol(patrol)
+
+        goal = self._shared_view.goal()
+        goal_change = None
+        if goal is not None:
+            new_goal = transform(goal)
+            self._shared_view.set_goal(new_goal)
+            goal_change = {
+                "old_xy": [goal[0], goal[1]],
+                "new_xy": [new_goal[0], new_goal[1]],
+            }
+            n_transformed += 1
+
+        if n_transformed > 0:
+            try:
+                self._tracer.emit(
+                    "patrol", "world_relocated",
+                    {
+                        "prior_pose": [
+                            float(prior[0]), float(prior[1]), float(prior[2]),
+                        ],
+                        "dx": dx,
+                        "dy": dy,
+                        "dtheta": dtheta,
+                        "n_waypoints": (
+                            len(patrol.waypoints) if patrol is not None else 0
+                        ),
+                        "waypoints": wp_changes,
+                        "goal": goal_change,
+                    },
+                )
+            except Exception:
+                logger.exception("world_relocated emit raised")
+
+        return n_transformed
+
     def _on_go(self) -> None:
         """Validate preconditions and transition the mission to
         FOLLOWING. Each subsequent redraw tick pushes the follower's
-        cmd_vel to chassis until ARRIVED, CANCELED, or FAILED."""
+        cmd_vel to chassis until ARRIVED, CANCELED, or FAILED.
+
+        Patrol precedence: if a patrol with at least one waypoint is
+        loaded, Go drives the patrol (sets goal to wp[0]; advances on
+        each ARRIVED via the PatrolRunner). Otherwise Go drives to the
+        single goal pin as before. The toolbar Plan label / Stop /
+        Cancel paths are common between both modes.
+        """
         if not self._mission.can_start():
             return  # already FOLLOWING — nothing to do
+        # If a patrol is loaded with waypoints, override the goal pin
+        # to wp[0]'s effective (snapped) position before validating the
+        # plan — the existing planner only knows about
+        # `_shared_view.goal()`, so we hand it the current target.
+        # The snap cache starts empty at each Go so a re-run sees the
+        # current costmap, not the prior mission's snap result.
+        patrol = self._shared_view.patrol()
+        patrol_runner: Optional[PatrolRunner] = None
+        self._snapped_wp_xys.clear()
+        if patrol is not None and len(patrol.waypoints) > 0:
+            wp0 = patrol.waypoints[0]
+            eff_xy = self._get_effective_wp_xy(wp0, 0)
+            self._shared_view.set_goal(eff_xy)
+            self._shared_view.set_patrol_active_wp_index(0)
+            patrol_runner = PatrolRunner(patrol)
+            # Force a synchronous replan so the plan precondition below
+            # sees a fresh result against the freshly-set wp[0] goal.
+            cm = self._last_costmap
+            latest = self.fuser.pose_source.latest_pose()
+            pose0 = latest[0] if latest is not None else None
+            if cm is not None and pose0 is not None:
+                self._replan(cm, pose0)
         plan = self._last_plan
         if plan is None or not plan.ok:
             self._mission.fail("no plan — drop a goal pin first")
@@ -929,6 +1480,26 @@ class NavMainWindow(QMainWindow):
                 "Live cmd is OFF — enable it on the safety toolbar first"
             )
             return
+        # Open the per-mission trace file before start() so the very
+        # first emit (mission.start) lands in the file rather than only
+        # the ring buffer. A separate Go that fails a precondition above
+        # leaves no file behind — those fail() emits ring-only, which
+        # matches the operator-visible UI (nothing to report).
+        try:
+            self._tracer.open(
+                session_id=self.fuser.grid.session_id,
+                configs=self._trace_configs_snapshot(),
+                patrol=patrol.to_dict() if patrol_runner is not None else None,
+                git_sha=git_sha(),
+                snapshot_at_start=None,
+            )
+        except Exception:
+            logger.exception("tracer open failed; continuing without trace")
+        self._patrol_runner = patrol_runner
+        self._active_rotation = None
+        self._pending_advance = None
+        self._mission_was_active = True
+        self._patrol_dock.set_mission_active(True)
         self._mission.start()
 
     def _on_cancel(self) -> None:
@@ -974,17 +1545,36 @@ class NavMainWindow(QMainWindow):
                 f"Could not load snapshot:\n{type(e).__name__}: {e}",
             )
             return
+        # If the bundle contains a patrols.json, load it into the
+        # shared view so the operator gets the patrol back alongside
+        # the world layers. Best-effort — a malformed sidecar
+        # shouldn't block the layer reload.
+        patrol_info = ""
+        patrol_path = os.path.join(os.path.dirname(path), "patrols.json")
+        if os.path.isfile(patrol_path):
+            try:
+                p = patrol_mod.load_from_file(patrol_path)
+                self._shared_view.set_patrol(p)
+                self._shared_view.set_patrol_active_wp_index(0)
+                patrol_info = (
+                    f"\n\npatrol loaded: {p.name} "
+                    f"({len(p.waypoints)} waypoints)"
+                )
+            except Exception:
+                logger.exception("patrols.json load from bundle failed")
+                patrol_info = "\n\npatrols.json found but failed to load"
         QMessageBox.information(
             self, "Snapshot loaded",
             f"Loaded {summary['cells_observed']} cells from\n"
             f"{path}\n\n"
             f"loaded session: {summary['loaded_session_id'][:8]}\n"
             f"live session:   {summary['current_session_id'][:8]}"
+            + patrol_info
         )
 
     def _on_save_snapshot(self) -> None:
         try:
-            out_dir = self.fuser.save_snapshot_bundle()
+            out_dir = self._save_bundle_with_trace()
         except Exception as e:
             logger.exception("snapshot bundle write failed")
             QMessageBox.warning(
@@ -1004,6 +1594,93 @@ class NavMainWindow(QMainWindow):
         if box.clickedButton() is open_btn:
             QDesktopServices.openUrl(QUrl.fromLocalFile(out_dir))
 
+    # ── Trace integration helpers ────────────────────────────────────
+
+    def _save_bundle_with_trace(self) -> str:
+        """Write a snapshot bundle and, if a trace is currently open,
+        copy the active trace.jsonl into the bundle directory. Also
+        embeds the active patrol (when one is loaded) as
+        `patrols.json`, so a reload of the bundle restores the patrol
+        alongside the world layers. Returns the bundle path. Raises
+        on bundle-write errors; trace/patrol side files are best-
+        effort.
+        """
+        out_dir = self.fuser.save_snapshot_bundle()
+        trace_path = self._tracer.current_path()
+        if trace_path:
+            try:
+                shutil.copy(
+                    trace_path, os.path.join(out_dir, "trace.jsonl"),
+                )
+            except Exception:
+                logger.exception(
+                    "trace copy into snapshot bundle failed"
+                )
+        patrol = self._shared_view.patrol()
+        if patrol is not None and len(patrol.waypoints) > 0:
+            try:
+                patrol_mod.write_to_file(
+                    patrol, os.path.join(out_dir, "patrols.json"),
+                )
+            except Exception:
+                logger.exception(
+                    "patrol embed into snapshot bundle failed"
+                )
+        return out_dir
+
+    def _sample_pose_for_trace(self):
+        """Pose sampler registered with the Tracer. Returns the latest
+        world-frame pose or None when none is available."""
+        try:
+            latest = self.fuser.pose_source.latest_pose()
+        except Exception:
+            return None
+        if latest is None:
+            return None
+        return latest[0]
+
+    def _auto_snapshot_for_trace(self, event_code: str) -> Optional[str]:
+        """Tracer-invoked auto-snapshot. Writes a full bundle (including
+        the active trace prefix) and returns the bundle path so it can
+        be stamped into the triggering event's data.
+        """
+        try:
+            return self._save_bundle_with_trace()
+        except Exception:
+            logger.exception(
+                f"auto-snapshot for {event_code} raised; skipping"
+            )
+            return None
+
+    def _trace_configs_snapshot(self) -> Dict[str, Any]:
+        """Snapshot the frozen run-time config (mission, follower,
+        safety, A*, costmap, fuser, chassis) into the trace header so
+        a reviewer doesn't need access to the source tree to interpret
+        thresholds and tunables.
+        """
+        cfg: Dict[str, Any] = {}
+        try:
+            cfg["mission"] = asdict(self._mission_config)
+            cfg["follower"] = asdict(self._follower.config)
+            cfg["safety"] = asdict(self._safety_config)
+            cfg["astar"] = asdict(self._astar_config)
+            cfg["costmap"] = asdict(self._costmap_config)
+        except Exception:
+            logger.exception("config snapshot raised")
+        # Fuser + chassis configs include router; useful for "which Pi
+        # was this run against." Captured loosely so unrelated dataclass
+        # shape changes can't break trace opening.
+        try:
+            cfg["fuser"] = asdict(self.fuser_config)
+        except Exception:
+            cfg["fuser"] = {"router": getattr(self.fuser_config, "router", None)}
+        try:
+            cfg["chassis"] = asdict(self.chassis_config)
+        except Exception:
+            cfg["chassis"] = {"router": getattr(self.chassis_config, "router", None)}
+        cfg["sustained_block_s"] = _SUSTAINED_BLOCK_S
+        return cfg
+
     def _on_fit_maps(self) -> None:
         # Single call: shared view propagates to all attached panels.
         self._shared_view.reset_view()
@@ -1013,6 +1690,43 @@ class NavMainWindow(QMainWindow):
             self._stream_rgb_timer.start()
         else:
             self._stream_rgb_timer.stop()
+
+    # ── Patrol UI handlers ───────────────────────────────────────────
+
+    def _on_patrol_edit_action(self, checked: bool) -> None:
+        """Toolbar toggle → propagate to shared view + dock checkbox.
+        The dock has its own checkbox; we keep both in sync via the
+        shared-view boolean so either control reflects reality."""
+        self._shared_view.set_patrol_edit_mode(bool(checked))
+        # Keep the dock checkbox visually in sync without firing its
+        # toggle signal (which would re-enter this handler).
+        if self._patrol_dock._edit_box.isChecked() != bool(checked):
+            blk = self._patrol_dock._edit_box.blockSignals(True)
+            self._patrol_dock._edit_box.setChecked(bool(checked))
+            self._patrol_dock._edit_box.blockSignals(blk)
+
+    def _on_patrol_edit_toggled(self, on: bool) -> None:
+        """Dock checkbox → propagate to toolbar action."""
+        if self._patrol_edit_act.isChecked() != bool(on):
+            blk = self._patrol_edit_act.blockSignals(True)
+            self._patrol_edit_act.setChecked(bool(on))
+            self._patrol_edit_act.blockSignals(blk)
+
+    def _on_patrol_append_requested(self, x_w: float, y_w: float) -> None:
+        """Right-click append handler — wired into the SharedMapView.
+        Creates an empty patrol if none is loaded (so the operator can
+        start placing pins without an explicit New click), then appends
+        the world point.
+        """
+        if self._mission.is_active():
+            # Edit-mid-mission is locked by design.
+            return
+        p = self._shared_view.patrol()
+        if p is None:
+            live_sid = self.fuser.grid.session_id
+            p = patrol_mod.new_empty(session_id=live_sid)
+        p.append(x_w, y_w)
+        self._shared_view.set_patrol(p)
 
     def _on_stream_rgb_tick(self) -> None:
         # Streaming-mode capture: in-flight gating in the controller
@@ -1051,6 +1765,13 @@ class NavMainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         try:
             self._redraw_timer.stop()
+        except Exception:
+            pass
+        # Flush + close any open trace file so the last events aren't
+        # left in an unclosed handle (line-buffering covers writes, but
+        # close releases the fd cleanly for any tail consumer).
+        try:
+            self._tracer.close()
         except Exception:
             pass
         super().closeEvent(event)

@@ -340,6 +340,11 @@ class ImuPlusScanMatchPose(PoseSource):
             "dx": float(dx),
             "dy": float(dy),
             "dtheta": float(dth),
+            "prior_pose": [
+                float(prior_pose.x),
+                float(prior_pose.y),
+                float(prior_pose.theta),
+            ],
             "improvement": float(result.improvement),
             "score": float(result.score),
             "score_prior": float(result.score_prior),

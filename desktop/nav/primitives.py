@@ -116,6 +116,76 @@ class Rotate360:
         self._canceled = True
 
 
+# ── RotateToHeading ─────────────────────────────────────────────────
+
+
+@dataclass
+class RotateToHeadingConfig:
+    # Spin rate; sign tracks direction (handled per-tick from the
+    # measured error). Default matches Rotate360 — comfortable for
+    # scan-match when SLAM is promoted.
+    omega_radps: float = 0.30
+    # Stop tolerance. ±5° is tighter than the follower's 35°
+    # rotate-in-place gate, so on hand-off back to FOLLOWING the
+    # robot is already aligned enough for smooth pure-pursuit.
+    tolerance_rad: float = math.radians(5.0)
+
+
+class RotateToHeading:
+    """Spin in place until the robot's yaw is within `tolerance_rad`
+    of `target_theta_rad` (world frame). Direction is picked from the
+    sign of the (wrapped) heading error each tick, so a small
+    overshoot self-corrects rather than spinning a full loop.
+
+    Used by patrol execution at each waypoint to face the next leg's
+    bearing before the follower takes over. Idempotent on pose-loss:
+    if pose temporarily disappears, the primitive holds (returns
+    RUNNING with zero cmd_vel) until pose returns.
+    """
+
+    def __init__(
+        self,
+        target_theta_rad: float,
+        config: Optional[RotateToHeadingConfig] = None,
+    ):
+        self.target_theta_rad = float(target_theta_rad)
+        self.config = config or RotateToHeadingConfig()
+        self._canceled: bool = False
+
+    def name(self) -> str:
+        return f"rotate_to_heading({math.degrees(self.target_theta_rad):+.0f}°)"
+
+    def update(
+        self,
+        pose: Optional[Pose],
+        costmap: Optional[Costmap],
+    ) -> PrimitiveOutput:
+        if self._canceled:
+            return PrimitiveOutput.aborted(note="canceled")
+        if pose is None:
+            # Hold position until pose returns. Mission's no_pose
+            # guard owns the eventual fail; the primitive just waits.
+            return PrimitiveOutput.running(note="awaiting pose")
+
+        yaw = pose[2]
+        error = _wrap_pi(self.target_theta_rad - yaw)
+        if abs(error) <= self.config.tolerance_rad:
+            return PrimitiveOutput.done(
+                note=f"aligned (|err|={math.degrees(abs(error)):.1f}°)"
+            )
+        # Sign of error picks rotation direction so a small overshoot
+        # self-corrects rather than spinning all the way around.
+        sign = 1.0 if error >= 0.0 else -1.0
+        omega = sign * self.config.omega_radps
+        return PrimitiveOutput.running(
+            v=0.0, omega=omega,
+            note=f"rotating, err={math.degrees(error):+.1f}°",
+        )
+
+    def cancel(self) -> None:
+        self._canceled = True
+
+
 # ── BackUp ──────────────────────────────────────────────────────────
 
 

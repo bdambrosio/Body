@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, Qt
@@ -76,6 +76,21 @@ class SharedMapView:
         # Follower visualization: the pure-pursuit lookahead point
         # (None when no follower is active).
         self._lookahead_world: Optional[Tuple[float, float]] = None
+        # Patrol overlay state. `_patrol` is a duck-typed Patrol from
+        # `desktop.nav.patrol` (held loosely so this module doesn't
+        # import from `desktop.nav`). When set, all attached views
+        # render numbered waypoint pins + a connecting polyline
+        # instead of (or alongside) the single goal pin.
+        # `_patrol_edit_mode` toggles right-click semantics — when
+        # True, right-click appends a waypoint via
+        # `_patrol_append_callback`; when False, right-click goes
+        # through the existing `_goal_callback`.
+        self._patrol: Optional[Any] = None
+        self._patrol_active_wp_index: int = 0
+        self._patrol_edit_mode: bool = False
+        self._patrol_append_callback: Optional[
+            Callable[[float, float], None]
+        ] = None
 
     # ── Subscriptions ───────────────────────────────────────────────
 
@@ -174,6 +189,58 @@ class SharedMapView:
             (float(xy[0]), float(xy[1])) if xy is not None else None
         )
         self._notify()
+
+    # ── Patrol overlay ──────────────────────────────────────────────
+
+    def patrol(self) -> Optional[Any]:
+        return self._patrol
+
+    def set_patrol(self, patrol: Optional[Any]) -> None:
+        """Install / clear the active Patrol. The view holds a duck-
+        typed reference; the only attributes accessed on render are
+        `.waypoints` (iterable of objects with `.x_m`/`.y_m`) and
+        `.loop` (bool). Passing None clears the overlay and resets the
+        active-wp highlight to 0.
+        """
+        self._patrol = patrol
+        if patrol is None:
+            self._patrol_active_wp_index = 0
+        self._notify()
+
+    def patrol_active_wp_index(self) -> int:
+        return self._patrol_active_wp_index
+
+    def set_patrol_active_wp_index(self, i: int) -> None:
+        self._patrol_active_wp_index = int(max(0, i))
+        self._notify()
+
+    def patrol_edit_mode(self) -> bool:
+        return self._patrol_edit_mode
+
+    def set_patrol_edit_mode(self, on: bool) -> None:
+        self._patrol_edit_mode = bool(on)
+        self._notify()
+
+    def set_patrol_append_callback(
+        self, cb: Optional[Callable[[float, float], None]],
+    ) -> None:
+        """Register the function called when a view detects a
+        right-click WHILE `patrol_edit_mode` is on. Receives the
+        world (x, y) of the click. When edit mode is off, right-clicks
+        fall through to the existing `goal_callback` instead.
+        """
+        self._patrol_append_callback = cb
+
+    def request_patrol_append(self, x_w: float, y_w: float) -> bool:
+        """Right-click handler dispatch. Returns True if the click was
+        consumed as a waypoint append, False otherwise."""
+        if not self._patrol_edit_mode:
+            return False
+        cb = self._patrol_append_callback
+        if cb is None:
+            return False
+        cb(x_w, y_w)
+        return True
 
 
 class _WorldViewBase(QWidget):
@@ -427,6 +494,12 @@ class _WorldViewBase(QWidget):
                     color=QColor(255, 255, 255), label=None,
                 )
 
+            # Patrol overlay (numbered pins + connecting polyline).
+            # Drawn under the goal pin so the active waypoint's goal
+            # pin reads as the operator's primary target while the
+            # rest of the route is visible context.
+            self._draw_patrol(p, ox, oy, side_px)
+
             # Goal pin (above robot/anchor — operator's primary
             # attention focus during nav).
             self._draw_goal_pin(p, ox, oy, side_px)
@@ -632,6 +705,82 @@ class _WorldViewBase(QWidget):
         p.drawEllipse(QPointF(rx_la, ry_la), 4.0, 4.0)
         p.restore()
 
+    def _draw_patrol(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+    ) -> None:
+        """Render the active patrol (if any) as numbered circles with
+        a connecting polyline. The closing segment (wp[N-1] → wp[0])
+        is drawn dashed when `loop=True` so a reviewer can read
+        "closed loop" at a glance. The active waypoint (per
+        `patrol_active_wp_index`) is filled rather than outlined.
+        """
+        patrol = self._shared.patrol()
+        if patrol is None:
+            return
+        wps = getattr(patrol, "waypoints", None) or []
+        if not wps:
+            return
+
+        active_idx = self._shared.patrol_active_wp_index()
+        loop_closed = bool(getattr(patrol, "loop", False))
+
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+
+        # Connecting polyline. Solid for wp[i]→wp[i+1], dashed for the
+        # closing wp[N-1]→wp[0] when loop=True.
+        if len(wps) >= 2:
+            solid_pen = QPen(QColor(140, 220, 200, 200), 1.5)
+            dashed_pen = QPen(
+                QColor(140, 220, 200, 200), 1.5, Qt.PenStyle.DashLine,
+            )
+            p.setPen(solid_pen)
+            for i in range(len(wps) - 1):
+                ax, ay = self._world_to_widget(wps[i].x_m, wps[i].y_m)
+                bx, by = self._world_to_widget(
+                    wps[i + 1].x_m, wps[i + 1].y_m,
+                )
+                p.drawLine(QPointF(ax, ay), QPointF(bx, by))
+            if loop_closed:
+                p.setPen(dashed_pen)
+                ax, ay = self._world_to_widget(
+                    wps[-1].x_m, wps[-1].y_m,
+                )
+                bx, by = self._world_to_widget(wps[0].x_m, wps[0].y_m)
+                p.drawLine(QPointF(ax, ay), QPointF(bx, by))
+
+        # Numbered pins. Display ordinal is 1-based so the operator
+        # reads "wp 1, wp 2, ..." even though wp_index is 0-based
+        # internally.
+        outline = QColor(140, 220, 200, 230)
+        active_fill = QColor(140, 220, 200, 160)
+        text_color = QColor(20, 20, 20)
+        for i, wp in enumerate(wps):
+            rx, ry = self._world_to_widget(wp.x_m, wp.y_m)
+            in_rect = (
+                ox <= rx <= ox + side_px and oy <= ry <= oy + side_px
+            )
+            if not in_rect:
+                rx = max(ox, min(ox + side_px - 1, rx))
+                ry = max(oy, min(oy + side_px - 1, ry))
+            r = 10.0
+            if i == active_idx:
+                p.setPen(QPen(outline, 2))
+                p.setBrush(active_fill)
+            else:
+                p.setPen(QPen(outline, 1.5))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(rx, ry), r, r)
+            # Number label (1-based). Centered visually via small
+            # offset; QFontMetrics would be more correct but the
+            # number is at most 2-3 digits in any realistic patrol.
+            p.setPen(text_color if i == active_idx else outline)
+            label = str(i + 1)
+            offset = -3 if len(label) == 1 else -6
+            p.drawText(int(rx) + offset, int(ry) + 4, label)
+        p.restore()
+
     def _draw_goal_pin(
         self, p: QPainter, ox: int, oy: int, side_px: int,
     ) -> None:
@@ -776,19 +925,25 @@ class _WorldViewBase(QWidget):
         self.update()
 
     def mousePressEvent(self, event) -> None:
-        # Right-click reserved for "set goal" if anybody upstream
-        # registered a goal callback; otherwise it falls through to
-        # pan (preserves single-view behavior with no nav stack).
+        # Right-click semantics, in priority order:
+        #   1. Patrol-edit mode on → append a waypoint to the active
+        #      patrol (consumes the click).
+        #   2. A goal callback is registered → set the single goal.
+        #   3. Otherwise → fall through to pan (preserves single-view
+        #      behavior with no nav stack).
         if (event.button() == Qt.MouseButton.RightButton
-                and self._shared.has_goal_callback()
                 and self._paint_geom is not None):
             x_w, y_w = self._widget_to_world(
                 float(event.position().x()),
                 float(event.position().y()),
             )
-            self._shared.request_goal(x_w, y_w)
-            event.accept()
-            return
+            if self._shared.request_patrol_append(x_w, y_w):
+                event.accept()
+                return
+            if self._shared.has_goal_callback():
+                self._shared.request_goal(x_w, y_w)
+                event.accept()
+                return
 
         if event.button() in (Qt.MouseButton.MiddleButton,
                               Qt.MouseButton.RightButton,

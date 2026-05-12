@@ -39,6 +39,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from .tracing import Tracer
 
 
 class MissionState:
@@ -46,13 +50,20 @@ class MissionState:
     FOLLOWING = "FOLLOWING"
     PAUSED = "PAUSED"
     RECOVERING = "RECOVERING"
+    # Patrols only: between FOLLOWING (arrived at wp[i]) and the next
+    # FOLLOWING (toward wp[i+1]). cmd_vel during this state comes from
+    # a RotateToHeading primitive, not the follower.
+    ROTATING_TO_NEXT = "ROTATING_TO_NEXT"
     ARRIVED = "ARRIVED"
     CANCELED = "CANCELED"
     FAILED = "FAILED"
 
 
 _TERMINAL = {MissionState.ARRIVED, MissionState.CANCELED, MissionState.FAILED}
-_ACTIVE = {MissionState.FOLLOWING, MissionState.PAUSED, MissionState.RECOVERING}
+_ACTIVE = {
+    MissionState.FOLLOWING, MissionState.PAUSED, MissionState.RECOVERING,
+    MissionState.ROTATING_TO_NEXT,
+}
 
 
 @dataclass
@@ -92,6 +103,32 @@ class Mission:
     recovery_action: str = ""
     recovery_attempts: int = 0
 
+    # Patrol-only: index of the waypoint the robot is currently
+    # targeting and the number of laps completed since start. Single-
+    # goal missions leave these at zero (a single goal is conceptually
+    # a Patrol of length 1, loop=False, laps=1).
+    waypoint_index: int = 0
+    lap_index: int = 0
+    # During ROTATING_TO_NEXT, the world-frame heading the robot is
+    # spinning toward. Informational only — the primitive owns the
+    # actual rotation; this is for tracing / UI labels.
+    rotate_target_rad: float = 0.0
+
+    # Optional Tracer for emitting state transitions. Wired by
+    # main_window; tests construct Mission() with no tracer. None means
+    # "transitions still run normally, just no trace output."
+    tracer: Optional["Tracer"] = None
+
+    def _emit(self, category: str, event: str, **data: Any) -> None:
+        t = self.tracer
+        if t is None:
+            return
+        try:
+            t.emit(category, event, data)
+        except Exception:
+            # Tracing must never crash the mission tick.
+            pass
+
     def is_active(self) -> bool:
         """True when the mission is in any state that wants the follower
         to be running and the chassis to be live (FOLLOWING / PAUSED /
@@ -106,6 +143,9 @@ class Mission:
 
     def is_recovering(self) -> bool:
         return self.state == MissionState.RECOVERING
+
+    def is_rotating_to_next(self) -> bool:
+        return self.state == MissionState.ROTATING_TO_NEXT
 
     def is_terminal(self) -> bool:
         return self.state in _TERMINAL
@@ -131,6 +171,10 @@ class Mission:
         self.pause_started_at = 0.0
         self.recovery_action = ""
         self.recovery_attempts = 0
+        self.waypoint_index = 0
+        self.lap_index = 0
+        self.rotate_target_rad = 0.0
+        self._emit("mission", "start")
 
     def arrive(self) -> None:
         if self.is_active():
@@ -138,6 +182,7 @@ class Mission:
             self.finished_at = time.time()
             self.pause_reason = ""
             self.recovery_action = ""
+            self._emit("mission", "arrive")
 
     def cancel(self) -> None:
         # Cancel is benign on terminal states (no-op); allowed from any
@@ -147,6 +192,7 @@ class Mission:
             self.finished_at = time.time()
             self.pause_reason = ""
             self.recovery_action = ""
+            self._emit("mission", "cancel")
 
     def fail(self, reason: str) -> None:
         self.state = MissionState.FAILED
@@ -154,6 +200,7 @@ class Mission:
         self.finished_at = time.time()
         self.pause_reason = ""
         self.recovery_action = ""
+        self._emit("mission", "fail", reason=reason)
 
     def pause(self, reason: str) -> None:
         """Enter PAUSED with the given reason. If already PAUSED with
@@ -163,6 +210,8 @@ class Mission:
         reason gets its full grace window.
         """
         now = time.time()
+        # Idempotent re-entry: same reason, no emit so the trace stays
+        # edge-triggered.
         if self.state == MissionState.PAUSED and self.pause_reason == reason:
             return
         # PAUSED → PAUSED with new reason, FOLLOWING/RECOVERING → PAUSED.
@@ -170,19 +219,27 @@ class Mission:
         # while the mission is active.
         if not self.is_active():
             return
+        prev_state = self.state
         self.state = MissionState.PAUSED
         self.pause_reason = reason
         self.pause_started_at = now
         self.recovery_action = ""
+        self._emit("mission", "pause", reason=reason, from_state=prev_state)
 
     def resume(self) -> None:
         """PAUSED or RECOVERING → FOLLOWING. The condition that caused
         the pause has cleared (fresh pose arrived, or recovery action
         succeeded)."""
         if self.state in (MissionState.PAUSED, MissionState.RECOVERING):
+            prev_state = self.state
+            prev_reason = self.pause_reason
             self.state = MissionState.FOLLOWING
             self.pause_reason = ""
             self.recovery_action = ""
+            self._emit(
+                "mission", "resume",
+                from_state=prev_state, prev_reason=prev_reason,
+            )
 
     def begin_recovery(self, action: str) -> None:
         """PAUSED → RECOVERING. The policy has chosen to run a
@@ -191,9 +248,16 @@ class Mission:
         """
         if self.state != MissionState.PAUSED:
             return
+        reason = self.pause_reason
         self.state = MissionState.RECOVERING
         self.recovery_action = action
         self.recovery_attempts += 1
+        self._emit(
+            "recovery", "begin",
+            action=action,
+            reason=reason,
+            attempt=self.recovery_attempts,
+        )
 
     def end_recovery(self, success: bool) -> None:
         """RECOVERING → FOLLOWING (success) or PAUSED (failure, allowing
@@ -201,18 +265,27 @@ class Mission:
         FAIL)."""
         if self.state != MissionState.RECOVERING:
             return
+        prior_action = self.recovery_action
+        attempts = self.recovery_attempts
         if success:
             self.state = MissionState.FOLLOWING
             self.pause_reason = ""
             self.recovery_action = ""
+            self._emit(
+                "recovery", "end",
+                action=prior_action, success=True, attempt=attempts,
+            )
         else:
             # Drop back to PAUSED with an explanatory reason so the
             # policy / operator can see why we re-paused.
-            prior_action = self.recovery_action
             self.state = MissionState.PAUSED
             self.pause_reason = f"recovery_failed:{prior_action}"
             self.pause_started_at = time.time()
             self.recovery_action = ""
+            self._emit(
+                "recovery", "end",
+                action=prior_action, success=False, attempt=attempts,
+            )
 
     def reset(self) -> None:
         """Force back to IDLE. Used when the goal is cleared, so the
@@ -226,3 +299,83 @@ class Mission:
         self.pause_started_at = 0.0
         self.recovery_action = ""
         self.recovery_attempts = 0
+        self.waypoint_index = 0
+        self.lap_index = 0
+        self.rotate_target_rad = 0.0
+
+    # ── Patrol transitions ─────────────────────────────────────────
+
+    def begin_rotation_to_next(
+        self,
+        target_theta_rad: float,
+        *,
+        to_wp_index: Optional[int] = None,
+    ) -> None:
+        """FOLLOWING → ROTATING_TO_NEXT. Called after arriving at a
+        non-final waypoint of a patrol, before driving the next leg.
+        Emits `patrol.rotating` with the target heading; the actual
+        spin is driven by a RotateToHeading primitive in main_window.
+
+        `to_wp_index` (optional) is the index the patrol is rotating
+        TOWARD — captured in the trace so a reviewer can read intent
+        without inferring it from waypoint geometry. Omitted in
+        non-patrol contexts (no current caller, but reserved).
+        """
+        if self.state != MissionState.FOLLOWING:
+            return
+        self.state = MissionState.ROTATING_TO_NEXT
+        self.rotate_target_rad = float(target_theta_rad)
+        data = {
+            "from_wp_index": self.waypoint_index,
+            "lap_index": self.lap_index,
+            "target_theta_rad": self.rotate_target_rad,
+        }
+        if to_wp_index is not None:
+            data["to_wp_index"] = int(to_wp_index)
+        t = self.tracer
+        if t is not None:
+            try:
+                t.emit("patrol", "rotating", data)
+            except Exception:
+                pass
+
+    def complete_rotation_to_next(
+        self,
+        new_wp_index: int,
+        new_lap_index: int,
+        lap_completed: bool,
+    ) -> None:
+        """ROTATING_TO_NEXT → FOLLOWING. Update wp/lap indices to the
+        new leg's target. Emits `patrol.lap_complete` if this advance
+        closed a lap, and always emits `patrol.advance` with the new
+        index pair.
+        """
+        if self.state != MissionState.ROTATING_TO_NEXT:
+            return
+        prev_wp = self.waypoint_index
+        prev_lap = self.lap_index
+        self.waypoint_index = int(new_wp_index)
+        self.lap_index = int(new_lap_index)
+        self.state = MissionState.FOLLOWING
+        self.rotate_target_rad = 0.0
+        if lap_completed:
+            self._emit(
+                "patrol", "lap_complete",
+                lap_index=self.lap_index,
+                prev_lap_index=prev_lap,
+            )
+        self._emit(
+            "patrol", "advance",
+            wp_index=self.waypoint_index,
+            prev_wp_index=prev_wp,
+            lap_index=self.lap_index,
+        )
+
+    def abort_rotation_to_next(self) -> None:
+        """ROTATING_TO_NEXT → FOLLOWING with no advance. Used when the
+        primitive is canceled (operator stop, pose loss, etc.)."""
+        if self.state != MissionState.ROTATING_TO_NEXT:
+            return
+        self.state = MissionState.FOLLOWING
+        self.rotate_target_rad = 0.0
+        self._emit("patrol", "rotation_aborted")
