@@ -70,6 +70,10 @@ class PatrolDock(QDockWidget):
 
     def _build(self) -> None:
         host = QWidget(self)
+        # Constrain the dock's natural width — the content (short labels
+        # + button rows) doesn't need anywhere near the half-window the
+        # dock would otherwise claim.
+        host.setMaximumWidth(220)
         col = QVBoxLayout(host)
         col.setContentsMargins(8, 6, 8, 6)
         col.setSpacing(4)
@@ -107,6 +111,12 @@ class PatrolDock(QDockWidget):
         self._status_lbl = QLabel("no patrol")
         self._status_lbl.setStyleSheet("color: #ccc;")
         col.addWidget(self._status_lbl)
+
+        # Pin the labels above to the top of the dock and let the
+        # edit-mode + button rows below sit at the bottom. Without this,
+        # QVBoxLayout spreads the empty space between adjacent widgets
+        # and the panel looks like it has gaps mid-column.
+        col.addStretch(1)
 
         # Row 4: Edit-on-map toggle
         em_row = QHBoxLayout()

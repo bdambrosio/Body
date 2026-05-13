@@ -342,14 +342,13 @@ class CameraPanels:
         self._feeds_dock.request_rgb_clicked.connect(self._on_request_rgb)
 
     def set_visible(self, visible: bool) -> None:
+        # Only the feeds widget lives in the central splitter; vision
+        # is a separate left-dock-area dock with its own toggle in
+        # main_window. So this toggle now refers strictly to feeds.
         self.feeds_widget.setVisible(visible)
-        self.vision_widget.setVisible(visible)
 
     def is_visible(self) -> bool:
-        return (
-            self.feeds_widget.isVisible()
-            or self.vision_widget.isVisible()
-        )
+        return self.feeds_widget.isVisible()
 
     def update_state(self, snap: dict) -> None:
         """Render feeds only while the feeds pane is visible."""

@@ -18,8 +18,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-    QMessageBox, QSplitter, QToolBar, QVBoxLayout, QWidget,
+    QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel,
+    QMainWindow, QMessageBox, QSplitter, QToolBar, QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtCore import QUrl
@@ -215,17 +215,12 @@ class NavMainWindow(QMainWindow):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
 
-        # Horizontal split: [ left column (maps + camera feeds stacked)
-        # | vision column ]. The left column is itself a vertical
-        # splitter so maps and feeds can rebalance without stealing
-        # height from the chat. The vision column is narrow by default
-        # but resizable — grabbing a wide transcript is a click-drag
-        # away. Each image widget aspect-preserves its own render.
-        self._h_splitter = QSplitter(Qt.Orientation.Horizontal, central)
-        self._h_splitter.setChildrenCollapsible(True)
-
-        self._left_splitter = QSplitter(Qt.Orientation.Vertical)
-        self._left_splitter.setChildrenCollapsible(True)
+        # Vertical stack: [ maps | feeds | vision ]. Pulling vision out
+        # of a right-hand column lets the patrol dock + maps fit on a
+        # 1440-wide laptop screen without horizontal overflow. Each row
+        # is independently collapsible via splitter handles.
+        self._v_splitter = QSplitter(Qt.Orientation.Vertical, central)
+        self._v_splitter.setChildrenCollapsible(True)
 
         maps_widget = QWidget()
         maps = QHBoxLayout(maps_widget)
@@ -314,25 +309,20 @@ class NavMainWindow(QMainWindow):
         self._shared_view.set_patrol_append_callback(
             self._on_patrol_append_requested
         )
-        self._left_splitter.addWidget(maps_widget)
+        self._v_splitter.addWidget(maps_widget)
 
         self._cameras = CameraPanels(self.chassis)
-        self._left_splitter.addWidget(self._cameras.feeds_widget)
+        self._v_splitter.addWidget(self._cameras.feeds_widget)
+        # Vision is now a left-dock-area dock (stacks vertically with
+        # Patrol) — see _build_docks. Removed from the central splitter
+        # so chat doesn't compete with maps + feeds for vertical room.
 
-        # Maps and feeds share the left column 50/50 by default.
-        self._left_splitter.setStretchFactor(0, 1)
-        self._left_splitter.setStretchFactor(1, 1)
-
-        self._h_splitter.addWidget(self._left_splitter)
-        self._h_splitter.addWidget(self._cameras.vision_widget)
-
-        # Left column dominates horizontally; vision column is narrow
-        # but user-resizable.
-        self._h_splitter.setStretchFactor(0, 4)
-        self._h_splitter.setStretchFactor(1, 1)
+        # Maps dominates; feeds is a thin strip below it.
+        self._v_splitter.setStretchFactor(0, 3)
+        self._v_splitter.setStretchFactor(1, 1)
         self._splitter_balanced = False
 
-        outer.addWidget(self._h_splitter, stretch=1)
+        outer.addWidget(self._v_splitter, stretch=1)
 
         # Bottom status block: 3 narrow rows of fixed-width labels +
         # a notes row. Fixed widths and Ignored size policies keep the
@@ -384,7 +374,7 @@ class NavMainWindow(QMainWindow):
         outer.addLayout(status)
 
         self.setCentralWidget(central)
-        self.resize(1400, 900)
+        self.resize(960, 880)
 
     def _mk_status_label(
         self, initial_text: str, width_px: int, font,
@@ -406,8 +396,8 @@ class NavMainWindow(QMainWindow):
         return lbl
 
     def _build_docks(self) -> None:
-        # Cameras + vision live in the central splitter (built in
-        # _build_ui); only teleop remains a dock-area panel.
+        # Camera feeds live in the central splitter (built in _build_ui).
+        # Teleop, Patrol, and Vision are dock-area panels.
         self._teleop = TeleopPanels(self.chassis, self.chassis_config)
         self._teleop.attach_to(self)
         # Patrol dock: lives on the left dock area to avoid stealing
@@ -419,6 +409,15 @@ class NavMainWindow(QMainWindow):
         )
         self._patrol_dock.attach_to(self)
         self._patrol_dock.edit_mode_toggled.connect(self._on_patrol_edit_toggled)
+        # Vision dock: same left dock area as Patrol so they share the
+        # vertical column. Qt stacks dock widgets added to the same
+        # area; user can drag handles to rebalance. Visible by default
+        # (parity with the previous central-splitter placement).
+        self._vision_dock = QDockWidget("Vision", self)
+        self._vision_dock.setWidget(self._cameras.vision_widget)
+        self.addDockWidget(
+            Qt.DockWidgetArea.LeftDockWidgetArea, self._vision_dock,
+        )
 
     def _build_menu(self) -> None:
         view_menu = self.menuBar().addMenu("&View")
@@ -442,6 +441,13 @@ class NavMainWindow(QMainWindow):
         self._patrol_action.setShortcut("Ctrl+P")
         self._patrol_action.triggered.connect(self._patrol_dock.set_visible)
         view_menu.addAction(self._patrol_action)
+
+        self._vision_action = QAction("Vision panel", self)
+        self._vision_action.setCheckable(True)
+        self._vision_action.setChecked(self._vision_dock.isVisible())
+        self._vision_action.setShortcut("Ctrl+Shift+V")
+        self._vision_action.triggered.connect(self._vision_dock.setVisible)
+        view_menu.addAction(self._vision_action)
 
         view_menu.addSeparator()
 
@@ -505,6 +511,8 @@ class NavMainWindow(QMainWindow):
             self._teleop_action.setChecked(self._teleop.is_visible())
         if self._camera_action.isChecked() != self._cameras.is_visible():
             self._camera_action.setChecked(self._cameras.is_visible())
+        if self._vision_action.isChecked() != self._vision_dock.isVisible():
+            self._vision_action.setChecked(self._vision_dock.isVisible())
         if self._patrol_action.isChecked() != self._patrol_dock.is_visible():
             self._patrol_action.setChecked(self._patrol_dock.is_visible())
         # Sync the patrol dock's widgets with the current shared-view
@@ -1739,22 +1747,19 @@ class NavMainWindow(QMainWindow):
 
     def _balance_splitter_once(self) -> None:
         # Applied via QTimer.singleShot(0, …) from showEvent: by the
-        # time this fires, the splitters have real sizes from the
-        # first layout pass. Idempotent so spurious re-fires don't
-        # stomp on a user's drag.
+        # time this fires, the splitter has a real size from the first
+        # layout pass. Idempotent so spurious re-fires don't stomp on
+        # a user's drag.
         if self._splitter_balanced:
             return
-        h_total = self._h_splitter.width()
-        v_total = self._left_splitter.height()
-        if h_total <= 0 or v_total <= 0:
+        v_total = self._v_splitter.height()
+        if v_total <= 0:
             return
-        # Vision column defaults to ~320 px; left column takes the
-        # rest. Narrow enough to keep the images wide, wide enough
-        # for a readable chat.
-        vision_w = min(360, max(260, h_total // 5))
-        self._h_splitter.setSizes([h_total - vision_w, vision_w])
-        # Maps ≈ feeds in the left column.
-        self._left_splitter.setSizes([v_total // 2, v_total // 2])
+        # Maps gets ~75% of the column, feeds the remaining ~25%.
+        # Vision lives in the left dock area now (alongside Patrol).
+        maps_h = int(v_total * 0.75)
+        feeds_h = max(0, v_total - maps_h)
+        self._v_splitter.setSizes([maps_h, feeds_h])
         self._splitter_balanced = True
 
     def showEvent(self, event) -> None:
