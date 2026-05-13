@@ -302,6 +302,7 @@ def main() -> None:
     lidar_slab_min_range = float(lm.get("lidar_slab_min_range_m", 0.15))
     lidar_slab_block_frames = max(1, int(lm.get("lidar_slab_block_frames", 2)))
     lidar_slab_min_hits = max(1, int(lm.get("lidar_slab_min_hits", 1)))
+    depth_slab_block_frames = max(1, int(lm.get("depth_slab_block_frames", 2)))
     if not driveable_on or clearance_m <= 0.0:
         driveable_on = False
 
@@ -320,9 +321,9 @@ def main() -> None:
     floor_n, floor_d = _default_floor_plane(ground_z)
     next_floor_fit = 0.0
     last_floor_log = 0.0
-    driveable_prev = np.full((nx, ny), _D_NONE, dtype=np.int8)
     clear_streak = np.zeros((nx, ny), dtype=np.int32)
     lidar_streak = np.zeros((nx, ny), dtype=np.int32)
+    depth_slab_streak = np.zeros((nx, ny), dtype=np.int32)
 
     lock = threading.Lock()
     last_lidar: dict[str, Any] | None = None
@@ -513,11 +514,13 @@ def main() -> None:
             lidar_raw = lidar_slab_count >= lidar_slab_min_hits
             lidar_streak = np.where(lidar_raw, lidar_streak + 1, 0)
             lidar_blocked = lidar_streak >= lidar_slab_block_frames
-            slab_hit = (
+            depth_raw = (
                 slab_count >= slab_min_pixels
                 if slab_count is not None
                 else np.zeros((nx, ny), dtype=bool)
             )
+            depth_slab_streak = np.where(depth_raw, depth_slab_streak + 1, 0)
+            slab_hit = depth_slab_streak >= depth_slab_block_frames
             floor_seen = (
                 floor_count >= floor_seen_min_pixels
                 if floor_count is not None
@@ -537,17 +540,15 @@ def main() -> None:
             new_streak[unobs] = np.maximum(0, clear_streak[unobs] - unobs_decay)
             clear_streak = new_streak
             ok_mask = clear_streak >= clear_frames_need
-            faded = unobs & (clear_streak <= 0)
             d_now = np.where(
                 instant_block,
                 _D_BLOCK,
                 np.where(
                     observed,
                     np.where(ok_mask, _D_OK, _D_BLOCK),
-                    np.where(faded, _D_NONE, driveable_prev),
+                    _D_NONE,
                 ),
             )
-            driveable_prev = d_now
             driveable_rows = []
             for ix in range(nx):
                 dr: list[bool | None] = []
