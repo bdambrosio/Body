@@ -84,11 +84,16 @@ class CostmapConfig:
     # over (traversed_ts != NaN) are forced clear (cost=0, not
     # lethal) — they are known drivable, regardless of how the
     # blocked-cell inflation around them tries to paint them.
+    # The traversed mask (Pi stamps a footprint_radius_m disk per
+    # pose) is dilated by `traversal_protection_extra_radius_m`
+    # before applying, so the protected corridor extends past the
+    # exact wheel path and covers the body-width swath around it.
     # Override: if a traversed cell is currently within the
     # forward-cone of regard (radius + half-angle of robot heading),
     # the live classification stands instead. This lets a freshly
     # observed obstacle (chair pulled into a doorway, person in the
     # way) inflate normally even into previously-driven cells.
+    traversal_protection_extra_radius_m: float = 0.15
     live_override_radius_m: float = 1.0
     live_override_half_angle_rad: float = _DEFAULT_LIVE_OVERRIDE_HALF_ANGLE_RAD
 
@@ -182,6 +187,12 @@ def build_costmap(
     traversed_ts = snap.get("traversed_ts")
     if traversed_ts is not None:
         traversed = ~np.isnan(traversed_ts)
+        extra_cells = max(
+            0,
+            int(math.ceil(cfg.traversal_protection_extra_radius_m / res)),
+        )
+        if extra_cells > 0 and np.any(traversed):
+            traversed = _dilate_bool(traversed, iters=extra_cells)
         if pose is not None:
             in_cone = _forward_cone_mask(
                 pose=pose, meta=meta,
@@ -253,6 +264,22 @@ def _shift(arr: np.ndarray, di: int, dj: int, fill) -> np.ndarray:
     dj0 = max(0,  dj); dj1 = min(w, w + dj)
     if si1 > si0 and sj1 > sj0:
         out[di0:di1, dj0:dj1] = arr[si0:si1, sj0:sj1]
+    return out
+
+
+def _dilate_bool(mask: np.ndarray, *, iters: int) -> np.ndarray:
+    """8-connected boolean dilation, `iters` times. Each iteration
+    extends the True region by one cell in every direction.
+    """
+    out = mask
+    for _ in range(iters):
+        nxt = out
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                nxt = nxt | _shift(out, di, dj, fill=False)
+        out = nxt
     return out
 
 

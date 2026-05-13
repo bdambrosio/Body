@@ -172,6 +172,8 @@ class FuserController:
             traversal_vote_weight=config.traversal_vote_weight,
             footprint_radius_m=config.footprint_radius_m,
             vote_capacity=config.vote_capacity,
+            clear_vote_weight=config.clear_vote_weight,
+            block_vote_weight=config.block_vote_weight,
         )
 
         # Zenoh handles

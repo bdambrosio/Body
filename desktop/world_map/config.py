@@ -43,7 +43,7 @@ class FuserConfig:
     # the zenoh session is open. See docs/slam_pi_contract.md.
     slam_enabled: bool = False
 
-    vote_margin: int = 4
+    vote_margin: int = 2
     # Sum-bounded vote model ("FIFO of length vote_capacity"):
     # per cell, clear_votes + block_votes ≤ vote_capacity. New
     # observations on one side displace existing evidence on the
@@ -54,9 +54,17 @@ class FuserConfig:
     # observed cells stay at their saved values until the next
     # session's observations actively contradict them.
     #
-    # Override cost: ~10 contradicting observations to flip a fully
-    # saturated cell, ~2 s of fresh observation at 5 Hz fusion.
-    vote_capacity: float = 10.0
+    # Override cost: ~vote_capacity contradicting observations to
+    # flip a fully saturated cell.
+    vote_capacity: float = 20.0
+    # Per-fusion vote weights. Pi-side block classification is
+    # asymmetric — a single slab pixel flips a cell to block
+    # instantly, while clear requires `driveable_clear_frames`
+    # consecutive observations. Weighting block votes < 1.0 here
+    # restores symmetry so dust speckle / single-frame returns
+    # don't out-vote a 4-frame clear streak.
+    clear_vote_weight: float = 1.0
+    block_vote_weight: float = 0.5
     traversal_stamp_hz: float = 10.0
     traversal_vote_weight: int = 3
     footprint_radius_m: float = 0.15

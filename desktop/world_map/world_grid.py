@@ -44,6 +44,8 @@ class WorldGrid:
         traversal_vote_weight: int,
         footprint_radius_m: float,
         vote_capacity: float = 10.0,
+        clear_vote_weight: float = 1.0,
+        block_vote_weight: float = 1.0,
     ):
         if resolution_m <= 0:
             raise ValueError("resolution_m must be > 0")
@@ -65,6 +67,10 @@ class WorldGrid:
         # side displace the other. No time decay; values persist
         # forever until contradicted. See FuserConfig docstring.
         self._vote_capacity = float(vote_capacity)
+        # Per-fusion vote weights. Asymmetric weights compensate for
+        # the Pi local_map's instant-block vs 4-frame-clear bias.
+        self._clear_vote_weight = float(clear_vote_weight)
+        self._block_vote_weight = float(block_vote_weight)
 
         # Pre-compute footprint cell offsets (square mask, then circular).
         r_cells = int(math.ceil(self._footprint_radius_m / self._res))
@@ -234,13 +240,13 @@ class WorldGrid:
                     np.add.at(
                         self.clear_votes,
                         (iw_v[clear_mask], jw_v[clear_mask]),
-                        1.0,
+                        self._clear_vote_weight,
                     )
                 if np.any(block_mask):
                     np.add.at(
                         self.block_votes,
                         (iw_v[block_mask], jw_v[block_mask]),
-                        1.0,
+                        self._block_vote_weight,
                     )
 
             # Sum-bounded constraint: clear + block ≤ vote_capacity.
