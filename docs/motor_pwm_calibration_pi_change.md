@@ -3,7 +3,7 @@
 **Date:** 2026-05-14
 **Audience:** Pi-side developer (Bruce, via Cursor Remote-SSH)
 **Scope:** one-line `config.json` edit. No code change. No schema / topic changes.
-**Status:** request — desktop has characterized the symptom via Sweep-360.
+**Status:** applied in repo (`motor.min_drive_pwm` = **0.18**). On-robot Sweep-360 re-run and `motor_state` check still **pending** — use §Verification below.
 
 ---
 
@@ -32,9 +32,10 @@ ff = v_wheel / max_v = (omega * wheel_base/2) / max_v
    = 0.037   (3.7% duty)
 ```
 
-The PI loop snaps that up to `min_drive_pwm = 0.10` (currently configured), but
-even 10% duty appears to be below the breakaway threshold on this floor — wheels
-sit static until the integrator winds up over multiple seconds.
+With **`min_drive_pwm` = 0.10** (previous default), the PI loop snapped that up to
+10% duty, which was still below the breakaway threshold on this floor — wheels sat
+static until the integrator wound up over multiple seconds. **0.18** is the next test
+value (see §The change).
 
 ## Why it's a config-only fix
 
@@ -48,10 +49,9 @@ if self.min_drive_pwm > 0.0 and abs(pwm) < self.min_drive_pwm:
 ```
 
 `min_drive_pwm` is read from `motor.min_drive_pwm` in `config.json` (line 100 of
-`motor_controller.py`), currently set to **0.10**. The infrastructure is correct;
-the value is just too low for this floor + tire + battery combination. The
-21-day-old memory `project_body_motor_deadzone` estimated breakaway at 15–25%
-duty — consistent with the symptom.
+`motor_controller.py`). The infrastructure is correct; **0.10 was too low** for this
+floor + tire + battery combination. A prior breakaway estimate (`project_body_motor_deadzone`)
+was **15–25%** duty — consistent with the symptom.
 
 This is a **calibration** task, not a code task. No PR review of `motor_controller.py`
 needed.
@@ -125,7 +125,9 @@ Two possibilities, in order of likelihood:
 - "Live cmd dropped" mission-fail demotion (desktop-side; shipping now in
   the same desktop commit as this spec).
 
-## Commit
+## Commit message (for `main` / changelog)
+
+Use when summarizing this change:
 
 ```
 motor: bump min_drive_pwm 0.10 → 0.18 for breakaway
