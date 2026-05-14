@@ -75,6 +75,18 @@ class SweepMission(QThread):
     SCAN_MATCH_MIN_CONFIDENCE = 0.35
     FUSE_VOTE_MARGIN = 1
 
+    # Closed-loop rotation gate: stop ROTATING when the IMU-measured
+    # delta is within this many degrees of commanded. 2° is tight enough
+    # that the post-settle scan-match has a clean baseline; loose enough
+    # that gyro noise doesn't hold the loop open indefinitely.
+    ROTATE_TOLERANCE_DEG = 2.0
+    # Multiplier on the open-loop step duration. If IMU feedback hasn't
+    # closed the gate by `rotate_max_time_s = budget * t_step`, fall
+    # back to time-based termination (matches pre-IMU behavior on this
+    # step). 3× absorbs reasonable slip; bigger means a stuck-wheel
+    # step doesn't burn the whole mission.
+    ROTATE_TIME_BUDGET = 3.0
+
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
@@ -307,25 +319,64 @@ class SweepMission(QThread):
         self._set_state(SweepState.ROTATING)
         # Snapshot IMU yaw at step start. ImuYawTracker.latest() returns
         # the newest unwrapped sample (no historical lookup needed) —
-        # post-step yaw will come from latest() again after the scan_post
+        # post-step yaw is read from latest() again after the scan_post
         # wait completes, and the difference is imu_deg for this step.
         # None until the tracker has settled (~0.2 s after the first
-        # body/imu sample); falls back gracefully to lidar/cmd fusion.
+        # body/imu sample); the rotating loop falls back to pure time
+        # in that case (pre-IMU behavior).
         pre = self._imu_yaw.latest()
         self._yaw_pre_step_rad = pre[1] if pre is not None else None
         # Make sure we're commanding the twist topic, not direct.
         self.controller.set_cmd_mode("cmd_vel")
         self.controller.set_cmd_vel(0.0, sign * rate_rad_s)
         self.controller.set_live_command(True)
-        deadline = time.monotonic() + t_step
+        # Closed-loop ROTATING: end the step when the IMU-measured
+        # rotation in the commanded direction reaches step_deg (slip-
+        # immune), or when the time budget runs out (fallback for
+        # unsettled IMU / stuck wheel). Direction-aware: `progress =
+        # sign * measured_deg` is always positive when rotation is
+        # going the commanded way, so an overshoot past step_deg
+        # stays inside the gate (progress only grows) rather than
+        # vanishing into "residual flipped sign and the bot kept
+        # spinning a full loop."
+        step_deg = float(params["step_deg"])
+        time_budget_s = self.ROTATE_TIME_BUDGET * t_step
+        deadline = time.monotonic() + time_budget_s
+        last_log_t = 0.0
+        # 25 ms tick → 40 Hz feedback. At rate=30 dps, one tick is
+        # 0.75° of motion — well inside the 2° tolerance even if the
+        # IMU sample lands at the worst phase.
+        tick_s = 0.025
         while True:
             now = time.monotonic()
             if now >= deadline:
                 break
             if self._abort_or_estop_check():
                 return None
+            # IMU feedback gate. Sample latest yaw; if both pre and
+            # current snapshots exist, project onto the commanded
+            # direction and break when progress clears step_deg
+            # (minus tolerance).
+            cur = self._imu_yaw.latest()
+            if (
+                self._yaw_pre_step_rad is not None
+                and cur is not None
+            ):
+                measured_deg = math.degrees(cur[1] - self._yaw_pre_step_rad)
+                progress = sign * measured_deg
+                if progress >= step_deg - self.ROTATE_TOLERANCE_DEG:
+                    break
+                # Light tracing — once per second at most — so a
+                # debugger sees the closed-loop progressing without
+                # flooding the log on a healthy run.
+                if now - last_log_t >= 1.0:
+                    last_log_t = now
+                    logger.debug(
+                        f"sweep step {i}: imu_progress={progress:.1f}/"
+                        f"{step_deg:.1f}°"
+                    )
             self._publish_status()
-            time.sleep(min(0.1, deadline - now))
+            time.sleep(tick_s)
         # Stop motion; keep live_command so cmd_loop emits zeros (and so
         # the watchdog stays happy) through settling and fusing.
         self.controller.set_cmd_vel(0.0, 0.0)
