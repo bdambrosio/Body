@@ -59,7 +59,7 @@ class CostmapConfig:
     # Beyond the footprint, a band of width safety_margin_m carries
     # the maximum halo cost (planner strongly prefers to avoid).
     # Past that, cost decays exponentially.
-    safety_margin_m: float = 0.10
+    safety_margin_m: float = 0.05
 
     # Exponential decay length-scale beyond the safety band.
     inflation_decay_m: float = 0.15
