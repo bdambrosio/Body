@@ -25,6 +25,9 @@ from typing import Any, Dict, Optional
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from desktop.nav.slam.imu_yaw import ImuYawTracker
+from desktop.nav.slam.types import ImuReading
+
 from .yaw_estimator import estimate_lidar_corr
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,7 @@ class SweepMission(QThread):
 
     STATUS_TOPIC = "body/sweep/status"
     MAP_TOPIC = "body/map/sweep_360"
+    IMU_TOPIC = "body/imu"
 
     SCAN_MATCH_MIN_CONFIDENCE = 0.35
     FUSE_VOTE_MARGIN = 1
@@ -81,6 +85,15 @@ class SweepMission(QThread):
         # Publishers (declared on entering run, undeclared on exit)
         self._status_pub: Optional[Any] = None
         self._map_pub: Optional[Any] = None
+        # IMU subscription for per-step yaw measurement. Tracker buffer
+        # is short (default 2 s) — we only need the latest sample at
+        # each step boundary, not historical lookup.
+        self._imu_yaw = ImuYawTracker()
+        self._imu_sub: Optional[Any] = None
+        # Yaw snapshot at the start of the current rotating step.
+        # Captured in _do_step before motion begins; compared to the
+        # post-settle yaw to produce per-step imu_deg.
+        self._yaw_pre_step_rad: Optional[float] = None
         # Mission-local state
         self._anchor_pose: Dict[str, float] = {"x_m": 0.0, "y_m": 0.0, "theta_rad": 0.0}
         self._first_scan: Optional[Dict[str, Any]] = None
@@ -292,6 +305,14 @@ class SweepMission(QThread):
 
         # ── ROTATING ────────────────────────────────────────────────
         self._set_state(SweepState.ROTATING)
+        # Snapshot IMU yaw at step start. ImuYawTracker.latest() returns
+        # the newest unwrapped sample (no historical lookup needed) —
+        # post-step yaw will come from latest() again after the scan_post
+        # wait completes, and the difference is imu_deg for this step.
+        # None until the tracker has settled (~0.2 s after the first
+        # body/imu sample); falls back gracefully to lidar/cmd fusion.
+        pre = self._imu_yaw.latest()
+        self._yaw_pre_step_rad = pre[1] if pre is not None else None
         # Make sure we're commanding the twist topic, not direct.
         self.controller.set_cmd_mode("cmd_vel")
         self.controller.set_cmd_vel(0.0, sign * rate_rad_s)
@@ -342,7 +363,16 @@ class SweepMission(QThread):
 
         commanded_deg = sign * params["step_deg"]
         lidar_deg, lidar_conf = estimate_lidar_corr(pre_step_scan, scan_post)
-        imu_deg = None  # current hardware has no IMU
+        # IMU per-step yaw delta. BNO085 publishes body/imu at 100 Hz;
+        # we sampled latest() before motion started and sample it again
+        # here after scan_post arrived. Either snapshot can be None if
+        # the tracker wasn't settled at that boundary — fall through to
+        # the existing lidar/cmd fusion in that case.
+        post = self._imu_yaw.latest()
+        if self._yaw_pre_step_rad is not None and post is not None:
+            imu_deg = math.degrees(post[1] - self._yaw_pre_step_rad)
+        else:
+            imu_deg = None
         cmd_deg = commanded_deg
 
         if lidar_deg is not None and lidar_conf >= self.SCAN_MATCH_MIN_CONFIDENCE:
@@ -606,6 +636,13 @@ class SweepMission(QThread):
             logger.exception("sweep publishers declare failed")
             self._status_pub = None
             self._map_pub = None
+        try:
+            self._imu_sub = sess.declare_subscriber(
+                self.IMU_TOPIC, self._on_imu,
+            )
+        except Exception:
+            logger.exception("sweep imu subscribe failed")
+            self._imu_sub = None
 
     def _undeclare_publishers(self) -> None:
         for pub in (self._status_pub, self._map_pub):
@@ -616,6 +653,25 @@ class SweepMission(QThread):
                     pass
         self._status_pub = None
         self._map_pub = None
+        if self._imu_sub is not None:
+            try:
+                self._imu_sub.undeclare()
+            except Exception:
+                pass
+            self._imu_sub = None
+
+    def _on_imu(self, sample: Any) -> None:
+        """Zenoh callback for body/imu. Feeds ImuReading samples into
+        the tracker. Best-effort: any parse failure is silently dropped
+        so a single bad payload can't tear down the consumer.
+        """
+        try:
+            msg = json.loads(bytes(sample.payload))
+        except Exception:
+            return
+        reading = ImuReading.from_payload(msg)
+        if reading is not None:
+            self._imu_yaw.update(reading)
 
     # ── Motion shutdown ──────────────────────────────────────────────
 
