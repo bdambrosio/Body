@@ -89,6 +89,15 @@ class MissionConfig:
     # local_map stall but won't wedge the operator on a dead Pi.
     no_pose_timeout_s: float = 30.0
 
+    # Hard ceiling on PAUSED("no_live_cmd") duration. live_command drops
+    # mid-mission are almost always deliberate (operator ALL-STOP, Live
+    # toggle off, chassis reconnect). The short timeout still ends the
+    # mission for those, while cushioning brief flag races so a transient
+    # interleaving doesn't kill a long patrol. Pi watchdog stops motors
+    # in ~500 ms regardless, so the bot is already halted during the
+    # pause window.
+    no_live_cmd_timeout_s: float = 5.0
+
 
 @dataclass
 class Mission:

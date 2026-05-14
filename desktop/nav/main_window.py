@@ -45,7 +45,7 @@ from .planner import AStarConfig, PlanResult, plan_path
 from .primitives import RotateToHeading
 from .recovery import (
     PRIM_ABORTED, PRIM_DONE, PRIM_RUNNING,
-    REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
+    REASON_NO_LIVE_CMD, REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
     classify_replan_failure,
 )
 from .safety import SafetyConfig, forward_arc_blocked
@@ -785,12 +785,18 @@ class NavMainWindow(QMainWindow):
         is in an active state (FOLLOWING / PAUSED / RECOVERING).
 
         Order of concerns:
-            1. Hard gates (chassis disconnect, Live cmd dropped) — both
-               are terminal; recovery doesn't help.
-            2. Pose freshness — pause if stale, resume if fresh after
+            1. Chassis disconnect — terminal; recovery doesn't help.
+            2. Live cmd flag — pause if dropped, resume if restored,
+               fail on short timeout. Operator ALL-STOP / Live toggle /
+               chassis reconnect all drop the flag; the timeout still
+               ends the mission deliberately while cushioning transient
+               flag races. cmd_loop stops publishing while live=False,
+               so the Pi watchdog halts motors during the pause window
+               regardless.
+            3. Pose freshness — pause if stale, resume if fresh after
                a no_pose pause. Stale pose is treated as universal:
                applies in any active state and overrides the others.
-            3. Per-state behavior.
+            4. Per-state behavior.
         """
         with self.chassis.state.lock:
             connected = self.chassis.state.connected
@@ -803,12 +809,29 @@ class NavMainWindow(QMainWindow):
             self._update_safety_block_trace(False)
             return
         if not live:
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._mission.fail("Live cmd dropped")
             self._cancel_recovery()
+            # pause() is idempotent for the same reason — won't reset
+            # the pause clock if we're already in no_live_cmd pause.
+            self._mission.pause(REASON_NO_LIVE_CMD)
+            if (
+                self._mission.is_paused()
+                and self._mission.pause_reason == REASON_NO_LIVE_CMD
+            ):
+                elapsed = time.time() - self._mission.pause_started_at
+                if elapsed > self._mission_config.no_live_cmd_timeout_s:
+                    self._mission.fail(
+                        f"live cmd lost for {elapsed:.0f}s "
+                        f"(threshold {self._mission_config.no_live_cmd_timeout_s:.0f}s)"
+                    )
+            self.chassis.set_cmd_vel(0.0, 0.0)
             self._safety_blocked = False
             self._update_safety_block_trace(False)
             return
+        if (
+            self._mission.is_paused()
+            and self._mission.pause_reason == REASON_NO_LIVE_CMD
+        ):
+            self._mission.resume()
 
         # Pose freshness applies regardless of current state. None pose
         # is treated as max-stale.

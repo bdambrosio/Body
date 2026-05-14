@@ -50,6 +50,7 @@ Point2 = Tuple[float, float]
 # Stable reason strings — the policy switches on these. Extending later
 # is fine; main_window passes whatever it gets straight through.
 REASON_NO_POSE = "no_pose"
+REASON_NO_LIVE_CMD = "no_live_cmd"
 REASON_GOAL_IN_UNKNOWN = "no_path:goal_in_unknown"
 REASON_GOAL_IN_LETHAL_HALO = "no_path:goal_in_lethal_halo"
 REASON_BOXED_IN = "no_path:boxed_in"
