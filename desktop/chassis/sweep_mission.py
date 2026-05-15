@@ -426,10 +426,17 @@ class SweepMission(QThread):
             imu_deg = None
         cmd_deg = commanded_deg
 
-        if lidar_deg is not None and lidar_conf >= self.SCAN_MATCH_MIN_CONFIDENCE:
-            fused = lidar_deg
-        elif imu_deg is not None:
+        # Fusion preference: IMU > lidar > cmd. The BNO085 gyro is
+        # slip-immune and drifts ~0.05° per 3 s step in
+        # game_rotation_vector mode — substantially more accurate than
+        # scan-match in featureless rooms (where lidar reliably reports
+        # 0° at 0.70 conf because successive scans look identical, even
+        # when the robot rotated). Lidar remains the fallback when the
+        # tracker is unsettled; cmd is the last resort.
+        if imu_deg is not None:
             fused = imu_deg
+        elif lidar_deg is not None and lidar_conf >= self.SCAN_MATCH_MIN_CONFIDENCE:
+            fused = lidar_deg
         else:
             fused = cmd_deg
         self._yaw_accum_deg += fused
