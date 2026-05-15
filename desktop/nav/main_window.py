@@ -48,7 +48,7 @@ from .recovery import (
     REASON_NO_LIVE_CMD, REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
     classify_replan_failure,
 )
-from .safety import SafetyConfig, forward_arc_blocked_local
+from .safety import SafetyConfig, forward_arc_blocked_local, rear_arc_blocked_local
 from .tracing import (
     CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
 )
@@ -896,7 +896,7 @@ class NavMainWindow(QMainWindow):
             self._mission.pause(reason)
             self._update_safety_block_trace(False)
             return
-        # FOLLOWING / ROTATING — forward-arc safety check.
+        # FOLLOWING / ROTATING — forward / rear arc safety check.
         # Reads the body-frame local_map.driveable directly (the freshest
         # fused lidar+depth observation from the Pi), not the world-frame
         # costmap. Drift-immune: a pose error doesn't shift our view of
@@ -913,16 +913,37 @@ class NavMainWindow(QMainWindow):
         lm_stale_threshold_s = max(1.0, 2.0 * lm_period)
         lm_age_s = time.time() - lm_ts if lm_ts > 0 else float("inf")
         if lm_drive is None or lm_meta is None or lm_age_s > lm_stale_threshold_s:
-            blocked = True  # no recent observation → refuse to drive
+            fwd_blocked = True
+            rear_blocked = True
         else:
-            blocked = forward_arc_blocked_local(
+            fwd_blocked = forward_arc_blocked_local(
                 lm_drive, lm_meta, self._safety_config,
             )
+            rear_blocked = rear_arc_blocked_local(
+                lm_drive, lm_meta, self._safety_config,
+            )
+        # Clip the *commanded translation* by the direction-appropriate
+        # arc, but always pass ω through. Rotation in place doesn't
+        # advance the body, so an obstacle in the forward arc must not
+        # prevent the bot from rotating to face a clear direction —
+        # rotation is precisely how it escapes. Zeroing ω here was a
+        # deadlock: facing a bookshelf, forward arc fires every tick,
+        # bot stuck unable to turn away. Direction-appropriate clip
+        # keeps the safety semantics (don't translate into obstacles)
+        # without making rotation impossible.
+        v_cmd = out.v_mps
+        omega_cmd = out.omega_radps
+        if v_cmd > 0.0 and fwd_blocked:
+            v_cmd = 0.0
+        elif v_cmd < 0.0 and rear_blocked:
+            v_cmd = 0.0
+        # `_safety_blocked` drives the GO BLOCKED status label and the
+        # safety.* trace event. Edge on "the commanded forward motion
+        # was clipped" — purely-rotating ticks are not "blocked" in the
+        # user-facing sense, they're driving around the problem.
+        blocked = (v_cmd != out.v_mps)
         self._safety_blocked = blocked
-        if blocked:
-            self.chassis.set_cmd_vel(0.0, 0.0)
-        else:
-            self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
+        self.chassis.set_cmd_vel(v_cmd, omega_cmd)
         self._update_safety_block_trace(blocked)
 
     def _update_safety_block_trace(self, blocked: bool) -> None:
