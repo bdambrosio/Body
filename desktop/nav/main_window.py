@@ -48,7 +48,12 @@ from .recovery import (
     REASON_NO_LIVE_CMD, REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
     classify_replan_failure,
 )
-from .safety import SafetyConfig, forward_arc_blocked_local, rear_arc_blocked_local
+from .safety import (
+    OmegaRateLimiter,
+    SafetyConfig,
+    forward_arc_blocked_local,
+    rear_arc_blocked_local,
+)
 from .tracing import (
     CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
 )
@@ -269,6 +274,15 @@ class NavMainWindow(QMainWindow):
         # stays FOLLOWING so we resume when the arc clears.
         self._safety_config = SafetyConfig()
         self._safety_blocked: bool = False
+        # Rate-limit ω before sending to chassis. 15 dps cap + 500 ms
+        # inter-reversal hold prevents wheel slip during left/right
+        # heading-hunt episodes (which would otherwise lose IMU yaw
+        # lock and encoder alignment). Doesn't slow continuous turning;
+        # only kicks in on sustained direction reversals.
+        self._omega_limiter = OmegaRateLimiter(
+            omega_max_radps=math.radians(15.0),
+            reversal_hold_s=0.5,
+        )
         # Tracing: one JSONL file per mission, edge-triggered emits.
         # Pose sampler + auto-snapshot callback are attached here so
         # the Mission and LivenessWatcher can use them as soon as the
@@ -943,6 +957,7 @@ class NavMainWindow(QMainWindow):
         # user-facing sense, they're driving around the problem.
         blocked = (v_cmd != out.v_mps)
         self._safety_blocked = blocked
+        omega_cmd = self._omega_limiter.limit(omega_cmd, time.monotonic())
         self.chassis.set_cmd_vel(v_cmd, omega_cmd)
         self._update_safety_block_trace(blocked)
 

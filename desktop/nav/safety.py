@@ -204,3 +204,56 @@ def _arc_blocked_local(
 
     in_arc = (dist <= r_max) & (np.abs(angle_off) <= cfg.arc_half_angle_rad)
     return bool(np.any(blocked & in_arc))
+
+
+# ── Rotation rate limiter ──────────────────────────────────────────
+
+
+class OmegaRateLimiter:
+    """Caps |ω| and inserts a settle window between direction reversals.
+
+    Two constraints:
+      * Magnitude cap: |emitted ω| ≤ `omega_max_radps`.
+      * Reversal hold: when input ω flips sign, emit 0.0 for at least
+        `reversal_hold_s` before allowing the new sign through. The
+        hold timer is reset whenever input ω comes back to zero or to
+        the previously-emitted sign — only a sustained reversal
+        request actually pays the hold.
+
+    Reason this exists: on a small differential-drive bot, rapid
+    left/right ω commands (e.g. when the follower is hunting heading
+    while the forward arc keeps clipping translation) make the wheels
+    slip, which loses IMU yaw lock + encoder odometry alignment. A
+    15 dps cap with a 500 ms inter-reversal hold prevents the slip
+    regime in practice without slowing legitimate continuous turning.
+    """
+
+    def __init__(self, omega_max_radps: float, reversal_hold_s: float):
+        self._omega_max = float(omega_max_radps)
+        self._hold_s = float(reversal_hold_s)
+        self._last_sign: int = 0  # sign of the last non-zero emission
+        self._zero_emit_started: Optional[float] = None
+
+    def limit(self, omega_in: float, now: float) -> float:
+        omega = max(-self._omega_max, min(self._omega_max, omega_in))
+        if abs(omega) < 1e-6:
+            if self._zero_emit_started is None:
+                self._zero_emit_started = now
+            return 0.0
+        sign = 1 if omega > 0 else -1
+        if self._last_sign == 0 or sign == self._last_sign:
+            self._last_sign = sign
+            self._zero_emit_started = None
+            return omega
+        # Reversal requested. Hold 0 until we've been emitting 0 for
+        # at least `hold_s`. _zero_emit_started is set either by a
+        # prior zero emit (input was 0) or by us, the first time we
+        # see the reversal request.
+        if self._zero_emit_started is None:
+            self._zero_emit_started = now
+            return 0.0
+        if now - self._zero_emit_started < self._hold_s:
+            return 0.0
+        self._last_sign = sign
+        self._zero_emit_started = None
+        return omega
