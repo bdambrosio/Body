@@ -28,7 +28,7 @@
     "velocity_kp": 0.8,
     "velocity_ki": 2.0,
     "velocity_integ_limit": 0.5,
-    "min_drive_pwm": 0.18
+    "min_drive_pwm": 0.16
   },
   "lidar": {
     "stub_only": false,
