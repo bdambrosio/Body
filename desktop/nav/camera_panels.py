@@ -15,11 +15,12 @@ gets a single toggle for the group.
 from __future__ import annotations
 
 import logging
+import math
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (
     QDockWidget, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
     QVBoxLayout, QWidget,
@@ -31,6 +32,114 @@ from desktop.chassis.ui_qt import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class LidarFeedView(QWidget):
+    """Top-down body-frame plot of the latest lidar scan.
+
+    Robot at center, forward (+x) up. Concentric range rings at
+    1/2/5 m. Returns rendered as dots at body-frame (x, y) computed
+    from (angle, range). Self-scales to fit min(width, height) so
+    the widget can share a row with the camera panels without
+    forcing a fixed aspect.
+    """
+
+    PLOT_RANGE_M = 5.0
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._scan: Optional[Dict[str, Any]] = None
+        self._scan_ts: float = 0.0
+        self.setMinimumSize(160, 80)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
+        self.setStyleSheet("background-color:#111;")
+
+    def update_scan(self, scan: Optional[Dict[str, Any]], ts: float) -> None:
+        self._scan = scan
+        self._scan_ts = ts
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: D401
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.fillRect(self.rect(), QColor(17, 17, 17))
+            w = self.width()
+            h = self.height()
+            side = min(w, h)
+            cx = w / 2.0
+            cy = h / 2.0
+            scale = (side / 2.0 - 6.0) / self.PLOT_RANGE_M
+
+            # Range rings (1 m, 2 m, 5 m) for spatial reference.
+            p.setPen(QPen(QColor(60, 60, 60), 1))
+            for r in (1.0, 2.0, 5.0):
+                rr = r * scale
+                if rr <= 0:
+                    continue
+                p.drawEllipse(QPointF(cx, cy), rr, rr)
+
+            # Lidar returns. Body frame: +x forward, +y left. Map to
+            # screen with forward = up: screen_x = cx - y_body*scale,
+            # screen_y = cy - x_body*scale.
+            if self._scan is not None:
+                ranges = self._scan.get("ranges") or []
+                angle_min = float(self._scan.get("angle_min", 0.0))
+                angle_inc = self._scan.get("angle_increment")
+                angle_inc = (
+                    float(angle_inc)
+                    if isinstance(angle_inc, (int, float)) and angle_inc > 0
+                    else (2.0 * math.pi) / max(1, len(ranges))
+                )
+                range_max = self._scan.get("range_max")
+                range_max_v = (
+                    float(range_max)
+                    if isinstance(range_max, (int, float)) and range_max > 0
+                    else math.inf
+                )
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(128, 200, 255))
+                for i, r in enumerate(ranges):
+                    try:
+                        rv = float(r)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(rv) or rv <= 0.0 or rv > range_max_v:
+                        continue
+                    if rv > self.PLOT_RANGE_M:
+                        rv = self.PLOT_RANGE_M
+                    a = angle_min + i * angle_inc
+                    x_b = rv * math.cos(a)
+                    y_b = rv * math.sin(a)
+                    sx = cx - y_b * scale
+                    sy = cy - x_b * scale
+                    p.drawEllipse(QPointF(sx, sy), 1.5, 1.5)
+
+            # Robot triangle (forward = up).
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255))
+            tri = QPolygonF([
+                QPointF(cx, cy - 7),
+                QPointF(cx - 5, cy + 5),
+                QPointF(cx + 5, cy + 5),
+            ])
+            p.drawPolygon(tri)
+
+            # Age + count text in top-left.
+            p.setPen(QColor(140, 140, 140))
+            if self._scan is None or self._scan_ts <= 0:
+                p.drawText(QRectF(4, 2, w - 8, 16), 0, "no scan")
+            else:
+                age = max(0.0, time.time() - self._scan_ts)
+                n = len(self._scan.get("ranges") or [])
+                p.drawText(
+                    QRectF(4, 2, w - 8, 16), 0,
+                    f"lidar  n={n}  age={age:4.2f}s",
+                )
+        finally:
+            p.end()
 
 
 class CameraFeedsDock(QDockWidget):
@@ -84,8 +193,17 @@ class CameraFeedsDock(QDockWidget):
         self.depth_meta.setStyleSheet("color:#888;")
         depth_col.addWidget(self.depth_meta)
 
+        lidar_col = QVBoxLayout()
+        lidar_col.addWidget(QLabel("Lidar (top-down)"))
+        self.lidar_view = LidarFeedView()
+        lidar_col.addWidget(self.lidar_view, stretch=1)
+        self.lidar_meta = QLabel("—")
+        self.lidar_meta.setStyleSheet("color:#888;")
+        lidar_col.addWidget(self.lidar_meta)
+
         feeds.addLayout(rgb_col, stretch=1)
         feeds.addLayout(depth_col, stretch=1)
+        feeds.addLayout(lidar_col, stretch=1)
         v.addLayout(feeds, stretch=1)
 
         btn_row = QHBoxLayout()
@@ -152,6 +270,19 @@ class CameraFeedsDock(QDockWidget):
                     f"age={age_s:4.2f}s"
                 )
                 self.rgb_meta.setStyleSheet("color: #888;")
+
+    def render_lidar(self, snap: dict) -> None:
+        scan = snap.get("lidar_scan")
+        ts = float(snap.get("lidar_ts") or 0.0)
+        self.lidar_view.update_scan(scan, ts)
+        if scan is None or ts <= 0:
+            self.lidar_meta.setText("—")
+            return
+        ranges = scan.get("ranges") or []
+        age_s = time.time() - ts
+        self.lidar_meta.setText(
+            f"{len(ranges)} rays  age={age_s:4.2f}s"
+        )
 
     def render_depth(self, snap: dict) -> None:
         img = snap["depth_image"]
@@ -358,6 +489,7 @@ class CameraPanels:
             snap, self.vision_driver.boxes, self.vision_driver.boxes_for_ts,
         )
         self._feeds_dock.render_depth(snap)
+        self._feeds_dock.render_lidar(snap)
 
     def _on_request_rgb(self) -> None:
         req = self.chassis.request_rgb()
@@ -389,6 +521,7 @@ def build_camera_snapshot(chassis: StubController) -> dict:
             depth_image=s.depth_image, depth_width=s.depth_width,
             depth_height=s.depth_height, depth_format=s.depth_format,
             depth_ts=s.depth_ts,
+            lidar_scan=s.lidar_scan, lidar_ts=s.lidar_ts,
         )
     snap["streaming_misses"] = chassis.streaming_rgb_misses
     return snap
