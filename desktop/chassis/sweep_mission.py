@@ -86,6 +86,13 @@ class SweepMission(QThread):
     # step). 3× absorbs reasonable slip; bigger means a stuck-wheel
     # step doesn't burn the whole mission.
     ROTATE_TIME_BUDGET = 3.0
+    # IMU↔lidar agreement gate: if both signals are present and the
+    # absolute difference exceeds this many degrees, the step is
+    # flagged in last_step_info and a logger warning is emitted.
+    # 10° handles the typical scan-match-locked-at-0° failure mode
+    # (commanded 60° / lidar 0° → Δ = 60°) without firing on
+    # ordinary scan-match resolution noise (~2–3° per step).
+    IMU_LIDAR_DISAGREEMENT_DEG = 10.0
 
     def __init__(self, controller, parent=None):
         super().__init__(parent)
@@ -443,6 +450,26 @@ class SweepMission(QThread):
 
         self._fuse_local_map(local_map_post, self._yaw_accum_deg)
 
+        # IMU↔lidar agreement check. Only meaningful when both signals
+        # are present AND lidar has the confidence we'd ordinarily
+        # trust — a low-conf lidar value disagreeing with IMU is
+        # uninteresting (lidar is just unreliable). Disagreement value
+        # is lidar - imu so the sign tells you which way lidar is off.
+        disagreement_deg: Optional[float] = None
+        if (
+            imu_deg is not None
+            and lidar_deg is not None
+            and lidar_conf >= self.SCAN_MATCH_MIN_CONFIDENCE
+        ):
+            disagreement_deg = float(lidar_deg - imu_deg)
+            if abs(disagreement_deg) > self.IMU_LIDAR_DISAGREEMENT_DEG:
+                logger.warning(
+                    f"sweep step {i}: imu↔lidar disagreement "
+                    f"Δ={disagreement_deg:+.1f}° (lidar={lidar_deg:+.1f}° "
+                    f"conf={lidar_conf:.2f}, imu={imu_deg:+.1f}°, "
+                    f"cmd={cmd_deg:+.1f}°)"
+                )
+
         self._last_step_info = {
             "commanded_deg": commanded_deg,
             "yaw_sources": {"lidar": lidar_deg, "imu": imu_deg, "cmd": cmd_deg},
@@ -450,6 +477,7 @@ class SweepMission(QThread):
             "residual_xy_m": [0.0, 0.0],  # correlation gives no translation
             "settle_ms": int(settle_s * 1000),
             "lidar_confidence": lidar_conf,
+            "imu_lidar_disagreement_deg": disagreement_deg,
         }
         self.step_complete.emit(dict(self._last_step_info))
         self.accumulator_updated.emit()

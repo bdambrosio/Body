@@ -290,8 +290,20 @@ class SweepDock(QDockWidget):
         )
         fused = info.get("fused_deg")
         conf = info.get("lidar_confidence", 0.0)
+        # IMU↔lidar disagreement annotation — appended only when the
+        # mission flagged it (i.e. both signals present with adequate
+        # lidar conf, |Δ| > threshold). On healthy runs the label is
+        # the same as before.
+        disagreement = info.get("imu_lidar_disagreement_deg")
+        threshold = getattr(
+            self.mission, "IMU_LIDAR_DISAGREEMENT_DEG", 10.0,
+        )
+        if disagreement is not None and abs(disagreement) > threshold:
+            tail = f"  [DISAGREE lidar−imu={disagreement:+.1f}°]"
+        else:
+            tail = ""
         self.fused_label.setText(
-            f"last fused: {fmt(fused)}  (lidar conf={conf:.2f})"
+            f"last fused: {fmt(fused)}  (lidar conf={conf:.2f}){tail}"
         )
 
     def _on_mission_done(self, _final: Dict[str, Any]) -> None:
