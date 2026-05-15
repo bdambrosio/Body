@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QSignalBlocker, pyqtSignal
 from PyQt6.QtWidgets import (
     QDockWidget, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel,
     QMainWindow, QScrollArea, QVBoxLayout, QWidget,
@@ -267,18 +267,27 @@ class TeleopPanels:
 
         Safety toolbar's ALL-STOP and Live checkbox remain live — the
         operator must always be able to panic-stop a mission.
+
+        Block signals on the pad and engage button when forcibly
+        resetting their UI state. recenter() emits twist_changed(0, 0)
+        → _on_cmd_vel_twist → chassis.set_cmd_vel(0, 0); unchecking
+        engage_btn emits mode_change_requested("cmd_vel") →
+        chassis.stop_all(). Both race against the sweep worker's
+        per-step set_cmd_vel(0, ω) + set_live_command(True), and
+        mission_active fires on every state change (PRECHECK,
+        ROTATING, SETTLING, ...) — when the GUI wins those races, the
+        worker's command is clobbered back to zero and the bot sits
+        still for the whole sweep. Signal-blocking preserves the
+        visual reset without the controller-state side effects.
         """
         self.cmd_vel_dock.pad.setEnabled(not active)
         self.motor_dock.engage_btn.setEnabled(not active)
         if active:
-            # Snap the pad back to zero so the stored cmd_vel doesn't
-            # retain a stale value that would fire when the sweep ends
-            # and the pad is re-enabled.
-            self.cmd_vel_dock.pad.recenter()
+            with QSignalBlocker(self.cmd_vel_dock.pad):
+                self.cmd_vel_dock.pad.recenter()
         if active and self.motor_dock.engage_btn.isChecked():
-            # Running sweep while direct-mode engaged would race; force
-            # disengage (same pattern as chassis).
-            self.motor_dock.engage_btn.setChecked(False)
+            with QSignalBlocker(self.motor_dock.engage_btn):
+                self.motor_dock.engage_btn.setChecked(False)
 
     # ── Per-tick update ──────────────────────────────────────────────
 

@@ -27,7 +27,7 @@ from typing import Optional
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, QPointF, QProcess, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QPointF, QProcess, QSignalBlocker, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF,
 )
@@ -1606,14 +1606,25 @@ class BodyStubWindow(QMainWindow):
 
         Sweep owns cmd_vel for the duration; the Live cmd checkbox and
         the motor-test dock would race. Abort + ALL STOP stay live.
+
+        Block the toggled signals while resetting the checkbox UI state.
+        The worker thread sets live_command=True at every step start, and
+        it gets there only microseconds after emitting the queued
+        state_changed("precheck") signal that brings us here. Letting
+        these unchecks fire _on_live_toggled / _on_motor_mode_change
+        would race against the worker's set_live_command(True) (and call
+        stop_all in the motor-dock branch) — when the GUI loses the race
+        the cmd_loop sees live=False through step 0 and nothing publishes.
+        The visual state still needs to reflect "sweep owns it", but
+        controller state belongs to the worker now.
         """
         if active:
-            # Disengage motor dock if user had it engaged.
             if self.motor_dock.engage_btn.isChecked():
-                self.motor_dock.engage_btn.setChecked(False)
-            # Drop the main-window live toggle; sweep manages live_command itself.
+                with QSignalBlocker(self.motor_dock.engage_btn):
+                    self.motor_dock.engage_btn.setChecked(False)
             if self.live_box.isChecked():
-                self.live_box.setChecked(False)
+                with QSignalBlocker(self.live_box):
+                    self.live_box.setChecked(False)
         self.live_box.setEnabled(not active and self._snapshot()["connected"])
         self.motor_dock.engage_btn.setEnabled(not active)
         self.apply_btn.setEnabled(not active)

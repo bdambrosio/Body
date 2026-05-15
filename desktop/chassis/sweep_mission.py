@@ -75,17 +75,35 @@ class SweepMission(QThread):
     SCAN_MATCH_MIN_CONFIDENCE = 0.35
     FUSE_VOTE_MARGIN = 1
 
-    # Closed-loop rotation gate: stop ROTATING when the IMU-measured
-    # delta is within this many degrees of commanded. 2° is tight enough
-    # that the post-settle scan-match has a clean baseline; loose enough
-    # that gyro noise doesn't hold the loop open indefinitely.
-    ROTATE_TOLERANCE_DEG = 2.0
+    # Closed-loop rotation gate: stop commanding ω when the IMU-measured
+    # progress reaches (step_deg - tolerance). Tolerance is rate-scaled
+    # to anticipate motor coast — the gate fires *before* the target
+    # so the bot can coast through settling and land near step_deg.
+    #
+    # Coast model fit to 2026-05-15 sweep data (Bruce's robot):
+    #   30 dps → 18° coast/step; 15 dps → 6° coast/step.
+    #   Linear+quadratic in dps passes through both points exactly.
+    #   tolerance = max(MIN_DEG, LINEAR·ω + QUADRATIC·ω²)
+    # MIN floor keeps the gate above BNO085 gyro noise at very low rates.
+    # Recalibrate the coefficients if motor PWM / battery / floor friction
+    # changes significantly (different surface, swapped tires, etc.).
+    ROTATE_TOLERANCE_MIN_DEG = 2.0
+    ROTATE_COAST_LINEAR_DEG_PER_DPS = 0.224
+    ROTATE_COAST_QUADRATIC_DEG_PER_DPS2 = 0.0128
     # Multiplier on the open-loop step duration. If IMU feedback hasn't
     # closed the gate by `rotate_max_time_s = budget * t_step`, fall
     # back to time-based termination (matches pre-IMU behavior on this
     # step). 3× absorbs reasonable slip; bigger means a stuck-wheel
     # step doesn't burn the whole mission.
     ROTATE_TIME_BUDGET = 3.0
+    # Per-step IMU prior window for scan-match. Per-step rotations are
+    # tightly constrained by step_deg + coast, so a narrow window suffices
+    # and reliably defeats the 90°/180° flip ambiguity in symmetric rooms.
+    SCAN_MATCH_PRIOR_WINDOW_PER_STEP_DEG = 15.0
+    # Loop-closure prior window. Wider because yaw_accum has accumulated
+    # 13 steps of fusion noise, but still tight enough to reject the
+    # symmetric-room flip alignments.
+    SCAN_MATCH_PRIOR_WINDOW_LOOP_DEG = 30.0
     # IMU↔lidar agreement gate: if both signals are present and the
     # absolute difference exceeds this many degrees, the step is
     # flagged in last_step_info and a logger warning is emitted.
@@ -210,6 +228,39 @@ class SweepMission(QThread):
     def run(self) -> None:
         try:
             self._declare_publishers()
+            # Take ownership of the cmd channel before announcing
+            # PRECHECK. The chassis/nav _on_sweep_active handlers wrap
+            # their UI resets in QSignalBlocker so the toggled signals
+            # don't race against our per-step set_live_command(True) —
+            # but that also means they no longer call stop_all() /
+            # set_cmd_mode("cmd_vel") on our behalf. Without an explicit
+            # zero+switch+settle here, any residual cmd_vel still
+            # decelerating from the user's last manual command (or
+            # stale cmd_direct values from a previously-engaged
+            # motor_dock) keeps being published by _cmd_loop through
+            # _take_anchor / first_scan capture — and that pre-step
+            # motion lands inside step 0's imu_deg measurement as a
+            # phantom "large initial rotation."
+            #
+            # Order matters:
+            #   1. set_cmd_mode publishes a one-shot zero on both
+            #      topics via supersede() if prev was cmd_direct,
+            #      defeating any stale cmd_direct PWM.
+            #   2. set_cmd_vel zeroes the cmd_vel state so _cmd_loop's
+            #      next tick publishes a clean zero on top of it.
+            #   3. set_live_command(True) arms _cmd_loop so step 1's
+            #      zero actually propagates (if live was False, the
+            #      loop skips publishing entirely and the zero is just
+            #      state-internal).
+            #   4. Brief sleep gives _cmd_loop (10 Hz default) at least
+            #      one tick to push the zero out and the Pi's velocity
+            #      loop time to actively brake any residual motion.
+            #      Without this, step 0's `pre = imu.latest()` lands
+            #      while the bot is still decelerating.
+            self.controller.set_cmd_mode("cmd_vel")
+            self.controller.set_cmd_vel(0.0, 0.0)
+            self.controller.set_live_command(True)
+            time.sleep(0.3)
             self._set_state(SweepState.PRECHECK)
             if not self._precheck():
                 return
@@ -236,8 +287,16 @@ class SweepMission(QThread):
                 self._last_scan = pre_step_scan
 
             # Loop closure: compare first scan to last post-settle scan.
+            # Pass yaw_accum (wrapped) as a prior so a symmetric room can't
+            # snap scan-match to the 90°/180° decoy alignment — without
+            # this guard, conf~0.4 results regularly land 150°+ off truth.
             if self._first_scan is not None and self._last_scan is not None:
-                deg, _ = estimate_lidar_corr(self._first_scan, self._last_scan)
+                prior_deg = ((self._yaw_accum_deg + 180.0) % 360.0) - 180.0
+                deg, _ = estimate_lidar_corr(
+                    self._first_scan, self._last_scan,
+                    prior_deg=prior_deg,
+                    prior_window_deg=self.SCAN_MATCH_PRIOR_WINDOW_LOOP_DEG,
+                )
                 if deg is not None:
                     residual = deg - self._yaw_accum_deg
                     residual = ((residual + 180.0) % 360.0) - 180.0
@@ -347,6 +406,12 @@ class SweepMission(QThread):
         # vanishing into "residual flipped sign and the bot kept
         # spinning a full loop."
         step_deg = float(params["step_deg"])
+        rate_dps = float(params["angular_rate_dps"])
+        tolerance_deg = max(
+            self.ROTATE_TOLERANCE_MIN_DEG,
+            self.ROTATE_COAST_LINEAR_DEG_PER_DPS * rate_dps
+            + self.ROTATE_COAST_QUADRATIC_DEG_PER_DPS2 * rate_dps * rate_dps,
+        )
         time_budget_s = self.ROTATE_TIME_BUDGET * t_step
         deadline = time.monotonic() + time_budget_s
         last_log_t = 0.0
@@ -371,7 +436,7 @@ class SweepMission(QThread):
             ):
                 measured_deg = math.degrees(cur[1] - self._yaw_pre_step_rad)
                 progress = sign * measured_deg
-                if progress >= step_deg - self.ROTATE_TOLERANCE_DEG:
+                if progress >= step_deg - tolerance_deg:
                     break
                 # Light tracing — once per second at most — so a
                 # debugger sees the closed-loop progressing without
@@ -420,7 +485,6 @@ class SweepMission(QThread):
             return None
 
         commanded_deg = sign * params["step_deg"]
-        lidar_deg, lidar_conf = estimate_lidar_corr(pre_step_scan, scan_post)
         # IMU per-step yaw delta. BNO085 publishes body/imu at 100 Hz;
         # we sampled latest() before motion started and sample it again
         # here after scan_post arrived. Either snapshot can be None if
@@ -432,6 +496,17 @@ class SweepMission(QThread):
         else:
             imu_deg = None
         cmd_deg = commanded_deg
+
+        # Compute lidar scan-match with IMU (preferred) or commanded ω·Δt
+        # as the prior. The window is narrow enough to defeat
+        # 90°/180° symmetric-room flip ambiguity but loose enough to
+        # absorb coast variance + IMU noise.
+        scan_prior_deg = imu_deg if imu_deg is not None else commanded_deg
+        lidar_deg, lidar_conf = estimate_lidar_corr(
+            pre_step_scan, scan_post,
+            prior_deg=scan_prior_deg,
+            prior_window_deg=self.SCAN_MATCH_PRIOR_WINDOW_PER_STEP_DEG,
+        )
 
         # Fusion preference: IMU > lidar > cmd. The BNO085 gyro is
         # slip-immune and drifts ~0.05° per 3 s step in
@@ -479,6 +554,19 @@ class SweepMission(QThread):
             "lidar_confidence": lidar_conf,
             "imu_lidar_disagreement_deg": disagreement_deg,
         }
+        # Per-step trace on stderr (INFO level) so a calibration sweep
+        # produces a readable transcript without needing the dock open.
+        # One line per step, fixed columns for grep-friendliness.
+        def _fmt(v: Optional[float]) -> str:
+            return "  none " if v is None else f"{v:+7.2f}"
+        logger.info(
+            f"sweep step {i+1:2d}/{self._step_count:2d}: "
+            f"cmd={_fmt(cmd_deg)}° "
+            f"imu={_fmt(imu_deg)}° "
+            f"lidar={_fmt(lidar_deg)}°(conf={lidar_conf:.2f}) "
+            f"fused={_fmt(fused)}° "
+            f"yaw_accum={self._yaw_accum_deg:+8.2f}°"
+        )
         self.step_complete.emit(dict(self._last_step_info))
         self.accumulator_updated.emit()
 

@@ -80,6 +80,8 @@ def estimate_lidar_corr(
     scan_b: Dict[str, Any],
     *,
     n_bins: int = 360,
+    prior_deg: Optional[float] = None,
+    prior_window_deg: float = 30.0,
 ) -> Tuple[Optional[float], float]:
     """Estimate Δyaw between two scans by circular cross-correlation.
 
@@ -87,6 +89,13 @@ def estimate_lidar_corr(
         deg ∈ (-180, 180]; positive = CCW rotation from scan_a to scan_b.
         confidence ∈ [0, 1]; higher means a sharper correlation peak.
     Returns (None, 0.0) if either scan is unusable.
+
+    If `prior_deg` is given, the argmax is restricted to bins within
+    ±`prior_window_deg` of that prior (wrap-aware). This avoids the
+    180°-flip / 90°-flip ambiguity that hits symmetric rooms — pass the
+    IMU-measured Δyaw (or commanded ω·Δt) as the prior to keep
+    scan-match honest. Confidence is still computed over the full
+    correlation so a featureless room scores low regardless.
     """
     va = _scan_to_vector(scan_a, n_bins=n_bins)
     vb = _scan_to_vector(scan_b, n_bins=n_bins)
@@ -101,8 +110,24 @@ def estimate_lidar_corr(
     B = np.fft.rfft(b)
     corr = np.fft.irfft(np.conj(A) * B, n=n_bins)
 
-    k = int(np.argmax(corr))
     bin_step_deg = 360.0 / n_bins
+    if prior_deg is not None:
+        # The correlation index k maps to deg = -k*bin_step (mod 360),
+        # wrapped to (-180, 180]. Build a mask over k that selects bins
+        # whose deg lies within prior_window_deg of prior_deg, with
+        # circular distance.
+        idx = np.arange(n_bins)
+        deg_per_k = -idx * bin_step_deg
+        deg_per_k = ((deg_per_k + 180.0) % 360.0) - 180.0
+        delta = np.abs(((deg_per_k - float(prior_deg) + 180.0) % 360.0) - 180.0)
+        mask = delta <= float(prior_window_deg)
+        if np.any(mask):
+            masked = np.where(mask, corr, -np.inf)
+            k = int(np.argmax(masked))
+        else:
+            k = int(np.argmax(corr))
+    else:
+        k = int(np.argmax(corr))
     # When the robot rotates CCW by Δθ, the angular bin at index i in
     # scan_a corresponds to bin (i - Δθ_bins) in scan_b. The argmax of
     # the cross-correlation above gives k such that scan_b best matches
