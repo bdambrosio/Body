@@ -48,7 +48,7 @@ from .recovery import (
     REASON_NO_LIVE_CMD, REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
     classify_replan_failure,
 )
-from .safety import SafetyConfig, forward_arc_blocked
+from .safety import SafetyConfig, forward_arc_blocked_local
 from .tracing import (
     CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
 )
@@ -897,12 +897,27 @@ class NavMainWindow(QMainWindow):
             self._update_safety_block_trace(False)
             return
         # FOLLOWING / ROTATING — forward-arc safety check.
-        blocked = (
-            self._last_costmap is not None
-            and forward_arc_blocked(
-                self._last_costmap, pose, self._safety_config,
+        # Reads the body-frame local_map.driveable directly (the freshest
+        # fused lidar+depth observation from the Pi), not the world-frame
+        # costmap. Drift-immune: a pose error doesn't shift our view of
+        # what's physically in front of the robot.
+        #
+        # Staleness rule: if local_map is missing or older than 2× its
+        # median publish period (fallback 1.0 s), treat as BLOCKED. We
+        # would rather refuse to drive than drive blind on stale data.
+        with self.chassis.state.lock:
+            lm_drive = self.chassis.state.local_map_driveable
+            lm_meta = self.chassis.state.local_map_meta
+            lm_ts = self.chassis.state.local_map_ts
+        lm_period = self.chassis.state.local_map_period_s() or 0.5
+        lm_stale_threshold_s = max(1.0, 2.0 * lm_period)
+        lm_age_s = time.time() - lm_ts if lm_ts > 0 else float("inf")
+        if lm_drive is None or lm_meta is None or lm_age_s > lm_stale_threshold_s:
+            blocked = True  # no recent observation → refuse to drive
+        else:
+            blocked = forward_arc_blocked_local(
+                lm_drive, lm_meta, self._safety_config,
             )
-        )
         self._safety_blocked = blocked
         if blocked:
             self.chassis.set_cmd_vel(0.0, 0.0)
