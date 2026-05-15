@@ -22,28 +22,47 @@ STALL_VELOCITY_EPS_MS = 0.01
 
 @dataclass
 class WheelPI:
-    """Per-wheel velocity PI with feed-forward and dead-zone snap.
+    """Per-wheel velocity PI with feed-forward and gated/ramped dead-zone kick.
 
     ``ff = v_cmd / max_v`` (the prior open-loop mapping) is the starting duty; the
     integrator absorbs the residual so commanded wheel velocity matches measured.
-    ``min_drive_pwm`` snaps any nonzero output past the static-friction threshold
-    so the loop doesn't spend its first ticks waiting for the integrator to wind up.
+
+    Dead-zone kick policy:
+      * The kick only fires while the wheel is in the static-friction regime
+        (``|v_meas| < kinetic_threshold_ms``). Once the wheel is actually moving,
+        kinetic friction is much lower than static, the PI's natural PWM is
+        sufficient, and we let the loop run free — otherwise the kick would
+        floor the PWM at ``min_drive_pwm`` and the loop can't decelerate (slow
+        commands oscillate, wheels overshoot).
+      * Within the static regime, the kick ramps from 0 to ``min_drive_pwm``
+        over ``kick_ramp_ticks`` consecutive ticks rather than slamming the
+        full value on tick 1. With ``kick_ramp_ticks=5`` at a 50 Hz loop, the
+        ramp takes ~100 ms — fast enough to break static friction quickly,
+        slow enough to avoid the torque step that was producing visible
+        startup wheelies + IMU shake.
+      * ``kick_tick_count`` resets to 0 whenever the wheel is moving or no
+        command is active, so the next stationary-start gets a fresh ramp.
     """
 
     kp: float
     ki: float
     integ_limit: float
     min_drive_pwm: float
+    kinetic_threshold_ms: float = 0.02
+    kick_ramp_ticks: int = 5
     integ: float = 0.0
+    kick_tick_count: int = 0
 
     def reset(self) -> None:
         self.integ = 0.0
+        self.kick_tick_count = 0
 
     def step(
         self, v_cmd: float, v_meas: float, dt: float, max_v: float
     ) -> tuple[float, str]:
         if max_v <= 0.0 or abs(v_cmd) < 1e-6:
             self.integ = 0.0
+            self.kick_tick_count = 0
             return 0.0, "fwd"
         ff = v_cmd / max_v
         err = v_cmd - v_meas
@@ -53,8 +72,20 @@ class WheelPI:
         elif self.integ < -self.integ_limit:
             self.integ = -self.integ_limit
         pwm = ff + self.kp * err + self.ki * self.integ
-        if self.min_drive_pwm > 0.0 and abs(pwm) < self.min_drive_pwm:
-            pwm = math.copysign(self.min_drive_pwm, v_cmd)
+        if self.min_drive_pwm > 0.0:
+            if abs(v_meas) < self.kinetic_threshold_ms:
+                # Static-friction regime: ramp the PWM floor.
+                self.kick_tick_count += 1
+                t_frac = min(
+                    1.0,
+                    self.kick_tick_count / max(1, self.kick_ramp_ticks),
+                )
+                floor = self.min_drive_pwm * t_frac
+                if abs(pwm) < floor:
+                    pwm = math.copysign(floor, v_cmd)
+            else:
+                # Wheel is moving — kinetic regime, PI runs free.
+                self.kick_tick_count = 0
         if pwm > 1.0:
             pwm = 1.0
         elif pwm < -1.0:
@@ -98,8 +129,18 @@ def main() -> None:
     velocity_ki = float(motor_cfg.get("velocity_ki", 2.0))
     velocity_integ_limit = float(motor_cfg.get("velocity_integ_limit", 0.5))
     min_drive_pwm = float(motor_cfg.get("min_drive_pwm", 0.0))
-    pi_left = WheelPI(velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm)
-    pi_right = WheelPI(velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm)
+    kinetic_threshold_ms = float(motor_cfg.get("kinetic_threshold_ms", 0.02))
+    kick_ramp_ticks = int(motor_cfg.get("kick_ramp_ticks", 5))
+    pi_left = WheelPI(
+        velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm,
+        kinetic_threshold_ms=kinetic_threshold_ms,
+        kick_ramp_ticks=kick_ramp_ticks,
+    )
+    pi_right = WheelPI(
+        velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm,
+        kinetic_threshold_ms=kinetic_threshold_ms,
+        kick_ramp_ticks=kick_ramp_ticks,
+    )
     if encoders_wanted and not gpio_enabled:
         print(
             "motor_controller: encoders_enabled requires gpio_enabled — encoder GPIO skipped.",
