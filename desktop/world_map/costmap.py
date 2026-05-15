@@ -59,7 +59,13 @@ class CostmapConfig:
     # Beyond the footprint, a band of width safety_margin_m carries
     # the maximum halo cost (planner strongly prefers to avoid).
     # Past that, cost decays exponentially.
-    safety_margin_m: float = 0.05
+    #
+    # 0.10 m → 2 cells at 0.05 m resolution. Gives A* an incentive to
+    # leave a ~2-cell buffer between the path and lethal cells when an
+    # alternative route exists within ~10 cells of extra length per
+    # avoided full-cost cell. Smaller bands let A* hug walls to save
+    # one pixel — bad behavior next to scattered lidar speckle.
+    safety_margin_m: float = 0.10
 
     # Exponential decay length-scale beyond the safety band.
     inflation_decay_m: float = 0.15
@@ -202,9 +208,22 @@ def build_costmap(
             protected = traversed & ~in_cone
         else:
             protected = traversed
-        if np.any(protected):
-            lethal[protected] = False
-            cost[protected] = 0.0
+        # Only force-clear cells that aren't currently raw-blocked.
+        # The original intent of traversal protection was to clear
+        # *inflation-induced* lethal (a prior pose's halo surrounding
+        # the bot, blocking retreat through its own trail) — not to
+        # override live lidar that reports the cell is actually
+        # occupied. Without this `& ~blocked` guard, a chair pulled
+        # into a previously-driven corridor stays cleared in the
+        # costmap (lethal=False, cost=0), and A* happily routes the
+        # bot into it. With the guard, raw blocked always wins; only
+        # the inflation-only lethal around traversed cells is cleared.
+        # Forward-cone exception still matters for halo cost, just not
+        # for the blocked-cell case (which never gets cleared now).
+        clearable = protected & ~blocked
+        if np.any(clearable):
+            lethal[clearable] = False
+            cost[clearable] = 0.0
 
     return Costmap(
         cost=cost,
