@@ -568,6 +568,26 @@ just ship the divergence.
   field across particles whose priors sit inside the window); (c)
   preallocated-buffer micro-optimization deferred — current ~6 KB
   field allocation per scan is fine at 1–10 Hz.
+- **2026-05-16 (later):** Phase 2 complete on CPU. Four sub-commits:
+  (2.1) `desktop/world_map/particle_filter_pose.py` — `ParticleFilterPose`
+  with motion model (Phase 0 α priors, σ floor for diversity), IMU yaw
+  Gaussian observation, posterior mean. (2.2) `update_from_scan_likelihood`
+  + vectorized trilinear interp into the Phase 1 score field — einops
+  `rearrange` + `reduce` over a (P, 2, 2, 2) corner cube; auto-temperature
+  defaults to `max(field.std(), 1.0)` so a 1σ score gap = 1 nat of
+  log-weight (Phase 1 open-question (a) resolved). (2.3) Systematic
+  low-variance resampling, N_eff < N/2 gating, 3×3 posterior cov via
+  `torch.einsum`, `FilterDiagnostics` snapshot. (2.4) `shadow_pf_driver.py`
+  attaches to FuserController's session; `--pf-shadow PATH` flag in
+  `desktop/nav/__main__.py` writes one JSONL record per scan tick
+  comparing legacy pose to filter posterior. No production flip.
+  Test count: 24 filter unit + 6 driver integration + 33 pre-existing
+  = 63 desktop tests passing. torch + einops + matplotlib added to
+  `desktop/requirements.txt` (commit 6cf4bd4). Phase 2 plan §6 ask
+  "sanity check on the proposal distribution" still pending — Bruce
+  to review the (Δs, Δθ) Gaussian-additive model in
+  particle_filter_pose.py::predict against α priors. Ready for live
+  Pi shadow-mode trace capture and offline analysis before Phase 3.
 
 ---
 

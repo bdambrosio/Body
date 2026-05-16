@@ -85,6 +85,13 @@ def _parse_args(argv):
              "world grid. See docs/slam_pi_contract.md.",
     )
     p.add_argument(
+        "--pf-shadow", metavar="PATH", default=None,
+        help="Run the Phase 2 particle filter in shadow mode and write "
+             "a JSONL trace to PATH (one record per scan tick comparing "
+             "legacy pose to filter posterior). Does not write to the "
+             "fuser's pose. See desktop/world_map/shadow_pf_driver.py.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
     )
     return p.parse_args(argv)
@@ -152,10 +159,42 @@ def main(argv=None) -> int:
                 "live Pi, or restart after connecting via the UI.",
             )
 
+    # Phase 2.4 particle-filter shadow driver. Pure observer; runs
+    # alongside whatever production pose source is active.
+    pf_shadow = None
+    if args.pf_shadow:
+        if fuser.connected:
+            from desktop.world_map.shadow_pf_driver import (
+                ShadowParticleFilterDriver,
+            )
+            pf_shadow = ShadowParticleFilterDriver(
+                session=fuser.session,
+                grid=fuser.grid,
+                pose_source=fuser.pose_source,
+                trace_path=Path(args.pf_shadow),
+            )
+            try:
+                pf_shadow.connect()
+                log.info("pf_shadow: tracing to %s", args.pf_shadow)
+            except Exception:
+                log.exception("pf_shadow connect failed; continuing without it")
+                pf_shadow = None
+        else:
+            log.warning(
+                "pf_shadow requested but fuser not connected; "
+                "driver not installed. Launch with --router pointing at a "
+                "live Pi, or restart after connecting via the UI.",
+            )
+
     try:
         return run_app(fuser, fuser_config, chassis, chassis_config)
     finally:
         # Shadow first — its subscribers live on the fuser's session.
+        if pf_shadow is not None:
+            try:
+                pf_shadow.disconnect()
+            except Exception:
+                log.exception("pf_shadow disconnect raised")
         if shadow is not None:
             try:
                 shadow.disconnect()
