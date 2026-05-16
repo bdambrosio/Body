@@ -34,7 +34,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
-from einops import rearrange
+from einops import rearrange, reduce
+
+from desktop.nav.slam.types import Pose2D, ScoreField
 
 # Phase 0 noise priors. See docs/noise_models.md §"Output: filter priors".
 # Convention: σ_X² = α_{X→from_trans}² · Δs² + α_{X→from_rot}² · Δθ²
@@ -90,6 +92,95 @@ def _wrap_torch(a: torch.Tensor) -> torch.Tensor:
     """Wrap angles to (-π, π]. torch.remainder is the right idiom here —
     it handles negative inputs correctly, unlike a naive `% (2π) - π`."""
     return (a + math.pi).remainder(2.0 * math.pi) - math.pi
+
+
+def _frac_indices(
+    v: torch.Tensor, axis: torch.Tensor, n: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized fractional index along a uniform axis.
+
+    Returns (i0, frac, oob_mask). i0 is the lower cell index (clamped
+    so i0+1 is valid), frac ∈ [0, 1] is the offset within the cell, and
+    oob_mask is True where the query was strictly outside the axis
+    extent (modulo a 1e-9 fp tolerance so exact-lattice queries don't
+    fall off the upper edge).
+    """
+    if n == 1:
+        zeros_long = torch.zeros_like(v, dtype=torch.int64)
+        zeros = torch.zeros_like(v)
+        return zeros_long, zeros, torch.zeros_like(v, dtype=torch.bool)
+    step = (axis[-1] - axis[0]) / (n - 1)
+    t = (v - axis[0]) / step
+    eps = 1e-9
+    oob = (t < -eps) | (t > (n - 1 + eps))
+    t = t.clamp(min=0.0, max=float(n - 1))
+    i0 = t.floor().to(torch.int64).clamp(max=n - 2)
+    frac = t - i0.to(t.dtype)
+    return i0, frac, oob
+
+
+def interp_score_field(
+    score_field: ScoreField,
+    dx: torch.Tensor,
+    dy: torch.Tensor,
+    dth: torch.Tensor,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Vectorized trilinear interpolation into a ScoreField.
+
+    All of dx, dy, dth share the same (P,) shape — the per-particle
+    delta-from-prior. Returns (P,) scores. Out-of-window queries return
+    0.0, matching the scalar ``likelihood_at`` convention.
+
+    einops `rearrange` stacks the 2×2×2 corner block per particle and
+    the 2×2×2 weight block as named-axis tensors, then `reduce` collapses
+    them — much closer to the math than manual `.expand()` / `.view()`.
+    """
+    field = torch.as_tensor(score_field.field, device=device, dtype=dtype)
+    ax = torch.as_tensor(score_field.dx_axis, device=device, dtype=dtype)
+    ay = torch.as_tensor(score_field.dy_axis, device=device, dtype=dtype)
+    ath = torch.as_tensor(score_field.dth_axis, device=device, dtype=dtype)
+    nx, ny, nth = field.shape
+
+    dx = dx.to(device=device, dtype=dtype)
+    dy = dy.to(device=device, dtype=dtype)
+    dth = dth.to(device=device, dtype=dtype)
+
+    ix0, fx, oob_x = _frac_indices(dx, ax, nx)
+    iy0, fy, oob_y = _frac_indices(dy, ay, ny)
+    ith0, fth, oob_th = _frac_indices(dth, ath, nth)
+    oob = oob_x | oob_y | oob_th
+
+    # Pair indices and fractional weights along each axis. Shape (P, 2)
+    # where the trailing dim is [lower, upper].
+    ix_pair = torch.stack([ix0, ix0 + 1], dim=-1)
+    iy_pair = torch.stack([iy0, iy0 + 1], dim=-1)
+    ith_pair = torch.stack([ith0, ith0 + 1], dim=-1)
+    wx = torch.stack([1.0 - fx, fx], dim=-1)
+    wy = torch.stack([1.0 - fy, fy], dim=-1)
+    wth = torch.stack([1.0 - fth, fth], dim=-1)
+
+    # Broadcast indices to (P, 2, 2, 2) — one entry per cube corner.
+    # The named axes i, j, k correspond to (x, y, θ) endpoint choice.
+    P = dx.shape[0]
+    ix_g = rearrange(ix_pair, "p i -> p i 1 1").expand(P, 2, 2, 2)
+    iy_g = rearrange(iy_pair, "p j -> p 1 j 1").expand(P, 2, 2, 2)
+    ith_g = rearrange(ith_pair, "p k -> p 1 1 k").expand(P, 2, 2, 2)
+    corners = field[ix_g, iy_g, ith_g]  # (P, 2, 2, 2)
+
+    # Outer-product the three (P, 2) weight vectors into the matching
+    # (P, 2, 2, 2) blend tensor — exactly the trilinear weight identity.
+    weights = (
+        rearrange(wx, "p i -> p i 1 1")
+        * rearrange(wy, "p j -> p 1 j 1")
+        * rearrange(wth, "p k -> p 1 1 k")
+    )
+
+    # Trilinear blend = Σ corners · weights over the corner cube.
+    out = reduce(corners * weights, "p i j k -> p", "sum")
+    out = torch.where(oob, torch.zeros_like(out), out)
+    return out
 
 
 class ParticleFilterPose:
@@ -251,6 +342,57 @@ class ParticleFilterPose:
         # one precision. The 1/σ² term is small enough that float32 is
         # plenty for log-weights.
         log_lik = -0.5 * (err / sigma) ** 2
+        self._log_w = self._log_w + log_lik.to(self.cfg.weight_dtype)
+
+    # ── Scan-likelihood observation ──────────────────────────────────
+
+    def update_from_scan_likelihood(
+        self,
+        score_field: ScoreField,
+        prior_pose: Pose2D,
+        temperature: Optional[float] = None,
+    ) -> None:
+        """Apply a scan-match log-likelihood term to log_weights.
+
+        For each particle, interpolate its (dx, dy, dθ)-from-prior into
+        the score field (trilinear) and add ``score / temperature`` to
+        log_weights. Particles outside the field's window contribute
+        zero (matches the scalar likelihood_at convention).
+
+        Args:
+            score_field: from ``ScanMatcher.search(..., return_field=True)``.
+            prior_pose: the world-frame prior the field was computed
+                at — same Pose2D that was passed to ``search()``.
+            temperature: divides raw scores before they enter the log-
+                weight. Phase 1 left score normalization open: scores
+                are raw correlation sums in evidence units, no absolute
+                scale. The temperature converts them to log-likelihood
+                units. Default = max(field.std(), 1.0) so a 1σ score
+                difference equals 1 nat of log-weight; auto-scales to
+                each scan's information content (flat scan → flat
+                contribution).
+        """
+        self._require_seeded()
+        assert self._state is not None and self._log_w is not None
+
+        dx = self._state[:, 0] - prior_pose.x
+        dy = self._state[:, 1] - prior_pose.y
+        dth = _wrap_torch(self._state[:, 2] - prior_pose.theta)
+
+        scores = interp_score_field(
+            score_field, dx, dy, dth,
+            device=self.cfg.device, dtype=self.cfg.state_dtype,
+        )
+
+        if temperature is None:
+            std = float(scores.std())
+            T = max(std, 1.0)
+        else:
+            T = float(temperature)
+        if T <= 0:
+            raise ValueError(f"update_from_scan_likelihood: T must be > 0, got {T}")
+
+        log_lik = scores / T
         self._log_w = self._log_w + log_lik.to(self.cfg.weight_dtype)
 
     # ── Diagnostics + posterior summary ──────────────────────────────

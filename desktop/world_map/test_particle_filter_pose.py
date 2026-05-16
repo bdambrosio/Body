@@ -20,10 +20,16 @@ import unittest
 
 import torch
 
+import numpy as np
+
+from desktop.nav.slam.scan_matcher import likelihood_at
+from desktop.nav.slam.types import Pose2D, ScoreField
+
 from .particle_filter_pose import (
     ParticleFilterConfig,
     ParticleFilterPose,
     _wrap_torch,
+    interp_score_field,
 )
 
 
@@ -196,6 +202,175 @@ class TestPosteriorMean(unittest.TestCase):
         _, _, theta = pf.posterior_mean()
         # Wrap to [-π, π], then |θ| close to π.
         self.assertGreater(abs(theta), math.radians(178.0))
+
+
+def _gaussian_score_field(
+    peak_dx: float = 0.06,
+    peak_dy: float = -0.04,
+    peak_dth: float = math.radians(2.0),
+    sigma_xy: float = 0.05,
+    sigma_th: float = math.radians(3.0),
+    amplitude: float = 1000.0,
+) -> ScoreField:
+    """Synthetic peaky Gaussian score field for filter tests."""
+    dx_axis = np.linspace(-0.30, 0.30, 31).astype(np.float64)
+    dy_axis = np.linspace(-0.30, 0.30, 31).astype(np.float64)
+    dth_axis = np.linspace(
+        math.radians(-15.0), math.radians(15.0), 31,
+    ).astype(np.float64)
+    DX, DY, DTH = np.meshgrid(dx_axis, dy_axis, dth_axis, indexing="ij")
+    z2 = (
+        ((DX - peak_dx) / sigma_xy) ** 2
+        + ((DY - peak_dy) / sigma_xy) ** 2
+        + ((DTH - peak_dth) / sigma_th) ** 2
+    )
+    field = (amplitude * np.exp(-0.5 * z2)).astype(np.float32)
+    return ScoreField(field=field, dx_axis=dx_axis, dy_axis=dy_axis, dth_axis=dth_axis)
+
+
+class TestInterpScoreField(unittest.TestCase):
+    """Validate the vectorized trilinear interp matches scalar likelihood_at."""
+
+    def test_lattice_points_match_scalar(self):
+        sf = _gaussian_score_field()
+        # Sample a handful of lattice points; vectorized eval must match
+        # the scalar likelihood_at at every one.
+        ixs = [0, 5, 15, 20, 30]
+        iys = [0, 7, 15, 25, 30]
+        iths = [0, 5, 15, 22, 30]
+        dx = torch.tensor(sf.dx_axis[ixs])
+        dy = torch.tensor(sf.dy_axis[iys])
+        dth = torch.tensor(sf.dth_axis[iths])
+        out = interp_score_field(sf, dx, dy, dth)
+        for k, (i, j, m) in enumerate(zip(ixs, iys, iths)):
+            scalar = likelihood_at(
+                float(sf.dx_axis[i]), float(sf.dy_axis[j]), float(sf.dth_axis[m]), sf,
+            )
+            self.assertAlmostEqual(float(out[k]), scalar, places=4)
+
+    def test_oob_returns_zero(self):
+        sf = _gaussian_score_field()
+        dx = torch.tensor([1.0, 0.0, 0.0])
+        dy = torch.tensor([0.0, -1.0, 0.0])
+        dth = torch.tensor([0.0, 0.0, math.radians(45.0)])
+        out = interp_score_field(sf, dx, dy, dth)
+        for v in out.tolist():
+            self.assertEqual(v, 0.0)
+
+    def test_midpoint_interpolation(self):
+        sf = _gaussian_score_field()
+        # Midpoint between two cells on the dx axis. Result should be
+        # the linear average of the two cell values (within rounding).
+        ix0, ix1 = 14, 15
+        iy = 15
+        ith = 15
+        v0 = float(sf.field[ix0, iy, ith])
+        v1 = float(sf.field[ix1, iy, ith])
+        mid_dx = 0.5 * (sf.dx_axis[ix0] + sf.dx_axis[ix1])
+        out = interp_score_field(
+            sf,
+            torch.tensor([mid_dx]),
+            torch.tensor([float(sf.dy_axis[iy])]),
+            torch.tensor([float(sf.dth_axis[ith])]),
+        )
+        self.assertAlmostEqual(float(out[0]), 0.5 * (v0 + v1), places=4)
+
+
+class TestScanLikelihoodUpdate(unittest.TestCase):
+    """End-to-end: scan-likelihood observation pulls particles toward the
+    field's peak and tightens N_eff."""
+
+    def test_observation_shifts_posterior_toward_peak(self):
+        # Field peaks at (+0.06, -0.04, +2°). Prior pose is at origin
+        # in world frame. The expected posterior pose ≈ prior + peak.
+        sf = _gaussian_score_field(
+            peak_dx=0.06, peak_dy=-0.04, peak_dth=math.radians(2.0),
+            sigma_xy=0.04, sigma_th=math.radians(2.5),
+        )
+        prior = Pose2D(x=0.0, y=0.0, theta=0.0)
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=4000,
+            # Spread wide enough that some particles hit the peak.
+            init_sigma_xy_m=0.08,
+            init_sigma_theta_rad=math.radians(4.0),
+            seed=101,
+        ))
+        pf.seed_at(prior.x, prior.y, prior.theta)
+        pf.update_from_scan_likelihood(sf, prior)
+
+        x, y, th = pf.posterior_mean()
+        # Posterior mean within a few cm / 1° of the true peak.
+        self.assertAlmostEqual(x, 0.06, delta=0.015)
+        self.assertAlmostEqual(y, -0.04, delta=0.015)
+        self.assertAlmostEqual(th, math.radians(2.0), delta=math.radians(1.0))
+
+    def test_flat_field_does_not_reweight(self):
+        # Zero-variance field → temperature floor kicks in (max(std, 1))
+        # so every particle gets the same log_lik = 0 → no reweight.
+        flat = ScoreField(
+            field=np.zeros((15, 15, 17), dtype=np.float32),
+            dx_axis=np.linspace(-0.28, 0.28, 15).astype(np.float64),
+            dy_axis=np.linspace(-0.28, 0.28, 15).astype(np.float64),
+            dth_axis=np.linspace(
+                math.radians(-8.0), math.radians(8.0), 17
+            ).astype(np.float64),
+        )
+        prior = Pose2D(x=0.0, y=0.0, theta=0.0)
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=1000, init_sigma_xy_m=0.05, seed=42,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        n_eff_before = pf.n_eff()
+        pf.update_from_scan_likelihood(flat, prior)
+        n_eff_after = pf.n_eff()
+        # Within sampling noise. N_eff for uniform weights is exactly N.
+        self.assertAlmostEqual(n_eff_after, n_eff_before, places=3)
+
+    def test_observation_drops_n_eff(self):
+        # Peaky field over a wide-but-overlapping cloud: N_eff must drop
+        # substantially while leaving enough survivors to keep filtering.
+        # If the cloud is much wider than the field's peak σ, N_eff
+        # legitimately collapses toward 1 — that's a posterior with
+        # very little support, and the right response is "resample"
+        # (Phase 2.3) rather than refusing to reweight.
+        sf = _gaussian_score_field(
+            peak_dx=0.0, peak_dy=0.0, peak_dth=0.0,
+            sigma_xy=0.03, sigma_th=math.radians(2.0),
+            amplitude=2000.0,
+        )
+        prior = Pose2D(x=0.0, y=0.0, theta=0.0)
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=2000,
+            init_sigma_xy_m=0.06,        # 2× field σ — meaningful overlap
+            init_sigma_theta_rad=math.radians(4.0),
+            seed=99,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        n0 = pf.n_eff()
+        pf.update_from_scan_likelihood(sf, prior)
+        n1 = pf.n_eff()
+        self.assertLess(n1, n0 * 0.5)
+        # Survivors are well above 1: a reasonable cloud-vs-peak overlap
+        # keeps tens to hundreds of effective particles after one obs.
+        self.assertGreater(n1, 20.0)
+
+    def test_oob_particles_contribute_zero(self):
+        # Particles whose delta-from-prior exceeds the field's window
+        # should get log_lik += 0, so their relative weight is unchanged.
+        sf = _gaussian_score_field()  # window ±0.30 m, ±15°
+        prior = Pose2D(x=0.0, y=0.0, theta=0.0)
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=200, init_sigma_xy_m=0.0,
+            init_sigma_theta_rad=0.0, seed=5,
+        ))
+        # Plant the seed pose well outside the field window.
+        pf.seed_at(2.0, 2.0, math.radians(60.0))
+        log_w_before = pf.log_weights.clone()
+        pf.update_from_scan_likelihood(sf, prior)
+        # OOB contributes 0 to scores; auto-temperature divides by std
+        # of an all-zero score array → falls back to floor 1 → 0/1 = 0.
+        # Net effect: log-weights unchanged.
+        self.assertTrue(torch.allclose(pf.log_weights, log_w_before))
 
 
 if __name__ == "__main__":
