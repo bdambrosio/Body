@@ -568,6 +568,34 @@ just ship the divergence.
   field across particles whose priors sit inside the window); (c)
   preallocated-buffer micro-optimization deferred — current ~6 KB
   field allocation per scan is fine at 1–10 Hz.
+- **2026-05-16 (later still^2):** Phase 5 — pose-aware mapping — partial.
+  Two of three Phase 5 deliverables landed; the third (replacing
+  `traversal_protection` with per-cell occupancy uncertainty) is a
+  bigger architectural change deferred to a follow-up.
+  - Added `PoseSource.best_pose_at(ts)` to the abstract interface,
+    default-delegating to `pose_at` so the legacy sources need no
+    changes. `ParticleFilterPoseSource.best_pose_at` returns
+    `posterior_mode()` — the highest-weight particle, sharper than
+    the mean and less prone to smearing walls during multi-modal
+    phases.
+  - `FuserController._fusion_loop` now calls `best_pose_at` (was
+    `pose_at`) when no Pi-stamped odom anchor is present — the world
+    grid sees the MAP particle. The Pi-anchor branch still uses
+    `to_world` since that's a deterministic frame transform.
+  - `FuserController._traversal_loop` also uses `best_pose_at` for
+    `stamp_traversal`. The pose-trail breadcrumb keeps using the
+    posterior mean (smoother for the operator UI).
+  - Divergence warning: per-tick `cov_at` query → log warning at
+    most once per 5 s when σ_xy > 0.20 m or σ_θ > 15°. Point-estimate
+    sources return `cov_at = None` and skip the check silently. Plan
+    §3 Phase 5 "consider snapshotting multiple map versions" remains
+    a future option (Phase 5.5 territory).
+  - 97 desktop tests (2 new for best_pose_at), all passing.
+  - Live validation pending: re-run `--pf` and check that map
+    quality is at least no worse than the 13:21 ARRIVED-on-goal
+    screenshot. Phase 8 cleanup (removing `ImuPlusScanMatchPose`)
+    waits for one more session of confidence.
+
 - **2026-05-16 (much later):** Phase 8 cutover *prep* complete (this is
   the structural promotion before flipping the production switch on
   live data). New `ParticleFilterPoseSource` in

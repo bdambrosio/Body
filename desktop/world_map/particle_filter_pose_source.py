@@ -222,6 +222,21 @@ class ParticleFilterPoseSource(PoseSource):
         # and the difference is below filter noise.
         return latest[0]
 
+    def best_pose_at(self, ts: float) -> Optional[Pose]:
+        """Highest-weight particle (discrete MAP) at the latest tick.
+
+        Used by mapping consumers (Phase 5). For a tight posterior,
+        mode and mean agree within a particle spread (sub-cm in
+        typical operation). For a skewed or weakly-multimodal posterior
+        the mode tracks the dominant peak, which is what mapping wants
+        — building a grid against the mean during a mode transition
+        would smear walls.
+        """
+        with self._lock:
+            if not self._seeded or self._last_odom is None:
+                return None
+            return self._pf.posterior_mode()
+
     def rebind_world_to_current(self) -> Optional[Pose]:
         with self._lock:
             if not self._seeded or self._last_odom is None:

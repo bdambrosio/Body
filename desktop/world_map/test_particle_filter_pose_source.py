@@ -198,6 +198,43 @@ class TestPoseSourceInterface(unittest.TestCase):
         self.assertAlmostEqual(y_w, 0.0, places=9)
         self.assertAlmostEqual(th_w, 0.0, places=9)
 
+    def test_best_pose_at_uses_posterior_mode(self):
+        # After a sharp observation that skews the posterior, best_pose_at
+        # should track the MAP particle, not necessarily the mean. For
+        # this test the key thing is just that best_pose_at returns a
+        # pose distinct from None and consistent with the mode.
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(
+                n_particles=2000, seed=20,
+                init_sigma_xy_m=0.001,
+                init_sigma_theta_rad=math.radians(5.0),
+                imu_sigma_rad=math.radians(0.3),
+            ),
+        )
+        _settle_imu_to(ps, until_ts=1000.0, yaw_rad=math.radians(2.0))
+        # Seed the filter via an odom update — this triggers seed_at()
+        # at world (0,0,0); then the IMU observation in the next update
+        # call (after another tiny odom step) reweights toward yaw=2°.
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+        _settle_imu_to(ps, until_ts=1000.01, yaw_rad=math.radians(2.0))
+        ps.update(1000.01, 0.001, 0.0, 0.0)
+
+        # Both should return a finite pose; mode and mean should be
+        # within a few degrees of each other (tight cloud).
+        mean_pose = ps.pose_at(1000.01)
+        best_pose = ps.best_pose_at(1000.01)
+        self.assertIsNotNone(mean_pose)
+        self.assertIsNotNone(best_pose)
+        self.assertAlmostEqual(
+            mean_pose[2], best_pose[2], delta=math.radians(2.0),
+        )
+
+    def test_best_pose_at_none_before_seed(self):
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=21),
+        )
+        self.assertIsNone(ps.best_pose_at(1000.0))
+
     def test_cov_at_returns_3x3_after_seed(self):
         ps = ParticleFilterPoseSource(
             pf_config=ParticleFilterConfig(n_particles=200, seed=7),

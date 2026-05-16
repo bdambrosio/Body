@@ -508,7 +508,14 @@ class FuserController:
                     # doesn't manage an odom→world transform).
                     pose = self.pose_source.to_world(*pose_in_odom)
                 else:
-                    pose = self.pose_source.pose_at(cap_ts)
+                    # Phase 5: ask for the *best-particle* pose for
+                    # mapping. For point-estimate sources this is the
+                    # same as pose_at; for the particle filter it's
+                    # the posterior mode (highest-weight particle),
+                    # which is what we want for grid building — sharper
+                    # than the mean and less likely to smear walls
+                    # during multi-modal phases.
+                    pose = self.pose_source.best_pose_at(cap_ts)
 
                 if pose is None:
                     with self._lock:
@@ -544,18 +551,56 @@ class FuserController:
 
     def _traversal_loop(self) -> None:
         period = 1.0 / max(0.5, self.config.traversal_stamp_hz)
+        # Phase 5 divergence-check throttling: log at most once every
+        # 5 s so a sustained divergent posterior doesn't spam the log.
+        last_divergence_log = 0.0
         while not self._stop_event.is_set():
             start = time.monotonic()
             try:
                 latest = self.pose_source.latest_pose()
                 if latest is not None:
-                    pose, sample_ts = latest
+                    _mean_pose, sample_ts = latest
                     age = _now() - sample_ts
                     if age <= self.config.stale_odom_s:
-                        self.grid.stamp_traversal(
-                            x_w=pose[0], y_w=pose[1], ts=_now(),
-                        )
-                        self._maybe_record_pose(pose, sample_ts)
+                        # Phase 5: use the best-particle pose for
+                        # stamp_traversal so the traversed footprint
+                        # matches what mapping uses for fuse_local_map.
+                        # Falls back to pose_at via the default in the
+                        # base class — point-estimate sources are
+                        # unaffected.
+                        best = self.pose_source.best_pose_at(sample_ts)
+                        if best is not None:
+                            self.grid.stamp_traversal(
+                                x_w=best[0], y_w=best[1], ts=_now(),
+                            )
+                            # Pose-trail uses the mean (smoother, what
+                            # the operator UI expects to see); only the
+                            # grid stamp uses the mode.
+                            self._maybe_record_pose(_mean_pose, sample_ts)
+
+                        # Phase 5 divergence check. cov_at returns None
+                        # for point-estimate sources — silently skipped.
+                        # For the particle filter, log when posterior
+                        # σ_xy or σ_θ exceeds a threshold suggesting
+                        # multi-modal or unconverged posterior. Doesn't
+                        # snapshot multiple maps yet (the plan's "Phase
+                        # 5.5" option) — just surfaces the condition.
+                        cov = self.pose_source.cov_at(sample_ts)
+                        if cov is not None and cov.shape == (3, 3):
+                            sigma_xy = float(
+                                max(cov[0, 0], 0.0) ** 0.5
+                                + max(cov[1, 1], 0.0) ** 0.5
+                            ) / 2.0
+                            sigma_th = float(max(cov[2, 2], 0.0) ** 0.5)
+                            now_mono = time.monotonic()
+                            if ((sigma_xy > 0.20 or sigma_th > math.radians(15.0))
+                                    and now_mono - last_divergence_log > 5.0):
+                                logger.warning(
+                                    "pose posterior divergent: σ_xy=%.3f m, "
+                                    "σ_θ=%.2f° — map quality may degrade",
+                                    sigma_xy, math.degrees(sigma_th),
+                                )
+                                last_divergence_log = now_mono
             except Exception:
                 logger.exception("traversal stamp failed; continuing")
             elapsed = time.monotonic() - start

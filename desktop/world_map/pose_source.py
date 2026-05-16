@@ -52,6 +52,26 @@ class PoseSource:
     def cov_at(self, ts: float) -> Optional[np.ndarray]:
         return None
 
+    def best_pose_at(self, ts: float) -> Optional[Pose]:
+        """Single-best-estimate pose at ``ts`` for *mapping* consumers.
+
+        For point-estimate sources (OdomPose, ImuPlusScanMatchPose) this
+        is identical to ``pose_at(ts)`` — there's only one pose.
+
+        For distributional sources (particle filter) the right answer
+        for mapping differs from the right answer for UI display:
+        the posterior **mean** (returned by ``pose_at``) is smooth and
+        appropriate for the breadcrumb trail; the posterior **mode**
+        (highest-weight particle, returned here) is sharper and
+        less likely to smear walls during a multi-modal phase. Phase 5
+        of the localization redesign threads this through
+        ``WorldGrid.fuse_local_map`` and ``stamp_traversal``.
+
+        Default delegates to ``pose_at`` so existing pose sources keep
+        working with no override.
+        """
+        return self.pose_at(ts)
+
     def notify_correction(
         self, dx: float, dy: float, dtheta: float, ts: float,
     ) -> None:
