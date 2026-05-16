@@ -229,12 +229,132 @@ def analyze_rotation(
     print("# Run ≥3 rotations of varying magnitudes/rates to fit α_4 properly.")
 
 
+def analyze_combined(
+    odom: list[tuple[float, float, float, float]],
+    imu_samples: list[tuple[float, float]],
+    measured_endpoint_xy_m: Optional[tuple[float, float]],
+    measured_endpoint_theta_rad: Optional[float],
+) -> None:
+    """Combined translation + rotation calibration → point estimate
+    of α_2 (translation σ from rotation).
+
+    The bot drives a path that interleaves translation and rotation
+    (figure-8, square loop, S-curve…) and the operator records the
+    measured *true* final pose relative to the seed. We compare:
+
+      encoder_end:   raw odom integration to end-of-drive.
+      truth_end:     operator-measured (tape + protractor, or
+                     return-to-known-mark).
+
+    Decompose end-position error in the bot's *initial* frame:
+        Δ = encoder_end − truth_end
+    The xy magnitude is the total translation drift. From a single
+    drive we can fit a point estimate of α_2 by assuming:
+        σ_trans² ≈ α_1² · S²  +  α_2² · |Θ|²
+    where S is total arc length and Θ is total |Δθ| traversed.
+    α_1 from Phase 0 is fixed (=0.04). Solve for α_2:
+        α_2² = (Δxy² / N) − α_1² · S² / N      (single sample → N=1)
+        α_2  = sqrt(max(Δxy² − α_1² · S², 0)) / |Θ|
+
+    Multiple drives at varying rotation amounts give the standard fit.
+    With one drive we get a point estimate plus a sanity check.
+    """
+    if len(odom) < 10:
+        print("not enough odom samples", file=sys.stderr); return
+    x0, y0, th0 = odom[0][1], odom[0][2], odom[0][3]
+    xN, yN, thN = odom[-1][1], odom[-1][2], odom[-1][3]
+
+    # Arc length S = Σ|chord|; total |rotation| = Σ|Δθ|.
+    arc_length_m = 0.0
+    abs_rotation_rad = 0.0
+    for prev, curr in zip(odom[:-1], odom[1:]):
+        dx = curr[1] - prev[1]
+        dy = curr[2] - prev[2]
+        dth = ((curr[3] - prev[3] + math.pi) % (2 * math.pi)) - math.pi
+        arc_length_m += math.hypot(dx, dy)
+        abs_rotation_rad += abs(dth)
+
+    enc_dx = xN - x0
+    enc_dy = yN - y0
+    enc_dth = ((thN - th0 + math.pi) % (2 * math.pi)) - math.pi
+
+    print(f"# Combined-motion analysis")
+    print(f"# Drive: arc_length = {arc_length_m:.2f} m  "
+          f"|rotation| = {math.degrees(abs_rotation_rad):.1f}°  "
+          f"net_dθ = {math.degrees(enc_dth):+.1f}°")
+    print(f"# Encoder Δ from seed (in seed-frame): "
+          f"({enc_dx:+.3f}, {enc_dy:+.3f}) m, "
+          f"net_θ = {math.degrees(enc_dth):+.1f}°")
+
+    if measured_endpoint_xy_m is None:
+        print("# Pass --measured-endpoint-xy mx,my to fit α_2.")
+        print(f"# If the drive started and ended at the same physical mark, "
+              f"--measured-endpoint-xy 0,0 works.")
+        return
+
+    truth_dx, truth_dy = measured_endpoint_xy_m
+    # Rotate truth Δ from seed-physical frame into the seed *odom-frame*
+    # if heading at seed wasn't aligned. We assume seed odom frame
+    # aligns with the seed bot orientation, which it should after a
+    # rebind. If not, pass --seed-heading-offset.
+    err_dx = enc_dx - truth_dx
+    err_dy = enc_dy - truth_dy
+    err_xy = math.hypot(err_dx, err_dy)
+
+    alpha_1 = 0.04  # locked from Phase 0
+    expected_alpha1_drift = alpha_1 * arc_length_m
+    print(f"# Expected drift from α_1 alone (Phase 0): "
+          f"{expected_alpha1_drift*100:.1f} cm  "
+          f"(α_1={alpha_1} × S={arc_length_m:.2f} m)")
+    print(f"# Observed end-position error: "
+          f"|err| = {err_xy*100:.1f} cm  "
+          f"(dx={err_dx*100:+.1f}, dy={err_dy*100:+.1f})")
+
+    # Residual after subtracting α_1 contribution (in quadrature).
+    residual2 = err_xy**2 - expected_alpha1_drift**2
+    if residual2 <= 0 or abs_rotation_rad < 1e-3:
+        print(f"# α_2 cannot be fit from this drive — "
+              f"observed drift ({err_xy*100:.1f} cm) does not exceed "
+              f"α_1-only prediction ({expected_alpha1_drift*100:.1f} cm).")
+        print(f"# Either α_2 ≈ 0, or this drive's rotation was too "
+              f"small to detect the cross-term.")
+        return
+    alpha_2_point = math.sqrt(residual2) / abs_rotation_rad
+    print(f"# α_2 point estimate: {alpha_2_point:.4f} m/rad")
+    print(f"#   ({alpha_2_point*100:.1f} cm of σ per radian of rotation)")
+    print(f"# Sanity: total |rotation| was "
+          f"{math.degrees(abs_rotation_rad):.1f}° → α_2 contribution "
+          f"= α_2·|Θ| = {alpha_2_point*abs_rotation_rad*100:.1f} cm")
+    print(f"# Run ≥3 drives at varying rotation amounts to fit properly.")
+
+    if measured_endpoint_theta_rad is not None:
+        truth_dth = ((measured_endpoint_theta_rad + math.pi) % (2 * math.pi)) - math.pi
+        th_err = abs((enc_dth - truth_dth + math.pi) % (2 * math.pi) - math.pi)
+        print(f"# Bonus: encoder heading error = "
+              f"{math.degrees(th_err):.2f}° vs measured.")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("jsonl", type=Path)
-    p.add_argument("--mode", choices=("translation", "rotation"), required=True)
+    p.add_argument(
+        "--mode", choices=("translation", "rotation", "combined"), required=True,
+    )
     p.add_argument("--measured-distance-m", type=float, default=None,
                    help="Required for --mode translation. Tape-measured distance.")
+    p.add_argument(
+        "--measured-endpoint-xy", type=str, default=None,
+        help="--mode combined: 'mx,my' (m) — true end-position relative "
+             "to seed in the seed bot frame. e.g. '0,0' if you returned "
+             "to the same physical mark, or '1.5,-0.3' if you measured "
+             "the end position relative to start.",
+    )
+    p.add_argument(
+        "--measured-endpoint-theta-deg", type=float, default=None,
+        help="--mode combined: optional true end-heading relative to "
+             "seed (degrees). Lets the script also report encoder yaw "
+             "error as a sanity check.",
+    )
     p.add_argument("--start-ts", type=float, default=None)
     p.add_argument("--end-ts", type=float, default=None)
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
@@ -253,8 +373,19 @@ def main(argv=None) -> int:
     print(f"# {args.jsonl}")
     if args.mode == "translation":
         analyze_translation(odom, imu_samples, args.measured_distance_m)
-    else:
+    elif args.mode == "rotation":
         analyze_rotation(odom, imu_samples)
+    else:
+        endpoint_xy = None
+        if args.measured_endpoint_xy is not None:
+            parts = args.measured_endpoint_xy.split(",")
+            if len(parts) != 2:
+                p.error("--measured-endpoint-xy must be 'mx,my'")
+            endpoint_xy = (float(parts[0]), float(parts[1]))
+        endpoint_th = None
+        if args.measured_endpoint_theta_deg is not None:
+            endpoint_th = math.radians(args.measured_endpoint_theta_deg)
+        analyze_combined(odom, imu_samples, endpoint_xy, endpoint_th)
     return 0
 
 

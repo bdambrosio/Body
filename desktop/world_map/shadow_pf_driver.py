@@ -412,6 +412,7 @@ class ShadowParticleFilterDriver:
                 self._counters["resamples_fired"] += 1
             diagnostics = self._pf.diagnostics(resampled=resampled)
             filter_mean = self._pf.posterior_mean()
+            filter_mode = self._pf.posterior_mode()
             cov = self._pf.posterior_cov()
 
         self._counters["scan_obs_run"] += 1
@@ -425,6 +426,7 @@ class ShadowParticleFilterDriver:
                 if legacy_pose is not None else None
             ),
             "filter_mean": [float(filter_mean[0]), float(filter_mean[1]), float(filter_mean[2])],
+            "filter_mode": [float(filter_mode[0]), float(filter_mode[1]), float(filter_mode[2])],
             "filter_cov_diag": [
                 float(cov[0, 0]), float(cov[1, 1]), float(cov[2, 2]),
             ],

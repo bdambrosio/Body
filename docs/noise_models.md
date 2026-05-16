@@ -280,6 +280,86 @@ IMU_DRIFT_RATE_RAD_PER_S = 3.42e-6          # upper bound; treat as 0
 These go into `desktop/world_map/particle_filter_pose.py` when Phase 2
 starts.
 
+## Experiment D — α_2 cross-term (combined motion). **Phase 2 follow-up**
+
+The Phase 2 live trace (run_20260516_102327) showed a ~5 cm systematic
+forward-axis bias of the filter's posterior mean vs production's pose.
+The most likely cause is the unmeasured α_2 cross-term (translation σ
+from rotation): when the bot turns while moving, the motion model
+currently under-estimates xy noise, so the cloud doesn't widen enough
+during combined motion and the scan-likelihood observation can't pull
+the posterior all the way to the truth.
+
+This is the experiment Phase 0 §10 ("Known loose ends") flagged as
+"Easy 10-line addition; do it next time we need C-style data."
+
+### Procedure
+
+Same general setup as Experiment B (translation). The drive needs to
+combine translation and rotation simultaneously — a straight line
+won't tell us anything about α_2.
+
+1. Mark a starting position on the floor (X) and the bot's orientation
+   (an arrow on the floor or aligned with a wall).
+2. Start `scripts/record_body_topics.py` recording.
+3. Rebind world to current (UI → Rebind, or just note the encoder pose
+   at start; we don't actually need a UI rebind for this analysis).
+4. Drive a combined-motion path of your choosing. Three good shapes:
+
+   - **Square loop** (1.5 m × 1.5 m): 4 × straight + 4 × 90° turn.
+     Easy to set up, predictable expectations. Total rotation = 360°,
+     total path = 6 m.
+   - **Figure-8**: drive two ~1 m circles connected at center.
+     Total rotation = 720°, total path = ~6 m. Stresses α_2 more.
+   - **Half-circle** of ~1 m radius: 180° turn with continuous arc.
+     Total rotation = 180°, total path = ~3 m. Simpler analysis.
+
+5. Stop the bot. Measure where it ended up:
+   - **xy**: tape distance to the start mark, in two perpendicular
+     directions (the bot's starting forward axis = +x, perpendicular
+     to bot's starting left = +y). Sign matters.
+   - **θ**: protractor or visual estimate vs bot's starting heading.
+6. Run:
+
+   ```
+   python scripts/phase0_odom_drive.py PATH.jsonl --mode combined \
+       --measured-endpoint-xy <mx>,<my> \
+       --measured-endpoint-theta-deg <deg>
+   ```
+
+7. Report (mx, my, deg) along with the script output.
+
+### Fit
+
+A single drive gives a point estimate via:
+
+    σ_trans² ≈ α_1² · S²  +  α_2² · Θ²
+
+where S = total arc length, Θ = total |rotation|. With α_1 = 0.04
+(locked from Phase 0), and observed |encoder_end − truth_end| = Δxy:
+
+    α_2 ≈ sqrt(max(Δxy² − α_1²·S², 0)) / Θ      [m / rad]
+
+The "max(..., 0)" guard catches drives where the observed drift is
+already within α_1 prediction — then α_2 is consistent with 0.
+
+≥3 drives at varying |Θ| values give a proper linear fit (Δxy² vs
+α_1²·S² + α_2²·Θ²); the script reports the point estimate per drive.
+
+### What success looks like
+
+- A consistent α_2 in the 0.01-0.05 m/rad range across drives.
+- After updating `ALPHA_TRANS_PER_RAD` in particle_filter_pose.py and
+  re-running a live shadow trace, the bot-frame "along" bias drops
+  from ~5 cm to <2 cm.
+
+If α_2 measures very small (≪ 0.01 m/rad), the cross-term is not the
+explanation for the bias — likely the MMSE-vs-MAP estimator difference
+discussed in the Phase 2 status log. In that case, switching the
+filter's reported pose to `posterior_mode()` (highest-weight particle)
+is the alternative; the shadow trace already logs `filter_mode`
+alongside `filter_mean` for this comparison.
+
 ## Out of scope for Phase 0
 
 - **Scan-match likelihood landscape** — deferred until we have a clean

@@ -189,6 +189,41 @@ class TestObserveImuYaw(unittest.TestCase):
         self.assertLess(abs(y), 0.01)
 
 
+class TestPosteriorMode(unittest.TestCase):
+    def test_mode_agrees_with_mean_on_uniform_weights(self):
+        # Uniform weights → argmax picks the first particle (or
+        # whichever index ties to the max). For a tight Gaussian cloud,
+        # any single particle is within ~σ of the mean.
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=2000,
+            init_sigma_xy_m=0.02,
+            init_sigma_theta_rad=math.radians(1.0),
+            seed=600,
+        ))
+        pf.seed_at(0.5, -0.3, 0.0)
+        mean = pf.posterior_mean()
+        mode = pf.posterior_mode()
+        # Within 3σ for each coordinate.
+        self.assertAlmostEqual(mean[0], mode[0], delta=0.06)
+        self.assertAlmostEqual(mean[1], mode[1], delta=0.06)
+        self.assertAlmostEqual(mean[2], mode[2], delta=math.radians(3.0))
+
+    def test_mode_tracks_peak_after_sharp_observation(self):
+        # Sharp IMU observation → one particle (near the obs) dominates.
+        # Mode should sit at that particle, very close to the obs value.
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=2000,
+            init_sigma_xy_m=0.001,
+            init_sigma_theta_rad=math.radians(5.0),
+            imu_sigma_rad=math.radians(0.3),
+            seed=601,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        pf.observe_imu_yaw(math.radians(2.0))
+        _, _, theta = pf.posterior_mode()
+        self.assertAlmostEqual(theta, math.radians(2.0), delta=math.radians(0.7))
+
+
 class TestPosteriorMean(unittest.TestCase):
     def test_posterior_mean_uses_circular_mean_for_theta(self):
         # Seed cloud straddling +π/-π. Naive linear mean would land

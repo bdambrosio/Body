@@ -606,6 +606,30 @@ class ParticleFilterPose:
         self.resample()
         return True
 
+    def posterior_mode(self) -> Tuple[float, float, float]:
+        """Highest-weight particle's pose — discrete MAP.
+
+        Useful for comparison against the weighted mean when the
+        posterior is skewed (e.g., scan-likelihood pulling the cloud
+        toward an argmax while the motion-model prior anchors it to
+        encoder integration). For tight clouds, posterior_mode and
+        posterior_mean agree within a particle spread; for skewed or
+        multi-modal posteriors, they diverge and the mode tracks the
+        dominant peak.
+
+        This is the discrete MAP (the highest-weight *particle*), not
+        the continuous posterior mode. For a well-resolved posterior
+        they coincide; for under-resolved ones the mode is one
+        particle's location, which can be noisy.
+        """
+        self._require_seeded()
+        assert self._state is not None and self._log_w is not None
+        idx = int(torch.argmax(self._log_w))
+        x = float(self._state[idx, 0])
+        y = float(self._state[idx, 1])
+        theta = float(self._state[idx, 2])
+        return (x, y, theta)
+
     def posterior_mean(self) -> Tuple[float, float, float]:
         """Weighted mean of the particle cloud as (x, y, θ).
 
