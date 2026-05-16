@@ -1,6 +1,8 @@
 # Noise Models — Phase 0 Calibration
 
-**Status:** Awaiting data collection. Tools landed; experiments + numbers pending.
+**Status:** Phase 0 complete (2026-05-15). All five priors locked.
+Ready to drive Phase 1 (likelihood-field scan matcher) and Phase 2
+(particle filter motion model).
 
 This document records the empirically-measured sensor noise priors that
 the Bayesian SLAM redesign
@@ -31,11 +33,11 @@ show they matter.
 - [x] Experiment B run (3 drives at 1/3/5 m, 2026-05-15).
 - [x] Experiment C run (3 rotations 180/360/720°, 2026-05-15).
 - [x] Calibration fix applied (`motor.wheel_base_m: 0.190 → 0.181`,
-      2026-05-15 — requires Pi-side resync + motor_controller restart).
-- [ ] Post-fix sanity check (single 360° rotation to confirm bias
-      collapsed and lock final α_4).
-- [ ] Numbers below filled in (A + B + C; α_4 pending verification).
-- [ ] Bruce review.
+      2026-05-15 — Pi-side resync + motor_controller restart done).
+- [x] Post-fix sanity check (single 360° rotation): bias collapsed
+      from -5.58% to -0.61%, α_4 verified.
+- [x] All numbers locked.
+- [x] Bruce review (informal, in-conversation).
 
 ## Pi-side changes
 
@@ -226,12 +228,23 @@ restart. After restart, sweep coast model may also want re-fitting
 since commanded ω will now produce matching actual ω; the current
 coefficients were tuned on top of the 5% over-rotation bias.
 
-**Predicted post-fix α_4 ≈ 0.01.** Residuals after removing the
-constant 5% bias: 1.8°, 2.1°, 2.5° (signed mixed) → roughly 2° per
-rotation of any magnitude, suggesting it's per-rotation noise plus
-a tiny per-radian component. With one post-fix verification run we
-can confirm and lock the final value. **Until verified, use the
-pre-fix conservative α_4 = 0.05.**
+**Post-fix verification run (2026-05-15 19:49, C2′):**
+
+| Run | IMU Δθ | Encoder Δθ | Abs err | Frac err | α_4 point |
+|---|---|---|---|---|---|
+| C2′ post-fix | +355.78° | +353.61° | -2.17° | **-0.61%** | **0.0061** |
+
+Bias collapsed 9× (from -5.58% → -0.61%). The residual 0.61% is
+within the noise floor for a single in-place rotation run. Direction
+still consistent (encoder slightly *under*-reports), so wheel_base
+could in principle nudge lower (0.180 m?) to bisect the bias to 0,
+but the residual is already small enough that calling it noise is
+defensible.
+
+**α_4 locked at 0.01** — a touch conservative vs the 0.006 point
+estimate. Leaves headroom for the direction-asymmetry we haven't yet
+measured (only ccw runs) and for slip variance under different floor
+conditions.
 
 Notes:
 - Direction asymmetry not tested (all 3 runs were ccw). Worth a
@@ -254,9 +267,9 @@ with:
 # Motion model (per odom step Δs, Δθ):
 SIGMA_TRANSLATION_PER_M       = 0.04        # α_1
 SIGMA_ROTATION_PER_M_OF_TRANS = 0.017       # α_3 (rad/m)
-SIGMA_ROTATION_PER_RAD        = 0.05        # α_4 (pre-fix value;
-                                            # after wheel_base recal,
-                                            # expect ~0.01 — re-measure)
+SIGMA_ROTATION_PER_RAD        = 0.01        # α_4 (post wheel_base
+                                            # recal; verified by C2′
+                                            # at 0.6% residual error)
 
 # IMU yaw observation (BNO085 game_rotation_vector):
 IMU_SIGMA_PER_SAMPLE_RAD = 1.23e-3          # 0.07 deg

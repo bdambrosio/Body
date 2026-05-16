@@ -503,3 +503,8 @@ just ship the divergence.
   `scripts/phase0_imu_stationary.py` and `scripts/phase0_odom_drive.py`.
   Procedure + result template at `docs/noise_models.md`. No Pi-side
   changes. Awaiting Bruce's experiment runs A/B/C.
+- **2026-05-15 (later):** Phase 0 complete. All five priors locked
+  (α_1 = 0.04, α_3 = 0.017 rad/m, α_4 = 0.01, σ_IMU_sample = 1.23 mrad,
+  drift ≈ 0). Side-effect: wheel_base_m calibration bug found and
+  fixed (0.190 → 0.181 m); same root cause as the sweep rotation
+  overshoot. Ready for Phase 1.
