@@ -34,12 +34,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-
-def _quat_to_yaw(w: float, x: float, y: float, z: float) -> float:
-    """Yaw in radians from a wxyz quaternion. Mirrors the desktop helper."""
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
+from desktop.nav.slam.types import ImuReading, quaternion_to_yaw
 
 
 def _unwrap_to(prev: float, raw: float) -> float:
@@ -84,21 +79,20 @@ def main(argv=None) -> int:
             if args.end_ts is not None and recv_ts > args.end_ts:
                 continue
             payload = rec.get("payload") or {}
-            quat = payload.get("quat_wxyz") or payload.get("quaternion_wxyz")
-            if not (isinstance(quat, list) and len(quat) == 4):
+            reading = ImuReading.from_payload(payload)
+            if reading is None or reading.quat_wxyz is None:
                 skipped_no_quat += 1
                 continue
-            sensor_ts = float(payload.get("ts") or recv_ts)
-            if sensor_ts <= 0:
+            if reading.ts <= 0:
                 skipped_no_ts += 1
                 continue
-            yaw_raw = _quat_to_yaw(*[float(v) for v in quat])
+            yaw_raw = quaternion_to_yaw(reading.quat_wxyz)
             if prev_yaw is None:
                 yaw = yaw_raw
             else:
                 yaw = _unwrap_to(prev_yaw, yaw_raw)
             prev_yaw = yaw
-            samples.append((sensor_ts, yaw))
+            samples.append((reading.ts, yaw))
 
     if len(samples) < 50:
         print(

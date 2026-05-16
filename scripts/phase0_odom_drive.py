@@ -47,11 +47,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-
-def _quat_to_yaw(w: float, x: float, y: float, z: float) -> float:
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
+from desktop.nav.slam.types import ImuReading, quaternion_to_yaw
 
 
 def _unwrap_to(prev: float, raw: float) -> float:
@@ -73,7 +69,7 @@ def _load_odom_imu(
     imu_samples : (sensor_ts, yaw_unwrapped).
     """
     odom: list[tuple[float, float, float, float]] = []
-    imu_raw: list[tuple[float, list[float]]] = []
+    imu_raw: list[tuple[float, tuple[float, float, float, float]]] = []
     with jsonl.open() as f:
         for line in f:
             try:
@@ -87,8 +83,8 @@ def _load_odom_imu(
                 continue
             topic = rec.get("topic")
             payload = rec.get("payload") or {}
-            sensor_ts = float(payload.get("ts") or recv_ts)
             if topic == "body/odom":
+                sensor_ts = float(payload.get("ts") or recv_ts)
                 try:
                     x = float(payload.get("x", 0.0))
                     y = float(payload.get("y", 0.0))
@@ -97,9 +93,9 @@ def _load_odom_imu(
                     continue
                 odom.append((sensor_ts, x, y, th))
             elif topic == "body/imu":
-                q = payload.get("quat_wxyz") or payload.get("quaternion_wxyz")
-                if isinstance(q, list) and len(q) == 4:
-                    imu_raw.append((sensor_ts, [float(v) for v in q]))
+                reading = ImuReading.from_payload(payload)
+                if reading is not None and reading.quat_wxyz is not None:
+                    imu_raw.append((reading.ts, reading.quat_wxyz))
 
     odom.sort(key=lambda r: r[0])
 
@@ -107,7 +103,7 @@ def _load_odom_imu(
     imu_samples: list[tuple[float, float]] = []
     prev_yaw: Optional[float] = None
     for ts, q in imu_raw:
-        y = _quat_to_yaw(*q)
+        y = quaternion_to_yaw(q)
         y = y if prev_yaw is None else _unwrap_to(prev_yaw, y)
         prev_yaw = y
         imu_samples.append((ts, y))
