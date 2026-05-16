@@ -300,10 +300,18 @@ class TestScanLikelihoodUpdate(unittest.TestCase):
         pf.update_from_scan_likelihood(sf, prior)
 
         x, y, th = pf.posterior_mean()
-        # Posterior mean within a few cm / 1° of the true peak.
-        self.assertAlmostEqual(x, 0.06, delta=0.015)
-        self.assertAlmostEqual(y, -0.04, delta=0.015)
-        self.assertAlmostEqual(th, math.radians(2.0), delta=math.radians(1.0))
+        # Posterior mean shifts toward peak from origin. The default
+        # auto-temperature (log_ratio=5) caps the per-particle weight
+        # ratio at exp(5)≈148, so a single observation pulls the mean
+        # most of the way to peak but not all the way — that's the
+        # whole point of the softening (cloud retains diversity for the
+        # *next* observation). Tolerance widened accordingly.
+        self.assertAlmostEqual(x, 0.06, delta=0.035)
+        self.assertAlmostEqual(y, -0.04, delta=0.035)
+        self.assertAlmostEqual(th, math.radians(2.0), delta=math.radians(1.5))
+        # And the shift is in the right direction.
+        self.assertGreater(x, 0.02)
+        self.assertLess(y, -0.01)
 
     def test_flat_field_does_not_reweight(self):
         # Zero-variance field → temperature floor kicks in (max(std, 1))

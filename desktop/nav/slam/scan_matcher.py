@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -161,50 +162,88 @@ class ScanMatcher:
         best_iy = 0
         best_ith = 0
 
-        # Loop over θ (few values), vectorize over dx, dy inside.
-        # For each θ: rotate points once, then score a grid of xy
-        # translations in one vectorized pass.
+        # Vectorized over (dx, dy) — single Python loop on θ.
+        #
+        # For each θ value: rotate scan points once, then compute the
+        # (Ndx × Ndy) score grid in one shot via:
+        #   1. Broadcast the per-point world x and y across the (Ndx,)
+        #      and (Ndy,) candidate-offset axes → (N, Ndx) and (N, Ndy)
+        #      integer cell indices.
+        #   2. 3-D gather ev[i[:, :, None], j[:, None, :]] → (N, Ndx, Ndy)
+        #      evidence values per (point, dx, dy).
+        #   3. Mask out-of-bounds entries to 0 and sum over the point
+        #      axis → (Ndx, Ndy) score grid.
+        #
+        # Bit-for-bit tie-breaking is preserved: argmax over the (Ndx,
+        # Ndy) grid in C-order matches the old (ix outer, iy inner)
+        # Python iteration order; strict `>` against the running best
+        # across θ keeps first-θ-wins on ties.
+        #
+        # The prior nested Python loop was 3825 iterations × ~100 µs at
+        # default config → ~380 ms per search. Vectorized: 17 numpy
+        # passes × a few ms each → ~30–80 ms, which keeps the chassis
+        # heartbeat happy without needing a worker thread.
         for ith, dth in enumerate(dth_vals):
+            # Explicit GIL yield per θ candidate. Python's automatic
+            # switchinterval (5 ms default) usually handles this, but
+            # the live shadow-mode trace exposed cases where the chassis
+            # heartbeat thread (5 Hz, 200 ms period; Pi watchdog 2 s
+            # timeout) was starved during long search calls. sleep(0)
+            # is sub-microsecond — costs nothing in dedicated-CPU runs
+            # but guarantees a yield point per θ.
+            time.sleep(0)
+
             th = prior_pose.theta + dth
             c, s = math.cos(th), math.sin(th)
             # Rotated body→world points (pre-translation).
             px = c * points[:, 0] - s * points[:, 1]
             py = s * points[:, 0] + c * points[:, 1]
-
-            # World position at prior xy + (dx, dy)
             base_x = prior_pose.x + px
             base_y = prior_pose.y + py
 
-            # Evaluate each (dx, dy) — loop over dx outer, vectorize
-            # dy inner across points. A fully-vectorized 3D scoring
-            # tensor would blow RAM for the default window; this
-            # nested loop is 31*31 = ~1 k iterations × point count.
-            for ix, dx in enumerate(dx_vals):
-                x_world = base_x + dx
-                # Columns -> i index
-                i = np.floor(
-                    (x_world - origin_x_m) / resolution_m + 1e-9
-                ).astype(np.int32)
-                # We'll add dy along the j axis.
-                # Actually: inner-vectorize over dy too, per point.
-                for iy, dy in enumerate(dy_vals):
-                    y_world = base_y + dy
-                    j = np.floor(
-                        (y_world - origin_y_m) / resolution_m + 1e-9
-                    ).astype(np.int32)
-                    in_bounds = (
-                        (i >= 0) & (i < nx) & (j >= 0) & (j < ny)
-                    )
-                    if not np.any(in_bounds):
-                        # Field cell stays at its zero-init value.
-                        continue
-                    score = float(ev[i[in_bounds], j[in_bounds]].sum())
-                    if field is not None:
-                        field[ix, iy, ith] = score
-                    if score > best_score:
-                        best_score = score
-                        best_dx, best_dy, best_dth = float(dx), float(dy), float(dth)
-                        best_ix, best_iy, best_ith = ix, iy, ith
+            # (N, Ndx) and (N, Ndy) world-cell indices.
+            i_all = np.floor(
+                (base_x[:, None] + dx_vals[None, :] - origin_x_m)
+                / resolution_m + 1e-9
+            ).astype(np.int32)
+            j_all = np.floor(
+                (base_y[:, None] + dy_vals[None, :] - origin_y_m)
+                / resolution_m + 1e-9
+            ).astype(np.int32)
+            in_x = (i_all >= 0) & (i_all < nx)
+            in_y = (j_all >= 0) & (j_all < ny)
+            # Clip to a safe range for the gather; the in_bounds mask
+            # zeros the contribution of any clipped lookups.
+            i_safe = np.clip(i_all, 0, nx - 1)
+            j_safe = np.clip(j_all, 0, ny - 1)
+            # (N, Ndx, Ndy) — broadcast i along the dy axis, j along dx.
+            ev_at = ev[i_safe[:, :, None], j_safe[:, None, :]]
+            in_bounds_3d = in_x[:, :, None] & in_y[:, None, :]
+            ev_at = np.where(in_bounds_3d, ev_at, np.float32(0.0))
+            # (Ndx, Ndy) score grid for this θ.
+            score_grid = ev_at.sum(axis=0)
+            # Cells where *no* point landed in bounds match the old
+            # "continue" branch — field stays at zero-init, candidate
+            # is excluded from argmax. Masking with -inf during argmax
+            # preserves that behavior.
+            any_in_bounds = in_bounds_3d.any(axis=0)
+
+            if field is not None:
+                # Zero-init covers the no-points-in-bounds cells; we
+                # write the full grid since those cells already evaluate
+                # to 0 from the np.where mask above.
+                field[:, :, ith] = score_grid
+
+            masked = np.where(any_in_bounds, score_grid, -np.inf)
+            grid_max = float(masked.max())
+            if grid_max > best_score:
+                flat_idx = int(np.argmax(masked))
+                ix_max, iy_max = np.unravel_index(flat_idx, masked.shape)
+                best_score = grid_max
+                best_dx = float(dx_vals[ix_max])
+                best_dy = float(dy_vals[iy_max])
+                best_dth = float(dth)
+                best_ix, best_iy, best_ith = int(ix_max), int(iy_max), ith
 
         # Detect "best was at window edge" — means the prior is too far
         # off and we should either widen the search or flag low trust.

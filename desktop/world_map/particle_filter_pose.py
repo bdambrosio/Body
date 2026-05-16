@@ -100,6 +100,17 @@ class ParticleFilterConfig:
     state_dtype: torch.dtype = torch.float64
     weight_dtype: torch.dtype = torch.float32
 
+    # Scan-likelihood temperature: log_ratio controls how strongly a
+    # single observation reweights the cloud. The effective temperature
+    # is max(score_range / log_ratio, 1.0), so the worst-to-best
+    # particle weight ratio is bounded at exp(log_ratio). Default 5.0
+    # → ratio ≈ 148, strong enough to inform the posterior, gentle
+    # enough that the cloud retains diversity (doesn't collapse to a
+    # delta in one observation, which was the failure mode the first
+    # live trace exposed). Phase 2.2 used field.std() which is far too
+    # peaky for realistic correlation scores.
+    scan_temperature_log_ratio: float = 5.0
+
     # Resampling threshold: gate fires when N_eff < threshold * N.
     # Default N/2 follows the AMCL / Probabilistic Robotics convention.
     # Resampling less often is a *feature* — it preserves cloud
@@ -390,11 +401,15 @@ class ParticleFilterPose:
             temperature: divides raw scores before they enter the log-
                 weight. Phase 1 left score normalization open: scores
                 are raw correlation sums in evidence units, no absolute
-                scale. The temperature converts them to log-likelihood
-                units. Default = max(field.std(), 1.0) so a 1σ score
-                difference equals 1 nat of log-weight; auto-scales to
-                each scan's information content (flat scan → flat
-                contribution).
+                scale. Default = ``max(score_range / log_ratio, 1.0)``
+                where score_range = scores.max() - scores.min() across
+                the *particle* sample (not the whole field — particles
+                outside the window get 0 and would skew the range).
+                log_ratio comes from ``cfg.scan_temperature_log_ratio``
+                (default 5.0). Bounds the worst-to-best particle weight
+                ratio at exp(log_ratio) so a single observation can
+                inform the posterior without collapsing the cloud to a
+                delta. Override with a fixed temperature for tuning.
         """
         self._require_seeded()
         assert self._state is not None and self._log_w is not None
@@ -409,8 +424,8 @@ class ParticleFilterPose:
         )
 
         if temperature is None:
-            std = float(scores.std())
-            T = max(std, 1.0)
+            score_range = float(scores.max() - scores.min())
+            T = max(score_range / self.cfg.scan_temperature_log_ratio, 1.0)
         else:
             T = float(temperature)
         if T <= 0:

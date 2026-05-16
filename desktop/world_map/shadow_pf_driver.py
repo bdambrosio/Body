@@ -43,10 +43,11 @@ from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 import numpy as np
 
+from desktop.nav.slam.imu_yaw import ImuYawTracker
 from desktop.nav.slam.scan_matcher import (
     ScanMatcher, ScanMatcherConfig, lidar_scan_to_xy,
 )
-from desktop.nav.slam.types import Pose2D
+from desktop.nav.slam.types import ImuReading, Pose2D
 
 from .particle_filter_pose import (
     ParticleFilterConfig, ParticleFilterPose,
@@ -57,8 +58,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ShadowPfConfig:
-    # Scan-likelihood rate cap. Matches ShadowSlamDriver default.
-    scan_hz: float = 2.0
+    # Scan-likelihood rate cap. Dropped from 2.0 → 0.5 after the first
+    # live trace showed CPU saturation: production scan-match runs every
+    # 500 ms and ours did too (~400 ms each on CPU), saturating one
+    # core and starving the chassis heartbeat thread → Pi watchdog →
+    # bot e-stop. 0.5 Hz halves shadow's cost; the filter has plenty
+    # of information at 1 obs / 2 s and is largely driven by predict +
+    # IMU between scan ticks anyway.
+    scan_hz: float = 0.5
 
     # Skip scan-likelihood if grid evidence is too sparse — same logic
     # as the production matcher.
@@ -82,6 +89,7 @@ class ShadowParticleFilterDriver:
     """
 
     ODOM_TOPIC = "body/odom"
+    IMU_TOPIC = "body/imu"
     SCAN_TOPIC = "body/lidar/scan"
 
     def __init__(
@@ -103,27 +111,50 @@ class ShadowParticleFilterDriver:
 
         self._pf = ParticleFilterPose(pf_config)
         self._matcher = ScanMatcher(scan_matcher_config or ScanMatcherConfig())
+        # Own IMU tracker — decouples us from production's pose_source
+        # buffer. The first live trace showed 30% of odom callbacks
+        # racing ahead of the fuser's _on_odom, returning None from
+        # pose_at(ts), and skipping predicts. Subscribing to body/imu
+        # ourselves removes the race; we feed the tracker on _on_imu
+        # and query it directly on each predict.
+        self._imu_tracker = ImuYawTracker()
 
         self._pf_lock = threading.RLock()
+        # Lock around the scan-rate gate. Without it, multiple zenoh
+        # threads can race past the "elapsed >= period" check while
+        # the previous callback is still inside the 400 ms scan-match.
+        # The first live trace logged scan records 100 ms apart for
+        # this reason.
+        self._scan_rate_lock = threading.Lock()
         self._subs: List[Any] = []
         self._trace_fp: Optional[TextIO] = None
         self._trace_pending = 0
-        # (ts, x_w, y_w, θ_w) — last world-frame pose seen on odom.
-        self._last_pose: Optional[Tuple[float, float, float, float]] = None
+        # (ts, x_o, y_o, θ_o) — last raw odom-frame sample. We integrate
+        # in odom frame and apply the seed-time world offset; this avoids
+        # any dependency on production's pose buffer being current.
+        self._last_odom: Optional[Tuple[float, float, float, float]] = None
+        # Seed bookkeeping. The seed needs both a world-frame pose
+        # snapshot (from production at seed-ts) and an IMU yaw reading
+        # (from our tracker at seed-ts) so the filter is anchored
+        # consistently in world frame.
         self._seeded = False
+        self._yaw_offset: Optional[float] = None  # imu_yaw_seed - world_yaw_seed
         self._last_scan_mono: float = 0.0
 
         self._counters: Dict[str, int] = {
             "odom_received": 0,
             "odom_malformed": 0,
             "predicts_run": 0,
-            "predicts_skipped_no_pose": 0,
+            "predicts_skipped_no_seed": 0,
+            "imu_received": 0,
+            "imu_malformed": 0,
             "teleports_detected": 0,
             "scan_received": 0,
             "scan_malformed": 0,
             "scan_obs_run": 0,
             "scan_obs_skipped_rate_limit": 0,
             "scan_obs_skipped_sparse_grid": 0,
+            "scan_obs_skipped_no_seed": 0,
             "resamples_fired": 0,
             "trace_records_written": 0,
         }
@@ -148,11 +179,15 @@ class ShadowParticleFilterDriver:
             self._session.declare_subscriber(self.ODOM_TOPIC, self._on_odom),
         )
         self._subs.append(
+            self._session.declare_subscriber(self.IMU_TOPIC, self._on_imu),
+        )
+        self._subs.append(
             self._session.declare_subscriber(self.SCAN_TOPIC, self._on_scan),
         )
         logger.info(
-            "shadow_pf: subscribed to %s + %s, trace=%s",
-            self.ODOM_TOPIC, self.SCAN_TOPIC, self._trace_path,
+            "shadow_pf: subscribed to %s + %s + %s, trace=%s, scan_hz=%.2f",
+            self.ODOM_TOPIC, self.IMU_TOPIC, self.SCAN_TOPIC,
+            self._trace_path, self._config.scan_hz,
         )
 
     def disconnect(self) -> None:
@@ -183,6 +218,19 @@ class ShadowParticleFilterDriver:
         except AttributeError:
             return bytes(sample.payload)
 
+    def _on_imu(self, sample: Any) -> None:
+        self._counters["imu_received"] += 1
+        try:
+            msg = json.loads(self._payload_bytes(sample).decode("utf-8"))
+        except Exception:
+            self._counters["imu_malformed"] += 1
+            return
+        reading = ImuReading.from_payload(msg)
+        if reading is None:
+            self._counters["imu_malformed"] += 1
+            return
+        self._imu_tracker.update(reading)
+
     def _on_odom(self, sample: Any) -> None:
         self._counters["odom_received"] += 1
         try:
@@ -192,74 +240,100 @@ class ShadowParticleFilterDriver:
             return
 
         ts = float(msg.get("ts") or time.time())
-
-        # Pull the IMU-corrected world pose from the production source.
-        # pose_at uses the production's IMU yaw substitution, which is
-        # exactly the yaw observation we want to integrate.
-        pose_at = self._pose_source.pose_at(ts)
-        if pose_at is None:
-            self._counters["predicts_skipped_no_pose"] += 1
+        try:
+            x_o = float(msg["x"])
+            y_o = float(msg["y"])
+            th_o = float(msg["theta"])
+        except (KeyError, TypeError, ValueError):
+            self._counters["odom_malformed"] += 1
             return
-        x_w, y_w, th_w = pose_at
 
         with self._pf_lock:
             if not self._seeded:
+                # Seeding requires three things at the same ts:
+                #   (a) a raw odom sample — have it
+                #   (b) production's world pose at ts (for the world
+                #       offset and the comparison anchor)
+                #   (c) IMU yaw at ts (to capture yaw_offset)
+                # If (b) or (c) aren't ready yet (subscriber buffers
+                # still warming up, or IMU tracker still settling),
+                # defer the seed. The fuser doesn't read this driver's
+                # output, so deferring is harmless.
+                world = self._pose_source.pose_at(ts)
+                imu = self._imu_tracker.yaw_at(ts)
+                if world is None or imu is None:
+                    self._counters["predicts_skipped_no_seed"] += 1
+                    return
+                x_w, y_w, th_w = world
+                imu_yaw, _imu_sigma = imu
+                self._yaw_offset = _wrap(imu_yaw - th_w)
                 self._pf.seed_at(x_w, y_w, th_w)
-                self._last_pose = (ts, x_w, y_w, th_w)
+                self._last_odom = (ts, x_o, y_o, th_o)
                 self._seeded = True
                 logger.info(
-                    "shadow_pf: seeded at (%+.2f, %+.2f, %+.1f°)",
+                    "shadow_pf: seeded at world (%+.2f, %+.2f, %+.1f°), "
+                    "yaw_offset=%+.1f°",
                     x_w, y_w, math.degrees(th_w),
+                    math.degrees(self._yaw_offset),
                 )
                 return
 
-            assert self._last_pose is not None  # for the type-checker
-            _last_ts, last_x, last_y, last_th = self._last_pose
-            dx = x_w - last_x
-            dy = y_w - last_y
-            dth = _wrap(th_w - last_th)
+            assert self._last_odom is not None  # for the type-checker
+            _last_ts, last_xo, last_yo, last_tho = self._last_odom
+            dx = x_o - last_xo
+            dy = y_o - last_yo
+            dth = _wrap(th_o - last_tho)
 
             if (math.hypot(dx, dy) > self._config.teleport_distance_m
                     or abs(dth) > self._config.teleport_rotation_rad):
-                # Production rebound the world frame (or a stale buffer
-                # was filled in late). Re-seed; don't try to absorb a
-                # 1 m / 90° jump through the motion model.
+                # The Pi's odom integration shouldn't produce jumps this
+                # large at 50 Hz. Treat as a glitch — log and skip.
                 logger.info(
-                    "shadow_pf: teleport detected dist=%.2f m dθ=%.1f° → reseed",
+                    "shadow_pf: odom teleport detected dist=%.2f m dθ=%.1f° "
+                    "→ skip this step (cloud unchanged)",
                     math.hypot(dx, dy), math.degrees(dth),
                 )
                 self._counters["teleports_detected"] += 1
-                self._pf.seed_at(x_w, y_w, th_w)
-                self._last_pose = (ts, x_w, y_w, th_w)
+                self._last_odom = (ts, x_o, y_o, th_o)
                 return
 
-            # Project (dx, dy) onto the midpoint heading to recover the
-            # signed forward displacement Δs. Diff-drive cannot move
-            # laterally, so this projection is lossless modulo the small
-            # arc-vs-chord term that the motion model's σ floor absorbs.
-            th_mid = last_th + 0.5 * dth
+            # Δs is the signed body-frame forward displacement, frame-
+            # invariant — same in odom and world frames since they
+            # differ by a constant rigid transform. Projected on the
+            # midpoint heading in odom frame.
+            th_mid = last_tho + 0.5 * dth
             ds = dx * math.cos(th_mid) + dy * math.sin(th_mid)
 
             self._pf.predict(ds, dth)
-            # Treat the production world yaw as the IMU observation.
-            # In Phase 2 we're consuming production's already-fused yaw
-            # rather than raw BNO085 — keeps the comparison apples-to-
-            # apples. Decoupling and going to raw IMU is a later experiment.
-            self._pf.observe_imu_yaw(th_w)
+            # IMU observation: convert raw IMU yaw to world frame via
+            # the seed-time offset. tracker.yaw_at returns (yaw, σ);
+            # use σ as the observation σ floor so the obs auto-relaxes
+            # when the IMU tracker reports lower confidence.
+            imu = self._imu_tracker.yaw_at(ts)
+            if imu is not None and self._yaw_offset is not None:
+                imu_yaw, imu_sigma = imu
+                world_yaw = _wrap(imu_yaw - self._yaw_offset)
+                self._pf.observe_imu_yaw(
+                    world_yaw, sigma_rad=max(imu_sigma, 1e-4),
+                )
 
             self._counters["predicts_run"] += 1
-            self._last_pose = (ts, x_w, y_w, th_w)
+            self._last_odom = (ts, x_o, y_o, th_o)
 
     def _on_scan(self, sample: Any) -> None:
         self._counters["scan_received"] += 1
 
-        # Rate-limit before decode.
-        now_mono = time.monotonic()
-        min_period = 1.0 / max(0.1, self._config.scan_hz)
-        if now_mono - self._last_scan_mono < min_period:
-            self._counters["scan_obs_skipped_rate_limit"] += 1
-            return
-        self._last_scan_mono = now_mono
+        # Rate-limit before decode. Locked so simultaneous zenoh threads
+        # can't both pass the gate while a previous callback is still
+        # inside the 400 ms scan-match — the first live trace logged
+        # records 100 ms apart for exactly this reason.
+        with self._scan_rate_lock:
+            now_mono = time.monotonic()
+            min_period = 1.0 / max(0.1, self._config.scan_hz)
+            if now_mono - self._last_scan_mono < min_period:
+                self._counters["scan_obs_skipped_rate_limit"] += 1
+                return
+            self._last_scan_mono = now_mono
 
         try:
             msg = json.loads(self._payload_bytes(sample).decode("utf-8"))
@@ -278,6 +352,7 @@ class ShadowParticleFilterDriver:
         with self._pf_lock:
             if not self._seeded:
                 # Wait for the first odom to seed us.
+                self._counters["scan_obs_skipped_no_seed"] += 1
                 return
             posterior = self._pf.posterior_mean()
         prior_pose = Pose2D(*posterior)

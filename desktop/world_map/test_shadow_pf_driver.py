@@ -93,9 +93,43 @@ class _MockPoseSource:
         return (nearest[1], nearest[2], nearest[3])
 
 
-def _odom_sample(ts: float) -> _MockSample:
-    payload = json.dumps({"ts": ts}).encode("utf-8")
+def _odom_sample(
+    ts: float, x: float = 0.0, y: float = 0.0, theta: float = 0.0,
+) -> _MockSample:
+    payload = json.dumps({"ts": ts, "x": x, "y": y, "theta": theta}).encode("utf-8")
     return _MockSample(payload)
+
+
+def _imu_sample(ts: float, yaw_rad: float = 0.0) -> _MockSample:
+    """Synthetic body/imu message — quaternion encoding world-frame
+    yaw, GAME_ROTATION_VECTOR mode with the BNO085's default accuracy
+    so ImuYawTracker settles after min_settle_samples (default 20).
+    """
+    half = yaw_rad * 0.5
+    payload = json.dumps({
+        "ts": ts,
+        "gyro": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "orientation": {
+            "w": math.cos(half), "x": 0.0, "y": 0.0, "z": math.sin(half),
+        },
+        "fusion": {
+            "mode": "game_rotation_vector",
+            "accuracy_rad": 0.05,  # below the tracker's settle floor
+        },
+    }).encode("utf-8")
+    return _MockSample(payload)
+
+
+def _settle_imu(driver_session, until_ts: float, yaw_rad: float = 0.0,
+                n_samples: int = 25) -> None:
+    """Feed n_samples evenly-spaced IMU readings ending at until_ts so
+    ImuYawTracker.yaw_at(until_ts) returns a settled reading.
+    """
+    cb = driver_session.subs["body/imu"]
+    dt = 0.005
+    ts0 = until_ts - (n_samples - 1) * dt
+    for i in range(n_samples):
+        cb(_imu_sample(ts0 + i * dt, yaw_rad))
 
 
 def _scan_sample(
@@ -142,10 +176,11 @@ class TestShadowPfDriverFlow(unittest.TestCase):
         driver.connect()
         return driver, session, pose_source
 
-    def test_connect_subscribes_to_both_topics(self):
+    def test_connect_subscribes_to_all_three_topics(self):
         driver, session, _ = self._build()
         try:
             self.assertIn("body/odom", session.subs)
+            self.assertIn("body/imu", session.subs)
             self.assertIn("body/lidar/scan", session.subs)
         finally:
             driver.disconnect()
@@ -153,27 +188,31 @@ class TestShadowPfDriverFlow(unittest.TestCase):
     def test_odom_seed_then_predict(self):
         driver, session, pose_source = self._build()
         try:
+            _settle_imu(session, until_ts=1000.0, yaw_rad=0.0)
             pose_source.push(1000.0, 0.0, 0.0, 0.0)
-            session.subs["body/odom"](_odom_sample(1000.0))
+            session.subs["body/odom"](_odom_sample(1000.0, 0.0, 0.0, 0.0))
             self.assertEqual(driver.counters()["odom_received"], 1)
             # First sample seeds; no predict yet.
             self.assertEqual(driver.counters()["predicts_run"], 0)
 
             # Second sample at +10 cm forward — drives a predict.
-            pose_source.push(1000.02, 0.10, 0.0, 0.0)
-            session.subs["body/odom"](_odom_sample(1000.02))
+            _settle_imu(session, until_ts=1000.02, yaw_rad=0.0)
+            session.subs["body/odom"](_odom_sample(1000.02, 0.10, 0.0, 0.0))
             self.assertEqual(driver.counters()["predicts_run"], 1)
         finally:
             driver.disconnect()
 
-    def test_teleport_detection_reseeds(self):
+    def test_teleport_detection_skips_step(self):
         driver, session, pose_source = self._build()
         try:
+            _settle_imu(session, until_ts=1000.0, yaw_rad=0.0)
             pose_source.push(1000.0, 0.0, 0.0, 0.0)
-            session.subs["body/odom"](_odom_sample(1000.0))
-            # Next sample jumps 2 m — well past the 0.5 m threshold.
-            pose_source.push(1000.02, 2.0, 0.0, 0.0)
-            session.subs["body/odom"](_odom_sample(1000.02))
+            session.subs["body/odom"](_odom_sample(1000.0, 0.0, 0.0, 0.0))
+            # Next sample jumps 2 m in raw odom — well past the 0.5 m
+            # threshold. Driver counts it and skips the predict; raw
+            # odom shouldn't ever produce a jump that big at 50 Hz.
+            _settle_imu(session, until_ts=1000.02, yaw_rad=0.0)
+            session.subs["body/odom"](_odom_sample(1000.02, 2.0, 0.0, 0.0))
             self.assertEqual(driver.counters()["teleports_detected"], 1)
             self.assertEqual(driver.counters()["predicts_run"], 0)
         finally:
@@ -182,9 +221,10 @@ class TestShadowPfDriverFlow(unittest.TestCase):
     def test_scan_observation_writes_trace_record(self):
         driver, session, pose_source = self._build()
         try:
-            # Seed via odom, then deliver a scan.
+            # Seed via odom (need IMU settled + production pose at ts).
+            _settle_imu(session, until_ts=1000.0, yaw_rad=0.0)
             pose_source.push(1000.0, 0.0, 0.0, 0.0)
-            session.subs["body/odom"](_odom_sample(1000.0))
+            session.subs["body/odom"](_odom_sample(1000.0, 0.0, 0.0, 0.0))
             pose_source.push(1000.5, 0.0, 0.0, 0.0)
             session.subs["body/lidar/scan"](_scan_sample(1000.5))
             self.assertEqual(driver.counters()["scan_obs_run"], 1)
@@ -223,6 +263,23 @@ class TestShadowPfDriverFlow(unittest.TestCase):
             # Garbage payload — driver should swallow and move on.
             session.subs["body/odom"](_MockSample(b"\x00not-json"))
             self.assertEqual(driver.counters()["odom_malformed"], 1)
+        finally:
+            driver.disconnect()
+
+    def test_seed_deferred_until_imu_and_pose_ready(self):
+        driver, session, pose_source = self._build()
+        try:
+            # IMU not settled yet → odom arrives but seed deferred.
+            pose_source.push(1000.0, 0.0, 0.0, 0.0)
+            session.subs["body/odom"](_odom_sample(1000.0, 0.0, 0.0, 0.0))
+            self.assertEqual(driver.counters()["predicts_skipped_no_seed"], 1)
+
+            # After IMU settles, the next odom seeds.
+            _settle_imu(session, until_ts=1000.5, yaw_rad=0.0)
+            session.subs["body/odom"](_odom_sample(1000.5, 0.0, 0.0, 0.0))
+            # Seeded but no predict (this was the seed itself).
+            self.assertEqual(driver.counters()["predicts_run"], 0)
+            self.assertEqual(driver.counters()["odom_received"], 2)
         finally:
             driver.disconnect()
 
