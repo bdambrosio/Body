@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class Pose2D:
@@ -99,6 +101,31 @@ class ImuReading:
 
 
 @dataclass(frozen=True)
+class ScoreField:
+    """Per-candidate correlation score grid from a scan-match search.
+
+    Indexed as ``field[ix, iy, ith]``; the candidate pose at that cell is
+
+        (prior.x + dx_axis[ix],
+         prior.y + dy_axis[iy],
+         prior.theta + dth_axis[ith]).
+
+    Scores are raw correlation sums in evidence units — *not* normalized
+    to probabilities. The particle filter treats them as log-likelihood
+    up to an additive constant: only ratios between cells matter, so the
+    overall offset cancels in importance-weight normalization.
+
+    Frame: indexed by delta-from-prior in the world frame. Two callers
+    with different priors can share one field as long as their priors
+    both sit inside the search window.
+    """
+    field: "np.ndarray"      # (Nx, Ny, Nth) float32
+    dx_axis: "np.ndarray"    # (Nx,) float64, world-frame x delta
+    dy_axis: "np.ndarray"    # (Ny,) float64, world-frame y delta
+    dth_axis: "np.ndarray"   # (Nth,) float64, theta delta (rad)
+
+
+@dataclass(frozen=True)
 class ScanMatchResult:
     """Output of ScanMatcher.search.
 
@@ -110,6 +137,8 @@ class ScanMatchResult:
     - accepted: True iff improvement cleared the confidence gate.
     - search_exhausted: True iff the best candidate was at the edge of
       the search window (prior was too far off; window should grow).
+    - score_field: full (Nx, Ny, Nth) score grid + axes. Populated only
+      when search() was called with return_field=True.
     """
     pose: Pose2D
     score: float
@@ -117,6 +146,7 @@ class ScanMatchResult:
     improvement: float
     accepted: bool
     search_exhausted: bool
+    score_field: Optional[ScoreField] = None
 
 
 def _wrap(a: float) -> float:

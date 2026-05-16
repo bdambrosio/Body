@@ -551,6 +551,23 @@ just ship the divergence.
   drift ≈ 0). Side-effect: wheel_base_m calibration bug found and
   fixed (0.190 → 0.181 m); same root cause as the sweep rotation
   overshoot. Ready for Phase 1.
+- **2026-05-16:** Phase 1 complete. `ScanMatcher.search` gained a
+  `return_field=True` kwarg; result carries an optional
+  `ScoreField(field, dx_axis, dy_axis, dth_axis)` of dtype float32,
+  indexed by delta-from-prior. `likelihood_at(dx, dy, dth, field)`
+  helper does trilinear interp. Argmax-path is bit-for-bit unchanged
+  when the flag is off (regression test asserts this). Demo script
+  `scripts/phase1_likelihood_field_demo.py` plots corridor / open-room
+  / symmetric-room scenes — the symmetric (4×4 m) square exposes a
+  4-peak dθ marginal at 0°/±90°/±180°, exactly the basin a point
+  estimate would silently collapse. Phase 1 open-question decisions
+  for the PR record: (a) normalization deferred — raw correlation
+  scores returned as log-likelihood up to additive constant, particle
+  filter (Phase 2) normalizes via importance weights; (b) coord frame
+  indexed by delta-from-prior in world frame (lets a filter share one
+  field across particles whose priors sit inside the window); (c)
+  preallocated-buffer micro-optimization deferred — current ~6 KB
+  field allocation per scan is fine at 1–10 Hz.
 
 ---
 
