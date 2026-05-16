@@ -74,10 +74,23 @@ class ParticleFilterConfig:
     alpha_rot_per_m: float = ALPHA_ROT_PER_M
     alpha_rot_per_rad: float = ALPHA_ROT_PER_RAD
 
-    # IMU yaw observation σ (per single measurement). Drift rate from
-    # Phase 0 was ≈ 0; consumers can pass a wider σ at the call site if
-    # they're integrating over an interval where drift is non-negligible.
-    imu_sigma_rad: float = IMU_SIGMA_PER_SAMPLE_RAD
+    # IMU yaw observation σ. Default is *not* the Phase 0 per-sample
+    # noise (1.23 mrad ≈ 0.07°) directly — that value assumes
+    # independent samples, and the shadow driver observes at 50 Hz
+    # (every odom tick) while BNO085 gyro samples are correlated over
+    # several samples. Treating them as independent at 50 Hz over-counts
+    # the information: effective constraint after 1 s would be
+    # 1.23/√50 ≈ 0.17 mrad, which is absurdly tight and risks cloud
+    # collapse.
+    #
+    # 5 mrad (0.3°) is a defensible compromise — loose enough to absorb
+    # the correlation, tight enough that the cloud's θ converges within
+    # ~1° over a few seconds. Tunable based on what live traces show.
+    # The Phase 0 measurement is preserved as IMU_SIGMA_PER_SAMPLE_RAD
+    # at module top; callers integrating over a longer effective
+    # window (e.g. one observation per scan tick) should pass that
+    # value explicitly.
+    imu_sigma_rad: float = 5.0e-3
 
     # Per-step floor on motion-noise σ. Without this, zero-motion ticks
     # add zero noise and the cloud freezes — the "particle deprivation"
