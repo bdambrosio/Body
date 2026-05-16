@@ -666,6 +666,12 @@ class NavMainWindow(QMainWindow):
 
         # SLAM health: pose-unavailable streak (≥10 = sticky note set)
         # plus cumulative scan-match correction since session reset.
+        # Labelled "corr=" (matches PoseSource.correction_summary API)
+        # not "drift=" — for ImuPlusScanMatchPose this *is* cumulative
+        # snap distance, but for ParticleFilterPoseSource it's the sum
+        # of per-match |argmax − prior|, of which the filter only
+        # applies a fractional Bayesian reweight to its posterior. The
+        # label has to be honest for both.
         unavail = int(st.get("pose_unavail_streak") or 0)
         corr = st.get("correction_summary") or {}
         corr_m = float(corr.get("total_m") or 0.0)
@@ -673,7 +679,7 @@ class NavMainWindow(QMainWindow):
         n_corr = int(corr.get("n_applied") or 0)
         self._slam_lbl.setText(
             f"slam: lost={unavail:>2d}  "
-            f"drift={corr_m:>5.2f}m/{corr_deg:>+5.0f}°  "
+            f"corr={corr_m:>5.2f}m/{corr_deg:>+5.0f}°  "
             f"n={n_corr:>3d}"
         )
         if unavail >= 10:
