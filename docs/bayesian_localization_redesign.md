@@ -499,3 +499,7 @@ just ship the divergence.
 ## 9. Status log
 
 - **2026-05-15:** Document drafted. Phase 0 pending.
+- **2026-05-15:** Phase 0 kickoff. Analysis tooling shipped:
+  `scripts/phase0_imu_stationary.py` and `scripts/phase0_odom_drive.py`.
+  Procedure + result template at `docs/noise_models.md`. No Pi-side
+  changes. Awaiting Bruce's experiment runs A/B/C.
