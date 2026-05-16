@@ -47,6 +47,22 @@ ALPHA_ROT_PER_RAD: float = 0.01        # α_4 — rotation σ from |Δθ|
 IMU_SIGMA_PER_SAMPLE_RAD: float = 1.23e-3  # BNO085 game_rotation_vector
 
 
+@dataclass(frozen=True)
+class FilterDiagnostics:
+    """Snapshot of filter health, written per-step into the trace.
+
+    All fields are plain floats so the struct serializes trivially to
+    JSON for Phase 2.4's shadow-mode artifact.
+    """
+    n_eff: float
+    max_weight: float
+    weight_entropy: float       # Σ -wᵢ log wᵢ, nats. Max = log N (uniform).
+    std_x: float                # weighted, world frame, meters
+    std_y: float
+    std_theta: float            # rad, computed from circular-mean residuals
+    resampled: bool             # True if a resample happened this step
+
+
 @dataclass
 class ParticleFilterConfig:
     # Particle count. Plan §3 Phase 2 calls for 1000–2000 on CPU.
@@ -83,6 +99,14 @@ class ParticleFilterConfig:
     # sessions; float32 is fine for log_weights (only ratios matter).
     state_dtype: torch.dtype = torch.float64
     weight_dtype: torch.dtype = torch.float32
+
+    # Resampling threshold: gate fires when N_eff < threshold * N.
+    # Default N/2 follows the AMCL / Probabilistic Robotics convention.
+    # Resampling less often is a *feature* — it preserves cloud
+    # diversity. Lower this if you observe runaway diversity loss in
+    # the shadow-mode trace; raise it if particles drift in informative
+    # regions.
+    resample_n_eff_ratio: float = 0.5
 
     # Deterministic seed for reproducible tests. None = nondeterministic.
     seed: Optional[int] = None
@@ -413,6 +437,126 @@ class ParticleFilterPose:
         """
         w = self.normalized_weights()
         return float(1.0 / (w * w).sum())
+
+    def posterior_cov(self) -> torch.Tensor:
+        """Weighted 3×3 SE(2) covariance Σ.
+
+        Σ_ij = Σ_p w_p · (R_p,i)(R_p,j) where R_p = (x_p − x̄, y_p − ȳ,
+        wrap(θ_p − θ̄)). θ residuals use the wrap-aware circular mean
+        from `posterior_mean`; the linearization fails for clouds
+        spread over more than ~45° in θ, but at that spread the bot is
+        more confused than any 3×3 Gaussian could honestly convey.
+
+        Returned tensor lives on cfg.device with cfg.state_dtype.
+        """
+        self._require_seeded()
+        assert self._state is not None
+        w = self.normalized_weights().to(self.cfg.state_dtype)
+        mean_x, mean_y, mean_th = self.posterior_mean()
+        res = torch.stack(
+            [
+                self._state[:, 0] - mean_x,
+                self._state[:, 1] - mean_y,
+                _wrap_torch(self._state[:, 2] - mean_th),
+            ],
+            dim=-1,
+        )  # (P, 3)
+        # einsum is the natural form for Σ_ij = Σ_p w_p R_pi R_pj.
+        # einops doesn't replace einsum here — torch.einsum already
+        # carries the named-axis story in its index string.
+        return torch.einsum("p,pi,pj->ij", w, res, res)
+
+    def diagnostics(self, resampled: bool = False) -> FilterDiagnostics:
+        """Snapshot the current filter health.
+
+        Pass ``resampled=True`` after a resample step so the trace
+        records whether this step's posterior is pre- or post-resample.
+        Cheap; safe to call every step.
+        """
+        self._require_seeded()
+        assert self._state is not None and self._log_w is not None
+        w = self.normalized_weights()
+        w64 = w.to(torch.float64)
+        # -Σ w log w. Drop the 0 log 0 = 0 edge cases by clamping.
+        entropy = float((-w64 * torch.log(w64.clamp(min=1e-300))).sum())
+        cov = self.posterior_cov()
+        return FilterDiagnostics(
+            n_eff=float(1.0 / (w * w).sum()),
+            max_weight=float(w.max()),
+            weight_entropy=entropy,
+            std_x=float(cov[0, 0].clamp(min=0.0).sqrt()),
+            std_y=float(cov[1, 1].clamp(min=0.0).sqrt()),
+            std_theta=float(cov[2, 2].clamp(min=0.0).sqrt()),
+            resampled=resampled,
+        )
+
+    # ── Resampling ────────────────────────────────────────────────────
+
+    def resample(self) -> None:
+        """Systematic (low-variance) resampling.
+
+        One uniform draw u₀ ~ U(0, 1/N) followed by N evenly-spaced
+        offsets u₀ + i/N (i = 0..N-1) and a single ``searchsorted`` over
+        the cumulative weight vector. Same expected count per particle
+        as multinomial (E[count_i] = N·wᵢ) but the variance is N times
+        lower — there's effectively no reason to prefer multinomial.
+
+        Diversity note: every resample step replaces low-weight particles
+        with duplicates of high-weight ones — that's where most diversity
+        loss happens. Resampling unconditionally would crush the cloud
+        in flat regions where each observation barely reweights anything.
+        Hence the N_eff gate in ``maybe_resample``; call this directly
+        only if you want unconditional behavior.
+
+        After resampling, log_weights are reset to uniform (-log N) and
+        the (predict, observe) cycle resumes against the new cloud.
+        """
+        self._require_seeded()
+        assert self._state is not None and self._log_w is not None
+        P = self.cfg.n_particles
+
+        # Cumulative weights in float64 — float32 cumsum at P=1000+
+        # accumulates rounding error that can push the last bin past 1.
+        w = self.normalized_weights().to(torch.float64)
+        cum = torch.cumsum(w, dim=0)
+        # Force the last bin to exactly 1.0 so searchsorted's binary
+        # search never falls past the end due to fp slop.
+        cum[-1] = 1.0
+
+        # Draw u₀ from the same generator as the rest of the filter so
+        # the seed reproduces.
+        u0 = torch.rand(
+            1, generator=self._gen, device=self.cfg.device,
+            dtype=torch.float64,
+        ).item()
+        u0 = u0 / P
+        positions = (
+            u0 + torch.arange(P, device=self.cfg.device, dtype=torch.float64) / P
+        )
+        indices = torch.searchsorted(cum, positions).clamp(max=P - 1)
+
+        # Advanced indexing copies — explicit clone for clarity / to
+        # be robust against any future torch behavior change.
+        self._state = self._state[indices].clone()
+        self._log_w = torch.full(
+            (P,), -math.log(P),
+            dtype=self.cfg.weight_dtype, device=self.cfg.device,
+        )
+
+    def maybe_resample(self) -> bool:
+        """Resample only if N_eff drops below ``resample_n_eff_ratio·N``.
+
+        Returns True if a resample happened. Default ratio is 0.5
+        (AMCL convention). Skipping resampling on "weak" observations
+        is the dominant diversity-preservation mechanism — most weight
+        loss is gradual and the cloud can absorb several mild updates
+        before consolidating.
+        """
+        threshold = self.cfg.resample_n_eff_ratio * self.cfg.n_particles
+        if self.n_eff() >= threshold:
+            return False
+        self.resample()
+        return True
 
     def posterior_mean(self) -> Tuple[float, float, float]:
         """Weighted mean of the particle cloud as (x, y, θ).

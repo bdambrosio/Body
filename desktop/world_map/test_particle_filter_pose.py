@@ -26,6 +26,7 @@ from desktop.nav.slam.scan_matcher import likelihood_at
 from desktop.nav.slam.types import Pose2D, ScoreField
 
 from .particle_filter_pose import (
+    FilterDiagnostics,
     ParticleFilterConfig,
     ParticleFilterPose,
     _wrap_torch,
@@ -371,6 +372,158 @@ class TestScanLikelihoodUpdate(unittest.TestCase):
         # of an all-zero score array → falls back to floor 1 → 0/1 = 0.
         # Net effect: log-weights unchanged.
         self.assertTrue(torch.allclose(pf.log_weights, log_w_before))
+
+
+class TestResampling(unittest.TestCase):
+    def test_uniform_resample_is_near_identity_in_distribution(self):
+        # With uniform weights, systematic resampling is essentially a
+        # permutation — each particle gets one expected copy. The
+        # weighted mean should not move (within sampling noise).
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=2000,
+            init_sigma_xy_m=0.10,
+            init_sigma_theta_rad=math.radians(5.0),
+            seed=200,
+        ))
+        pf.seed_at(0.5, -0.3, math.radians(15.0))
+        mx0, my0, mth0 = pf.posterior_mean()
+        pf.resample()
+        mx1, my1, mth1 = pf.posterior_mean()
+        self.assertAlmostEqual(mx1, mx0, places=3)
+        self.assertAlmostEqual(my1, my0, places=3)
+        self.assertAlmostEqual(mth1, mth0, places=3)
+
+    def test_resample_resets_log_weights_to_uniform(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=500, init_sigma_xy_m=0.05,
+            init_sigma_theta_rad=math.radians(3.0), seed=201,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        # Bias weights so resample has work to do.
+        pf.observe_imu_yaw(world_yaw=math.radians(0.0), sigma_rad=math.radians(1.0))
+        self.assertLess(pf.n_eff(), 500.0)
+        pf.resample()
+        self.assertAlmostEqual(pf.n_eff(), 500.0, places=2)
+        # All log-weights equal -log(N).
+        self.assertTrue(
+            torch.allclose(
+                pf.log_weights,
+                torch.full_like(pf.log_weights, -math.log(500)),
+                atol=1e-5,
+            )
+        )
+
+    def test_resample_concentrates_around_observation_peak(self):
+        # Drive the cloud with a sharp observation at +5°, then resample.
+        # Post-resample particles should cluster around +5°.
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=2000,
+            init_sigma_xy_m=0.001,
+            init_sigma_theta_rad=math.radians(10.0),
+            imu_sigma_rad=math.radians(0.5),
+            seed=202,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        pf.observe_imu_yaw(world_yaw=math.radians(5.0))
+        pf.resample()
+        # Post-resample θ std should be much smaller than the seed σ.
+        std_th = float(pf.state[:, 2].std())
+        self.assertLess(std_th, math.radians(2.0))
+        # And the mean θ near +5°.
+        _, _, theta = pf.posterior_mean()
+        self.assertAlmostEqual(theta, math.radians(5.0), delta=math.radians(0.5))
+
+    def test_maybe_resample_skips_when_n_eff_high(self):
+        # Uniform-ish weights → no resample fires.
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=1000, init_sigma_xy_m=0.02, seed=203,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        fired = pf.maybe_resample()
+        self.assertFalse(fired)
+
+    def test_maybe_resample_fires_when_n_eff_low(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=1000,
+            init_sigma_theta_rad=math.radians(10.0),
+            imu_sigma_rad=math.radians(0.5),
+            seed=204,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        pf.observe_imu_yaw(world_yaw=0.0)
+        # That sharp observation pushes N_eff < N/2.
+        self.assertLess(pf.n_eff(), 500.0)
+        fired = pf.maybe_resample()
+        self.assertTrue(fired)
+
+
+class TestPosteriorCov(unittest.TestCase):
+    def test_cov_matches_init_sigma(self):
+        # Uniform weights, isotropic Gaussian seed cloud → diagonal cov
+        # with σ_x = σ_y = init_sigma, σ_θ = init_sigma_theta.
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=5000,
+            init_sigma_xy_m=0.08,
+            init_sigma_theta_rad=math.radians(3.0),
+            seed=300,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        cov = pf.posterior_cov()
+        # Standard error on σ² estimate at N=5000 ≈ σ²·sqrt(2/N) ≈ 2%.
+        self.assertAlmostEqual(float(cov[0, 0].sqrt()), 0.08, delta=0.005)
+        self.assertAlmostEqual(float(cov[1, 1].sqrt()), 0.08, delta=0.005)
+        self.assertAlmostEqual(
+            float(cov[2, 2].sqrt()), math.radians(3.0),
+            delta=math.radians(0.3),
+        )
+        # Off-diagonals near zero — seed components are independent.
+        self.assertLess(abs(float(cov[0, 1])), 5e-4)
+        self.assertLess(abs(float(cov[0, 2])), 5e-4)
+        self.assertLess(abs(float(cov[1, 2])), 5e-4)
+
+    def test_cov_shrinks_after_observation(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=2000,
+            init_sigma_theta_rad=math.radians(8.0),
+            imu_sigma_rad=math.radians(1.0),
+            seed=301,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        std0 = float(pf.posterior_cov()[2, 2].sqrt())
+        pf.observe_imu_yaw(world_yaw=0.0)
+        std1 = float(pf.posterior_cov()[2, 2].sqrt())
+        self.assertLess(std1, std0 * 0.5)
+
+
+class TestDiagnostics(unittest.TestCase):
+    def test_diagnostics_uniform_weights(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=1000, init_sigma_xy_m=0.05, seed=400,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        d = pf.diagnostics()
+        self.assertIsInstance(d, FilterDiagnostics)
+        self.assertAlmostEqual(d.n_eff, 1000.0, places=2)
+        # Uniform: max_weight = 1/N, entropy = log N.
+        self.assertAlmostEqual(d.max_weight, 1.0 / 1000.0, places=5)
+        self.assertAlmostEqual(d.weight_entropy, math.log(1000.0), places=4)
+        self.assertFalse(d.resampled)
+
+    def test_diagnostics_after_observation(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=1000,
+            init_sigma_theta_rad=math.radians(8.0),
+            imu_sigma_rad=math.radians(1.0),
+            seed=401,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        pf.observe_imu_yaw(world_yaw=0.0)
+        d = pf.diagnostics()
+        # N_eff dropped; entropy below max.
+        self.assertLess(d.n_eff, 1000.0)
+        self.assertLess(d.weight_entropy, math.log(1000.0))
+        self.assertGreater(d.max_weight, 1.0 / 1000.0)
+        self.assertGreater(d.std_x, 0.0)
 
 
 if __name__ == "__main__":
