@@ -111,6 +111,22 @@ class ParticleFilterConfig:
     # peaky for realistic correlation scores.
     scan_temperature_log_ratio: float = 5.0
 
+    # Post-resample roughening: small Gaussian jitter added to every
+    # particle immediately after the systematic resample step. Without
+    # it, the cloud after resample is a handful of distinct points each
+    # replicated many times (Gordon 1993's "particle degeneracy"); the
+    # motion model's σ floor takes many predict steps to restore
+    # diversity, and a strong observation in between can collapse the
+    # cloud onto the wrong mode before it gets the chance.
+    #
+    # Defaults sized just below the natural between-resample drift the
+    # σ floor accumulates over a typical scan interval (~12 odom steps
+    # at 50 Hz, 250 ms): √12 · σ_floor ≈ 3.5 mm and 0.02° — so the
+    # roughening adds about one resample interval's worth of "natural"
+    # cloud growth back in. Configurable; set to 0 to disable.
+    roughening_xy_m: float = 0.002          # 2 mm per axis
+    roughening_theta_rad: float = math.radians(0.015)
+
     # Resampling threshold: gate fires when N_eff < threshold * N.
     # Default N/2 follows the AMCL / Probabilistic Robotics convention.
     # Resampling less often is a *feature* — it preserves cloud
@@ -553,6 +569,23 @@ class ParticleFilterPose:
         # Advanced indexing copies — explicit clone for clarity / to
         # be robust against any future torch behavior change.
         self._state = self._state[indices].clone()
+
+        # Roughening: small Gaussian jitter on every dim so post-
+        # resample particles aren't bit-identical duplicates. Skips
+        # the noise draw entirely when both factors are zero so the
+        # disabled case has zero runtime cost.
+        rx = self.cfg.roughening_xy_m
+        rth = self.cfg.roughening_theta_rad
+        if rx > 0.0 or rth > 0.0:
+            jitter = self._randn((P, 3))
+            if rx > 0.0:
+                self._state[:, 0] += rx * jitter[:, 0]
+                self._state[:, 1] += rx * jitter[:, 1]
+            if rth > 0.0:
+                self._state[:, 2] = _wrap_torch(
+                    self._state[:, 2] + rth * jitter[:, 2]
+                )
+
         self._log_w = torch.full(
             (P,), -math.log(P),
             dtype=self.cfg.weight_dtype, device=self.cfg.device,

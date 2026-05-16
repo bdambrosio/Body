@@ -109,7 +109,20 @@ class ShadowParticleFilterDriver:
         self._config = config or ShadowPfConfig()
 
         self._pf = ParticleFilterPose(pf_config)
-        self._matcher = ScanMatcher(scan_matcher_config or ScanMatcherConfig())
+        # Wider θ window than production's ±8° default. The first live
+        # trace (run_20260516_095019) had 22% of scan-matches hitting
+        # scan_exhausted=True (window edge), almost always during
+        # rotation — the filter prior lagged actual rotation by >8°.
+        # 12° is the empirical sweet spot: enough headroom for typical
+        # joystick-driven rotation rates (~10–50°/s), still under the
+        # angular resolution where the score field starts aliasing
+        # against scan-feature spacing. Vectorization (commit 5447182)
+        # makes a 12° search cost ~28 ms instead of 22 ms — cheap.
+        if scan_matcher_config is None:
+            scan_matcher_config = ScanMatcherConfig(
+                theta_half_rad=math.radians(12.0),
+            )
+        self._matcher = ScanMatcher(scan_matcher_config)
         # Own IMU tracker — decouples us from production's pose_source
         # buffer. The first live trace showed 30% of odom callbacks
         # racing ahead of the fuser's _on_odom, returning None from
