@@ -10,9 +10,19 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
+
+# Force the Qt platform to xcb before any Qt import. The default on
+# this workstation is Wayland (Mutter); under load it has been seen to
+# hang nav's UI thread, with the side-effect of stalling the chassis
+# heartbeat publisher and freezing the bot via watchdog timeout
+# (run_20260516_115649). xcb is rock-solid here and the previous
+# stack has shipped on it for months. `setdefault` preserves a manual
+# override if you really want Wayland.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 # Support both `python -m desktop.nav` (from Body/) and `python -m nav`
 # (from Body/desktop/, where the .venv lives). The second form puts
