@@ -49,6 +49,8 @@ from desktop.nav.slam.scan_matcher import (
 )
 from desktop.nav.slam.types import ImuReading, Pose2D
 
+from .apriltag_calibration import AprilTagCalibration
+from .apriltag_observer import AprilTagObserver, AprilTagObserverConfig
 from .particle_filter_pose import (
     ParticleFilterConfig, ParticleFilterPose,
 )
@@ -101,12 +103,16 @@ class ShadowParticleFilterDriver:
         pf_config: Optional[ParticleFilterConfig] = None,
         scan_matcher_config: Optional[ScanMatcherConfig] = None,
         config: Optional[ShadowPfConfig] = None,
+        apriltag_calibration: Optional["AprilTagCalibration"] = None,
+        apriltag_config: Optional["AprilTagObserverConfig"] = None,
     ) -> None:
         self._session = session
         self._grid = grid
         self._pose_source = pose_source
         self._trace_path = Path(trace_path)
         self._config = config or ShadowPfConfig()
+        self._apriltag_calibration = apriltag_calibration
+        self._apriltag_config = apriltag_config
 
         self._pf = ParticleFilterPose(pf_config)
         # Wider θ window than production's ±8° default. The first live
@@ -171,6 +177,11 @@ class ShadowParticleFilterDriver:
             "trace_records_written": 0,
         }
 
+        # Phase 3 AprilTag observer. Optional; only attaches when a
+        # calibration is supplied. Observations get logged into the
+        # same JSONL trace via on_detection.
+        self._apriltag_observer: Optional[AprilTagObserver] = None
+
     # ── Lifecycle ────────────────────────────────────────────────────
 
     def connect(self) -> None:
@@ -202,7 +213,30 @@ class ShadowParticleFilterDriver:
             self._trace_path, self._config.scan_hz,
         )
 
+        # Phase 3 AprilTag observer. Shares the filter and lock; writes
+        # observations into our trace via on_detection callback.
+        if self._apriltag_calibration is not None:
+            self._apriltag_observer = AprilTagObserver(
+                session=self._session,
+                pf=self._pf,
+                pf_lock=self._pf_lock,
+                calibration=self._apriltag_calibration,
+                config=self._apriltag_config,
+                on_detection=self._write_trace,
+            )
+            try:
+                self._apriltag_observer.connect()
+            except Exception:
+                logger.exception("shadow_pf: apriltag observer connect failed")
+                self._apriltag_observer = None
+
     def disconnect(self) -> None:
+        if self._apriltag_observer is not None:
+            try:
+                self._apriltag_observer.disconnect()
+            except Exception:
+                logger.exception("shadow_pf: apriltag observer disconnect raised")
+            self._apriltag_observer = None
         for sub in self._subs:
             try:
                 sub.undeclare()

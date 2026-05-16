@@ -92,6 +92,20 @@ def _parse_args(argv):
              "fuser's pose. See desktop/world_map/shadow_pf_driver.py.",
     )
     p.add_argument(
+        "--apriltag-config", metavar="PATH", default=None,
+        help="Phase 3 — path to an AprilTag calibration YAML (see "
+             "config/apriltag_poses.yaml.example). Attaches the AprilTag "
+             "observer to the --pf-shadow filter, treating each detection "
+             "as a Gaussian (x, y, θ) observation. Filter still converges "
+             "without tags; this is opportunistic global anchoring.",
+    )
+    p.add_argument(
+        "--apriltag-request-hz", type=float, default=1.0,
+        help="--apriltag-config: rate at which to drive RGB captures via "
+             "body/oakd/config. 0 = passive (only consume captures driven "
+             "by others); default 1.0 Hz.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
     )
     return p.parse_args(argv)
@@ -167,11 +181,43 @@ def main(argv=None) -> int:
             from desktop.world_map.shadow_pf_driver import (
                 ShadowParticleFilterDriver,
             )
+
+            # Phase 3 — optional AprilTag observer.
+            apriltag_calibration = None
+            apriltag_obs_config = None
+            if args.apriltag_config:
+                from desktop.world_map.apriltag_calibration import (
+                    AprilTagCalibration,
+                )
+                from desktop.world_map.apriltag_observer import (
+                    AprilTagObserverConfig,
+                )
+                try:
+                    apriltag_calibration = AprilTagCalibration.from_yaml(
+                        Path(args.apriltag_config),
+                    )
+                    apriltag_obs_config = AprilTagObserverConfig(
+                        request_hz=args.apriltag_request_hz,
+                    )
+                    log.info(
+                        "apriltag: loaded %d tag(s) from %s, request_hz=%.2f",
+                        len(apriltag_calibration.tags),
+                        args.apriltag_config,
+                        args.apriltag_request_hz,
+                    )
+                except Exception:
+                    log.exception(
+                        "apriltag config load failed; continuing without tags",
+                    )
+                    apriltag_calibration = None
+
             pf_shadow = ShadowParticleFilterDriver(
                 session=fuser.session,
                 grid=fuser.grid,
                 pose_source=fuser.pose_source,
                 trace_path=Path(args.pf_shadow),
+                apriltag_calibration=apriltag_calibration,
+                apriltag_config=apriltag_obs_config,
             )
             try:
                 pf_shadow.connect()

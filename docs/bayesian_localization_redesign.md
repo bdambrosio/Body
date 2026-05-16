@@ -568,6 +568,29 @@ just ship the divergence.
   field across particles whose priors sit inside the window); (c)
   preallocated-buffer micro-optimization deferred — current ~6 KB
   field allocation per scan is fine at 1–10 Hz.
+- **2026-05-16 (later still):** Phase 3 plumbing complete (battery-
+  recharge session). Detector + calibration loader + observer +
+  launcher flag, all unit-tested (18 new tests, 84 total desktop).
+  Detection runs desktop-side via pupil-apriltags (plan §5 risk #1
+  predicted this); tag36h11 default. Observer subscribes to
+  body/oakd/rgb; optionally drives capture_rgb at a configurable
+  rate via body/oakd/config (default 1 Hz). For each known tag in
+  the calibration YAML, computes the implied bot world pose via
+  `T_world_body = T_world_tag · T_cam_tag⁻¹ · T_body_cam⁻¹`, then
+  applies `pf.observe_xy_world(x, y, σ_xy)` and `pf.observe_imu_yaw(θ, σ_θ)`
+  to the same filter the scan-likelihood update writes to. Trace
+  records of type `apriltag_obs` land in the same JSONL the scan_obs
+  records do, so legacy/filter/tag streams are all aligned by ts for
+  offline analysis. CLI: `--apriltag-config config/apriltag_poses.yaml`
+  + `--apriltag-request-hz 1.0`. Example calibration at
+  `config/apriltag_poses.yaml.example` with documentation of frame
+  conventions (world ENU, body x-forward, camera OpenCV). Validation
+  per plan: filter must still converge without tags — that's the
+  default code path when `--apriltag-config` is omitted. Live
+  validation pending Bruce printing/mounting a tag and recording a
+  trace; the plumbing is testable end-to-end via the mocked-detector
+  integration test (`test_apriltag.TestObserverFlow`).
+
 - **2026-05-16 (later):** Phase 2 complete on CPU. Four sub-commits:
   (2.1) `desktop/world_map/particle_filter_pose.py` — `ParticleFilterPose`
   with motion model (Phase 0 α priors, σ floor for diversity), IMU yaw

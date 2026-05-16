@@ -1,0 +1,74 @@
+# AprilTag calibration — example / template.
+#
+# Copy to config/apriltag_poses.yaml and edit for your room.
+# See desktop/world_map/apriltag_calibration.py for the schema and
+# frame conventions (world: x forward, y left, z up; camera: OpenCV).
+#
+# To add a tag:
+#  1. Print a tag36h11 PDF from https://github.com/AprilRobotics/apriltag-imgs
+#     (tag size: 10 cm black-border edge is a good starting point).
+#  2. Mount it on a wall, flat surface, etc. Measure (x, y, z) of the
+#     tag center in the world frame (the frame that was active when
+#     you most recently hit "Rebind world to current" in the nav UI).
+#  3. Measure the tag's facing direction. yaw_deg is the rotation
+#     around the world's +z axis (looking down from above):
+#        yaw=0    → tag normal points along world +x
+#        yaw=90   → tag normal points along world +y (left)
+#        yaw=180  → tag normal points along world -x (back)
+#        yaw=-90  → tag normal points along world -y (right)
+#  4. σ_xy_m and σ_θ_deg are your confidence in the world-pose
+#     measurement. 5 cm xy and 5° yaw are reasonable defaults; tighten
+#     if you measured very carefully, loosen if it's a quick eyeball.
+
+camera:
+  # OAK-D Lite intrinsics — replace with your device's calibration.
+  # Read these from the oakd_driver's `_log_oakd_calibration` line at
+  # startup, or run scripts/oakd_rgb_smoke.py.
+  intrinsics:
+    fx: 798.0
+    fy: 798.0
+    cx: 320.0
+    cy: 200.0
+
+  # Camera mount expressed as T_body_cam: where the camera sits in the
+  # body frame. Translation in meters, rotation as ZYX Euler in degrees
+  # (yaw → pitch → roll). Defaults below assume the OAK-D is mounted
+  # 10 cm forward of body center and 15 cm above the floor, looking
+  # forward and slightly down (-5° pitch).
+  mount:
+    x_m: 0.10
+    y_m: 0.00
+    z_m: 0.15
+    yaw_deg: 0.0
+    pitch_deg: -5.0
+    roll_deg: 0.0
+
+# Default tag size — the edge length of the BLACK border of the
+# printed tag, in meters. (The canonical AprilTag size; the white
+# margin around the tag doesn't count.)
+tag_size_m: 0.10
+
+tags:
+  # tag36h11 ID 0 mounted on the far wall, ~2.5 m forward of the seed
+  # position, facing back toward the origin.
+  0:
+    x_m: 2.50
+    y_m: 0.00
+    z_m: 1.00
+    yaw_deg: 180.0
+    pitch_deg: 0.0
+    roll_deg: 0.0
+    sigma_xy_m: 0.05
+    sigma_theta_deg: 5.0
+
+  # Another example — tag36h11 ID 1 on the left wall, 1.5 m away,
+  # facing right (toward bot's typical path).
+  1:
+    x_m: 0.00
+    y_m: 1.50
+    z_m: 0.80
+    yaw_deg: -90.0
+    pitch_deg: 0.0
+    roll_deg: 0.0
+    sigma_xy_m: 0.05
+    sigma_theta_deg: 5.0

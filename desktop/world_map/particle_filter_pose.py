@@ -395,6 +395,34 @@ class ParticleFilterPose:
         log_lik = -0.5 * (err / sigma) ** 2
         self._log_w = self._log_w + log_lik.to(self.cfg.weight_dtype)
 
+    # ── AprilTag-style world-frame position observation ─────────────
+
+    def observe_xy_world(
+        self, world_x: float, world_y: float, sigma_xy_m: float,
+    ) -> None:
+        """Apply a 2D Gaussian (x, y) observation to log_weights.
+
+        Used by AprilTag-style observations where a detected tag's
+        known world pose implies the bot's world position. ``sigma_xy_m``
+        is the 1-σ on both x and y (isotropic); tag-source-dependent —
+        a small high-confidence tag close to the camera has σ ~ 2 cm,
+        a large distant tag is more like σ ~ 10 cm.
+
+        The -log(2πσ²) normalization is omitted (cancels across
+        particles in softmax).
+        """
+        self._require_seeded()
+        assert self._state is not None and self._log_w is not None
+        sigma = float(sigma_xy_m)
+        if sigma <= 0:
+            raise ValueError(
+                f"observe_xy_world: sigma_xy_m must be > 0, got {sigma}"
+            )
+        ex = self._state[:, 0] - world_x
+        ey = self._state[:, 1] - world_y
+        log_lik = -0.5 * (ex * ex + ey * ey) / (sigma * sigma)
+        self._log_w = self._log_w + log_lik.to(self.cfg.weight_dtype)
+
     # ── Scan-likelihood observation ──────────────────────────────────
 
     def update_from_scan_likelihood(

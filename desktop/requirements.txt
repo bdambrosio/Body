@@ -14,3 +14,8 @@ requests>=2.31,<3
 einops>=0.7,<1
 matplotlib>=3.7,<4
 torch>=2.4,<3
+
+# Phase 3 — AprilTag observations. pupil-apriltags wraps the C apriltag
+# library (tag36h11 by default). pyyaml is for the calibration loader.
+pupil-apriltags>=1.0,<2
+pyyaml>=6.0,<7
