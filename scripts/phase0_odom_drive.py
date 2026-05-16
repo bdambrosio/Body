@@ -111,11 +111,26 @@ def _load_odom_imu(
 
 
 def _imu_at(imu_samples: list[tuple[float, float]], ts: float) -> Optional[float]:
-    """Linear-interpolate IMU yaw at ts. None if outside the buffer."""
-    if not imu_samples or ts < imu_samples[0][0] or ts > imu_samples[-1][0]:
+    """Linear-interpolate IMU yaw at ts. Within the buffer: interpolate.
+    Within one inter-sample period of either end: snap to that endpoint
+    (same grace window pattern as ImuYawTracker.yaw_at — odom and IMU
+    are published independently and the boundary samples will routinely
+    miss each other by a few ms). Outside the grace: None.
+    """
+    if not imu_samples:
         return None
+    n = len(imu_samples)
+    first_ts = imu_samples[0][0]
+    last_ts = imu_samples[-1][0]
+    grace = (last_ts - first_ts) / max(1, n - 1) if n >= 2 else 0.05
+    if ts < first_ts - grace or ts > last_ts + grace:
+        return None
+    if ts <= first_ts:
+        return imu_samples[0][1]
+    if ts >= last_ts:
+        return imu_samples[-1][1]
     # Binary search for bracketing pair.
-    lo, hi = 0, len(imu_samples) - 1
+    lo, hi = 0, n - 1
     while hi - lo > 1:
         mid = (lo + hi) // 2
         if imu_samples[mid][0] <= ts:

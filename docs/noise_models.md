@@ -28,9 +28,9 @@ show they matter.
 - [x] Analysis tooling shipped (`scripts/phase0_imu_stationary.py`,
       `scripts/phase0_odom_drive.py`).
 - [x] Experiment A run (2026-05-15).
-- [ ] Experiment B run (≥3 drives at different distances).
+- [x] Experiment B run (3 drives at 1/3/5 m, 2026-05-15).
 - [ ] Experiment C run (≥3 rotations at different magnitudes).
-- [ ] Numbers below partly filled in (A only).
+- [ ] Numbers below partly filled in (A + B).
 - [ ] Bruce review.
 
 ## Pi-side changes
@@ -155,14 +155,36 @@ not IMU drift.
 
 ### Encoder translation (Experiment B)
 
-_Pending._
+Three drives at nominal 1/3/5 m, twist-pad straight forward, ~0.1–0.15 m/s.
+Recordings in `~/body-logs/phase0/trans-{1,3,5}m-20260515-*.jsonl`.
 
-| Run | Measured (m) | Encoder (m) | Abs err (m) | Frac err | α_1 point |
-|---|---|---|---|---|---|
-|   |   |   |   |   |   |
+| Run | Measured (m) | Encoder (m) | Abs err (m) | Frac err | α_1 point | Encoder Δθ | IMU Δθ | Enc−IMU |
+|---|---|---|---|---|---|---|---|---|
+| B1 | 1.00 | 0.9883 | 0.0117 | 1.17% | 0.0117 | +1.64° | +0.41° | +1.23° |
+| B2 | 2.98 | 3.1125 | 0.1325 | 4.45% | 0.0445 | -0.29° | -3.40° | +3.11° |
+| B3 | 5.02 | 4.9096 | 0.1104 | 2.20% | 0.0220 | +10.26° | +6.08° | +4.18° |
 
-Fit / chosen α_1: `<>`.
-Notes (does the bot drive straight? any systematic skew?): _pending._
+**Fit / chosen α_1: 0.04** (slightly above mean+1σ of the three samples;
+conservative but not absurd).
+
+**Cross-term α_3 observed: 0.017 rad/m (~1°/m of translation).**
+Encoder θ over-reports rotation during translation in all three runs,
+consistently. Per-run estimates 1.23/1.04/0.84 °/m — tight enough that
+this is not noise; it's a real cross-coupling term that the motion
+model must include from the start. The standard Thrun-Burgard-Fox
+diff-drive noise model has α_3 as exactly this (rotation σ per meter
+of translation).
+
+Notes:
+- No calibration bias: error signs flip across runs (under, over,
+  under), so it's slip noise, not wheel-radius miscalibration.
+- The bot does NOT drive perfectly straight: IMU reports 0.4–6° of
+  rotation during each "straight" drive. Probably differential motor
+  output, floor camber, or slight pad-input bias from the operator.
+  Doesn't affect α_1 fit (chord-vs-arc correction for 10° is 0.1%).
+- The encoder consistently sees MORE rotation than the IMU during
+  translation — never less. Sign of differential wheel slip favoring
+  one side.
 
 ### Encoder rotation (Experiment C)
 
