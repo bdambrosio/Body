@@ -47,6 +47,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Make `from desktop....` resolve when run as `python3 scripts/...`
+# from the repo root, without requiring PYTHONPATH=. on the command
+# line. Same pattern desktop/nav/__main__.py uses.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from desktop.nav.slam.types import ImuReading, quaternion_to_yaw
 
 
