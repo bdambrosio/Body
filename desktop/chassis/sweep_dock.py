@@ -73,7 +73,11 @@ class SweepDock(QDockWidget):
         pl.setContentsMargins(6, 4, 6, 4)
 
         self.step_deg_box = QDoubleSpinBox()
-        self.step_deg_box.setRange(1.0, 90.0)
+        # Upper bound matches total_deg_box so the user can configure
+        # step_deg == total_deg → step_count == 1 (one continuous
+        # rotation). Used by phase 0 rotation-noise calibration where
+        # mid-step stops contaminate the measurement.
+        self.step_deg_box.setRange(1.0, 720.0)
         self.step_deg_box.setSingleStep(5.0)
         self.step_deg_box.setDecimals(1)
         self.step_deg_box.setValue(float(DEFAULT_PARAMS["step_deg"]))
