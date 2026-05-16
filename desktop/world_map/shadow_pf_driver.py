@@ -352,16 +352,20 @@ class ShadowParticleFilterDriver:
 
             self._pf.predict(ds, dth)
             # IMU observation: convert raw IMU yaw to world frame via
-            # the seed-time offset. tracker.yaw_at returns (yaw, σ);
-            # use σ as the observation σ floor so the obs auto-relaxes
-            # when the IMU tracker reports lower confidence.
+            # the seed-time offset. Use the Phase-0-measured per-sample
+            # σ (cfg.imu_sigma_rad = 1.23 mrad), NOT the tracker's
+            # reported accuracy. The tracker reports the BNO085's
+            # game_rotation_vector accuracy_rad which is a 0.175 rad
+            # (10°) constant — that's the calibration floor, not the
+            # per-sample noise. Run 6 (run_20260516_121220) showed the
+            # filter's θ drifting ~10°/s during a steady-heading drive
+            # because the 10° σ made the IMU obs effectively no-op,
+            # letting encoder α_4 noise accumulate unbounded.
             imu = self._imu_tracker.yaw_at(ts)
             if imu is not None and self._yaw_offset is not None:
-                imu_yaw, imu_sigma = imu
+                imu_yaw, _imu_sigma = imu
                 world_yaw = _wrap(imu_yaw - self._yaw_offset)
-                self._pf.observe_imu_yaw(
-                    world_yaw, sigma_rad=max(imu_sigma, 1e-4),
-                )
+                self._pf.observe_imu_yaw(world_yaw)  # cfg default σ
 
             self._counters["predicts_run"] += 1
             self._last_odom = (ts, x_o, y_o, th_o)
