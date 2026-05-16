@@ -27,10 +27,10 @@ show they matter.
 - [x] Plan locked (this doc + parent redesign doc).
 - [x] Analysis tooling shipped (`scripts/phase0_imu_stationary.py`,
       `scripts/phase0_odom_drive.py`).
-- [ ] Experiment A run.
+- [x] Experiment A run (2026-05-15).
 - [ ] Experiment B run (≥3 drives at different distances).
 - [ ] Experiment C run (≥3 rotations at different magnitudes).
-- [ ] Numbers below filled in.
+- [ ] Numbers below partly filled in (A only).
 - [ ] Bruce review.
 
 ## Pi-side changes
@@ -132,14 +132,26 @@ Record findings below.
 
 ### IMU drift (Experiment A)
 
-_Pending._
+Recording: `~/body-logs/phase0-imu-stationary-20260515-1857.jsonl`.
 
-Expected fields once filled:
-- Recording window: `<start_ts>` → `<end_ts>` (`<duration>` s).
-- Sample rate: `<>` Hz.
-- Drift rate: `<>` deg/min (= `<>` rad/s).
-- Per-sample σ: `<>` deg.
-- Per-second σ (random-walk equivalent): `<>` deg/√s.
+- Window duration: 421.6 s (~7 min).
+- Sample rate: 99.1 Hz (matches Pi-side `imu.publish_hz = 100`).
+- Samples used: 41,779.
+- **Drift rate: -0.012 deg/min (-3.42e-6 rad/s).**
+- Total drift across window: -0.083 deg (effectively below detection
+  floor — call this an *upper bound* on drift, not a measurement).
+- **Per-sample σ: 0.071 deg (1.23 mrad).**
+- Per-√s σ (assumes independent samples — conservative upper bound;
+  the SH-2 fusion filter induces sample-to-sample correlation):
+  0.70 deg/√s (1.23e-2 rad/√s).
+
+**Interpretation:** BNO085 in game_rotation_vector mode is unusually
+quiet on this bot. The IMU contributes essentially zero orientation
+error over any drive duration we care about (< 1 deg in a multi-minute
+drive even at the upper bound). In the particle filter, treat the IMU
+yaw observation as a tight constraint; the dominant orientation
+uncertainty will come from encoder rotation slip (Experiment C),
+not IMU drift.
 
 ### Encoder translation (Experiment B)
 
