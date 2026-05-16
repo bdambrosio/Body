@@ -1,8 +1,16 @@
-# Desktop-side requirements (operator station: chassis + world_map).
-# Pi-side requirements live in requirements.txt. Install both on a
-# laptop only if you need the OAK-D drivers locally.
+# Desktop-side requirements (operator station: chassis + world_map +
+# Bayesian-localization stack). Pi-side requirements live in
+# ../requirements.txt and are kept minimal. Install both on a laptop
+# only if you need the OAK-D drivers locally.
 
 eclipse-zenoh~=1.9.0
 PyQt6>=6.5,<7
 numpy>=1.24,<3
 requests>=2.31,<3
+
+# Bayesian-localization stack (desktop only — these are heavy and have
+# no business on the Pi). torch pulls in the CUDA runtime; Phase 2 runs
+# on CPU but Phase 4 will flip to GPU with no code change.
+einops>=0.7,<1
+matplotlib>=3.7,<4
+torch>=2.4,<3
