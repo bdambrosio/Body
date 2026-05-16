@@ -132,6 +132,44 @@ def _odom_xyt(msg: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]
         return None
 
 
+# Phase 5.5 Variant A — pose-σ → vote weight scale.
+#
+# σ_nominal: the filter's typical posterior std_xy under healthy
+# operation (~1–2 cm in our particle filter; live traces show p50
+# around 0.6–1.1 cm). 0.02 m gives a generous "tight" baseline; below
+# this we return full weight (legacy behaviour, no change for point-
+# estimate sources). Above, weight drops as (σ_nom/σ_now)² — Gaussian
+# information content per cell scales as 1/σ², so doubling σ quarters
+# the trustworthy votes a single scan can contribute.
+#
+# Floor at 0.05 so a transiently catastrophic σ (rare, but possible
+# during multi-modal phases) doesn't completely silence the grid —
+# we'd rather have noisy data than no data while the filter recovers.
+_POSE_SIGMA_NOMINAL_M = 0.02
+_POSE_WEIGHT_FLOOR = 0.05
+
+
+def _pose_weight_scale(cov: Optional[np.ndarray]) -> float:
+    """Pose-σ-aware vote-weight multiplier in [floor, 1].
+
+    cov is the 3×3 SE(2) posterior covariance from
+    ``PoseSource.cov_at()`` (returns None for point-estimate sources,
+    in which case we use full weight).
+    """
+    if cov is None or getattr(cov, "shape", None) != (3, 3):
+        return 1.0
+    sigma_x = math.sqrt(max(float(cov[0, 0]), 0.0))
+    sigma_y = math.sqrt(max(float(cov[1, 1]), 0.0))
+    # Use the worse of x/y as the limiting σ for this scan. We don't
+    # try to anisotropy-weight per-cell — the cells the scan touches
+    # span both axes, and the weakest direction governs trust.
+    sigma_xy = max(sigma_x, sigma_y)
+    if sigma_xy <= _POSE_SIGMA_NOMINAL_M:
+        return 1.0
+    ratio = _POSE_SIGMA_NOMINAL_M / sigma_xy
+    return max(_POSE_WEIGHT_FLOOR, ratio * ratio)
+
+
 def _local_map_capture_ts(meta: Dict[str, Any], fallback: float) -> float:
     """Pick the freshest sensor ts from a local_map's `sources` block;
     fall back to the message ts or the receipt ts.
@@ -529,12 +567,23 @@ class FuserController:
                 with self._lock:
                     self._last_pose_unavail_streak = 0
 
+                # Phase 5.5 Variant A — σ-aware downweighting. When the
+                # filter's posterior σ is large (the moments that plant
+                # phantom obstacles in the grid), the scan's per-vote
+                # contribution shrinks. Tight pose → full weight (1.0,
+                # legacy behaviour). σ at 2× nominal → 0.25× weight.
+                # 4× nominal → 1/16× weight. Squared because Gaussian
+                # information content scales as 1/σ².
+                pose_weight_scale = _pose_weight_scale(
+                    self.pose_source.cov_at(cap_ts),
+                )
                 n_in, n_out = self.grid.fuse_local_map(
                     grid=grid,
                     driveable=drive,
                     meta=meta,
                     pose_world=pose,
                     capture_ts=cap_ts,
+                    pose_weight_scale=pose_weight_scale,
                 )
                 if n_out > 0 and n_in == 0:
                     with self._lock:

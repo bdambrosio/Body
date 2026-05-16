@@ -568,6 +568,28 @@ just ship the divergence.
   field across particles whose priors sit inside the window); (c)
   preallocated-buffer micro-optimization deferred — current ~6 KB
   field allocation per scan is fine at 1–10 Hz.
+- **2026-05-16 (evening):** Phase 5.5 Variant A — σ-aware vote
+  weighting in WorldGrid. Cheaper alternative to the full per-cell
+  occupancy uncertainty rewrite; addresses the same root cause (poor
+  poses planting phantom obstacles in the grid) at ~zero CPU cost.
+  Each scan's per-vote contribution to the grid is now scaled by
+  ``(σ_nominal / σ_now)²`` where σ_now is the filter's posterior
+  std_xy from cov_at(). Tight pose (σ ≤ 2 cm nominal) → full weight
+  (legacy behaviour). 2× nominal → 0.25× weight. 4× nominal → 1/16×
+  weight. Floor at 0.05 prevents transient catastrophic σ from
+  silencing the grid entirely.
+  Motivated by the 13:21 doorway scrape (filter ran into the doorjamb;
+  costmap showed phantom narrowing on the right by 8–24 cm). 4×
+  higher corr/match than earlier short drives suggested the filter
+  was working harder than usual to correct itself; those uncertain
+  moments planted phantom votes.
+  Threading: FuserController calls cov_at(cap_ts) per fusion step,
+  passes pose_weight_scale to fuse_local_map. Point-estimate sources
+  return cov_at=None → scale stays 1.0, no behaviour change. 10 new
+  tests covering the helper and the fuse path; 107 total desktop.
+  Live validation: re-run the same drive and look at whether the
+  doorway maps with less phantom narrowing.
+
 - **2026-05-16 (later still^2):** Phase 5 — pose-aware mapping — partial.
   Two of three Phase 5 deliverables landed; the third (replacing
   `traversal_protection` with per-cell occupancy uncertainty) is a

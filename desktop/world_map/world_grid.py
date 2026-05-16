@@ -172,9 +172,18 @@ class WorldGrid:
         meta: Dict[str, Any],
         pose_world: Tuple[float, float, float],
         capture_ts: float,
+        pose_weight_scale: float = 1.0,
     ) -> Tuple[int, int]:
         """Fold a single local_2p5d frame into the world grid using the
         supplied pose. Returns (cells_written, cells_clipped).
+
+        ``pose_weight_scale`` (Phase 5.5 Variant A) is a [0, 1] multiplier
+        applied to the per-vote weights. When the caller's pose source
+        is *uncertain* (large posterior σ), the votes from this scan
+        should carry less weight in the grid since the scan is more
+        likely to be placed in the wrong cell. Default 1.0 = full weight
+        (legacy behaviour). FuserController computes this from
+        ``pose_source.cov_at(capture_ts)``.
         """
         with self._lock:
             res_in = float(meta.get("resolution_m", 0.0))
@@ -234,19 +243,25 @@ class WorldGrid:
                 src_d = driveable[in_world]
                 clear_mask = src_d == 1
                 block_mask = src_d == 0
+                # σ-aware downweighting (Variant A). When pose is
+                # uncertain, the scan is more likely placed in the
+                # wrong cell — weight its contribution accordingly.
+                ws = max(0.0, min(1.0, float(pose_weight_scale)))
+                clear_w = self._clear_vote_weight * ws
+                block_w = self._block_vote_weight * ws
                 # np.add.at handles repeated indices correctly when several
                 # source cells map to the same target cell.
-                if np.any(clear_mask):
+                if np.any(clear_mask) and clear_w > 0.0:
                     np.add.at(
                         self.clear_votes,
                         (iw_v[clear_mask], jw_v[clear_mask]),
-                        self._clear_vote_weight,
+                        clear_w,
                     )
-                if np.any(block_mask):
+                if np.any(block_mask) and block_w > 0.0:
                     np.add.at(
                         self.block_votes,
                         (iw_v[block_mask], jw_v[block_mask]),
-                        self._block_vote_weight,
+                        block_w,
                     )
 
             # Sum-bounded constraint: clear + block ≤ vote_capacity.
