@@ -58,14 +58,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ShadowPfConfig:
-    # Scan-likelihood rate cap. Dropped from 2.0 → 0.5 after the first
-    # live trace showed CPU saturation: production scan-match runs every
-    # 500 ms and ours did too (~400 ms each on CPU), saturating one
-    # core and starving the chassis heartbeat thread → Pi watchdog →
-    # bot e-stop. 0.5 Hz halves shadow's cost; the filter has plenty
-    # of information at 1 obs / 2 s and is largely driven by predict +
-    # IMU between scan ticks anyway.
-    scan_hz: float = 0.5
+    # Scan-likelihood rate cap. Matches production's ImuPlusScanMatchPose
+    # default (2 Hz) so the comparison is apples-to-apples. Pre-
+    # vectorization this was 4× the safe shadow rate (each match was
+    # ~400 ms); after the scan_matcher vectorization (commit 5447182,
+    # ~22 ms per match), 2 Hz costs ~4% of one core for the shadow
+    # alone, well inside the chassis heartbeat budget.
+    scan_hz: float = 2.0
 
     # Skip scan-likelihood if grid evidence is too sparse — same logic
     # as the production matcher.
