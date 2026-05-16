@@ -29,8 +29,12 @@ show they matter.
       `scripts/phase0_odom_drive.py`).
 - [x] Experiment A run (2026-05-15).
 - [x] Experiment B run (3 drives at 1/3/5 m, 2026-05-15).
-- [ ] Experiment C run (≥3 rotations at different magnitudes).
-- [ ] Numbers below partly filled in (A + B).
+- [x] Experiment C run (3 rotations 180/360/720°, 2026-05-15).
+- [x] Calibration fix applied (`motor.wheel_base_m: 0.190 → 0.181`,
+      2026-05-15 — requires Pi-side resync + motor_controller restart).
+- [ ] Post-fix sanity check (single 360° rotation to confirm bias
+      collapsed and lock final α_4).
+- [ ] Numbers below filled in (A + B + C; α_4 pending verification).
 - [ ] Bruce review.
 
 ## Pi-side changes
@@ -188,14 +192,58 @@ Notes:
 
 ### Encoder rotation (Experiment C)
 
-_Pending._
+Three in-place rotations via SweepDock with `step_deg == total_deg`
+(one continuous rotation), rate = 15 dps, direction = ccw. Recordings
+in `~/body-logs/phase0/rot-{180,360,720}-20260515-*.jsonl`.
 
-| Run | IMU Δθ (deg) | Encoder Δθ (deg) | Abs err (deg) | Frac err | α_4 point |
+**Pre-fix data (config had `wheel_base_m: 0.190 m`):**
+
+| Run | IMU Δθ | Encoder Δθ | Abs err | Frac err | α_4 point |
 |---|---|---|---|---|---|
-|   |   |   |   |   |   |
+| C1 | +175.31° | +168.32° | -7.00° | **-3.99%** | 0.040 |
+| C2 | +354.87° | +335.06° | -19.81° | **-5.58%** | 0.056 |
+| C3 | +716.26° | +677.91° | -38.35° | **-5.35%** | 0.054 |
 
-Fit / chosen α_4: `<>`.
-Notes (slip rate, direction asymmetry?): _pending._
+**Critical finding: ~5% systematic bias, same sign across all runs.**
+Not noise — calibration. The diff-drive odometry computes
+`Δθ_enc = (d_right - d_left) / wheel_base_m`, so if `wheel_base_m` is
+too large by factor `k`, encoder Δθ is too small by exactly `1/k`.
+Observed `Δθ_enc / Δθ_true ∈ [0.946, 0.960]` → true wheel_base is
+~0.181 m (0.181 / 0.190 = 0.953).
+
+This is the same root cause as the rotation overshoot we calibrated
+out with the sweep_mission coast model earlier this session: too-large
+`wheel_base_m` also makes the Pi command too-large wheel velocities
+for a requested ω → bot rotates faster than commanded. One root, two
+symptoms.
+
+Translation (Experiment B) shows NO systematic bias because translation
+uses `wheel_radius_m` (not wheel_base), which is apparently correct.
+
+**Fix applied:** `body/config.json` motor.wheel_base_m → 0.181 m
+(2026-05-15). Pi-side change; requires resync + `motor_controller.py`
+restart. After restart, sweep coast model may also want re-fitting
+since commanded ω will now produce matching actual ω; the current
+coefficients were tuned on top of the 5% over-rotation bias.
+
+**Predicted post-fix α_4 ≈ 0.01.** Residuals after removing the
+constant 5% bias: 1.8°, 2.1°, 2.5° (signed mixed) → roughly 2° per
+rotation of any magnitude, suggesting it's per-rotation noise plus
+a tiny per-radian component. With one post-fix verification run we
+can confirm and lock the final value. **Until verified, use the
+pre-fix conservative α_4 = 0.05.**
+
+Notes:
+- Direction asymmetry not tested (all 3 runs were ccw). Worth a
+  single cw run later to confirm symmetric behavior; if asymmetric,
+  the bot has a side-slip preference that the motion model should
+  capture as a yaw bias term.
+- For the lidar scan-match prior side of the architecture, the bias
+  matters: a 5% under-reporting encoder Δθ over a 30 m drive
+  accumulates ~5–10° of pose error vs reality, which is precisely
+  the amount that flips scan-match in symmetric rooms. Fixing this
+  may visibly improve the existing scan-match-as-prior pipeline
+  *before* the particle filter lands.
 
 ## Output: filter priors
 
@@ -204,12 +252,16 @@ with:
 
 ```python
 # Motion model (per odom step Δs, Δθ):
-SIGMA_TRANSLATION_PER_M = <α_1>
-SIGMA_ROTATION_PER_RAD  = <α_4>
+SIGMA_TRANSLATION_PER_M       = 0.04        # α_1
+SIGMA_ROTATION_PER_M_OF_TRANS = 0.017       # α_3 (rad/m)
+SIGMA_ROTATION_PER_RAD        = 0.05        # α_4 (pre-fix value;
+                                            # after wheel_base recal,
+                                            # expect ~0.01 — re-measure)
 
-# IMU yaw observation:
-IMU_SIGMA_PER_SAMPLE_RAD = <σ_sample>
-IMU_DRIFT_RATE_RAD_PER_S = <drift_rate>
+# IMU yaw observation (BNO085 game_rotation_vector):
+IMU_SIGMA_PER_SAMPLE_RAD = 1.23e-3          # 0.07 deg
+IMU_DRIFT_RATE_RAD_PER_S = 3.42e-6          # upper bound; treat as 0
+                                            # for most filter purposes
 ```
 
 These go into `desktop/world_map/particle_filter_pose.py` when Phase 2
