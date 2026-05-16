@@ -3,7 +3,7 @@
     "connect_endpoints": ["tcp/127.0.0.1:7447"]
   },
   "motor": {
-    "wheel_base_m": 0.190,
+    "wheel_base_m": 0.181,
     "wheel_radius_m": 0.0325,
     "ticks_per_rev": 1920,
     "max_wheel_vel_ms": 0.9,
