@@ -185,29 +185,44 @@ Drift-immune, orthogonal to global localization, correct.
 Each phase is a coherent, testable, mergeable brick. Estimated session
 counts assume Bruce-paced work (focused but not full-time).
 
-### Phase 0 — Foundation. **(1 session)**
+### Phase 0 — Foundation. **(1 session) — DONE 2026-05-15**
 
 **Goal:** noise-model calibration data.
 
-- Collect odom drift data: drive straight 5 m, measure end-pose error.
-  Repeat for rotation-only. This gives the variance scaling for
-  $\Sigma_\text{odom}$.
-- Collect IMU yaw drift data: bot stationary 5 minutes, log yaw vs
-  time. Gives game_rotation_vector drift rate empirically.
-- Collect scan-match likelihood landscape on a few representative
-  scans (corridor, open room, symmetric room). Verify the multi-modal
-  cases match our intuition.
+Numbers locked, recorded in `docs/noise_models.md`:
 
-**Deliverable:** `docs/noise_models.md` with measured Σ values and
-the data behind them.
+| Parameter | Value | Source |
+|---|---|---|
+| α_1 (trans σ / m) | 0.04 | Experiment B (3 runs at 1/3/5 m) |
+| α_3 (rot σ / m of trans) | 0.017 rad/m | Experiment B cross-term |
+| α_4 (rot σ / rad) | 0.01 | Experiment C2′ post-fix |
+| σ_IMU per sample | 1.23 mrad (0.07°) | Experiment A (7 min stationary) |
+| IMU drift rate | ≈ 0 (-0.012 °/min upper bound) | Experiment A |
 
-**Validation:** Bruce reviews — these become the priors for everything
-downstream. Wrong noise models → bad filter.
+**Two big findings beyond the numbers themselves:**
 
-**Dependencies:** none.
+1. **`wheel_base_m` was miscalibrated by 5% (0.190 → 0.181 m).** Same
+   root cause as the rotation overshoot the sweep coast model was
+   patching this session. Calibration > workarounds — the coast model
+   coefficients are now stale and should be re-fit (the bot will be
+   rotating closer to commanded ω now). Not a Phase 1 concern but
+   flagged in §10.
 
-**Open questions:** what's the cleanest way to log these? Probably
-extending nav tracing (per `project_body_nav_tracing_2026_05_12`).
+2. **BNO085 IMU yaw is much quieter than assumed.** game_rotation_vector
+   drift is ~50× below the textbook 0.5–1°/min estimate; per-sample
+   σ is sub-tenth-of-a-degree. **Architecture implication:** the IMU
+   is a near-rigid yaw constraint, not a drift source. The dominant
+   yaw uncertainty in the filter will come from encoder slip (α_3, α_4),
+   not from the IMU. The IMU yaw observation can use a very tight Σ.
+
+**Things Phase 0 deliberately did NOT measure** (deferred, see §10):
+- Direction asymmetry (cw vs ccw — only ccw was tested)
+- Cross-term α_2 (translation σ from rotation — pure rotation tests
+  didn't analyze residual translation drift)
+- Floor-surface dependence (one set of conditions)
+- Scan-match likelihood landscape characterization — deferred until
+  Phase 1 has the score field plumbing in place, then this becomes
+  a natural validation step inside Phase 1.
 
 ---
 
@@ -216,23 +231,51 @@ extending nav tracing (per `project_body_nav_tracing_2026_05_12`).
 **Goal:** scan matcher returns full score field, not just argmax.
 
 - Modify `nav/slam/scan_matcher.py::ScanMatcher.search` to optionally
-  return the $(N_x \times N_y \times N_\theta)$ score grid.
-- Add a `likelihood_at(x, y, θ, score_field)` lookup utility.
-- Backward-compatible: argmax interface still returns the same
-  PoseEstimate; new interface returns the full field.
+  return the $(N_x \times N_y \times N_\theta)$ score grid alongside
+  (or instead of) the argmax `PoseEstimate`.
+- Add a `likelihood_at(x, y, θ, score_field)` lookup utility — the
+  filter will call this once per particle to compute the per-particle
+  observation likelihood.
+- Backward-compatible: existing `search()` argmax interface still
+  returns the same `PoseEstimate` so `ImuPlusScanMatchPose` keeps
+  working unchanged. New optional output (kwarg `return_field=True`
+  or similar) exposes the field.
 
 **Deliverable:** updated `ScanMatcher`, unit tests, demo script that
-plots likelihood field for a hand-picked scan.
+plots likelihood field for a hand-picked scan (corridor, open room,
+symmetric room — provides the Phase 0 §"deferred scan-match landscape"
+characterization as a side benefit).
 
-**Validation:** likelihood field shows the expected peaks for a
-known-symmetric scan. Unit tests pass. Shadow-mode comparison: argmax
-result unchanged from current behavior.
+**Validation:**
+- Likelihood field shows expected peaks for known-symmetric scan
+  (the 180°-flip basin is visible and quantifiable, not just argmaxed
+  away).
+- Argmax-mode regression: existing scan-match tests + a shadow-mode
+  run against captured session data shows the argmax result is
+  identical to the current implementation, bit-for-bit.
 
-**Dependencies:** Phase 0 nice-to-have but not blocking.
+**Dependencies:** Phase 0 priors are useful but not blocking — we
+need σ_IMU to figure out reasonable score-→-likelihood normalization
+later, but the field itself is unit-agnostic.
 
-**Open questions:** normalization. Raw scores aren't probabilities;
-need to decide softmax temperature or similar. Probably calibrate
-against Phase 0 likelihood landscapes.
+**Open questions:**
+- **Normalization.** Raw scores from `_score_at` aren't probabilities.
+  Options to convert: (a) softmax with a temperature chosen from the
+  observed score-spread distribution at calibrated locations, (b)
+  Gaussian fit around the peak — return mean + Σ, (c) log-likelihood
+  proportional to score and let the particle filter normalize via
+  resampling. Probably (c) for the first pass — particle weight
+  ratios only need *relative* likelihood; absolute normalization is
+  only needed for divergence diagnostics. Document this choice in
+  the Phase 1 PR.
+- **Memory.** Full $(N_x \times N_y \times N_\theta)$ grid at current
+  config is ~40×40×72 floats ≈ 460 KB per call; fine for one scan/sec.
+  At 10 Hz it's 4.6 MB/s allocation churn — would want a preallocated
+  buffer. Probably fine to defer.
+- **Coordinate frame.** Current `search()` takes a `prior_pose` and
+  returns absolute world poses. The field should be indexed by
+  *delta from prior* so callers can shift it under a different prior
+  without recomputing. Easy change but worth being deliberate.
 
 ---
 
@@ -508,3 +551,52 @@ just ship the divergence.
   drift ≈ 0). Side-effect: wheel_base_m calibration bug found and
   fixed (0.190 → 0.181 m); same root cause as the sweep rotation
   overshoot. Ready for Phase 1.
+
+---
+
+## 10. Known loose ends (not blocking, track + revisit)
+
+Things we've noticed but deliberately deferred. None blocks the next
+phase; capture here so they don't get lost.
+
+- **Sweep coast model is stale.** `desktop/chassis/sweep_mission.py`
+  has `ROTATE_COAST_LINEAR_DEG_PER_DPS = 0.224` and
+  `ROTATE_COAST_QUADRATIC_DEG_PER_DPS2 = 0.0128`, both fitted on top
+  of the 5% wheel_base over-rotation bias. Post-fix the bot will be
+  rotating closer to commanded ω, so these coefficients now
+  over-anticipate coast and sweeps will land slightly *under*
+  step_deg. Acceptable for now; re-fit when convenient (one
+  calibration run at 30 dps + 15 dps).
+- **Encoder rotation bias still slightly negative (-0.61%) post-fix.**
+  wheel_base 0.181 m bisects the bias close to zero but not exactly.
+  Could nudge to 0.180 to bisect tighter. Marginal; defer unless we
+  see a reason. With one post-fix sample we can't distinguish
+  remaining-bias from slip noise anyway.
+- **Direction asymmetry untested.** Phase 0 C runs were all ccw.
+  Worth one cw run at 360° to confirm; if asymmetric, filter's
+  motion model wants a directional bias term (encoder Δθ × 0.95 vs
+  × 1.05 depending on sign of ω).
+- **α_2 not measured.** Cross-term: translation σ from rotation.
+  Would require a pure-rotation run analyzed for residual encoder
+  (x, y) drift. Not currently emitted by `phase0_odom_drive.py`.
+  Easy 10-line addition; do it next time we need C-style data.
+- **Floor-surface dependence undocumented.** Phase 0 calibration was
+  one set of conditions. If the bot operates on multiple surfaces
+  (wood floor vs rug vs tile), α_1 and α_4 will vary. Worth a
+  quick re-run when conditions change significantly.
+- **min_drive_pwm trim** (0.18 → 0.16, Bruce-side commit 0b10018
+  on 2026-05-15). Not yet validated with a fresh translation/rotation
+  noise pass. Likely fine — lower static kick is gentler — but if
+  α_1 drifts up in later sessions, the trimmed kick could be a
+  contributor.
+- **AprilTag observation stream (Phase 3) intentionally minimal.** The
+  current architecture doesn't depend on tags. They're a Phase 3
+  opportunistic observation; spatial distribution will be sparse. Don't
+  re-architect around them.
+- **scan_match coordinate frame question.** Phase 1 likely surfaces
+  the question: is the score field indexed by absolute world pose or
+  by Δfrom-prior? Δfrom-prior is more useful for the filter (each
+  particle has its own prior). Defer concrete answer to Phase 1 PR.
+
+These get re-evaluated at the start of every phase. If something here
+turns out to be blocking, promote it to the active phase's checklist.
