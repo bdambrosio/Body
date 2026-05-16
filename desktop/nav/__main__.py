@@ -89,10 +89,20 @@ def _parse_args(argv):
     )
     p.add_argument(
         "--slam", action="store_true",
-        help="Promote SLAM to the production pose source. Replaces "
-             "OdomPose with ImuPlusScanMatchPose: encoder translation "
-             "+ BNO085 yaw + lidar scan-match corrections against the "
-             "world grid. See docs/slam_pi_contract.md.",
+        help="Promote classical SLAM to the production pose source. "
+             "Replaces OdomPose with ImuPlusScanMatchPose: encoder "
+             "translation + BNO085 yaw + lidar scan-match corrections "
+             "against the world grid. See docs/slam_pi_contract.md. "
+             "Mutually exclusive with --pf.",
+    )
+    p.add_argument(
+        "--pf", action="store_true",
+        help="Phase 8 — promote the Bayesian particle filter to the "
+             "production pose source (encoder predict + IMU obs + "
+             "scan-likelihood obs, MMSE posterior reported). Replaces "
+             "OdomPose with ParticleFilterPoseSource. See "
+             "docs/bayesian_localization_redesign.md. Mutually "
+             "exclusive with --slam.",
     )
     p.add_argument(
         "--pf-shadow", metavar="PATH", default=None,
@@ -131,13 +141,20 @@ def main(argv=None) -> int:
     log = logging.getLogger(__name__)
     log.info(f"nav starting; router={router} (override via --router or ${ENV_VAR})")
 
+    if args.slam and args.pf:
+        log.error("--slam and --pf are mutually exclusive")
+        return 2
+    pose_source_type = (
+        "particle" if args.pf else ("slam" if args.slam else "odom")
+    )
     fuser_config = FuserConfig(
         router=router,
         world_extent_m=args.world_extent_m,
         world_resolution_m=args.world_resolution_m,
         publish_hz=args.publish_hz,
         map_stale_s=args.map_stale_s,
-        slam_enabled=args.slam,
+        pose_source_type=pose_source_type,
+        slam_enabled=args.slam,  # back-compat; ignored when pose_source_type != "odom"
     )
     chassis_config = StubConfig(
         router=router,

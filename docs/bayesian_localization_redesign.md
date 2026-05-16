@@ -568,6 +568,28 @@ just ship the divergence.
   field across particles whose priors sit inside the window); (c)
   preallocated-buffer micro-optimization deferred — current ~6 KB
   field allocation per scan is fine at 1–10 Hz.
+- **2026-05-16 (much later):** Phase 8 cutover *prep* complete (this is
+  the structural promotion before flipping the production switch on
+  live data). New `ParticleFilterPoseSource` in
+  `desktop/world_map/particle_filter_pose_source.py` implements the
+  full `PoseSource` interface (`pose_at`, `latest_pose`,
+  `rebind_world_to_current`, `to_world`, `cov_at`, `connect`/`disconnect`).
+  Owns its zenoh subscriptions to `body/imu` and `body/lidar/scan`;
+  consumes `body/odom` via `PoseSource.update()` driven by
+  `FuserController._on_odom`. World-offset bookkeeping mirrors
+  `OdomPose` (off_x, off_y, off_theta captured at seed/rebind) so the
+  Pi's odom-frame anchor on `body/map/local_2p5d` messages converts
+  correctly via `to_world`. `FuserController` grew a tri-state
+  `pose_source_type: "odom" | "slam" | "particle"`; `slam_enabled`
+  retained as a back-compat alias. Nav launcher: new `--pf` flag,
+  mutually exclusive with `--slam`. 11 new tests (95 total desktop),
+  all passing. Phase 5 (WorldGrid consumes filter pose for grid
+  building) is the next session — for now, `--pf` runs the filter as
+  the source-of-truth pose but the grid still uses `pose_at` the
+  same way it always has. Live validation: pending Bruce running
+  `python -m desktop.nav --pf ...` and watching for map smearing
+  vs the existing `--slam` baseline.
+
 - **2026-05-16 (later still):** Phase 3 plumbing complete (battery-
   recharge session). Detector + calibration loader + observer +
   launcher flag, all unit-tested (18 new tests, 84 total desktop).

@@ -158,11 +158,22 @@ class FuserController:
 
     def __init__(self, config: FuserConfig):
         self.config = config
-        if config.slam_enabled:
+        # Resolve the pose-source choice. slam_enabled is retained as a
+        # back-compat alias; new code sets pose_source_type directly.
+        kind = config.pose_source_type
+        if config.slam_enabled and kind == "odom":
+            kind = "slam"
+        if kind == "slam":
             # Imported lazily so OdomPose-only deployments don't pull
             # in the slam package on startup.
             from .imu_scan_pose import ImuPlusScanMatchPose
             self.pose_source: PoseSource = ImuPlusScanMatchPose()
+        elif kind == "particle":
+            # Phase 8 promotion. Same lazy-import discipline — the
+            # particle stack pulls in torch / einops, which OdomPose-
+            # only deployments don't need.
+            from .particle_filter_pose_source import ParticleFilterPoseSource
+            self.pose_source = ParticleFilterPoseSource()
         else:
             self.pose_source = OdomPose()
         self.grid = WorldGrid(

@@ -37,10 +37,17 @@ class FuserConfig:
     stale_odom_s: float = 0.25
     input_timeout_s: float = 2.0
 
-    pose_source: str = "odom"  # v1.1: "odom+scanmatch"
-    # When True, FuserController constructs ImuPlusScanMatchPose
-    # instead of OdomPose and calls .connect(session, grid) after
-    # the zenoh session is open. See docs/slam_pi_contract.md.
+    # PoseSource selection:
+    #   "odom"     — OdomPose (encoder integration only, no SLAM)
+    #   "slam"     — ImuPlusScanMatchPose (encoder + BNO085 yaw + scan-match
+    #                snap corrections; docs/slam_pi_contract.md)
+    #   "particle" — ParticleFilterPoseSource (Bayesian filter:
+    #                encoder predict + IMU obs + scan-likelihood obs;
+    #                docs/bayesian_localization_redesign.md Phase 8)
+    pose_source_type: str = "odom"
+    # Back-compat: True forces pose_source_type="slam". Pre-existing
+    # callers that set slam_enabled=True still work; new callers should
+    # set pose_source_type directly. Removed in a future cleanup pass.
     slam_enabled: bool = False
 
     vote_margin: int = 2
