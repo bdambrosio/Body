@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from desktop.world_map.costmap import Costmap
+from desktop.world_map.costmap import Costmap, _dilate_bool
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,17 @@ class AStarConfig:
     cost_per_unit: float = 0.05      # halo_max=100 → 5.0 distance penalty
     heuristic_weight: float = 1.0    # 1.0 = optimal; >1 = greedy/faster
     max_expansions: int = 200_000    # safety cap before declaring failure
+
+    # Minimum clearance from any lethal cell, in grid cells. The
+    # planner refuses to traverse any cell within this many cells of
+    # a lethal cell — i.e., the lethal mask is dilated by this many
+    # iterations before A* runs. ≥1 means paths always have at least
+    # one clear cell between the bot's planned position and any
+    # lethal cell. The map's costmap halo already discourages
+    # close-quarters paths via the halo cost field, but doesn't
+    # *forbid* them; the halo can be overridden when a goal is
+    # otherwise unreachable. This forbids them outright.
+    min_clearance_cells: int = 1
 
 
 @dataclass
@@ -95,23 +106,43 @@ def plan_path(
             "goal out of grid (pan view further or drive closer)",
         )
 
-    if costmap.lethal[si, sj]:
-        # Try a small relaxation: nearest non-lethal cell within a
-        # 5-cell neighborhood. Common when the robot is pinned to
-        # the inflation halo of its own pose-trail false positives.
-        relaxed = _nearest_non_lethal(costmap.lethal, si, sj, radius=5)
+    # Dilate the lethal mask by min_clearance_cells so the planner
+    # refuses any cell adjacent to lethal (Bruce's hard requirement
+    # after two doorjamb scrapes — costmap inflation already biases
+    # away from lethal via halo cost, but didn't outright forbid
+    # 0-cell clearance paths).
+    if cfg.min_clearance_cells > 0:
+        lethal_planning = _dilate_bool(
+            costmap.lethal, iters=int(cfg.min_clearance_cells),
+        )
+    else:
+        lethal_planning = costmap.lethal
+
+    if lethal_planning[si, sj]:
+        # Bot starts in a forbidden cell (e.g., currently parked
+        # one cell away from a wall). Relax to the nearest cell
+        # that satisfies the clearance constraint. Widen the search
+        # radius proportionally to clearance so a 2-cell clearance
+        # request doesn't fail on a bot 1 cell from a wall.
+        radius = max(5, 4 + 2 * int(cfg.min_clearance_cells))
+        relaxed = _nearest_non_lethal(lethal_planning, si, sj, radius=radius)
         if relaxed is None:
-            return PlanResult.fail("start cell is lethal — robot stuck?")
+            return PlanResult.fail(
+                "start cell has insufficient clearance — robot stuck?"
+            )
         si, sj = relaxed
-    if costmap.lethal[gi, gj]:
-        relaxed = _nearest_non_lethal(costmap.lethal, gi, gj, radius=8)
+    if lethal_planning[gi, gj]:
+        radius = max(8, 6 + 2 * int(cfg.min_clearance_cells))
+        relaxed = _nearest_non_lethal(lethal_planning, gi, gj, radius=radius)
         if relaxed is None:
-            return PlanResult.fail("goal is inside an obstacle (or its halo)")
+            return PlanResult.fail(
+                "goal has insufficient clearance from obstacles"
+            )
         gi, gj = relaxed
 
     cells, n_expansions, msg = _astar_8c(
         cost=costmap.cost,
-        lethal=costmap.lethal,
+        lethal=lethal_planning,
         start=(si, sj),
         goal=(gi, gj),
         cost_per_unit=cfg.cost_per_unit,
