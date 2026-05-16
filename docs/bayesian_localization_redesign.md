@@ -568,6 +568,27 @@ just ship the divergence.
   field across particles whose priors sit inside the window); (c)
   preallocated-buffer micro-optimization deferred — current ~6 KB
   field allocation per scan is fine at 1–10 Hz.
+- **2026-05-16 (end of day):** Phases 0–3, 5 (partial), 5.5 Variant A,
+  and 8 (cutover prep) all landed in one session. `--pf` is the
+  production pose source for live autonomous nav; particle filter has
+  driven an "ARRIVED on goal" mission start-to-finish (run 13:21 →
+  follow:ARRIVED goal=0.17 m) and a 99 s manual drive with 99.7%
+  predict success, 0 teleports, 0 catastrophic divergences. Doorway
+  scrape failure mode partly addressed: planner now requires ≥1 cell
+  clearance from any lethal cell, σ-aware vote weighting reduces
+  phantom-obstacle planting from high-σ scans. Two doorjamb collisions
+  remain instructive: in both cases, the planner was producing
+  zero-clearance paths and the costmap was showing phantom narrowing
+  on one side. After the clearance + σ-aware patches plus the
+  operational WiFi fix (single-AP `GL-MT3000-bee` on wlan1, wlan0
+  disabled — see `deploy/NETWORK.md`), the session ended with "solid
+  wifi, no hiccups." Total: 111 desktop tests, all passing. Remaining
+  Phases: 4 (GPU port, throughput optimization), 5 full (per-cell
+  occupancy uncertainty — Variant A is the cheap stand-in), 6 (VPR,
+  the real drift cure), 7 (persistent maps), 8 (removing
+  ImuPlusScanMatchPose). None are blocking; the system is operational
+  on the particle filter.
+
 - **2026-05-16 (evening):** Phase 5.5 Variant A — σ-aware vote
   weighting in WorldGrid. Cheaper alternative to the full per-cell
   occupancy uncertainty rewrite; addresses the same root cause (poor

@@ -216,11 +216,44 @@ After a heartbeat fault, recovery follows **§5.10** in [docs/body_project_spec.
 
 With the stack running, subscribe to `body/**` with Zenoh tooling (e.g. `zenoh-python` examples) and confirm traffic: `body/odom`, `body/lidar/scan`, `body/oakd/imu`, `body/status`, and—when `chassis` or Jill is active—`body/heartbeat` and `body/cmd_vel`.
 
+## Navigation UI (`desktop.nav`)
+
+A unified navigation shell that composes the chassis controller and the world-map fuser into one Qt process, with autonomous-mission support (set goal, plan path, drive, arrive). Three production pose-source modes:
+
+```bash
+# Encoder-only (simplest, no SLAM)
+python -m desktop.nav --router tcp/PI_IP:7447
+
+# Classical SLAM: encoder + BNO085 yaw + lidar scan-match snap corrections
+python -m desktop.nav --router tcp/PI_IP:7447 --slam
+
+# Bayesian particle filter (current default for autonomous nav)
+python -m desktop.nav --router tcp/PI_IP:7447 --pf
+```
+
+Optional diagnostics flags layered on top:
+
+```bash
+# Shadow-mode JSONL trace alongside whatever production pose source is active
+... --pf-shadow ~/pf_traces/run.jsonl
+
+# AprilTag observations (opportunistic global anchoring, --pf-shadow only)
+... --pf-shadow ~/pf_traces/run.jsonl --apriltag-config config/apriltag_poses.yaml
+```
+
+The particle filter and its supporting infrastructure are documented in [docs/bayesian_localization_redesign.md](docs/bayesian_localization_redesign.md); pose-source / scan-matcher / detector unit tests live next to the modules under `desktop/world_map/` and `desktop/nav/slam/`.
+
+## Network (Pi side)
+
+The Pi runs Body services as `body-launcher.service`. The Pi's WiFi should be on a dedicated single-AP network for stable zenoh — see [deploy/NETWORK.md](deploy/NETWORK.md) for the GL.iNet MT3000 setup that's been validated.
+
 ## Layout
 
-- [body/](body/) — Pi-side package: `launcher`, drivers (`motor_controller`, `lidar_driver`, `oakd_driver`, `watchdog`), `local_map`, `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`).
-- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis) (low-level monitoring + manual command UI), [`world_map`](desktop/world_map) (world-frame fuser), `vision_service.py` (VLM client), `utils/` (shared helpers). A higher-level navigation UI (`nav`) is planned but not yet present.
-- [deploy/](deploy/) — optional ops files (e.g. `zenohd-router.json`).
+- [body/](body/) — Pi-side package: `launcher`, drivers (`motor_controller`, `lidar_driver`, `oakd_driver`, `watchdog`, `imu_driver`), `local_map`, `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`, `host_metrics`).
+- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis) (low-level monitoring + manual command UI), [`world_map`](desktop/world_map) (world-frame fuser + particle filter), [`nav`](desktop/nav) (autonomous navigation shell + SLAM helpers), `vision_service.py` (VLM client), `utils/` (shared helpers).
+- [docs/](docs/) — specs and design docs, including [bayesian_localization_redesign.md](docs/bayesian_localization_redesign.md) (Phase 0–8 plan and status log) and [noise_models.md](docs/noise_models.md) (Phase 0 motion-model calibration).
+- [scripts/](scripts/) — calibration + analysis tools (`phase0_*.py`, `phase1_likelihood_field_demo.py`, `record_body_topics.py`).
+- [deploy/](deploy/) — ops files (`zenohd-router.json`, `body-launcher.service`, `99-pwm.rules`, `NETWORK.md`).
 
 ## License
 
