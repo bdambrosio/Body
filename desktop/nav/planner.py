@@ -8,9 +8,13 @@ between two adjacent cells is
 where `base` is 1.0 for cardinal moves and √2 for diagonals, and
 `cost_per_unit` translates halo cost (typically 0..100 from
 `CostmapConfig.halo_max`) into "extra distance equivalents." With
-defaults, a cell deep in the halo (cost ≈ halo_max) adds 5.0 to
-the path length — a strong "hug the center" incentive without making
-halo cells un-traversable.
+defaults (cost_per_unit=0.1), a cell deep in the halo (cost ≈
+halo_max) adds 10.0 to the path length — a strong "hug the center"
+incentive without making halo cells un-traversable when no other
+route exists. Bumped from 0.05 on 2026-05-16 after observing
+goal-driven paths still skirting too close to obstacles; the soft
+preference now overcomes A*'s tendency to take the geometrically-
+shortest route when there's lateral room available.
 
 Lethal cells are absolutely impassable (skipped during expansion).
 Unknown cells inherit `unknown_cost` from CostmapConfig; the planner
@@ -43,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AStarConfig:
-    cost_per_unit: float = 0.05      # halo_max=100 → 5.0 distance penalty
+    cost_per_unit: float = 0.10      # halo_max=100 → 10.0 distance penalty
     heuristic_weight: float = 1.0    # 1.0 = optimal; >1 = greedy/faster
     max_expansions: int = 200_000    # safety cap before declaring failure
 
