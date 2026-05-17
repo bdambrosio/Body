@@ -28,6 +28,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,12 @@ class AnchorOffsetEstimator:
         with self._lock:
             return len(self._pairs)
 
+    def snapshot_pairs(self) -> List[AnchorPair]:
+        """Return a copy of the current pair list (for diagnostics +
+        bootstrap scoring). Safe to call from any thread."""
+        with self._lock:
+            return list(self._pairs)
+
     # ── Accumulate ───────────────────────────────────────────────────
 
     def observe(
@@ -179,6 +186,20 @@ class AnchorOffsetEstimator:
                 self._result.n_pairs, dx, dy, math.degrees(dth), rms,
             )
             return self._result
+
+    def set_calibration(self, result: CalibrationResult) -> None:
+        """Force-install a calibration result (e.g. from a sweep-driven
+        scoring pass). No-op if already calibrated."""
+        with self._lock:
+            if self._result is not None:
+                return
+            self._result = result
+            logger.info(
+                "anchor: externally calibrated — Δ=(%+.3f m, %+.3f m, "
+                "%+.2f°) residual_rms=%.3f m (n_pairs=%d)",
+                result.dx, result.dy, math.degrees(result.dtheta_rad),
+                result.residual_rms_m, result.n_pairs,
+            )
 
     # ── Apply ────────────────────────────────────────────────────────
 
@@ -251,9 +272,170 @@ def _fit_se2(
     return tx, ty, dtheta, rms
 
 
+# ── Phase 6.4.2 — bootstrap covariance + structured scoring ──────────
+
+
+@dataclass(frozen=True)
+class CalibrationScore:
+    """Diagnostic snapshot of a calibration attempt. Always logged to
+    the VPR trace (under record type ``vpr_calibration``); ``passed``
+    governs whether the offset gets locked into the estimator."""
+
+    passed: bool
+    reason: str            # "passed" or first failed check
+    n_pairs: int
+    n_unique_bank_cells: int
+    spatial_spread_m: float
+    residual_rms_m: float
+    cov_xy_trace_m2: float
+    cov_theta_var_rad2: float
+    offset: Optional[CalibrationResult]
+
+
+@dataclass
+class CalibrationScoringConfig:
+    """Thresholds applied to a sweep-driven calibration attempt.
+
+    Stricter than the opportunistic-mode defaults in AnchorOffsetConfig
+    because the sweep procedure can collect enough pairs to actually
+    demand a high-confidence fit before locking the anchor."""
+
+    min_pairs: int = 5
+    min_unique_bank_cells: int = 3      # avoid pure-rotation degeneracy
+    bank_cell_size_m: float = 0.10      # for the unique-cells count
+    min_spatial_spread_m: float = 0.5
+    max_residual_rms_m: float = 0.15
+    max_cov_xy_trace_m2: float = 0.10
+    bootstrap_n_resamples: int = 100
+    bootstrap_seed: int = 0
+
+
+def bootstrap_se2_covariance(
+    pairs: List[AnchorPair],
+    n_resamples: int = 100,
+    seed: int = 0,
+) -> Optional[np.ndarray]:
+    """Empirical 3×3 covariance of (Δx, Δy, Δθ) via paired bootstrap.
+
+    Each resample draws ``len(pairs)`` indices with replacement, refits
+    SE(2), and collects the (dx, dy, dθ) estimate. The sample covariance
+    over those estimates is the bootstrap covariance. Returns ``None``
+    if too few pairs to fit (need ≥ 3).
+    """
+    if len(pairs) < 3:
+        return None
+    rng = np.random.default_rng(seed)
+    n = len(pairs)
+    samples = np.empty((n_resamples, 3), dtype=np.float64)
+    pair_arr = np.array(
+        [[p.bank_xy[0], p.bank_xy[1], p.current_xy[0], p.current_xy[1]]
+         for p in pairs], dtype=np.float64,
+    )
+    for i in range(n_resamples):
+        idx = rng.integers(0, n, size=n)
+        sub = pair_arr[idx]
+        src = [(float(r[0]), float(r[1])) for r in sub]
+        dst = [(float(r[2]), float(r[3])) for r in sub]
+        dx, dy, dth, _ = _fit_se2(src, dst)
+        samples[i] = (dx, dy, dth)
+    # rowvar=False: each row is one observation. ddof=1 for unbiased.
+    return np.cov(samples, rowvar=False, ddof=1)
+
+
+def score_calibration(
+    pairs: List[AnchorPair],
+    config: Optional[CalibrationScoringConfig] = None,
+) -> CalibrationScore:
+    """Attempt a calibration fit on the given pairs and score it.
+    Does not mutate any state — the caller can decide whether to
+    accept the fit (typically by injecting it into the estimator
+    via ``AnchorOffsetEstimator.set_calibration``)."""
+    cfg = config or CalibrationScoringConfig()
+    n = len(pairs)
+    if n < cfg.min_pairs:
+        return CalibrationScore(
+            passed=False, reason="too_few_pairs",
+            n_pairs=n, n_unique_bank_cells=0, spatial_spread_m=0.0,
+            residual_rms_m=float("nan"),
+            cov_xy_trace_m2=float("nan"), cov_theta_var_rad2=float("nan"),
+            offset=None,
+        )
+    bank_xy = [p.bank_xy for p in pairs]
+    current_xy = [p.current_xy for p in pairs]
+    spread = _max_pairwise_distance(bank_xy)
+    # Quantize bank XY to a coarse cell size and count unique cells —
+    # tells us how many physically distinct bank locations the matches
+    # cover. A 360° sweep at one spot might match 10 bank frames but
+    # all at the same physical point → poor rotation observability.
+    cell = max(1e-6, cfg.bank_cell_size_m)
+    unique_cells = {
+        (round(x / cell), round(y / cell)) for x, y in bank_xy
+    }
+    n_unique = len(unique_cells)
+    if spread < cfg.min_spatial_spread_m:
+        return CalibrationScore(
+            passed=False, reason="insufficient_spatial_spread",
+            n_pairs=n, n_unique_bank_cells=n_unique,
+            spatial_spread_m=spread,
+            residual_rms_m=float("nan"),
+            cov_xy_trace_m2=float("nan"), cov_theta_var_rad2=float("nan"),
+            offset=None,
+        )
+    if n_unique < cfg.min_unique_bank_cells:
+        return CalibrationScore(
+            passed=False, reason="too_few_unique_bank_cells",
+            n_pairs=n, n_unique_bank_cells=n_unique,
+            spatial_spread_m=spread,
+            residual_rms_m=float("nan"),
+            cov_xy_trace_m2=float("nan"), cov_theta_var_rad2=float("nan"),
+            offset=None,
+        )
+    dx, dy, dth, rms = _fit_se2(bank_xy, current_xy)
+    cov = bootstrap_se2_covariance(
+        pairs, n_resamples=cfg.bootstrap_n_resamples, seed=cfg.bootstrap_seed,
+    )
+    cov_xy_trace = (
+        float(cov[0, 0] + cov[1, 1]) if cov is not None else float("nan")
+    )
+    cov_theta_var = float(cov[2, 2]) if cov is not None else float("nan")
+    offset = CalibrationResult(
+        dx=dx, dy=dy, dtheta_rad=dth, n_pairs=n, residual_rms_m=rms,
+    )
+    if rms > cfg.max_residual_rms_m:
+        return CalibrationScore(
+            passed=False, reason="residual_too_large",
+            n_pairs=n, n_unique_bank_cells=n_unique,
+            spatial_spread_m=spread,
+            residual_rms_m=rms,
+            cov_xy_trace_m2=cov_xy_trace, cov_theta_var_rad2=cov_theta_var,
+            offset=offset,
+        )
+    if cov is not None and cov_xy_trace > cfg.max_cov_xy_trace_m2:
+        return CalibrationScore(
+            passed=False, reason="offset_covariance_too_large",
+            n_pairs=n, n_unique_bank_cells=n_unique,
+            spatial_spread_m=spread,
+            residual_rms_m=rms,
+            cov_xy_trace_m2=cov_xy_trace, cov_theta_var_rad2=cov_theta_var,
+            offset=offset,
+        )
+    return CalibrationScore(
+        passed=True, reason="passed",
+        n_pairs=n, n_unique_bank_cells=n_unique,
+        spatial_spread_m=spread,
+        residual_rms_m=rms,
+        cov_xy_trace_m2=cov_xy_trace, cov_theta_var_rad2=cov_theta_var,
+        offset=offset,
+    )
+
+
 __all__ = [
     "AnchorOffsetConfig",
     "AnchorOffsetEstimator",
     "AnchorPair",
     "CalibrationResult",
+    "CalibrationScore",
+    "CalibrationScoringConfig",
+    "bootstrap_se2_covariance",
+    "score_calibration",
 ]

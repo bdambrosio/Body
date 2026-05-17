@@ -9,8 +9,13 @@ import torch
 from desktop.world_map.vpr.anchor import (
     AnchorOffsetConfig,
     AnchorOffsetEstimator,
+    AnchorPair,
+    CalibrationResult,
+    CalibrationScoringConfig,
     _fit_se2,
     _max_pairwise_distance,
+    bootstrap_se2_covariance,
+    score_calibration,
 )
 
 
@@ -149,6 +154,143 @@ class TestEstimatorAccumulation(unittest.TestCase):
         est.observe(bank_xy=(0.0, 1.0),  current_xy=(0.0, 1.0),   similarity=0.9)
         est.observe(bank_xy=(1.0, 1.0),  current_xy=(5.0, -5.0),  similarity=0.9)
         self.assertIsNone(est.calibrate_if_ready())
+
+
+class TestBootstrapCovariance(unittest.TestCase):
+    @staticmethod
+    def _pairs_with_noise(n: int, dx: float, dy: float, dth: float,
+                          noise_m: float, seed: int = 0):
+        gen = torch.Generator().manual_seed(seed)
+        src = [(float(x), float(y)) for x in range(int(n ** 0.5) + 1)
+               for y in range(int(n ** 0.5) + 1)][:n]
+        dst_clean = _apply_se2(src, dx=dx, dy=dy, dtheta=dth)
+        noise = torch.randn(n, 2, generator=gen) * noise_m
+        dst = [(d[0] + float(noise[i, 0]), d[1] + float(noise[i, 1]))
+               for i, d in enumerate(dst_clean)]
+        return [AnchorPair(bank_xy=s, current_xy=d, similarity=0.9)
+                for s, d in zip(src, dst)]
+
+    def test_returns_none_when_too_few_pairs(self):
+        pairs = self._pairs_with_noise(2, 0, 0, 0, 0.01)
+        self.assertIsNone(bootstrap_se2_covariance(pairs))
+
+    def test_covariance_shrinks_with_more_pairs(self):
+        # More pairs → tighter offset covariance (CLT-like behavior).
+        p_few = self._pairs_with_noise(5, 0.5, -0.3, math.radians(10), 0.05, seed=1)
+        p_many = self._pairs_with_noise(50, 0.5, -0.3, math.radians(10), 0.05, seed=1)
+        cov_few = bootstrap_se2_covariance(p_few, n_resamples=200, seed=42)
+        cov_many = bootstrap_se2_covariance(p_many, n_resamples=200, seed=42)
+        self.assertEqual(cov_few.shape, (3, 3))
+        self.assertEqual(cov_many.shape, (3, 3))
+        self.assertGreater(cov_few[0, 0], cov_many[0, 0])
+        self.assertGreater(cov_few[1, 1], cov_many[1, 1])
+
+    def test_covariance_scales_with_noise(self):
+        p_low = self._pairs_with_noise(20, 0.0, 0.0, 0.0, 0.01, seed=2)
+        p_hi = self._pairs_with_noise(20, 0.0, 0.0, 0.0, 0.10, seed=2)
+        cov_low = bootstrap_se2_covariance(p_low, n_resamples=100, seed=7)
+        cov_hi = bootstrap_se2_covariance(p_hi, n_resamples=100, seed=7)
+        self.assertGreater(cov_hi[0, 0], cov_low[0, 0])
+
+
+class TestScoreCalibration(unittest.TestCase):
+    def _good_pairs(self, n=10, noise=0.02, seed=11):
+        gen = torch.Generator().manual_seed(seed)
+        src = [(float(x), float(y)) for x in range(int(n**0.5)+1)
+               for y in range(int(n**0.5)+1)][:n]
+        dst = _apply_se2(src, dx=0.3, dy=-0.2, dtheta=math.radians(15))
+        noise_t = torch.randn(n, 2, generator=gen) * noise
+        dst_noisy = [(d[0] + float(noise_t[i, 0]), d[1] + float(noise_t[i, 1]))
+                     for i, d in enumerate(dst)]
+        return [AnchorPair(bank_xy=s, current_xy=d, similarity=0.9)
+                for s, d in zip(src, dst_noisy)]
+
+    def test_passes_on_clean_data(self):
+        pairs = self._good_pairs(n=16, noise=0.02)
+        score = score_calibration(pairs, CalibrationScoringConfig(
+            min_pairs=5, min_unique_bank_cells=3,
+            min_spatial_spread_m=0.5, max_residual_rms_m=0.10,
+            max_cov_xy_trace_m2=0.10,
+        ))
+        self.assertTrue(score.passed, score.reason)
+        self.assertEqual(score.reason, "passed")
+        self.assertIsNotNone(score.offset)
+        self.assertAlmostEqual(score.offset.dx, 0.3, delta=0.05)
+        self.assertAlmostEqual(score.offset.dy, -0.2, delta=0.05)
+
+    def test_fails_on_too_few_pairs(self):
+        pairs = self._good_pairs(n=3)
+        score = score_calibration(pairs, CalibrationScoringConfig(min_pairs=5))
+        self.assertFalse(score.passed)
+        self.assertEqual(score.reason, "too_few_pairs")
+
+    def test_fails_on_insufficient_spatial_spread(self):
+        # All pairs at the same physical bank location.
+        pairs = [
+            AnchorPair(bank_xy=(0.1, 0.2), current_xy=(0.5 * i, 0.0),
+                       similarity=0.9)
+            for i in range(8)
+        ]
+        score = score_calibration(pairs, CalibrationScoringConfig(
+            min_pairs=5, min_spatial_spread_m=0.5,
+        ))
+        self.assertFalse(score.passed)
+        self.assertEqual(score.reason, "insufficient_spatial_spread")
+
+    def test_fails_on_residual_too_large(self):
+        # Big random current_xy noise → residual will be high.
+        gen = torch.Generator().manual_seed(99)
+        src = [(float(x), float(y)) for x in range(4) for y in range(4)]
+        noisy = torch.randn(len(src), 2, generator=gen) * 0.5
+        dst = [(float(noisy[i, 0]), float(noisy[i, 1])) for i in range(len(src))]
+        pairs = [AnchorPair(bank_xy=s, current_xy=d, similarity=0.9)
+                 for s, d in zip(src, dst)]
+        score = score_calibration(pairs, CalibrationScoringConfig(
+            min_pairs=5, min_spatial_spread_m=0.5, max_residual_rms_m=0.05,
+            max_cov_xy_trace_m2=1e9,  # don't fail this gate
+        ))
+        self.assertFalse(score.passed)
+        self.assertEqual(score.reason, "residual_too_large")
+
+    def test_fails_on_too_few_unique_cells(self):
+        # Many pairs but most at the same coarse cell — sweep-in-one-spot
+        # case where matches all point at one physical location.
+        pairs = ([
+            AnchorPair(bank_xy=(0.0, 0.0), current_xy=(0.5 * i, 0.0),
+                       similarity=0.9) for i in range(8)
+        ] + [
+            AnchorPair(bank_xy=(2.0, 2.0), current_xy=(2.5, 2.0),
+                       similarity=0.9),
+        ])
+        score = score_calibration(pairs, CalibrationScoringConfig(
+            min_pairs=5, min_spatial_spread_m=0.5,
+            min_unique_bank_cells=3, bank_cell_size_m=0.10,
+        ))
+        self.assertFalse(score.passed)
+        self.assertEqual(score.reason, "too_few_unique_bank_cells")
+
+
+class TestSetCalibration(unittest.TestCase):
+    def test_set_calibration_installs_result(self):
+        est = AnchorOffsetEstimator(AnchorOffsetConfig(min_pairs=99))
+        # Externally compute a calibration and inject it.
+        result = CalibrationResult(
+            dx=1.0, dy=2.0, dtheta_rad=math.radians(30.0),
+            n_pairs=10, residual_rms_m=0.05,
+        )
+        est.set_calibration(result)
+        self.assertEqual(est.state, "calibrated")
+        self.assertIs(est.calibration, result)
+
+    def test_set_calibration_is_no_op_when_already_calibrated(self):
+        est = AnchorOffsetEstimator(AnchorOffsetConfig(min_pairs=99))
+        r1 = CalibrationResult(dx=0, dy=0, dtheta_rad=0,
+                               n_pairs=5, residual_rms_m=0.01)
+        r2 = CalibrationResult(dx=99, dy=99, dtheta_rad=1.5,
+                               n_pairs=5, residual_rms_m=0.99)
+        est.set_calibration(r1)
+        est.set_calibration(r2)
+        self.assertIs(est.calibration, r1)
 
 
 if __name__ == "__main__":

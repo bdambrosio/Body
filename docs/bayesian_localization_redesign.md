@@ -729,6 +729,64 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.4.2):** VPR startup calibration via sweep-
+  in-place. Replaces the opportunistic anchor accumulation from 6.4
+  with an explicit preflight: when `--vpr` is set, the launcher
+  spawns a worker that (1) waits 3 s for PF to seed, (2) commands
+  the chassis to rotate ~370° at 25 °/s (~15 s), (3) lets 1 s
+  settle so in-flight RGB frames land in the estimator, (4) scores
+  the accumulated pairs and either installs the SE(2) offset or
+  falls through to continued opportunistic accumulation.
+
+  **New:** `desktop/world_map/vpr/calibration_sweep.py` —
+  `VPRCalibrationSweep` orchestrator (daemon thread; chassis
+  motion via `set_cmd_vel`/`set_live_command`; `finally`-block
+  zeroes the command on any exit path including exceptions).
+
+  `desktop/world_map/vpr/anchor.py` extensions:
+  - `bootstrap_se2_covariance(pairs, n_resamples=100)` — paired
+    bootstrap → 3×3 Σ of (Δx, Δy, Δθ).
+  - `score_calibration(pairs, cfg) → CalibrationScore` — checks
+    `min_pairs ≥ 5`, `unique_bank_cells ≥ 3` (avoids pure-
+    rotation degeneracy where 10 matches land at one physical
+    point), `spatial_spread ≥ 0.5 m`, `residual_rms ≤ 0.15 m`
+    (tighter than the opportunistic 0.25 m), `cov_xy_trace
+    ≤ 0.10 m²`. Returns the structured score with a `reason`
+    naming the first failed check.
+  - `AnchorOffsetEstimator.set_calibration(result)` — externally
+    inject the offset from the sweep's scored fit; no-op if
+    already calibrated.
+  - `AnchorOffsetEstimator.snapshot_pairs()` — read-only copy
+    for diagnostics + bootstrap.
+
+  `ShadowVPRDriver` exposes `log_event(record_type, payload)` and
+  `anchor()` so the sweep can emit `vpr_calibration` records and
+  install results without reaching into private state.
+
+  Trace record schema (`type: "vpr_calibration"`):
+  - `phase: "starting" | "motion_start" | "complete" | "aborted"
+    | "crashed"`
+  - On `complete`: `passed`, `reason`, `n_pairs`,
+    `n_unique_bank_cells`, `spatial_spread_m`, `residual_rms_m`,
+    `cov_xy_trace_m2`, `cov_theta_var_rad2`, `offset: {dx, dy,
+    dtheta_rad, n_pairs, residual_rms_m}`.
+
+  Launcher: when `--vpr` is set, the sweep is automatic —
+  no new CLI flag. Operators who can't sweep (tight space,
+  obstacles in rotation envelope) use `--no-vpr`.
+
+  16 new tests (10 anchor — 3 bootstrap, 5 scoring, 2
+  set_calibration — and 6 sweep — motion sequencing, trace
+  events, pass installs, fail rejects, on_complete fires, cancel
+  before motion). 208 desktop tests passing.
+
+  Operational expectation: a single sweep at session start now
+  produces a high-confidence anchor (residual ≤ 0.15 m, σ-bounded
+  via bootstrap) before any live observation can apply, recovering
+  the ~24 anchor-gated observations the 6.4 trace was wasting per
+  ~50-frame drive. Combined with 6.4.1.5 (IMU rate gate), live
+  VPR should now anchor cleanly from frame 1.
+
 - **2026-05-17 (Phase 6.4.1.5):** IMU obs rate gate — the actual
   root-cause fix. The 6.4.1 defensive-resampling experiment ran
   fine (cloud σ_xy 5.7 → 125 mm, first live-applied observations

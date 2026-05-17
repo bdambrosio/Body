@@ -12,6 +12,14 @@ from .anchor import (
     AnchorOffsetConfig,
     AnchorOffsetEstimator,
     CalibrationResult,
+    CalibrationScore,
+    CalibrationScoringConfig,
+    bootstrap_se2_covariance,
+    score_calibration,
+)
+from .calibration_sweep import (
+    CalibrationSweepConfig,
+    VPRCalibrationSweep,
 )
 from .bank import (
     QueryResult,
@@ -32,12 +40,18 @@ __all__ = [
     "AnchorOffsetConfig",
     "AnchorOffsetEstimator",
     "CalibrationResult",
+    "CalibrationScore",
+    "CalibrationScoringConfig",
+    "CalibrationSweepConfig",
     "DinoV2Extractor",
     "ExtractorConfig",
     "QueryResult",
     "ShadowVPRConfig",
     "ShadowVPRDriver",
     "VPRBank",
+    "VPRCalibrationSweep",
+    "bootstrap_se2_covariance",
     "load_default_extractor",
     "mixture_observation_from_query",
+    "score_calibration",
 ]

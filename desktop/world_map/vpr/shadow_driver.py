@@ -634,6 +634,18 @@ class ShadowVPRDriver:
 
     # ── Trace I/O ─────────────────────────────────────────────────────
 
+    def log_event(self, record_type: str, payload: Dict[str, Any]) -> None:
+        """Write a non-RGB-driven event to the trace (used by the
+        Phase 6.4.2 calibration sweep). Adds ``type`` + a timestamp
+        if not already present, then writes the line."""
+        record = {"type": record_type, "ts": time.time(), **payload}
+        self._write_trace(record)
+
+    def anchor(self):
+        """Expose the AnchorOffsetEstimator so external orchestrators
+        (calibration sweep) can read its pairs and inject a calibration."""
+        return self._anchor
+
     def _write_trace(self, record: Dict[str, Any]) -> None:
         if self._trace_fp is None:
             return

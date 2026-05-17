@@ -443,6 +443,21 @@ def main(argv=None) -> int:
                     "live" if vpr_live_mode else "shadow",
                     vpr_trace_path, bank.n_frames, pf_device,
                 )
+                # 6.4.2 — fire an auto sweep-in-place to anchor-calibrate
+                # before live VPR has any chance to apply observations.
+                # Failure mode (per design): fall through to current
+                # 6.4 opportunistic accumulation. No skip flag — operators
+                # who can't sweep use --no-vpr.
+                from desktop.world_map.vpr import VPRCalibrationSweep
+                vpr_sweep = VPRCalibrationSweep(
+                    chassis=chassis, vpr_driver=vpr_driver,
+                )
+                vpr_sweep.start()
+                log.info(
+                    "vpr_calibration: sweep scheduled "
+                    "(will rotate in ~%.1f s)",
+                    vpr_sweep._cfg.startup_delay_s,
+                )
             except Exception:
                 log.exception("vpr setup failed; continuing without it")
                 vpr_driver = None
