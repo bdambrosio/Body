@@ -76,21 +76,27 @@ class ParticleFilterConfig:
 
     # IMU yaw observation σ. Default is *not* the Phase 0 per-sample
     # noise (1.23 mrad ≈ 0.07°) directly — that value assumes
-    # independent samples, and the shadow driver observes at 50 Hz
-    # (every odom tick) while BNO085 gyro samples are correlated over
-    # several samples. Treating them as independent at 50 Hz over-counts
-    # the information: effective constraint after 1 s would be
-    # 1.23/√50 ≈ 0.17 mrad, which is absurdly tight and risks cloud
-    # collapse.
+    # independent samples, and the production loop applies the IMU
+    # observation on every odom tick (50 Hz) while BNO085 gyro samples
+    # are correlated over several samples. Treating them as independent
+    # at 50 Hz over-counts the information.
     #
-    # 5 mrad (0.3°) is a defensible compromise — loose enough to absorb
-    # the correlation, tight enough that the cloud's θ converges within
-    # ~1° over a few seconds. Tunable based on what live traces show.
+    # Empirical update (2026-05-17, from the Phase 6.3 shadow trace):
+    # at σ = 5 mrad, N_eff < 5 on 63% of 1 Hz VPR ticks — the cloud
+    # collapses between scan-tick resamples (50 IMU obs in 1 s puts the
+    # particle weight ratio at ≈ exp(50) for a 10 mrad error particle).
+    # Bumping to 15 mrad gives a per-obs ratio of ≈ exp(0.22), which
+    # accumulates to ≈ exp(5.6) over 25 obs — strong enough to track,
+    # gentle enough that the cloud retains meaningful diversity for
+    # later observations to act on.
+    #
     # The Phase 0 measurement is preserved as IMU_SIGMA_PER_SAMPLE_RAD
     # at module top; callers integrating over a longer effective
     # window (e.g. one observation per scan tick) should pass that
-    # value explicitly.
-    imu_sigma_rad: float = 5.0e-3
+    # value explicitly. The right architectural fix is to drop IMU
+    # observation rate to ~5 Hz at the calibrated σ; until that lands,
+    # the looser σ is the next-best mitigation.
+    imu_sigma_rad: float = 15.0e-3
 
     # Per-step floor on motion-noise σ. Without this, zero-motion ticks
     # add zero noise and the cloud freezes — the "particle deprivation"

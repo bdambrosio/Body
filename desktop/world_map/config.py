@@ -51,12 +51,17 @@ class FuserConfig:
     slam_enabled: bool = False
 
     # Particle filter knobs (only consulted when pose_source_type ==
-    # "particle"). Defaults preserve the pre-Phase-4 behaviour
-    # (CPU torch at 1000 particles, validated in shadow + production
-    # traces). Nav launcher auto-detects CUDA and bumps the particle
-    # count when both are available.
+    # "particle"). pf_n_particles default bumped 1000 → 20000 on
+    # 2026-05-17 after the Phase 6.3 shadow trace showed N_eff
+    # thrashing below 5 between 2 Hz scan-tick resamples. More
+    # particles don't fix the IMU-over-counting root cause (also
+    # addressed via ParticleFilterConfig.imu_sigma_rad 5→15 mrad)
+    # but they give the cloud more headroom to absorb sharp
+    # observations and survive between resamples. On Bruce's RTX 6000
+    # the cycle cost is flat from 10k to 100k particles, so 20k is
+    # essentially free.
     pf_device: str = "cpu"
-    pf_n_particles: int = 1000
+    pf_n_particles: int = 20000
 
     vote_margin: int = 2
     # Sum-bounded vote model ("FIFO of length vote_capacity"):

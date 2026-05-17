@@ -144,10 +144,13 @@ def _parse_args(argv):
              "10k–100k particles.",
     )
     p.add_argument(
-        "--pf-particles", type=int, default=1000,
-        help="Particle-filter cloud size. 1000 is healthy on CPU. With "
-             "--pf-device cuda you can go to 10000+ at essentially no "
-             "per-particle cost increase; useful in multi-modal scenes.",
+        "--pf-particles", type=int, default=20000,
+        help="Particle-filter cloud size (default 20000). Bumped from "
+             "the original 1000 after the Phase 6.3 shadow trace showed "
+             "N_eff thrashing below 5 between 2 Hz scan-tick resamples. "
+             "On GPU the cycle cost is flat from 10k to 100k particles "
+             "(RTX 6000: 0.13 ms/cycle at 10k), so the budget is free. "
+             "Drop to 1000 on CPU-only systems if you see filter latency.",
     )
     p.add_argument(
         "--vpr-shadow", metavar="PATH", default=None,
