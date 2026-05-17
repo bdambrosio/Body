@@ -83,6 +83,21 @@ class ParticleFilterPoseSourceConfig:
     teleport_distance_m: float = 0.5
     teleport_rotation_rad: float = math.radians(45.0)
 
+    # Relocate parameters (wide scan-match → re-seed). Mirror the
+    # legacy ImuPlusScanMatchPoseConfig defaults so the behavior of
+    # the UI "Relocate" button matches what users got under --slam.
+    relocate_xy_half_m: float = 3.0
+    relocate_xy_step_m: float = 0.10
+    relocate_theta_half_rad: float = math.pi          # full 360°
+    relocate_theta_step_rad: float = math.radians(5.0)
+    relocate_min_improvement: float = 30.0
+    relocate_max_scan_age_s: float = 2.0
+    # Re-seed σ after relocate: tight enough to lock in the relocate
+    # answer, loose enough that the next scan-likelihood update can
+    # refine it.
+    relocate_seed_sigma_xy_m: float = 0.05
+    relocate_seed_sigma_theta_rad: float = math.radians(2.0)
+
 
 class ParticleFilterPoseSource(PoseSource):
     """Particle-filter pose source for production use."""
@@ -156,6 +171,10 @@ class ParticleFilterPoseSource(PoseSource):
         self._grid: Optional[Any] = None
         self._subs: List[Any] = []
         self._last_scan_mono: float = 0.0
+        # Cached last scan for use by relocate(). Updated under
+        # self._lock at the top of _on_scan. ts is sensor (Pi) clock.
+        self._last_scan_points: Optional[np.ndarray] = None
+        self._last_scan_ts: float = 0.0
         # Phase 6.4.1.5 — IMU obs rate gate. Monotonic-clock timestamp
         # of the last applied observe_imu_yaw call. 0 means "never";
         # the gate fires immediately on first odom callback.
@@ -364,6 +383,122 @@ class ParticleFilterPoseSource(PoseSource):
                 "n_applied": int(self._correction_n_applied),
             }
 
+    def relocate(self) -> dict:
+        """Wide global scan-match against the world grid → re-seed
+        both filters at the found pose.
+
+        Mirrors ImuPlusScanMatchPose.relocate() in shape and return
+        contract so the UI "Relocate" button works identically across
+        pose sources. Use after a load_snapshot when the bot's
+        current PF posterior isn't aligned with the loaded map, or
+        when scan-matching has diverged so badly that local refinement
+        can't recover.
+
+        Re-seeds BOTH filters (nav + mapping, Phase 6.4.4) at the
+        found pose. Both get a fresh init_sigma-spread cloud; the
+        next scan-likelihood update concentrates them at the
+        relocate target.
+        """
+        if self._grid is None:
+            return {"success": False, "reason": "not_connected"}
+        with self._lock:
+            scan_ts = self._last_scan_ts
+            scan_points = self._last_scan_points
+        if scan_points is None or scan_ts <= 0.0:
+            return {"success": False, "reason": "no_scan_cached"}
+        scan_age = max(0.0, time.time() - scan_ts)
+        if scan_age > self._config.relocate_max_scan_age_s:
+            return {
+                "success": False, "reason": "scan_too_stale",
+                "scan_age_s": scan_age,
+            }
+
+        block_votes = self._grid.snapshot_block_votes()
+        evidence_count = int((block_votes > 0).sum())
+        if evidence_count < self._config.min_grid_evidence_cells:
+            return {
+                "success": False, "reason": "sparse_grid",
+                "evidence_cells": evidence_count,
+            }
+
+        with self._lock:
+            if not self._seeded:
+                return {"success": False, "reason": "not_seeded"}
+            # Use mapping filter's posterior as prior — scan-consistent,
+            # not VPR-influenced (same reasoning as scan-likelihood prior
+            # in _on_scan per Phase 6.4.4).
+            prior_xytheta = self._pf_mapping.posterior_mean()
+        prior_pose = Pose2D(*prior_xytheta)
+
+        wide_cfg = ScanMatcherConfig(
+            xy_half_m=self._config.relocate_xy_half_m,
+            xy_step_m=self._config.relocate_xy_step_m,
+            theta_half_rad=self._config.relocate_theta_half_rad,
+            theta_step_rad=self._config.relocate_theta_step_rad,
+            min_improvement=self._config.relocate_min_improvement,
+        )
+        wide_matcher = ScanMatcher(wide_cfg)
+        try:
+            result = wide_matcher.search(
+                scan_points, prior_pose, block_votes,
+                self._grid.origin_x_m, self._grid.origin_y_m,
+                self._grid.resolution_m,
+            )
+        except Exception:
+            logger.exception("particle_pose.relocate: scan_match crashed")
+            return {"success": False, "reason": "matcher_crashed"}
+
+        if result.improvement < self._config.relocate_min_improvement:
+            return {
+                "success": False, "reason": "low_improvement",
+                "improvement": float(result.improvement),
+                "score": float(result.score),
+                "score_prior": float(result.score_prior),
+                "search_exhausted": bool(result.search_exhausted),
+                "evidence_cells": evidence_count,
+            }
+
+        best = result.pose
+        dx = best.x - prior_pose.x
+        dy = best.y - prior_pose.y
+        dth = _wrap(best.theta - prior_pose.theta)
+
+        # Re-seed both filters at the found pose with a relocate-
+        # specific spread (tight enough to lock, loose enough for the
+        # next scan-likelihood update to refine).
+        seed_sigma_xy = self._config.relocate_seed_sigma_xy_m
+        seed_sigma_theta = self._config.relocate_seed_sigma_theta_rad
+        with self._lock:
+            for pf in (self._pf, self._pf_mapping):
+                pf.seed_at(
+                    best.x, best.y, best.theta,
+                    sigma_xy_m=seed_sigma_xy,
+                    sigma_theta_rad=seed_sigma_theta,
+                )
+            self._correction_total_m += math.hypot(dx, dy)
+            self._correction_total_rad += abs(dth)
+            self._correction_n_applied += 1
+
+        logger.info(
+            "particle_pose.relocate: applied dx=%+.2f dy=%+.2f dθ=%+.1f° "
+            "improvement=%.1f (score %.0f→%.0f, evidence=%d cells, exhausted=%s)",
+            dx, dy, math.degrees(dth),
+            result.improvement, result.score_prior, result.score,
+            evidence_count, result.search_exhausted,
+        )
+        return {
+            "success": True,
+            "dx": float(dx),
+            "dy": float(dy),
+            "dtheta": float(dth),
+            "prior_pose": [
+                float(prior_pose.x), float(prior_pose.y), float(prior_pose.theta),
+            ],
+            "best_pose": [float(best.x), float(best.y), float(best.theta)],
+            "improvement": float(result.improvement),
+            "evidence_cells": evidence_count,
+        }
+
     # ── Zenoh wiring ─────────────────────────────────────────────────
 
     def connect(self, session: Any, grid: Any) -> None:
@@ -469,6 +604,13 @@ class ParticleFilterPoseSource(PoseSource):
             return
         if points_xy.shape[0] < 10:
             return
+
+        # Cache for relocate() (uses wide search against the grid
+        # using the most recent scan).
+        scan_ts_msg = float(msg.get("ts") or time.time())
+        with self._lock:
+            self._last_scan_points = points_xy
+            self._last_scan_ts = scan_ts_msg
 
         try:
             result = self._matcher.search(

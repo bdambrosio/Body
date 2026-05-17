@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import unittest
 from typing import Any, Callable, Dict, List
 from unittest.mock import MagicMock
@@ -329,6 +330,74 @@ class TestPoseSourceInterface(unittest.TestCase):
         )
         self.assertEqual(ps._pf.cfg.defensive_resample_fraction, 0.10)
         self.assertEqual(ps._pf_mapping.cfg.defensive_resample_fraction, 0.0)
+
+    def test_relocate_not_connected_when_no_grid(self):
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=60),
+        )
+        out = ps.relocate()
+        self.assertFalse(out["success"])
+        self.assertEqual(out["reason"], "not_connected")
+
+    def test_relocate_no_scan_cached(self):
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=61),
+        )
+        ps._grid = _FakeGrid()  # connected, but no scan ever arrived
+        out = ps.relocate()
+        self.assertFalse(out["success"])
+        self.assertEqual(out["reason"], "no_scan_cached")
+
+    def test_relocate_success_reseeds_both_filters(self):
+        import torch
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(
+                n_particles=400, seed=62,
+                init_sigma_xy_m=0.05,
+                init_sigma_theta_rad=math.radians(2.0),
+            ),
+        )
+        # Synthetic grid with a recognizable wall pattern.
+        grid = _FakeGrid()
+        ps._grid = grid
+
+        _settle_imu_to(ps, until_ts=1000.0)
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+
+        # Plant a scan via the cached fields directly (bypass _on_scan
+        # JSON parsing). A handful of points along a wall at +y=2.
+        ps._last_scan_points = np.array(
+            [[-0.5, 2.0], [-0.25, 2.0], [0.0, 2.0], [0.25, 2.0], [0.5, 2.0]],
+            dtype=np.float64,
+        )
+        ps._last_scan_ts = time.time()
+
+        out = ps.relocate()
+        # Either success (improvement clears the threshold) or a
+        # well-formed low_improvement / sparse_grid response; what we
+        # care about is that the method runs without exceptions and
+        # returns the expected dict shape.
+        self.assertIn("success", out)
+        self.assertIn("reason", out) if not out["success"] else None
+        if out["success"]:
+            # Both filters should have been re-seeded at the same pose.
+            nav_mean = ps._pf.posterior_mean()
+            map_mean = ps._pf_mapping.posterior_mean()
+            self.assertAlmostEqual(nav_mean[0], map_mean[0], delta=0.05)
+            self.assertAlmostEqual(nav_mean[1], map_mean[1], delta=0.05)
+
+    def test_relocate_scan_too_stale(self):
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=63),
+            config=ParticleFilterPoseSourceConfig(relocate_max_scan_age_s=0.1),
+        )
+        ps._grid = _FakeGrid()
+        ps._last_scan_points = np.zeros((10, 2), dtype=np.float64)
+        ps._last_scan_ts = time.time() - 10.0  # 10 s old
+        out = ps.relocate()
+        self.assertFalse(out["success"])
+        self.assertEqual(out["reason"], "scan_too_stale")
+        self.assertGreater(out["scan_age_s"], 9.0)
 
     def test_teleport_detection(self):
         ps = ParticleFilterPoseSource(

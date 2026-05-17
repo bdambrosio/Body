@@ -338,23 +338,33 @@ class ParticleFilterPose:
 
     # ── Initialization ───────────────────────────────────────────────
 
-    def seed_at(self, x: float, y: float, theta: float) -> None:
+    def seed_at(
+        self, x: float, y: float, theta: float,
+        *,
+        sigma_xy_m: Optional[float] = None,
+        sigma_theta_rad: Optional[float] = None,
+    ) -> None:
         """Initialize the cloud as a tight Gaussian around (x, y, θ).
 
         Resets log-weights to uniform. Called once at session start and
         again when the operator hits 'rebind' to anchor the world frame.
+
+        ``sigma_xy_m`` / ``sigma_theta_rad`` optionally override the
+        configured init sigmas — useful for relocate (which wants a
+        wider seed than the default) without mutating cfg in flight.
         """
         P = self.cfg.n_particles
+        sx = self.cfg.init_sigma_xy_m if sigma_xy_m is None else float(sigma_xy_m)
+        sth = (
+            self.cfg.init_sigma_theta_rad
+            if sigma_theta_rad is None else float(sigma_theta_rad)
+        )
         mean_vec = torch.tensor(
             [x, y, theta],
             dtype=self.cfg.state_dtype, device=self.cfg.device,
         )
         sigma_vec = torch.tensor(
-            [
-                self.cfg.init_sigma_xy_m,
-                self.cfg.init_sigma_xy_m,
-                self.cfg.init_sigma_theta_rad,
-            ],
+            [sx, sx, sth],
             dtype=self.cfg.state_dtype, device=self.cfg.device,
         )
         noise = self._randn((P, 3))
