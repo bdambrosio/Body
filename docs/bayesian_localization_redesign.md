@@ -729,6 +729,27 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.2):** Bank query + Gaussian-mixture
+  observation. New `desktop/world_map/vpr/bank.py` adds `VPRBank`
+  (load from Phase-6.1 `.pt` file, cosine top-K via single matmul +
+  topk, optional `similarity_floor`), `QueryResult`, and
+  `mixture_observation_from_query` (softmax over `sims / temperature`
+  → mixture weights; default σ_m=0.5, temperature=0.05). New filter
+  method `ParticleFilterPose.observe_xy_mixture(positions_xy,
+  weights, sigma_xy_m)` applies a Gaussian-mixture position
+  likelihood via per-component `logsumexp` — bit-equivalent to
+  `observe_xy_world` in the K=1 degenerate case, and (verified)
+  preserves bimodal posterior variance on symmetric two-component
+  observations rather than collapsing to the mixture mean. 24 new
+  tests (18 bank + 6 mixture) cover: self-feature query returns
+  index with cosine 1, similarity-floor empties the result,
+  softmax temperature shifts entropy in the expected direction,
+  K=1 matches `observe_xy_world` exactly, equal-weight bimodal
+  posterior cov > unimodal cov, unequal weights bias posterior
+  mean. 155 desktop+scripts tests passing. Next: 6.3 shadow
+  observer pulling RGB from `body/oakd/rgb` and writing JSONL
+  traces of would-be filter updates, no live wiring yet.
+
 - **2026-05-17 (Phase 6.1):** VPR scaffolding. New package
   `desktop/world_map/vpr/` with `extractor.py` — a DINOv2 wrapper
   (default `dinov2_vitb14`, 518×518 input, ImageNet-normalized,

@@ -436,6 +436,85 @@ class ParticleFilterPose:
         log_lik = -0.5 * (ex * ex + ey * ey) / (sigma * sigma)
         self._log_w = self._log_w + log_lik.to(self.cfg.weight_dtype)
 
+    # ── Mixture position observation (Phase 6 VPR) ──────────────────
+
+    def observe_xy_mixture(
+        self,
+        positions_xy: torch.Tensor,
+        weights: torch.Tensor,
+        sigma_xy_m: float,
+    ) -> None:
+        """Apply a Gaussian-mixture position likelihood to log_weights.
+
+        Per particle i with world XY (x_i, y_i):
+
+            L_i = Σ_k w_k · N(pos_k − (x_i, y_i); σ² I)
+
+        Used by the Phase 6 VPR observer: a query of the feature bank
+        returns top-K matches with cosine similarities; those become a
+        K-component soft mixture in world XY space (single-mode top-1
+        is the K=1 degenerate case and matches ``observe_xy_world``
+        exactly).
+
+        The mixture form matters when the query is genuinely ambiguous
+        (repetitive corridor, two visually-similar rooms): a single-mode
+        observation would overcommit. With K>1 the filter retains
+        plausible alternatives until later evidence collapses them.
+
+        Args:
+            positions_xy: (K, 2) tensor of world-frame component centers,
+                meters. Will be moved to ``cfg.device`` if needed.
+            weights: (K,) non-negative mixture weights; do not need to be
+                normalized — ``logsumexp`` is shift-invariant in the
+                particle dimension, but the per-particle relative scale
+                across components matters, so we normalize here.
+            sigma_xy_m: per-component 1-σ in meters (isotropic). VPR is
+                room-scale; 0.3–0.8 m is the right ballpark.
+
+        Updates log_weights in place. -log(2πσ²) is omitted (cancels
+        across particles).
+        """
+        self._require_seeded()
+        assert self._state is not None and self._log_w is not None
+        sigma = float(sigma_xy_m)
+        if sigma <= 0:
+            raise ValueError(
+                f"observe_xy_mixture: sigma_xy_m must be > 0, got {sigma}"
+            )
+        pos = positions_xy.to(self.cfg.device, dtype=self.cfg.state_dtype)
+        w = weights.to(self.cfg.device, dtype=self.cfg.state_dtype)
+        if pos.ndim != 2 or pos.shape[1] != 2:
+            raise ValueError(
+                f"observe_xy_mixture: positions_xy must be (K, 2), "
+                f"got shape {tuple(pos.shape)}"
+            )
+        if w.ndim != 1 or w.shape[0] != pos.shape[0]:
+            raise ValueError(
+                f"observe_xy_mixture: weights must be (K,) matching "
+                f"positions_xy K, got shapes {tuple(w.shape)} and "
+                f"{tuple(pos.shape)}"
+            )
+        if (w < 0).any():
+            raise ValueError("observe_xy_mixture: weights must be non-negative")
+        w_sum = w.sum()
+        if not torch.isfinite(w_sum) or float(w_sum) <= 0:
+            raise ValueError(
+                "observe_xy_mixture: weights sum must be positive and finite"
+            )
+        w = w / w_sum
+        # Per-particle, per-component squared distance: (N, K).
+        # (N, 1, 2) − (1, K, 2) = (N, K, 2).
+        diff = self._state[:, None, :2] - pos[None, :, :]
+        sq = (diff * diff).sum(dim=-1)  # (N, K)
+        # log L_i = logsumexp_k(log w_k − 0.5 · sq / σ²)
+        # log_w_safe stays finite for w==0 components (treated as
+        # -inf log-weight by setting a hard mask).
+        eps = torch.finfo(self.cfg.state_dtype).tiny
+        log_w_k = torch.log(w.clamp_min(eps))
+        log_terms = log_w_k[None, :] - 0.5 * sq / (sigma * sigma)
+        log_lik = torch.logsumexp(log_terms, dim=-1)  # (N,)
+        self._log_w = self._log_w + log_lik.to(self.cfg.weight_dtype)
+
     # ── Scan-likelihood observation ──────────────────────────────────
 
     def update_from_scan_likelihood(

@@ -8,6 +8,11 @@ Module layout:
 See ``docs/bayesian_localization_redesign.md`` §"Phase 6" for the plan.
 """
 
+from .bank import (
+    QueryResult,
+    VPRBank,
+    mixture_observation_from_query,
+)
 from .extractor import (
     DinoV2Extractor,
     ExtractorConfig,
@@ -17,5 +22,8 @@ from .extractor import (
 __all__ = [
     "DinoV2Extractor",
     "ExtractorConfig",
+    "QueryResult",
+    "VPRBank",
     "load_default_extractor",
+    "mixture_observation_from_query",
 ]

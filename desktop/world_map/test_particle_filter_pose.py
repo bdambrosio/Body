@@ -617,5 +617,118 @@ class TestCudaDevice(unittest.TestCase):
         self.assertEqual(cov.device.type, "cuda")
 
 
+class TestObserveXyMixture(unittest.TestCase):
+    """Phase 6 VPR — Gaussian-mixture position observation."""
+
+    def _seeded(self, **cfg_kwargs):
+        cfg = ParticleFilterConfig(
+            n_particles=cfg_kwargs.pop("n_particles", 4000),
+            init_sigma_xy_m=cfg_kwargs.pop("init_sigma_xy_m", 1.0),
+            init_sigma_theta_rad=cfg_kwargs.pop("init_sigma_theta_rad", 0.01),
+            seed=cfg_kwargs.pop("seed", 91),
+            **cfg_kwargs,
+        )
+        pf = ParticleFilterPose(cfg)
+        pf.seed_at(0.0, 0.0, 0.0)
+        return pf
+
+    def test_k1_matches_observe_xy_world(self):
+        # Single-component mixture must be bit-equivalent (within the
+        # softmax-normalization no-op) to observe_xy_world.
+        pf_a = self._seeded(seed=101)
+        pf_b = self._seeded(seed=101)
+        pf_a.observe_xy_world(world_x=0.3, world_y=-0.2, sigma_xy_m=0.5)
+        pf_b.observe_xy_mixture(
+            positions_xy=torch.tensor([[0.3, -0.2]]),
+            weights=torch.tensor([1.0]),
+            sigma_xy_m=0.5,
+        )
+        wa = pf_a.normalized_weights()
+        wb = pf_b.normalized_weights()
+        # Normalized weights identical (log_w differ only by a constant
+        # logsumexp shift, which cancels in softmax).
+        self.assertTrue(torch.allclose(wa, wb, atol=1e-6))
+
+    def test_unimodal_mixture_pulls_posterior_to_mode(self):
+        pf = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=110)
+        target = torch.tensor([[0.7, -0.4]])
+        pf.observe_xy_mixture(
+            positions_xy=target, weights=torch.tensor([1.0]), sigma_xy_m=0.3,
+        )
+        x, y, _ = pf.posterior_mean()
+        self.assertAlmostEqual(x, 0.7, delta=0.08)
+        self.assertAlmostEqual(y, -0.4, delta=0.08)
+
+    def test_bimodal_mixture_preserves_both_modes(self):
+        # Two equal-weight components placed symmetrically around the
+        # seed should leave the posterior mean near the seed (the
+        # mixture-mean is the seed itself) while the marginal variance
+        # remains substantial — particles between the modes get high
+        # weight from both, but the cloud as a whole shouldn't collapse.
+        pf = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=120)
+        pos = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
+        w = torch.tensor([1.0, 1.0])
+        pf.observe_xy_mixture(positions_xy=pos, weights=w, sigma_xy_m=0.3)
+        x, y, _ = pf.posterior_mean()
+        # Mean stays near 0 (equal masses pull symmetrically).
+        self.assertAlmostEqual(x, 0.0, delta=0.10)
+        self.assertAlmostEqual(y, 0.0, delta=0.10)
+        # Posterior x-variance should still be > the single-mode case.
+        # Single-mode comparison filter:
+        pf_single = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=120)
+        pf_single.observe_xy_mixture(
+            positions_xy=torch.tensor([[1.0, 0.0]]),
+            weights=torch.tensor([1.0]),
+            sigma_xy_m=0.3,
+        )
+        cov_bi = pf.posterior_cov()
+        cov_uni = pf_single.posterior_cov()
+        self.assertGreater(float(cov_bi[0, 0]), float(cov_uni[0, 0]))
+
+    def test_unequal_weights_bias_mean_toward_heavier_mode(self):
+        pf = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=130)
+        pos = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
+        # 90/10 weighting — mean should sit closer to +1 than to -1.
+        w = torch.tensor([0.9, 0.1])
+        pf.observe_xy_mixture(positions_xy=pos, weights=w, sigma_xy_m=0.3)
+        x, _, _ = pf.posterior_mean()
+        self.assertGreater(x, 0.3)
+
+    def test_n_eff_drops_on_sharp_observation(self):
+        pf = self._seeded(n_particles=2000, init_sigma_xy_m=0.5, seed=140)
+        n_before = pf.n_eff()
+        pf.observe_xy_mixture(
+            positions_xy=torch.tensor([[0.0, 0.0]]),
+            weights=torch.tensor([1.0]),
+            sigma_xy_m=0.05,  # very sharp
+        )
+        n_after = pf.n_eff()
+        self.assertLess(n_after, n_before)
+
+    def test_rejects_bad_shapes_and_weights(self):
+        pf = self._seeded()
+        with self.assertRaises(ValueError):
+            pf.observe_xy_mixture(
+                torch.zeros((3, 3)), torch.ones(3), sigma_xy_m=0.5,
+            )
+        with self.assertRaises(ValueError):
+            pf.observe_xy_mixture(
+                torch.zeros((2, 2)), torch.ones(3), sigma_xy_m=0.5,
+            )
+        with self.assertRaises(ValueError):
+            pf.observe_xy_mixture(
+                torch.zeros((2, 2)), torch.tensor([-1.0, 1.0]),
+                sigma_xy_m=0.5,
+            )
+        with self.assertRaises(ValueError):
+            pf.observe_xy_mixture(
+                torch.zeros((1, 2)), torch.zeros(1), sigma_xy_m=0.5,
+            )
+        with self.assertRaises(ValueError):
+            pf.observe_xy_mixture(
+                torch.zeros((1, 2)), torch.ones(1), sigma_xy_m=0.0,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
