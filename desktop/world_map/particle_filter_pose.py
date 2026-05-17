@@ -79,23 +79,25 @@ class ParticleFilterConfig:
     # at module top.
     #
     # History:
-    # - Original 5 mrad: compromise for correlation when IMU was
-    #   applied on every odom tick (50 Hz). Still over-counted.
-    # - 2026-05-17 bump to 15 mrad: empirical compensation after
-    #   the Phase 6.3 shadow trace showed N_eff < 5 on 63% of ticks.
-    # - 2026-05-17 revert to 3 mrad (this value): the root cause of
-    #   the over-counting was the 50 Hz observation rate, not σ.
-    #   Phase 6.4.1.5 added an explicit IMU observation rate gate
-    #   in ParticleFilterPoseSourceConfig.imu_obs_hz (default 5 Hz),
-    #   so observations are now ~200 ms apart — past the gyro
-    #   white-noise correlation time. σ can drop back toward the
-    #   calibrated value; 3 mrad keeps a small safety margin for
-    #   residual correlation and slow BNO bias drift.
+    # - Original 5 mrad: compromise when IMU was applied on every
+    #   odom tick (50 Hz). Over-counted; cloud collapsed.
+    # - 2026-05-17 → 15 mrad: empirical compensation for over-counting.
+    # - 2026-05-17 → 3 mrad: rate gate (Phase 6.4.1.5) made
+    #   observations ~independent at 5 Hz, so σ could drop back
+    #   toward Phase 0 calibrated. But empirically this combined
+    #   with the rate gate to make IMU 2.5× more constraining
+    #   than pre-rate-gate behavior — cloud σ_xy median stuck at
+    #   ~63 mm, σ-gate-pass rate only 17%.
+    # - 2026-05-17 → 8 mrad (this value): the right operational
+    #   loosening. Information rate per second is now ≈ 5/8² ≈
+    #   0.08 units/s vs the pre-rate-gate ≈ 50/15² ≈ 0.22 — about
+    #   3× looser than the original collapsing regime, ~7× looser
+    #   than the σ=3 mrad over-correction.
     #
     # Callers integrating IMU at a different cadence (e.g. once per
     # scan tick) can override imu_sigma_rad explicitly to match their
     # effective independence interval.
-    imu_sigma_rad: float = 3.0e-3
+    imu_sigma_rad: float = 8.0e-3
 
     # Per-step floor on motion-noise σ. Without this, zero-motion ticks
     # add zero noise and the cloud freezes — the "particle deprivation"

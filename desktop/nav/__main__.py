@@ -107,13 +107,14 @@ def _parse_args(argv):
              "Mutually exclusive with --pf.",
     )
     p.add_argument(
-        "--pf", action="store_true",
-        help="Phase 8 — promote the Bayesian particle filter to the "
-             "production pose source (encoder predict + IMU obs + "
-             "scan-likelihood obs, MMSE posterior reported). Replaces "
-             "OdomPose with ParticleFilterPoseSource. See "
-             "docs/bayesian_localization_redesign.md. Mutually "
-             "exclusive with --slam.",
+        "--pf", action=argparse.BooleanOptionalAction, default=True,
+        help="Use the Bayesian particle filter as the production pose "
+             "source (encoder predict + IMU obs + scan-likelihood obs, "
+             "MMSE posterior). Default ON since 2026-05-17 — Phase 6.4 "
+             "live validation showed the filter performing comparably "
+             "or better than the legacy stacks across all tested drives. "
+             "Use --no-pf to revert to the legacy OdomPose / --slam path. "
+             "See docs/bayesian_localization_redesign.md.",
     )
     p.add_argument(
         "--pf-shadow", metavar="PATH", default=None,
@@ -237,12 +238,14 @@ def main(argv=None) -> int:
     log = logging.getLogger(__name__)
     log.info(f"nav starting; router={router} (override via --router or ${ENV_VAR})")
 
-    if args.slam and args.pf:
-        log.error("--slam and --pf are mutually exclusive")
-        return 2
-    pose_source_type = (
-        "particle" if args.pf else ("slam" if args.slam else "odom")
-    )
+    # --slam wins if explicitly set — assumed intentional override of
+    # the --pf default. --no-pf with no --slam falls back to OdomPose.
+    if args.slam:
+        pose_source_type = "slam"
+    elif args.pf:
+        pose_source_type = "particle"
+    else:
+        pose_source_type = "odom"
 
     # Resolve particle-filter device. "auto" = cuda if torch sees a
     # device, else cpu. Imported lazily so non-pf paths don't pay the
