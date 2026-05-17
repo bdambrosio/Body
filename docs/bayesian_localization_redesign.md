@@ -729,6 +729,44 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.4.1.5):** IMU obs rate gate — the actual
+  root-cause fix. The 6.4.1 defensive-resampling experiment ran
+  fine (cloud σ_xy 5.7 → 125 mm, first live-applied observations
+  ever) but 78% of observations were still σ-gated as
+  cloud_too_tight. The underlying issue: `observe_imu_yaw` was
+  being called on every odom callback (50 Hz), treating each
+  BNO085 gyro sample as an independent observation. The samples
+  aren't — short-time gyro correlation breaks the IID assumption,
+  so 50 Hz observations over-count information and crush
+  N_eff between scan-tick resamples no matter what σ we pick.
+  Earlier compensations (σ 5→15 mrad, 1k→20k particles, 0%→5%
+  defensive) all addressed downstream symptoms.
+
+  New: `ParticleFilterPoseSourceConfig.imu_obs_hz: float = 5.0`
+  + monotonic-clock gate in `_on_odom`. At 5 Hz, observations are
+  ~200 ms apart — comfortably past the gyro white-noise
+  correlation time — so each one carries its near-calibrated σ.
+  `imu_obs_hz=0` disables IMU entirely; `imu_obs_hz=50` reproduces
+  the pre-6.4.1.5 behavior. `FuserConfig.pf_imu_obs_hz` (default
+  5.0) + launcher `--pf-imu-obs-hz`.
+
+  `ParticleFilterConfig.imu_sigma_rad` reverted **15 → 3 mrad**
+  (Phase 0 calibrated single-sample was 1.23 mrad; 3 mrad keeps a
+  small safety margin for residual correlation and slow bias drift).
+  Comment now traces the full history (5 → 15 → 3) so future readers
+  can follow the reasoning.
+
+  Counters: new `imu_obs_applied` and `imu_obs_rate_skipped` on
+  the pose source for trace inspection. 3 new tests:
+  rate-gated cadence subsamples to ~configured Hz, hz=0 disables
+  obs, hz=∞ applies on every predict. 192 desktop tests passing.
+
+  Operational expectation: combined with 6.4.1's 5% defensive
+  fraction, the cloud should now stay broad enough that the σ
+  gate admits most well-calibrated VPR matches, not just the
+  occasional one. Defensive resampling becomes nearly free
+  insurance rather than the load-bearing fix.
+
 - **2026-05-17 (Phase 6.4.1):** Defensive resample fraction. The
   Phase 6.4 live trace (run 10:02:45) confirmed the predicted
   failure mode: anchor calibration succeeded (offset Δ=(-0.214,

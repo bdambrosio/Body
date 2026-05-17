@@ -144,6 +144,14 @@ def _parse_args(argv):
              "10k–100k particles.",
     )
     p.add_argument(
+        "--pf-imu-obs-hz", type=float, default=5.0,
+        help="Phase 6.4.1.5 — rate at which IMU yaw observations are "
+             "applied to the particle filter (Hz). 50 Hz (one per odom "
+             "tick) over-counts because BNO085 samples are correlated. "
+             "Default 5 Hz puts observations ~200 ms apart, past the "
+             "gyro's correlation time. 0 = disable IMU obs entirely.",
+    )
+    p.add_argument(
         "--pf-defensive-fraction", type=float, default=0.05,
         help="Phase 6.4.1 — at every resample, divert this fraction of "
              "particles to fresh draws from a wide Gaussian around the "
@@ -263,6 +271,7 @@ def main(argv=None) -> int:
         pf_device=pf_device,
         pf_n_particles=args.pf_particles,
         pf_defensive_fraction=args.pf_defensive_fraction,
+        pf_imu_obs_hz=args.pf_imu_obs_hz,
     )
     chassis_config = StubConfig(
         router=router,

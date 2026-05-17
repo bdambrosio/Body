@@ -73,6 +73,13 @@ class FuserConfig:
     # Set to 0.0 to disable.
     pf_defensive_fraction: float = 0.05
 
+    # Phase 6.4.1.5 — IMU observation rate gate. 5 Hz default puts
+    # IMU observations 200 ms apart so each one is approximately
+    # independent (past the BNO085's white-noise correlation time).
+    # 0 = disable IMU observations entirely; 50 = old per-odom-tick
+    # behavior. See ParticleFilterPoseSourceConfig.imu_obs_hz.
+    pf_imu_obs_hz: float = 5.0
+
     vote_margin: int = 2
     # Sum-bounded vote model ("FIFO of length vote_capacity"):
     # per cell, clear_votes + block_votes ≤ vote_capacity. New

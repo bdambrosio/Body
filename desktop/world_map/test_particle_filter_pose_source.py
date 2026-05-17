@@ -152,6 +152,70 @@ class TestPoseSourceInterface(unittest.TestCase):
         self.assertAlmostEqual(pose[0], 0.10, delta=0.02)
         self.assertEqual(ps.match_summary()["predicts_run"], 1)
 
+    def test_imu_obs_rate_gate_subsamples_at_configured_hz(self):
+        # Phase 6.4.1.5: with imu_obs_hz=5, at most one observation
+        # per 200 ms is applied even if .update() fires every 20 ms.
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=42),
+            config=ParticleFilterPoseSourceConfig(imu_obs_hz=5.0),
+        )
+        _settle_imu_to(ps, until_ts=1000.0)
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+        # 30 odom callbacks at 20 ms apart = 600 ms total.
+        # At 5 Hz cap (200 ms period), expect ~3–4 applied IMU obs
+        # (plus the first one from seed-time, depending on monotonic
+        # clock spacing).
+        for i in range(1, 31):
+            ts = 1000.0 + i * 0.02
+            _settle_imu_to(ps, until_ts=ts, n=2)
+            ps.update(ts, i * 0.001, 0.0, 0.0)
+        c = ps.match_summary()
+        applied = c["imu_obs_applied"]
+        skipped = c["imu_obs_rate_skipped"]
+        # Wall-clock dominated: 30 updates in real wall time still
+        # gets gated. Total applied + skipped equals number of
+        # update calls where IMU was available (30 here, all of
+        # them — the seed update doesn't go through the IMU path).
+        self.assertEqual(applied + skipped, 30)
+        # At 5 Hz over the wall clock, we should have applied a
+        # small handful — not all 30. The exact count is timing-
+        # sensitive but must be ≤ 30 and ≥ 1.
+        self.assertGreaterEqual(applied, 1)
+        self.assertLess(applied, 30)
+
+    def test_imu_obs_hz_zero_disables(self):
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=42),
+            config=ParticleFilterPoseSourceConfig(imu_obs_hz=0.0),
+        )
+        _settle_imu_to(ps, until_ts=1000.0)
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+        for i in range(1, 11):
+            ts = 1000.0 + i * 0.02
+            _settle_imu_to(ps, until_ts=ts, n=2)
+            ps.update(ts, i * 0.001, 0.0, 0.0)
+        c = ps.match_summary()
+        self.assertEqual(c["imu_obs_applied"], 0)
+        self.assertEqual(c["imu_obs_rate_skipped"], 10)
+
+    def test_imu_obs_hz_huge_applies_every_predict(self):
+        # The pre-6.4.1.5 behavior: every odom callback fires an obs.
+        # We test with hz=1e9 (1 ns period) so monotonic-clock motion
+        # between Python loop iterations (~µs) always clears the gate.
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=42),
+            config=ParticleFilterPoseSourceConfig(imu_obs_hz=1e9),
+        )
+        _settle_imu_to(ps, until_ts=1000.0)
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+        for i in range(1, 11):
+            ts = 1000.0 + i * 0.02
+            _settle_imu_to(ps, until_ts=ts, n=2)
+            ps.update(ts, i * 0.001, 0.0, 0.0)
+        c = ps.match_summary()
+        self.assertEqual(c["imu_obs_applied"], 10)
+        self.assertEqual(c["imu_obs_rate_skipped"], 0)
+
     def test_teleport_detection(self):
         ps = ParticleFilterPoseSource(
             pf_config=ParticleFilterConfig(n_particles=200, seed=4),

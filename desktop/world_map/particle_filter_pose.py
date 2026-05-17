@@ -74,29 +74,28 @@ class ParticleFilterConfig:
     alpha_rot_per_m: float = ALPHA_ROT_PER_M
     alpha_rot_per_rad: float = ALPHA_ROT_PER_RAD
 
-    # IMU yaw observation σ. Default is *not* the Phase 0 per-sample
-    # noise (1.23 mrad ≈ 0.07°) directly — that value assumes
-    # independent samples, and the production loop applies the IMU
-    # observation on every odom tick (50 Hz) while BNO085 gyro samples
-    # are correlated over several samples. Treating them as independent
-    # at 50 Hz over-counts the information.
+    # IMU yaw observation σ. Phase 0 measured per-sample noise at
+    # 1.23 mrad (≈ 0.07°), preserved as IMU_SIGMA_PER_SAMPLE_RAD
+    # at module top.
     #
-    # Empirical update (2026-05-17, from the Phase 6.3 shadow trace):
-    # at σ = 5 mrad, N_eff < 5 on 63% of 1 Hz VPR ticks — the cloud
-    # collapses between scan-tick resamples (50 IMU obs in 1 s puts the
-    # particle weight ratio at ≈ exp(50) for a 10 mrad error particle).
-    # Bumping to 15 mrad gives a per-obs ratio of ≈ exp(0.22), which
-    # accumulates to ≈ exp(5.6) over 25 obs — strong enough to track,
-    # gentle enough that the cloud retains meaningful diversity for
-    # later observations to act on.
+    # History:
+    # - Original 5 mrad: compromise for correlation when IMU was
+    #   applied on every odom tick (50 Hz). Still over-counted.
+    # - 2026-05-17 bump to 15 mrad: empirical compensation after
+    #   the Phase 6.3 shadow trace showed N_eff < 5 on 63% of ticks.
+    # - 2026-05-17 revert to 3 mrad (this value): the root cause of
+    #   the over-counting was the 50 Hz observation rate, not σ.
+    #   Phase 6.4.1.5 added an explicit IMU observation rate gate
+    #   in ParticleFilterPoseSourceConfig.imu_obs_hz (default 5 Hz),
+    #   so observations are now ~200 ms apart — past the gyro
+    #   white-noise correlation time. σ can drop back toward the
+    #   calibrated value; 3 mrad keeps a small safety margin for
+    #   residual correlation and slow BNO bias drift.
     #
-    # The Phase 0 measurement is preserved as IMU_SIGMA_PER_SAMPLE_RAD
-    # at module top; callers integrating over a longer effective
-    # window (e.g. one observation per scan tick) should pass that
-    # value explicitly. The right architectural fix is to drop IMU
-    # observation rate to ~5 Hz at the calibrated σ; until that lands,
-    # the looser σ is the next-best mitigation.
-    imu_sigma_rad: float = 15.0e-3
+    # Callers integrating IMU at a different cadence (e.g. once per
+    # scan tick) can override imu_sigma_rad explicitly to match their
+    # effective independence interval.
+    imu_sigma_rad: float = 3.0e-3
 
     # Per-step floor on motion-noise σ. Without this, zero-motion ticks
     # add zero noise and the cloud freezes — the "particle deprivation"

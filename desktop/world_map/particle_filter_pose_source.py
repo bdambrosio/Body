@@ -63,6 +63,18 @@ class ParticleFilterPoseSourceConfig:
     # 200 ms heartbeat period at this rate.
     scan_hz: float = 2.0
 
+    # IMU yaw observation rate cap (Hz). 5.0 default — the BNO085's
+    # short-time correlation makes 50 Hz observations *not*
+    # independent samples, so applying observe_imu_yaw on every
+    # odom callback over-counts information and crashes N_eff
+    # between scan-tick resamples (Phase 6.3+6.4 traces showed
+    # cloud σ_xy collapsing to ~6 mm). 5 Hz puts observations
+    # 200 ms apart, comfortably past the gyro white-noise
+    # correlation time, so each observation can carry its
+    # near-calibrated σ. 0 = disable IMU obs entirely; 50 =
+    # pre-6.4.1.5 behavior (one per odom callback).
+    imu_obs_hz: float = 5.0
+
     # Skip scan-likelihood if grid evidence is too sparse — same
     # convention as ImuPlusScanMatchPose / shadow driver.
     min_grid_evidence_cells: int = 200
@@ -119,6 +131,10 @@ class ParticleFilterPoseSource(PoseSource):
         self._grid: Optional[Any] = None
         self._subs: List[Any] = []
         self._last_scan_mono: float = 0.0
+        # Phase 6.4.1.5 — IMU obs rate gate. Monotonic-clock timestamp
+        # of the last applied observe_imu_yaw call. 0 means "never";
+        # the gate fires immediately on first odom callback.
+        self._last_imu_obs_mono: float = 0.0
 
         # Counters surfaced via match_summary().
         self._counters: Dict[str, int] = {
@@ -128,6 +144,8 @@ class ParticleFilterPoseSource(PoseSource):
             "teleports": 0,
             "imu_received": 0,
             "imu_malformed": 0,
+            "imu_obs_applied": 0,
+            "imu_obs_rate_skipped": 0,
             "scan_received": 0,
             "scan_skipped_rate_limit": 0,
             "scan_skipped_sparse_grid": 0,
@@ -199,9 +217,22 @@ class ParticleFilterPoseSource(PoseSource):
             imu = self._imu_tracker.yaw_at(ts)
             if imu is not None:
                 imu_yaw, _imu_sigma = imu
-                world_yaw = _wrap(imu_yaw - self._yaw_offset)
-                # cfg.imu_sigma_rad (5 mrad default) — see commit 6d8dc2d.
-                self._pf.observe_imu_yaw(world_yaw)
+                # 6.4.1.5 rate gate: BNO085 samples are correlated
+                # over short windows; applying observe_imu_yaw at
+                # 50 Hz (every odom tick) over-counts information.
+                # Subsample to imu_obs_hz so each observation carries
+                # roughly-independent evidence. 0 disables entirely.
+                hz = float(self._config.imu_obs_hz)
+                now_mono = time.monotonic()
+                if hz <= 0.0:
+                    self._counters["imu_obs_rate_skipped"] += 1
+                elif now_mono - self._last_imu_obs_mono < 1.0 / hz:
+                    self._counters["imu_obs_rate_skipped"] += 1
+                else:
+                    world_yaw = _wrap(imu_yaw - self._yaw_offset)
+                    self._pf.observe_imu_yaw(world_yaw)
+                    self._last_imu_obs_mono = now_mono
+                    self._counters["imu_obs_applied"] += 1
 
             self._counters["predicts_run"] += 1
             self._last_odom = (ts, x, y, theta)

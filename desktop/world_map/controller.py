@@ -212,11 +212,17 @@ class FuserController:
             # only deployments don't need.
             from .particle_filter_pose import ParticleFilterConfig
             from .particle_filter_pose_source import ParticleFilterPoseSource
+            from .particle_filter_pose_source import (
+                ParticleFilterPoseSourceConfig,
+            )
             self.pose_source = ParticleFilterPoseSource(
                 pf_config=ParticleFilterConfig(
                     device=config.pf_device,
                     n_particles=config.pf_n_particles,
                     defensive_resample_fraction=config.pf_defensive_fraction,
+                ),
+                config=ParticleFilterPoseSourceConfig(
+                    imu_obs_hz=config.pf_imu_obs_hz,
                 ),
             )
         else:
