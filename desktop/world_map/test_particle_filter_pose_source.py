@@ -216,6 +216,120 @@ class TestPoseSourceInterface(unittest.TestCase):
         self.assertEqual(c["imu_obs_applied"], 10)
         self.assertEqual(c["imu_obs_rate_skipped"], 0)
 
+    def test_phase644_pf_for_vpr_returns_nav_filter(self):
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(n_particles=200, seed=50),
+        )
+        # pf_for_vpr should return the same object as the internal _pf.
+        self.assertIs(ps.pf_for_vpr(), ps._pf)
+        # And it should NOT be the same object as _pf_mapping.
+        self.assertIsNot(ps.pf_for_vpr(), ps._pf_mapping)
+
+    def test_phase644_mapping_filter_unaffected_by_vpr(self):
+        # The load-bearing invariant: VPR observations applied to the
+        # nav filter must NOT change the mapping filter's state.
+        import torch
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(
+                n_particles=500, seed=51,
+                init_sigma_xy_m=0.05,
+                init_sigma_theta_rad=math.radians(2.0),
+            ),
+        )
+        _settle_imu_to(ps, until_ts=1000.0)
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+
+        # Snapshot mapping filter before VPR.
+        mapping_state_before = ps._pf_mapping.state.clone()
+        mapping_log_w_before = ps._pf_mapping._log_w.clone()
+
+        # Apply a strong VPR observation directly to the nav filter
+        # (simulates what shadow_driver does via pf_for_vpr()).
+        nav_filter = ps.pf_for_vpr()
+        nav_filter.observe_xy_mixture(
+            positions_xy=torch.tensor([[2.0, 1.0]]),
+            weights=torch.tensor([1.0]),
+            sigma_xy_m=0.5,
+        )
+
+        # Nav filter shifted; mapping filter must be byte-identical.
+        self.assertTrue(torch.equal(ps._pf_mapping.state, mapping_state_before))
+        self.assertTrue(torch.equal(ps._pf_mapping._log_w, mapping_log_w_before))
+        # Sanity: nav filter DID change.
+        self.assertFalse(torch.equal(nav_filter._log_w, mapping_log_w_before))
+
+    def test_phase644_best_pose_at_reads_mapping_filter(self):
+        # The core invariant: after a VPR observation that shifts the
+        # nav posterior in some direction, best_pose_at (mapping) stays
+        # near where it was. We don't assert on the absolute nav shift
+        # size (depends on cloud / observation σ ratio) — only that
+        # nav moved further than mapping, and mapping stayed near origin.
+        import torch
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(
+                n_particles=2000, seed=52,
+                init_sigma_xy_m=0.30,  # broad enough that VPR can pull
+                init_sigma_theta_rad=math.radians(2.0),
+            ),
+        )
+        _settle_imu_to(ps, until_ts=1000.0)
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+
+        # Apply a VPR observation that pulls the nav filter toward
+        # (+0.5, 0). With σ=0.3 m it's strong enough to shift the
+        # nav posterior several cm.
+        nav_filter = ps.pf_for_vpr()
+        nav_filter.observe_xy_mixture(
+            positions_xy=torch.tensor([[0.5, 0.0]]),
+            weights=torch.tensor([1.0]),
+            sigma_xy_m=0.3,
+        )
+
+        nav_pose = ps.pose_at(1000.0)
+        map_pose = ps.best_pose_at(1000.0)
+        # Nav drifted toward +x; mapping should not have.
+        self.assertGreater(nav_pose[0], 0.05)
+        self.assertGreater(nav_pose[0], map_pose[0])
+        # Mapping stays within init_sigma_xy_m (0.30 m) of origin —
+        # the seed point. It has had no observations applied.
+        self.assertLess(abs(map_pose[0]), 0.30)
+        self.assertLess(abs(map_pose[1]), 0.30)
+
+    def test_phase644_predict_and_imu_propagate_to_both(self):
+        # Drive the bot forward; both filters' posterior means should
+        # advance by approximately the same amount.
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(
+                n_particles=2000, seed=53,
+                init_sigma_xy_m=0.001, init_sigma_theta_rad=0.0,
+            ),
+        )
+        _settle_imu_to(ps, until_ts=1000.0)
+        ps.update(1000.0, 0.0, 0.0, 0.0)
+        _settle_imu_to(ps, until_ts=1000.02)
+        ps.update(1000.02, 0.20, 0.0, 0.0)  # 20 cm forward
+
+        nav_mean = ps._pf.posterior_mean()
+        map_mean = ps._pf_mapping.posterior_mean()
+        # Both filters should have advanced ~20 cm in x.
+        self.assertAlmostEqual(nav_mean[0], 0.20, delta=0.03)
+        self.assertAlmostEqual(map_mean[0], 0.20, delta=0.03)
+        # And they should agree with each other.
+        self.assertAlmostEqual(nav_mean[0], map_mean[0], delta=0.05)
+
+    def test_phase644_mapping_filter_has_no_defensive_resampling(self):
+        # The mapping filter's defensive_resample_fraction is forced
+        # to 0 regardless of the nav config; defensive existed for
+        # VPR's benefit and mapping doesn't need it.
+        ps = ParticleFilterPoseSource(
+            pf_config=ParticleFilterConfig(
+                n_particles=200, seed=54,
+                defensive_resample_fraction=0.10,  # nav has defensive
+            ),
+        )
+        self.assertEqual(ps._pf.cfg.defensive_resample_fraction, 0.10)
+        self.assertEqual(ps._pf_mapping.cfg.defensive_resample_fraction, 0.0)
+
     def test_teleport_detection(self):
         ps = ParticleFilterPoseSource(
             pf_config=ParticleFilterConfig(n_particles=200, seed=4),

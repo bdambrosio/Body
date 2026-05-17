@@ -417,7 +417,9 @@ def main(argv=None) -> int:
                 # The shadow shares the production filter's lock so its
                 # read-only snapshot can't race against ongoing predicts.
                 pf_source = fuser.pose_source
-                pf = pf_source._pf  # type: ignore[attr-defined]
+                # 6.4.4 — pf_for_vpr() returns the nav filter; the
+                # mapping filter never sees VPR observations.
+                pf = pf_source.pf_for_vpr()
                 pf_lock = pf_source._lock  # type: ignore[attr-defined]
                 vpr_driver = ShadowVPRDriver(
                     session=fuser.session,

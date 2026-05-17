@@ -97,7 +97,32 @@ class ParticleFilterPoseSource(PoseSource):
         scan_matcher_config: Optional[ScanMatcherConfig] = None,
         config: Optional[ParticleFilterPoseSourceConfig] = None,
     ) -> None:
+        # Phase 6.4.4 — dual filter for clean mapping / nav split.
+        # Both filters see identical predict + IMU + scan-likelihood +
+        # resample, so they converge to similar posteriors in normal
+        # operation. ONLY ``self._pf`` (the nav filter) receives VPR
+        # observations via ``pf_for_vpr()``; ``self._pf_mapping``
+        # stays scan-consistent. ``best_pose_at`` reads from the
+        # mapping filter so WorldGrid.fuse_local_map stamps scans
+        # at the scan-consistent pose, never at a VPR-shifted pose.
+        # See bayesian_localization_redesign.md "Phase 6.4.4" for
+        # the architectural rationale.
         self._pf = ParticleFilterPose(pf_config)
+        # Mapping filter: same config but no defensive resampling
+        # (defensive existed to help VPR; mapping doesn't benefit
+        # and the broader cloud would still jitter MAP slightly).
+        # Different seed so it isn't bit-identical to the nav filter
+        # — gives genuinely independent sampling of the same posterior.
+        import dataclasses as _dc
+        from .particle_filter_pose import ParticleFilterConfig as _PFC
+        base_cfg = pf_config or _PFC()
+        mapping_cfg = _dc.replace(
+            base_cfg,
+            defensive_resample_fraction=0.0,
+            seed=(base_cfg.seed + 1) if base_cfg.seed is not None else None,
+        )
+        self._pf_mapping = ParticleFilterPose(mapping_cfg)
+
         # Wider θ search (±12°) than production's classical scan-match
         # default (±8°) — empirically eliminated scan_exhausted hits
         # during rotation in shadow-mode validation. Vectorization
@@ -180,6 +205,7 @@ class ParticleFilterPoseSource(PoseSource):
                 # World (0, 0, 0) at seed time. The filter operates
                 # in that world frame from here on.
                 self._pf.seed_at(0.0, 0.0, 0.0)
+                self._pf_mapping.seed_at(0.0, 0.0, 0.0)
                 self._yaw_offset = _wrap(imu_yaw - 0.0)
                 self._off_x, self._off_y, self._off_theta = x, y, theta
                 self._last_odom = (ts, x, y, theta)
@@ -212,7 +238,10 @@ class ParticleFilterPoseSource(PoseSource):
             # constant rigid offsets between odom and world).
             th_mid = last_tho + 0.5 * dth
             ds = dx * math.cos(th_mid) + dy * math.sin(th_mid)
+            # Phase 6.4.4 — apply predict to BOTH filters. They
+            # diverge only on VPR (which goes only to _pf).
             self._pf.predict(ds, dth)
+            self._pf_mapping.predict(ds, dth)
 
             imu = self._imu_tracker.yaw_at(ts)
             if imu is not None:
@@ -231,6 +260,7 @@ class ParticleFilterPoseSource(PoseSource):
                 else:
                     world_yaw = _wrap(imu_yaw - self._yaw_offset)
                     self._pf.observe_imu_yaw(world_yaw)
+                    self._pf_mapping.observe_imu_yaw(world_yaw)
                     self._last_imu_obs_mono = now_mono
                     self._counters["imu_obs_applied"] += 1
 
@@ -254,19 +284,32 @@ class ParticleFilterPoseSource(PoseSource):
         return latest[0]
 
     def best_pose_at(self, ts: float) -> Optional[Pose]:
-        """Highest-weight particle (discrete MAP) at the latest tick.
+        """Highest-weight particle (discrete MAP) at the latest tick,
+        from the **mapping filter** — scan-consistent, never shifted
+        by VPR observations.
 
-        Used by mapping consumers (Phase 5). For a tight posterior,
-        mode and mean agree within a particle spread (sub-cm in
-        typical operation). For a skewed or weakly-multimodal posterior
-        the mode tracks the dominant peak, which is what mapping wants
-        — building a grid against the mean during a mode transition
-        would smear walls.
+        Phase 6.4.4 — this used to read from ``self._pf`` (the nav
+        filter), which meant VPR observations would shift the mapping
+        pose, causing scans to be stamped at VPR-influenced poses.
+        With VPR's σ_m=0.5 m vs scan-match's ~5 cm internal accuracy,
+        per-application shifts of 30+ cm corrupted the WorldGrid
+        (run 12:11:11 produced corr=12.7 m of scan-match correction
+        over 60 s with red-blob lethal cells throughout clear areas).
+
+        Now reads from the scan-consistent mapping filter so
+        WorldGrid.fuse_local_map stamps at the scan-match peak.
         """
         with self._lock:
             if not self._seeded or self._last_odom is None:
                 return None
-            return self._pf.posterior_mode()
+            return self._pf_mapping.posterior_mode()
+
+    def pf_for_vpr(self) -> ParticleFilterPose:
+        """Phase 6.4.4 — the nav filter that VPR observations should
+        be applied to. The shadow VPR driver receives this; the
+        launcher constructs it through here so VPR can't accidentally
+        be wired to the mapping filter."""
+        return self._pf
 
     def rebind_world_to_current(self) -> Optional[Pose]:
         with self._lock:
@@ -275,6 +318,7 @@ class ParticleFilterPoseSource(PoseSource):
             ts, x, y, theta = self._last_odom
             imu = self._imu_tracker.yaw_at(ts)
             self._pf.seed_at(0.0, 0.0, 0.0)
+            self._pf_mapping.seed_at(0.0, 0.0, 0.0)
             self._off_x, self._off_y, self._off_theta = x, y, theta
             if imu is not None:
                 imu_yaw, _ = imu
@@ -395,7 +439,15 @@ class ParticleFilterPoseSource(PoseSource):
         with self._lock:
             if not self._seeded:
                 return
-            posterior = self._pf.posterior_mean()
+            # Phase 6.4.4 — use the mapping filter's posterior as the
+            # scan-match prior. The mapping filter never sees VPR, so
+            # its posterior tracks scan-consistent pose. Using the nav
+            # filter's posterior here would let VPR shifts cascade
+            # into the scan-match prior → score field offset from
+            # scan-consistent reality → mapping filter gets a biased
+            # field too. Keeping the prior on the mapping filter
+            # decouples scan-matching from VPR cleanly.
+            posterior = self._pf_mapping.posterior_mean()
         prior_pose = Pose2D(*posterior)
 
         if self._grid is None:
@@ -431,10 +483,20 @@ class ParticleFilterPoseSource(PoseSource):
 
         with self._lock:
             if result.score_field is not None:
+                # Same score field applied to both. Each filter scores
+                # its own particles' (dx, dy, dθ)-from-prior_pose; the
+                # field doesn't care which filter consumes it.
                 self._pf.update_from_scan_likelihood(
                     result.score_field, prior_pose,
                 )
+                self._pf_mapping.update_from_scan_likelihood(
+                    result.score_field, prior_pose,
+                )
             resampled = self._pf.maybe_resample()
+            # Also resample mapping filter independently; it may
+            # need to resample at different N_eff thresholds since
+            # its weights diverged from nav's via VPR.
+            self._pf_mapping.maybe_resample()
             if resampled:
                 self._counters["resamples_fired"] += 1
             # Track the magnitude of the argmax shift for the operator

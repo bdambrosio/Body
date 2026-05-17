@@ -729,6 +729,70 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.4.4):** Split mapping pose from nav pose
+  (option C from the post-12:11 triage discussion).
+
+  Background: the 12:11 trace showed VPR live application
+  corrupting the WorldGrid because `pose_source.best_pose_at(ts)`
+  (used by `fuse_local_map`) returned the *nav* posterior mode —
+  which gets shifted by VPR observations (median 332 mm,
+  max 1605 mm shifts in that run). Scans then planted walls at
+  VPR-shifted poses, producing the red-blob lethal-cell mess
+  Bruce reported. The defensive_sigma_theta fix (commit 07c8ba4)
+  cleaned the worst of the smearing, but the architectural
+  conflict — VPR's σ=0.5 m soft anchor competing with scan-
+  matching's ~5 cm internal precision for the same pose stream —
+  remained. Option C is the principled fix.
+
+  **Architecture:** `ParticleFilterPoseSource` now holds **two
+  filter instances**:
+  - `self._pf` — the **nav filter**. Receives predict + IMU +
+    scan-likelihood + resample + **VPR**. Its posterior drives
+    `pose_at()`, `latest_pose()`, `cov_at()` — everything UI /
+    planner / follower consume.
+  - `self._pf_mapping` — the **mapping filter**. Receives the
+    same predict + IMU + scan-likelihood + resample as nav, but
+    **never sees VPR**. Its `posterior_mode()` is what
+    `best_pose_at()` returns — the scan-consistent pose
+    `WorldGrid.fuse_local_map` stamps against.
+
+  **Key design choices:**
+  - Mapping filter's `defensive_resample_fraction` is forced to
+    0 regardless of the nav config — defensive existed for VPR's
+    benefit; mapping doesn't need it, and the broader cloud
+    would still slightly jitter MAP.
+  - Different seed (`base.seed + 1`) so the two filters take
+    independent random paths even when no VPR is applied. They
+    converge to similar posteriors but aren't bit-identical.
+  - Scan-matcher prior now uses the **mapping filter's**
+    `posterior_mean()` instead of the nav filter's, so the score
+    field used for `update_from_scan_likelihood` on both filters
+    is independent of any prior VPR cascade.
+  - New accessor `pf_for_vpr()` returns the nav filter; launcher
+    uses it instead of reaching into `_pf` directly, so VPR can't
+    accidentally be wired to the mapping filter.
+
+  **Cost:** 2× particle compute on predict + IMU + scan-likelihood.
+  Per Phase 4 benchmarks (0.13 ms/cycle at 10k particles on
+  RTX 6000), the doubled cost is still trivial.
+
+  5 new tests in `test_particle_filter_pose_source.py`:
+  `pf_for_vpr_returns_nav_filter`,
+  **`mapping_filter_unaffected_by_vpr`** (load-bearing — byte-
+  identical state after a VPR observation),
+  `best_pose_at_reads_mapping_filter`,
+  `predict_and_imu_propagate_to_both`,
+  `mapping_filter_has_no_defensive_resampling`.
+
+  218 desktop tests passing.
+
+  Operational expectation: VPR applications now produce
+  drift-corrected nav posterior without touching the WorldGrid's
+  pose stream. The 12:11-style smearing (corr=12.7 m, red-blob
+  lethals everywhere) should not recur even with `--vpr` on and
+  the full defensive resampling enabled. Bruce's next run will
+  validate.
+
 - **2026-05-17 (Phase 6.4.3):** Auto-sweep disabled; opportunistic
   path gets structured scoring; kidnapping-detection diagnostic.
 
