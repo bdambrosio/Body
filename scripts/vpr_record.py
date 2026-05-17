@@ -62,7 +62,13 @@ WORLD_STATUS_TOPIC = "body/world_map/status"
 class RecorderState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     latest_pose: Optional[Dict[str, float]] = None  # x_m, y_m, theta_rad
+    # pose_ts is the publisher-side timestamp (desktop wall-clock for
+    # world_status); pose_recv_ts is *our* wall-clock at callback time.
+    # We compare ages against pose_recv_ts so that any Pi-vs-desktop
+    # clock skew on other topics (e.g. body/oakd/rgb's Pi-stamped ts)
+    # can't make every frame look stale.
     latest_pose_ts: float = 0.0
+    latest_pose_recv_ts: float = 0.0
     pose_source_name: str = "unknown"
     frame_idx: int = 0
     counters: Dict[str, int] = field(default_factory=lambda: {
@@ -102,7 +108,8 @@ def _make_world_status_cb(state: RecorderState):
         pose = msg.get("pose_world")
         if not isinstance(pose, dict):
             return
-        ts = float(msg.get("ts") or time.time())
+        recv_ts = time.time()
+        ts = float(msg.get("ts") or recv_ts)
         source = str(msg.get("pose_source") or "unknown")
         with state.lock:
             state.latest_pose = {
@@ -111,6 +118,7 @@ def _make_world_status_cb(state: RecorderState):
                 "theta_rad": float(pose["theta_rad"]),
             }
             state.latest_pose_ts = ts
+            state.latest_pose_recv_ts = recv_ts
             state.pose_source_name = source
             state.counters["world_status_received"] += 1
     return cb
@@ -150,19 +158,23 @@ def _make_rgb_cb(
                 state.counters["rgb_malformed"] += 1
             return
 
-        rgb_ts = float(msg.get("ts") or time.time())
+        rgb_recv_ts = time.time()
+        rgb_ts = float(msg.get("ts") or rgb_recv_ts)
 
         # Snapshot pose under lock.
         with state.lock:
             pose = state.latest_pose
             pose_ts = state.latest_pose_ts
+            pose_recv_ts = state.latest_pose_recv_ts
             pose_source = state.pose_source_name
 
         if pose is None:
             with state.lock:
                 state.counters["frames_dropped_no_pose"] += 1
             return
-        age = abs(rgb_ts - pose_ts)
+        # Compare desktop-side receive times; Pi clock for rgb_ts
+        # vs desktop clock for pose_ts can be skewed arbitrarily.
+        age = max(0.0, rgb_recv_ts - pose_recv_ts)
         if age > max_pose_age_s:
             with state.lock:
                 state.counters["frames_dropped_stale_pose"] += 1
@@ -183,9 +195,11 @@ def _make_rgb_cb(
 
         line = json.dumps({
             "idx": idx,
-            "rgb_ts": rgb_ts,
-            "pose_ts": pose_ts,
-            "pose_age_s": age,
+            "rgb_ts": rgb_ts,            # Pi sensor clock
+            "rgb_recv_ts": rgb_recv_ts,  # desktop wall clock at arrival
+            "pose_ts": pose_ts,          # publisher (desktop) clock
+            "pose_recv_ts": pose_recv_ts,  # desktop wall clock at arrival
+            "pose_age_s": age,           # desktop-side staleness
             "pose_world": pose,
             "pose_source": pose_source,
             "jpeg": f"rgb/{jpeg_name}",
