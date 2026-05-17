@@ -167,11 +167,27 @@ class ParticleFilterConfig:
     # cloud collapsing to ~6 mm spread between scan-tick resamples,
     # too tight for VPR at σ=0.5 m to discriminate. Defensive
     # injection preserves tail support so observations like VPR
-    # have particles to re-weight against. 0.0 = current behavior
-    # (off). 0.05 = first-cut experiment. Tune from the trace.
+    # have particles to re-weight against. 0.0 = off; 0.05 = the
+    # production experiment.
     defensive_resample_fraction: float = 0.0
     defensive_sigma_xy_m: float = 0.5
-    defensive_sigma_theta_rad: float = math.radians(20.0)
+
+    # Defensive yaw perturbation. Set to 0.0 on 2026-05-17 after the
+    # 12:11 run produced severe map smearing (corr=12.7 m over 60 s,
+    # walls planted at scattered yaws). Cause: 5% of 20k particles
+    # injected at ±20° yaw error per resample; with the 5 Hz IMU
+    # rate gate, those bad-yaw particles persist 200 ms before
+    # IMU can correct, accumulating ~3.5 cm lateral error from
+    # predict propagation. Occasionally one wins the MAP argmax
+    # → mapping stamps walls at the wrong angle → smearing.
+    #
+    # Why 0 is the right choice: VPR (the observation defensive is
+    # *for*) is XY-only. Yaw perturbation has no upside for any
+    # observation in the current pipeline. The defensive cloud
+    # only needs XY breadth. Steady-state yaw spread under normal
+    # scan-matching is 0.5–2°; if a future observation type needs
+    # to discriminate yaw at a wider scale, this can be re-enabled.
+    defensive_sigma_theta_rad: float = 0.0
 
     # Deterministic seed for reproducible tests. None = nondeterministic.
     seed: Optional[int] = None
