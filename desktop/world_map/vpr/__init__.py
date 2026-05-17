@@ -18,11 +18,17 @@ from .extractor import (
     ExtractorConfig,
     load_default_extractor,
 )
+from .shadow_driver import (
+    ShadowVPRConfig,
+    ShadowVPRDriver,
+)
 
 __all__ = [
     "DinoV2Extractor",
     "ExtractorConfig",
     "QueryResult",
+    "ShadowVPRConfig",
+    "ShadowVPRDriver",
     "VPRBank",
     "load_default_extractor",
     "mixture_observation_from_query",

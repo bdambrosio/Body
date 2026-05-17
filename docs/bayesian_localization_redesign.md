@@ -729,6 +729,28 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.3):** Shadow VPR driver. New
+  `desktop/world_map/vpr/shadow_driver.py` — `ShadowVPRDriver`
+  subscribes to `body/oakd/rgb`, runs DINOv2 extractor + bank
+  query + mixture conversion, and writes JSONL traces of *would-be*
+  filter updates. Production filter is read-only (snapshot
+  `pf.state` + `pf._log_w` under lock, compute the posterior shift
+  the observation *would* induce, log it; live filter is never
+  written to). Trace records: `session_start` (config + bank meta),
+  `vpr_obs` (top-k matches, mixture parameters, current pose,
+  `would_be` summary with `mean_xy_before/after`, `n_eff_before/after`,
+  `log_lik_stats`), `no_match` (similarity-floor rejections),
+  `session_end`. Launcher flags `--vpr-shadow PATH --vpr-bank PATH
+  --vpr-rate --vpr-similarity-floor --vpr-sigma-m`; only attaches
+  when `--pf` is the production source so the shared
+  `ParticleFilterPose._lock` snapshot is meaningful. 11 new tests
+  (process_frame on known matches, no-match path, **pf-state
+  unchanged invariant**, posterior shift toward bank pose, RGB
+  Zenoh callback with real JPEG payload, malformed-payload
+  counters, JPEG helpers). 164 desktop + 2 scripts = 166 total
+  passing. Next: 6.4 — promote to live observation behind `--vpr`
+  with σ/motion gating.
+
 - **2026-05-17 (Phase 6.2):** Bank query + Gaussian-mixture
   observation. New `desktop/world_map/vpr/bank.py` adds `VPRBank`
   (load from Phase-6.1 `.pt` file, cosine top-K via single matmul +
