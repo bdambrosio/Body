@@ -729,6 +729,74 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6 closeout — experiment dead-ended):** After
+  the day's full Phase 6.1 → 6.4.4 build-out, the VPR live-mode
+  experiment is closed. **Summary verdict: VPR works as a measurement
+  / diagnostic but does not pay for itself as a live observation
+  source on this stack.**
+
+  What's working:
+  - VPR shadow mode (`--vpr-shadow PATH`) is a useful diagnostic.
+    Trace records carry top-k matches, would-be posterior shifts,
+    anchor calibration, gating outcomes, kidnapping-detection
+    signal.
+  - The whole pipeline (DINOv2 extractor, bank build/load,
+    Procrustes SE(2) anchor fit, σ + distance + anchor gating,
+    dual-filter mapping/nav split) is in tree and tested
+    (28 dedicated VPR-side tests).
+  - Anchor calibration genuinely works post-opportunistic-only
+    accumulation (run 12:11 fit at residual 0.149 m, cov 0.072
+    m²) once we stopped polluting it with the broken sweep.
+
+  What didn't work — the load-bearing reasons VPR was retired:
+  1. **Cosine similarity ≠ geographic match.** DINOv2 returns the
+     nearest-neighbor frame even when the bot has driven outside
+     bank coverage; >50% of pairs in long drives were spurious
+     once the bot left the bank's ~1 m² extent (12:06 trace).
+     Mitigation: denser bank coverage — but that's a workflow
+     burden the operator pays for every recording.
+  2. **σ_m=0.5 m vs scan-match's ~5 cm internal accuracy.** Live
+     VPR observations pulled the nav posterior by 30+ cm per
+     application; with VPR feeding the mapping pose stream the
+     WorldGrid smeared catastrophically (12:11 — corr=12.7 m
+     over 60 s, red-blob lethals everywhere). Phase 6.4.4 fixed
+     this for *mapping* by splitting nav and mapping filters,
+     but then nav-vs-mapping frame divergence broke the planner
+     (16:25 — plan paths crossed lethals; `follow: canceled`).
+  3. **Even with both fixes (6.4.3 + 6.4.4), σ-gate rejected
+     85%+ of observations** as `cloud_too_tight`, because the
+     filter is concentrated by scan-likelihood faster than VPR
+     can broaden it. The few that fired were correct but rare.
+
+  The architectural alternative that actually works: **saved
+  maps + scan-match relocate()** (Phase 7-like). One thorough
+  mapping run produces a snapshot; subsequent sessions
+  `--load-map` the snapshot and `relocate()` finds the bot's
+  position in it via wide scan-match. That gives cross-session
+  global anchoring (the role VPR was supposed to fill) without
+  the appearance-vs-geometry mismatch, the σ-gap with scan-
+  matching, or the dual-filter complexity. Implemented in PF
+  (commit 0d7fe08); paired with `--load-map` / `--relocate-on-load`
+  flags in this commit.
+
+  All VPR code stays in tree:
+  - `desktop/world_map/vpr/` — entire subpackage retained
+  - `desktop/nav/__main__.py` — `--vpr` / `--vpr-shadow` flags
+    still functional (off by default; users who want to revisit
+    can do so without code archaeology)
+  - tests preserved
+
+  **LPR (Lidar Place Recognition) added as future TODO** —
+  same architectural pattern as VPR (bank + query + observation)
+  but with lidar shape descriptors (Scan Context, M2DP, or
+  similar). Lidar-based pose recovery is geometrically tied to
+  position rather than appearance-similar, so the
+  cosine-vs-geographic mismatch that killed VPR doesn't apply.
+  Sub-millisecond CPU cost per query. **Defer until we have a
+  concrete use case the saved-map + relocate stack can't cover**
+  — global re-localization in dynamic environments, multi-floor
+  buildings, large outdoor spaces.
+
 - **2026-05-17 (Phase 6.4.4):** Split mapping pose from nav pose
   (option C from the post-12:11 triage discussion).
 

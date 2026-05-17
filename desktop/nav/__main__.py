@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -223,6 +225,20 @@ def _parse_args(argv):
              "offset. Default 5.",
     )
     p.add_argument(
+        "--load-map", metavar="PATH", default=None,
+        help="Load a saved map snapshot (layers.npz from "
+             "controller.save_snapshot_bundle) into the live WorldGrid "
+             "at startup. Equivalent to UI File → Load Snapshot, but "
+             "deterministic and scriptable.",
+    )
+    p.add_argument(
+        "--relocate-on-load", action="store_true",
+        help="--load-map: automatically fire relocate() once a scan has "
+             "arrived after startup (≈2 s typical). Wide scan-match "
+             "against the loaded grid → bot finds itself within the "
+             "map without operator intervention.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
     )
     return p.parse_args(argv)
@@ -290,6 +306,67 @@ def main(argv=None) -> int:
             ok, err = ctrl.connect()
             if not ok:
                 log.warning(f"{name} autoconnect failed ({err}); retry via UI")
+
+    # --load-map: restore a saved snapshot into the live WorldGrid.
+    # Run after the fuser is connected so the grid exists; before
+    # shadow drivers / VPR so any pose-source initialization sees
+    # the loaded evidence.
+    if args.load_map:
+        if not fuser.connected:
+            log.warning("--load-map requires fuser to be connected; skipping")
+        else:
+            map_path = os.path.expanduser(args.load_map)
+            try:
+                summary = fuser.load_snapshot(map_path)
+                log.info(
+                    "loaded map %s — %d observed cells (session_id=%s)",
+                    map_path,
+                    summary.get("cells_loaded", "?"),
+                    summary.get("source_session_id", "?"),
+                )
+            except Exception:
+                log.exception("--load-map failed; continuing with empty grid")
+
+    # --relocate-on-load: fire relocate() once a scan has arrived.
+    # The PF source caches scans in _on_scan; we wait up to 5 s for
+    # the first cached scan, then call relocate. Best-effort: any
+    # failure (no scan, sparse grid, low improvement) is logged but
+    # doesn't block the rest of startup.
+    if args.relocate_on_load:
+        if not args.load_map:
+            log.warning("--relocate-on-load has no effect without --load-map")
+        elif fuser.connected and fuser.pose_source is not None:
+            import threading as _t
+            def _deferred_relocate():
+                deadline = time.time() + 5.0
+                ps = fuser.pose_source
+                while time.time() < deadline:
+                    has_scan = getattr(ps, "_last_scan_ts", 0.0) > 0.0
+                    if has_scan:
+                        break
+                    time.sleep(0.1)
+                try:
+                    result = ps.relocate()
+                except Exception:
+                    log.exception("--relocate-on-load: relocate raised")
+                    return
+                if result.get("success"):
+                    log.info(
+                        "relocate-on-load: succeeded — dx=%+.2f dy=%+.2f "
+                        "dθ=%+.1f° improvement=%.1f",
+                        result["dx"], result["dy"],
+                        math.degrees(result["dtheta"]),
+                        result.get("improvement", 0.0),
+                    )
+                else:
+                    log.warning(
+                        "relocate-on-load: failed (%s) — %s",
+                        result.get("reason", "?"), result,
+                    )
+            _t.Thread(
+                target=_deferred_relocate, name="relocate-on-load",
+                daemon=True,
+            ).start()
 
     # Shadow SLAM: only wires if the fuser already has a live session
     # (i.e. autoconnect succeeded). Post-launch reconnects via the
