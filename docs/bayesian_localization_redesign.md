@@ -729,6 +729,73 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.4.3):** Auto-sweep disabled; opportunistic
+  path gets structured scoring; kidnapping-detection diagnostic.
+
+  The 11:48 live trace showed the 6.4.2 auto-sweep was *geometrically
+  degenerate*: rotating in place produces pairs with constant
+  ``current_xy`` (the spawn point) and varied ``bank_xy``. The
+  Procrustes fit cannot resolve translation from this data — different
+  ``bank_xy`` values all want to map to the same target. 18 sweep
+  pairs poisoned the shared estimator's fit (residual locked at
+  0.44 m vs the 0.15 m threshold), and even subsequent good drive
+  pairs couldn't recover. Sweep failed; all 51 post-sweep
+  observations gated as anchor-uncalibrated; **0 live observations
+  applied**.
+
+  Earlier runs (10:28, 10:40, 11:00) had succeeded precisely because
+  there was no sweep — opportunistic accumulation during manual drive
+  produced pairs with varied ``current_xy``, and the SE(2) fit was
+  well-conditioned.
+
+  **Fix:**
+
+  - `desktop/nav/__main__.py` no longer fires `VPRCalibrationSweep`
+    when `--vpr` is set. The module stays in tree as a starting
+    point for a future *drive-based* calibration mission (e.g.
+    forward 1 m / rotate / forward 1 m to vary `current_xy`).
+  - `AnchorOffsetEstimator.calibrate_if_ready` now delegates to
+    `score_calibration` internally — opportunistic gets bootstrap
+    covariance + unique-cells checking + all the structured failure
+    reasons the sweep scoring had. New `on_attempt` callback so the
+    shadow driver can log a `vpr_calibration` event from the
+    opportunistic path (same schema the sweep used; `phase:
+    "opportunistic_attempt"`).
+  - `AnchorOffsetConfig` gains `max_cov_xy_trace_m2` (default
+    **0.5 m²** — looser than the sweep's 0.10 because opportunistic
+    typically locks at K≈5–8 where bootstrap variance is intrinsically
+    large), `min_unique_bank_cells`, `bank_cell_size_m`,
+    `bootstrap_n_resamples`, `bootstrap_seed`.
+
+  **Kidnapping-detection diagnostic (Bruce's insight, 6.4.3 part):**
+  softmax in the would-be update is shift-invariant — it throws
+  away the *absolute* likelihood scale. But that scale is exactly
+  what tells us "even the best particle is far from where the
+  observation says we should be." `_compute_would_be` now exposes
+  ``d_best_to_obs_m = sqrt(-2 · max(log_lik)) · σ`` in every
+  trace record. A top-level `kidnapping_suspected` boolean fires
+  when (top_1_sim ≥ 0.85) ∧ (anchor calibrated) ∧
+  (d_best_to_obs > 3·σ). Counter `kidnapping_suspected`
+  surfaces totals via `match_summary()`. **No behavioral
+  response yet** — diagnostic only, until we have trace data on
+  what `d_best_to_obs_m` looks like during normal vs deliberate-
+  kidnapping operation. After we see that, we decide whether
+  to: (a) widen `defensive_resample_fraction` on demand,
+  (b) hard re-seed PF around the VPR mixture peak, or
+  (c) alarm the operator.
+
+  Tests: 5 new in `test_shadow_driver.py` (d_best_to_obs computed,
+  kidnapping suspected on far-cloud match, not suspected when
+  anchor uncalibrated, not suspected on low-sim, opportunistic
+  anchor lock logs vpr_calibration event). 213 desktop tests
+  passing.
+
+  Operational note: the standard `python -m desktop.nav --router
+  ... --vpr ... --vpr-bank ...` invocation now behaves like the
+  10:28/10:40/11:00 runs that were actually working — opportunistic
+  accumulation during real driving — plus bootstrap covariance,
+  unique-cells check, and the kidnapping diagnostic in the trace.
+
 - **2026-05-17 (Phase 6.4.2):** VPR startup calibration via sweep-
   in-place. Replaces the opportunistic anchor accumulation from 6.4
   with an explicit preflight: when `--vpr` is set, the launcher

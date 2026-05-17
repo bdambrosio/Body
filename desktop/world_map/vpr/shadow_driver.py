@@ -394,8 +394,11 @@ class ShadowVPRDriver:
             )
             if self._anchor.n_pairs_collected > before:
                 self._counters["anchor_pairs_collected"] += 1
-            new_cal = self._anchor.calibrate_if_ready()
-            if new_cal is not None and self._counters["anchor_calibrations"] == 0:
+            was_calibrated = self._anchor.calibration is not None
+            new_cal = self._anchor.calibrate_if_ready(
+                on_attempt=self._on_anchor_attempt,
+            )
+            if new_cal is not None and not was_calibrated:
                 self._counters["anchor_calibrations"] += 1
 
         mixture = mixture_observation_from_query(
@@ -442,6 +445,21 @@ class ShadowVPRDriver:
                     positions_xy, weights, sigma_m, snapshot, gate,
                 )
 
+            # Phase 6.4.3 — kidnapping suspicion: high-confidence
+            # match + best particle far from observation + anchor
+            # already calibrated (otherwise distance is in a
+            # comparing-against-uncalibrated-frame which is meaningless).
+            # Purely diagnostic; trace consumers can flag patterns.
+            top1_sim = top_k_records[0]["sim"] if top_k_records else 0.0
+            d_best = (
+                would_be.get("d_best_to_obs_m", 0.0)
+                if would_be is not None else 0.0
+            )
+            kidnapping_suspected = (
+                top1_sim >= 0.85
+                and self._anchor.calibration is not None
+                and d_best > 3.0 * sigma_m
+            )
             record = {
                 "type": "vpr_obs",
                 "rgb_recv_ts": rgb_recv_ts,
@@ -458,7 +476,11 @@ class ShadowVPRDriver:
                 "anchor": anchor_payload,
                 "gating": gate,
                 "applied": applied,
+                "kidnapping_suspected": kidnapping_suspected,
             }
+            if kidnapping_suspected:
+                self._counters.setdefault("kidnapping_suspected", 0)
+                self._counters["kidnapping_suspected"] += 1
         self._write_trace(record)
         if self._on_trace is not None:
             try:
@@ -524,6 +546,23 @@ class ShadowVPRDriver:
         mean_after = (state[:, :2] * w_after[:, None]).sum(dim=0)
         n_eff_after = float(1.0 / (w_after * w_after).sum().clamp_min(eps))
 
+        # Phase 6.4.3 — kidnapping-detection diagnostic. softmax in
+        # the would-be update is shift-invariant, so the *absolute*
+        # likelihood scale gets thrown away. But the absolute scale
+        # is exactly what tells us "even the best particle is far
+        # from where this observation says we should be" — i.e.
+        # kidnapping / wrong-room / frame mismatch.
+        #
+        # max(log_lik) is the un-normalized log-weight of the closest
+        # particle to the nearest mixture component. For a single-
+        # component mixture with σ, log_lik_peak ≈ -0.5·d²/σ²
+        # where d is the closest particle's distance from the
+        # observation peak. Invert to recover distance:
+        max_log_lik = float(log_lik.max())
+        # Clamp -2*max so distance stays well-defined when peak is
+        # essentially at 0.
+        d_best_to_obs_m = math.sqrt(max(0.0, -2.0 * max_log_lik)) * sigma_m
+
         return {
             "mean_xy_before": [float(mean_before[0]), float(mean_before[1])],
             "mean_xy_after":  [float(mean_after[0]),  float(mean_after[1])],
@@ -533,8 +572,9 @@ class ShadowVPRDriver:
                 "mean": float(log_lik.mean()),
                 "std":  float(log_lik.std(unbiased=False)),
                 "min":  float(log_lik.min()),
-                "max":  float(log_lik.max()),
+                "max":  max_log_lik,
             },
+            "d_best_to_obs_m": d_best_to_obs_m,
         }
 
     def _evaluate_gate(
@@ -605,6 +645,42 @@ class ShadowVPRDriver:
             self._last_applied_xy = (snapshot["mean"][0], snapshot["mean"][1])
         self._counters["live_obs_applied"] += 1
         return True
+
+    def _on_anchor_attempt(self, score) -> None:
+        """Callback fired by AnchorOffsetEstimator on every
+        opportunistic calibration attempt — logs a vpr_calibration
+        event with the same schema the 6.4.2 sweep used. Only logs
+        once per state transition (first pass; first ~few fails)
+        to avoid trace spam during pre-calibration accumulation."""
+        # Suppress noise: only log fail attempts when scoring actually
+        # ran (not the "too few pairs" / "no spread" deferrals which
+        # fire on every RGB tick).
+        if not score.passed and score.reason in (
+            "too_few_pairs", "insufficient_spatial_spread",
+            "too_few_unique_bank_cells",
+        ):
+            return
+        try:
+            self.log_event("vpr_calibration", {
+                "phase": "opportunistic_attempt",
+                "passed": score.passed,
+                "reason": score.reason,
+                "n_pairs": score.n_pairs,
+                "n_unique_bank_cells": score.n_unique_bank_cells,
+                "spatial_spread_m": score.spatial_spread_m,
+                "residual_rms_m": score.residual_rms_m,
+                "cov_xy_trace_m2": score.cov_xy_trace_m2,
+                "cov_theta_var_rad2": score.cov_theta_var_rad2,
+                "offset": (
+                    {"dx": score.offset.dx, "dy": score.offset.dy,
+                     "dtheta_rad": score.offset.dtheta_rad,
+                     "n_pairs": score.offset.n_pairs,
+                     "residual_rms_m": score.offset.residual_rms_m}
+                    if score.offset is not None else None
+                ),
+            })
+        except Exception:
+            logger.exception("shadow_vpr: on_attempt log failed")
 
     def _anchor_payload(self) -> Tuple[str, Dict[str, Any]]:
         """Trace-friendly snapshot of anchor state."""

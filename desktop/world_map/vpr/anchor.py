@@ -59,6 +59,24 @@ class AnchorOffsetConfig:
     # query time is the particle filter's MMSE, not ground truth.
     max_residual_m: float = 0.25
 
+    # Phase 6.4.3 — bootstrap covariance gate for opportunistic mode.
+    # Looser than the sweep's 0.10 because opportunistic typically locks
+    # at K≈5–8 pairs where bootstrap variance is large by construction
+    # (any pair missing from a resample swings the fit). 0.5 m² ≈ 0.7 m
+    # 1-σ in each axis — generous enough that small N doesn't auto-fail
+    # but tight enough to catch genuinely uninformative data.
+    max_cov_xy_trace_m2: float = 0.5
+
+    # Quantize bank XY to this cell size when counting unique cells —
+    # avoids the degenerate "all matches at the same point" case where
+    # rotation is unobservable.
+    bank_cell_size_m: float = 0.10
+    min_unique_bank_cells: int = 3
+
+    # Bootstrap params for the covariance estimate.
+    bootstrap_n_resamples: int = 100
+    bootstrap_seed: int = 0
+
 
 @dataclass
 class AnchorPair:
@@ -145,9 +163,27 @@ class AnchorOffsetEstimator:
 
     # ── Fit ──────────────────────────────────────────────────────────
 
-    def calibrate_if_ready(self) -> Optional[CalibrationResult]:
+    def calibrate_if_ready(
+        self,
+        *,
+        on_attempt: Optional[Any] = None,
+    ) -> Optional[CalibrationResult]:
         """Attempt a fit; return the result if accepted (also stored),
         ``None`` if not enough data or fit was rejected.
+
+        Phase 6.4.3 — internally delegates to ``score_calibration`` so
+        the opportunistic path gets bootstrap covariance + unique-cells
+        checking + all the structured failure reasons that the sweep
+        scoring already had. The estimator's own ``min_pairs`` /
+        ``min_spatial_spread_m`` / ``max_residual_m`` thresholds are
+        passed through to ``CalibrationScoringConfig``.
+
+        Args:
+            on_attempt: optional callback fired with the full
+                ``CalibrationScore`` on every attempt (pass or fail).
+                Lets the shadow driver log a ``vpr_calibration`` trace
+                event from the opportunistic path, matching the schema
+                the sweep produces.
 
         Idempotent once calibrated — returns the stored result without
         re-running the math.
@@ -157,35 +193,59 @@ class AnchorOffsetEstimator:
                 return self._result
             if len(self._pairs) < self._cfg.min_pairs:
                 return None
-            bank = [(p.bank_xy[0], p.bank_xy[1]) for p in self._pairs]
-            curr = [(p.current_xy[0], p.current_xy[1]) for p in self._pairs]
-            # Spatial-spread guard on bank side.
-            spread = _max_pairwise_distance(bank)
-            if spread < self._cfg.min_spatial_spread_m:
-                logger.debug(
-                    "anchor: %d pairs collected but bank spread %.2f m < %.2f m "
-                    "threshold; deferring fit.",
-                    len(self._pairs), spread, self._cfg.min_spatial_spread_m,
-                )
-                return None
-            dx, dy, dth, rms = _fit_se2(bank, curr)
-            if rms > self._cfg.max_residual_m:
+            pairs_snapshot = list(self._pairs)
+
+        # Score off-lock — bootstrap covariance does N fits and can
+        # take a few ms; no reason to hold the estimator lock during it.
+        scoring_cfg = CalibrationScoringConfig(
+            min_pairs=self._cfg.min_pairs,
+            min_unique_bank_cells=self._cfg.min_unique_bank_cells,
+            bank_cell_size_m=self._cfg.bank_cell_size_m,
+            min_spatial_spread_m=self._cfg.min_spatial_spread_m,
+            max_residual_rms_m=self._cfg.max_residual_m,
+            max_cov_xy_trace_m2=self._cfg.max_cov_xy_trace_m2,
+            bootstrap_n_resamples=self._cfg.bootstrap_n_resamples,
+            bootstrap_seed=self._cfg.bootstrap_seed,
+        )
+        score = score_calibration(pairs_snapshot, scoring_cfg)
+
+        if on_attempt is not None:
+            try:
+                on_attempt(score)
+            except Exception:
+                logger.exception("anchor: on_attempt callback raised")
+
+        if not score.passed or score.offset is None:
+            if score.reason not in ("too_few_pairs", "insufficient_spatial_spread",
+                                    "too_few_unique_bank_cells"):
                 logger.warning(
-                    "anchor: %d pairs fit but residual RMS %.3f m > %.3f m "
-                    "threshold; rejecting fit, will retry with more data.",
-                    len(self._pairs), rms, self._cfg.max_residual_m,
+                    "anchor: %d pairs fit but %s — rms=%.3f cov_xy_trace=%.4f "
+                    "spread=%.2fm cells=%d. Will retry with more data.",
+                    score.n_pairs, score.reason, score.residual_rms_m,
+                    score.cov_xy_trace_m2, score.spatial_spread_m,
+                    score.n_unique_bank_cells,
                 )
-                return None
-            self._result = CalibrationResult(
-                dx=dx, dy=dy, dtheta_rad=dth,
-                n_pairs=len(self._pairs), residual_rms_m=rms,
-            )
-            logger.info(
-                "anchor: calibrated from %d pairs — Δ=(%+.3f m, %+.3f m, "
-                "%+.2f°) residual_rms=%.3f m",
-                self._result.n_pairs, dx, dy, math.degrees(dth), rms,
-            )
-            return self._result
+            else:
+                logger.debug(
+                    "anchor: %d pairs not yet calibratable (%s).",
+                    score.n_pairs, score.reason,
+                )
+            return None
+
+        with self._lock:
+            # Recheck — another thread might have set this while we
+            # were off-lock running the bootstrap.
+            if self._result is not None:
+                return self._result
+            self._result = score.offset
+        logger.info(
+            "anchor: calibrated from %d pairs — Δ=(%+.3f m, %+.3f m, "
+            "%+.2f°) residual_rms=%.3f m cov_xy_trace=%.4f m²",
+            score.n_pairs, score.offset.dx, score.offset.dy,
+            math.degrees(score.offset.dtheta_rad),
+            score.residual_rms_m, score.cov_xy_trace_m2,
+        )
+        return self._result
 
     def set_calibration(self, result: CalibrationResult) -> None:
         """Force-install a calibration result (e.g. from a sweep-driven
