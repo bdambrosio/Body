@@ -349,7 +349,7 @@ def main(argv=None) -> int:
         if not args.vpr_bank:
             log.error("--vpr-shadow requires --vpr-bank PATH")
             return 2
-        if fuser.connected and getattr(fuser, "_pose_source", None) is not None \
+        if fuser.connected and getattr(fuser, "pose_source", None) is not None \
                 and pose_source_type == "particle":
             try:
                 from desktop.world_map.vpr import (
