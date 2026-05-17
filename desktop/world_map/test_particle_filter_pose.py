@@ -569,5 +569,53 @@ class TestDiagnostics(unittest.TestCase):
         self.assertGreater(d.std_x, 0.0)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+class TestCudaDevice(unittest.TestCase):
+    """Phase 4: filter on GPU. Validate that the same predict/observe/
+    resample/posterior path that runs on CPU also works on cuda. We
+    don't assert bit-equivalence against CPU because torch's RNG is
+    device-specific — different sequences from the same seed are
+    expected and correct."""
+
+    def test_state_lives_on_cuda(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=500, device="cuda", seed=1,
+        ))
+        pf.seed_at(0.5, -0.3, 0.0)
+        self.assertEqual(pf.state.device.type, "cuda")
+        self.assertEqual(pf.log_weights.device.type, "cuda")
+
+    def test_pipeline_runs_on_cuda(self):
+        """End-to-end smoke: seed → predict → observe → resample → mean,
+        all on cuda, with sensible posterior values at the end."""
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=2000, device="cuda", seed=42,
+            init_sigma_xy_m=0.001,
+            init_sigma_theta_rad=math.radians(0.5),
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        # 50 forward-translation predicts (no rotation drift), each
+        # observing IMU yaw at 0°. After 50 × 1 cm forward = 0.5 m.
+        for _ in range(50):
+            pf.predict(0.01, 0.0)
+            pf.observe_imu_yaw(0.0)
+        pf.resample()
+        x, y, theta = pf.posterior_mean()
+        # Forward motion accumulates ≈ 50 cm in x. Within α_1 noise.
+        self.assertAlmostEqual(x, 0.50, delta=0.05)
+        self.assertAlmostEqual(y, 0.0, delta=0.05)
+        # IMU pinned θ to 0°.
+        self.assertAlmostEqual(theta, 0.0, delta=math.radians(0.5))
+
+    def test_posterior_cov_returns_3x3_on_cuda(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=500, device="cuda", seed=3,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        cov = pf.posterior_cov()
+        self.assertEqual(cov.shape, (3, 3))
+        self.assertEqual(cov.device.type, "cuda")
+
+
 if __name__ == "__main__":
     unittest.main()

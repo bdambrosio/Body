@@ -210,8 +210,14 @@ class FuserController:
             # Phase 8 promotion. Same lazy-import discipline — the
             # particle stack pulls in torch / einops, which OdomPose-
             # only deployments don't need.
+            from .particle_filter_pose import ParticleFilterConfig
             from .particle_filter_pose_source import ParticleFilterPoseSource
-            self.pose_source = ParticleFilterPoseSource()
+            self.pose_source = ParticleFilterPoseSource(
+                pf_config=ParticleFilterConfig(
+                    device=config.pf_device,
+                    n_particles=config.pf_n_particles,
+                ),
+            )
         else:
             self.pose_source = OdomPose()
         self.grid = WorldGrid(

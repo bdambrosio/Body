@@ -50,6 +50,14 @@ class FuserConfig:
     # set pose_source_type directly. Removed in a future cleanup pass.
     slam_enabled: bool = False
 
+    # Particle filter knobs (only consulted when pose_source_type ==
+    # "particle"). Defaults preserve the pre-Phase-4 behaviour
+    # (CPU torch at 1000 particles, validated in shadow + production
+    # traces). Nav launcher auto-detects CUDA and bumps the particle
+    # count when both are available.
+    pf_device: str = "cpu"
+    pf_n_particles: int = 1000
+
     vote_margin: int = 2
     # Sum-bounded vote model ("FIFO of length vote_capacity"):
     # per cell, clear_votes + block_votes ≤ vote_capacity. New

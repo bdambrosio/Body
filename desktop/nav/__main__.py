@@ -137,6 +137,19 @@ def _parse_args(argv):
              "by others); default 1.0 Hz.",
     )
     p.add_argument(
+        "--pf-device", choices=("auto", "cpu", "cuda"), default="auto",
+        help="Particle-filter compute device (Phase 4). 'auto' = cuda if "
+             "available else cpu. Affects both --pf and --pf-shadow. CPU "
+             "is fast enough at 1k particles; GPU buys headroom for "
+             "10k–100k particles.",
+    )
+    p.add_argument(
+        "--pf-particles", type=int, default=1000,
+        help="Particle-filter cloud size. 1000 is healthy on CPU. With "
+             "--pf-device cuda you can go to 10000+ at essentially no "
+             "per-particle cost increase; useful in multi-modal scenes.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
     )
     return p.parse_args(argv)
@@ -158,6 +171,23 @@ def main(argv=None) -> int:
     pose_source_type = (
         "particle" if args.pf else ("slam" if args.slam else "odom")
     )
+
+    # Resolve particle-filter device. "auto" = cuda if torch sees a
+    # device, else cpu. Imported lazily so non-pf paths don't pay the
+    # torch import cost.
+    if args.pf_device == "auto":
+        try:
+            import torch
+            pf_device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            pf_device = "cpu"
+    else:
+        pf_device = args.pf_device
+    if args.pf or args.pf_shadow:
+        log.info(
+            "pf: device=%s, particles=%d", pf_device, args.pf_particles,
+        )
+
     fuser_config = FuserConfig(
         router=router,
         world_extent_m=args.world_extent_m,
@@ -166,6 +196,8 @@ def main(argv=None) -> int:
         map_stale_s=args.map_stale_s,
         pose_source_type=pose_source_type,
         slam_enabled=args.slam,  # back-compat; ignored when pose_source_type != "odom"
+        pf_device=pf_device,
+        pf_n_particles=args.pf_particles,
     )
     chassis_config = StubConfig(
         router=router,
@@ -249,11 +281,20 @@ def main(argv=None) -> int:
                     )
                     apriltag_calibration = None
 
+            # Shadow driver uses its own ParticleFilterPose instance —
+            # we pass the same device + particle-count choices the
+            # production source would, so --pf-shadow benches the same
+            # config you'd actually run with --pf.
+            from desktop.world_map.particle_filter_pose import ParticleFilterConfig
             pf_shadow = ShadowParticleFilterDriver(
                 session=fuser.session,
                 grid=fuser.grid,
                 pose_source=fuser.pose_source,
                 trace_path=Path(args.pf_shadow),
+                pf_config=ParticleFilterConfig(
+                    device=pf_device,
+                    n_particles=args.pf_particles,
+                ),
                 apriltag_calibration=apriltag_calibration,
                 apriltag_config=apriltag_obs_config,
             )

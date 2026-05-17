@@ -568,6 +568,30 @@ just ship the divergence.
   field across particles whose priors sit inside the window); (c)
   preallocated-buffer micro-optimization deferred — current ~6 KB
   field allocation per scan is fine at 1–10 Hz.
+- **2026-05-16 (Phase 4):** Particle filter GPU support landed.
+  `ParticleFilterPose` already had `cfg.device` plumbed; we just
+  needed: (a) launcher flags `--pf-device {auto,cpu,cuda}` and
+  `--pf-particles N`, with `auto` resolving to cuda if available;
+  (b) plumb-through to `FuserConfig.pf_device` / `pf_n_particles`
+  → `FuserController` (particle branch) → `ParticleFilterPoseSource`.
+  Shadow driver (`--pf-shadow`) picks up the same device + particle
+  count so it benches the same config production runs with.
+  Scan_matcher.search stays on CPU — the numpy vectorization (commit
+  5447182) made it 22 ms, no longer a bottleneck worth porting.
+  Pre-launch microbench on Bruce's workstation (RTX PRO 6000
+  Blackwell Max-Q): 1k particles CPU 0.08 ms vs GPU 0.12 ms
+  (overhead loses), 10k CPU 0.49 ms vs GPU 0.13 ms (4× win), 100k
+  CPU 4.03 ms vs GPU 0.13 ms (30× win). GPU stays flat to 100k.
+  VRAM: torch+CUDA fixed overhead ~700 MB – 1 GB, particle state +
+  transients add < 50 MB even at 100k particles. Plenty of room for
+  Phase 6's DINOv2-B (~1 GB) on the same device. 3 new
+  `@skipUnless(cuda)` tests in test_particle_filter_pose.py covering
+  state-lives-on-cuda, end-to-end pipeline, cov_at returns
+  (3, 3) on cuda. 114 desktop tests passing (111 + 3 cuda when
+  available). Phase 4 closes the original redesign plan's GPU
+  port goal at the scope worth doing — scan_matcher CUDA kernel
+  port would be a future "if needed" item.
+
 - **2026-05-16 (end of day):** Phases 0–3, 5 (partial), 5.5 Variant A,
   and 8 (cutover prep) all landed in one session. `--pf` is the
   production pose source for live autonomous nav; particle filter has
