@@ -24,6 +24,17 @@ from typing import Optional
 # override if you really want Wayland.
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
+# Restrict CUDA to a single GPU before any torch import. Bruce's
+# workstation has two GPUs and another workload (vLLM) pinned to one
+# of them. `CUDA_VISIBLE_DEVICES=0` together with CUDA's default
+# CUDA_DEVICE_ORDER=FASTEST_FIRST selects the higher-compute-
+# capability device, leaving the second GPU free for whatever's
+# already on it. Single-GPU users are unaffected (cuda:0 is the only
+# device and the env var is a no-op). Override with
+# CUDA_VISIBLE_DEVICES=1 or 0,1 in the shell if you want both
+# devices visible to the body stack.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 # Support both `python -m desktop.nav` (from Body/) and `python -m nav`
 # (from Body/desktop/, where the .venv lives). The second form puts
 # Body/desktop/ on sys.path but not Body/, so `from desktop.*` would
