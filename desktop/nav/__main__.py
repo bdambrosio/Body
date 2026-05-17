@@ -144,6 +144,14 @@ def _parse_args(argv):
              "10k–100k particles.",
     )
     p.add_argument(
+        "--pf-defensive-fraction", type=float, default=0.05,
+        help="Phase 6.4.1 — at every resample, divert this fraction of "
+             "particles to fresh draws from a wide Gaussian around the "
+             "posterior mean (preserves tail support for observations "
+             "like VPR to discriminate against). Default 0.05 (5%%). "
+             "Set to 0.0 to disable.",
+    )
+    p.add_argument(
         "--pf-particles", type=int, default=20000,
         help="Particle-filter cloud size (default 20000). Bumped from "
              "the original 1000 after the Phase 6.3 shadow trace showed "
@@ -254,6 +262,7 @@ def main(argv=None) -> int:
         slam_enabled=args.slam,  # back-compat; ignored when pose_source_type != "odom"
         pf_device=pf_device,
         pf_n_particles=args.pf_particles,
+        pf_defensive_fraction=args.pf_defensive_fraction,
     )
     chassis_config = StubConfig(
         router=router,
@@ -350,6 +359,7 @@ def main(argv=None) -> int:
                 pf_config=ParticleFilterConfig(
                     device=pf_device,
                     n_particles=args.pf_particles,
+                    defensive_resample_fraction=args.pf_defensive_fraction,
                 ),
                 apriltag_calibration=apriltag_calibration,
                 apriltag_config=apriltag_obs_config,

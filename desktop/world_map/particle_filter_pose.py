@@ -154,6 +154,24 @@ class ParticleFilterConfig:
     # regions.
     resample_n_eff_ratio: float = 0.5
 
+    # Defensive resampling — Phase 6.4.1. At resample time, divert
+    # `fraction * N` particles to fresh draws from a wide Gaussian
+    # centered on the posterior mean (σ defaults below). The rest
+    # come from the standard systematic-resample weighted draw.
+    # All particles get uniform log_weight afterwards (the AMCL
+    # `random_particle_fraction` convention — practical pragmatism
+    # rather than strict importance sampling).
+    #
+    # Why this exists: the Phase 6.3+6.4 shadow trace showed the
+    # cloud collapsing to ~6 mm spread between scan-tick resamples,
+    # too tight for VPR at σ=0.5 m to discriminate. Defensive
+    # injection preserves tail support so observations like VPR
+    # have particles to re-weight against. 0.0 = current behavior
+    # (off). 0.05 = first-cut experiment. Tune from the trace.
+    defensive_resample_fraction: float = 0.0
+    defensive_sigma_xy_m: float = 0.5
+    defensive_sigma_theta_rad: float = math.radians(20.0)
+
     # Deterministic seed for reproducible tests. None = nondeterministic.
     seed: Optional[int] = None
 
@@ -672,6 +690,20 @@ class ParticleFilterPose:
         assert self._state is not None and self._log_w is not None
         P = self.cfg.n_particles
 
+        # Phase 6.4.1 — defensive injection. Reserve some particles
+        # for fresh draws from a wide Gaussian around the posterior
+        # mean; only (P - n_defensive) come from the weighted resample.
+        # Mean is snapshotted *before* mutation so the defensive cloud
+        # centers on the pre-resample posterior, not on whatever
+        # systematic resample produced.
+        frac = max(0.0, min(1.0, float(self.cfg.defensive_resample_fraction)))
+        n_def = int(round(frac * P))
+        n_keep = P - n_def
+        if n_def > 0:
+            mean_x, mean_y, mean_th = self.posterior_mean()
+        else:
+            mean_x = mean_y = mean_th = 0.0  # unused
+
         # Cumulative weights in float64 — float32 cumsum at P=1000+
         # accumulates rounding error that can push the last bin past 1.
         w = self.normalized_weights().to(torch.float64)
@@ -686,31 +718,44 @@ class ParticleFilterPose:
             1, generator=self._gen, device=self.cfg.device,
             dtype=torch.float64,
         ).item()
-        u0 = u0 / P
-        positions = (
-            u0 + torch.arange(P, device=self.cfg.device, dtype=torch.float64) / P
-        )
-        indices = torch.searchsorted(cum, positions).clamp(max=P - 1)
-
-        # Advanced indexing copies — explicit clone for clarity / to
-        # be robust against any future torch behavior change.
-        self._state = self._state[indices].clone()
+        u0 = u0 / max(1, n_keep)
+        if n_keep > 0:
+            positions = (
+                u0 + torch.arange(
+                    n_keep, device=self.cfg.device, dtype=torch.float64,
+                ) / n_keep
+            )
+            indices = torch.searchsorted(cum, positions).clamp(max=P - 1)
+            kept = self._state[indices].clone()
+        else:
+            # Pathological case: 100% defensive. Shouldn't be used in
+            # practice, but the math has to be valid.
+            kept = self._state.new_empty((0, 3))
 
         # Roughening: small Gaussian jitter on every dim so post-
-        # resample particles aren't bit-identical duplicates. Skips
-        # the noise draw entirely when both factors are zero so the
-        # disabled case has zero runtime cost.
+        # resample (non-defensive) particles aren't bit-identical
+        # duplicates. Skips entirely when both factors are zero.
         rx = self.cfg.roughening_xy_m
         rth = self.cfg.roughening_theta_rad
-        if rx > 0.0 or rth > 0.0:
-            jitter = self._randn((P, 3))
+        if n_keep > 0 and (rx > 0.0 or rth > 0.0):
+            jitter = self._randn((n_keep, 3))
             if rx > 0.0:
-                self._state[:, 0] += rx * jitter[:, 0]
-                self._state[:, 1] += rx * jitter[:, 1]
+                kept[:, 0] += rx * jitter[:, 0]
+                kept[:, 1] += rx * jitter[:, 1]
             if rth > 0.0:
-                self._state[:, 2] = _wrap_torch(
-                    self._state[:, 2] + rth * jitter[:, 2]
-                )
+                kept[:, 2] = _wrap_torch(kept[:, 2] + rth * jitter[:, 2])
+
+        if n_def > 0:
+            def_jitter = self._randn((n_def, 3))
+            def_part = self._state.new_empty((n_def, 3))
+            sx = float(self.cfg.defensive_sigma_xy_m)
+            sth = float(self.cfg.defensive_sigma_theta_rad)
+            def_part[:, 0] = mean_x + sx * def_jitter[:, 0]
+            def_part[:, 1] = mean_y + sx * def_jitter[:, 1]
+            def_part[:, 2] = _wrap_torch(mean_th + sth * def_jitter[:, 2])
+            self._state = torch.cat([kept, def_part], dim=0)
+        else:
+            self._state = kept
 
         self._log_w = torch.full(
             (P,), -math.log(P),

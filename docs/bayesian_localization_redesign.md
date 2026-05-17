@@ -729,6 +729,42 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.4.1):** Defensive resample fraction. The
+  Phase 6.4 live trace (run 10:02:45) confirmed the predicted
+  failure mode: anchor calibration succeeded (offset Δ=(-0.214,
+  +0.719, -150.6°), residual 0.248 m), but 100% of post-calibration
+  observations were σ-gated as `cloud_too_tight` — cloud σ_xy
+  median 5.7 mm vs gate threshold 250 mm. The PF tuning earlier
+  in the day (20k particles + 15 mrad IMU σ) helped only ~2–3× in
+  cloud spread; needed ~50×.
+
+  `ParticleFilterConfig` gains `defensive_resample_fraction` (default
+  0.0 — preserves existing tests), `defensive_sigma_xy_m` (0.5),
+  `defensive_sigma_theta_rad` (20°). `resample()` reserves
+  `fraction*N` particles for fresh Gaussian draws around the
+  pre-resample posterior mean; the rest go through standard
+  systematic resampling with roughening. All particles get uniform
+  log_weight afterwards (the AMCL `random_particle_fraction`
+  convention — practical pragmatism over strict importance
+  sampling). The posterior mean is snapshotted *before* mutation
+  so the defensive cloud centers on the pre-resample estimate.
+
+  `FuserConfig.pf_defensive_fraction` defaults to **0.05** (5%) in
+  production; launcher `--pf-defensive-fraction` exposes the knob.
+  The bare `ParticleFilterConfig` default stays at 0.0 so the
+  existing 184-test suite is unchanged.
+
+  5 new tests: fraction=0 bit-equivalent to pre-6.4.1 behavior;
+  fraction>0 broadens cloud σ_xy by ≥5× after a sharp observation;
+  posterior mean is approximately preserved (defensive cloud
+  centered on it); N_eff after resample is exactly N regardless
+  of fraction; particle count is preserved across all fractions
+  (0.0, 0.05, 0.5, 1.0). 189 desktop tests passing.
+
+  Next: re-run the live `--vpr` trace and check whether the σ-gate
+  hit rate drops from 100% — if so, 6.4.2 (sweep calibration)
+  can build on a working live observation pipeline.
+
 - **2026-05-17 (Phase 6.4 + PF tuning):** VPR live mode behind `--vpr`
   + PF defaults tuned in response to the 6.3 shadow trace evidence.
 

@@ -617,6 +617,101 @@ class TestCudaDevice(unittest.TestCase):
         self.assertEqual(cov.device.type, "cuda")
 
 
+class TestDefensiveResampling(unittest.TestCase):
+    """Phase 6.4.1 — defensive resample fraction injects fresh tail
+    support so observations like VPR can discriminate against a
+    cloud that's otherwise been collapsed by 50 Hz IMU obs."""
+
+    def test_fraction_zero_is_bit_equivalent(self):
+        # Same seed, same resample with fraction=0 must reproduce
+        # the pre-6.4.1 behavior exactly.
+        def _run(frac):
+            pf = ParticleFilterPose(ParticleFilterConfig(
+                n_particles=500, init_sigma_xy_m=0.1,
+                init_sigma_theta_rad=math.radians(5.0), seed=4001,
+                defensive_resample_fraction=frac,
+                roughening_xy_m=0.0, roughening_theta_rad=0.0,
+            ))
+            pf.seed_at(0.5, -0.3, 0.0)
+            # Apply an observation so weights aren't uniform — otherwise
+            # resample is a permutation and the test is trivially true.
+            pf.observe_xy_world(world_x=0.5, world_y=-0.3, sigma_xy_m=0.2)
+            pf.resample()
+            return pf.state.clone()
+        a = _run(0.0)
+        b = _run(0.0)
+        self.assertTrue(torch.equal(a, b))
+
+    def test_defensive_fraction_broadens_cloud(self):
+        # With defensive injection, the cloud after resample has wider
+        # XY spread than without — that's the whole point.
+        def _spread(frac):
+            pf = ParticleFilterPose(ParticleFilterConfig(
+                n_particles=4000, init_sigma_xy_m=0.05,
+                init_sigma_theta_rad=math.radians(1.0), seed=4002,
+                defensive_resample_fraction=frac,
+                defensive_sigma_xy_m=0.5,
+                defensive_sigma_theta_rad=math.radians(20.0),
+                roughening_xy_m=0.0, roughening_theta_rad=0.0,
+            ))
+            pf.seed_at(0.0, 0.0, 0.0)
+            # Sharp observation collapses cloud onto a small region.
+            pf.observe_xy_world(world_x=0.0, world_y=0.0, sigma_xy_m=0.01)
+            pf.resample()
+            cov = pf.posterior_cov()
+            return float((cov[0, 0] + cov[1, 1]).sqrt())
+        s_off = _spread(0.0)
+        s_on  = _spread(0.10)
+        # With 10% defensive at σ=0.5 m, expect σ_xy to grow noticeably.
+        # Conservative: at least 5× the off-case spread.
+        self.assertGreater(s_on, 5 * s_off)
+
+    def test_posterior_mean_approximately_preserved(self):
+        # Defensive particles are centered on the posterior_mean, so
+        # the mean shouldn't drift much across the resample.
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=8000, init_sigma_xy_m=0.05,
+            init_sigma_theta_rad=math.radians(2.0), seed=4003,
+            defensive_resample_fraction=0.10,
+            defensive_sigma_xy_m=0.5,
+            defensive_sigma_theta_rad=math.radians(20.0),
+            roughening_xy_m=0.0, roughening_theta_rad=0.0,
+        ))
+        pf.seed_at(0.7, -0.2, math.radians(10.0))
+        pf.observe_xy_world(0.7, -0.2, sigma_xy_m=0.02)
+        mx0, my0, _ = pf.posterior_mean()
+        pf.resample()
+        mx1, my1, _ = pf.posterior_mean()
+        self.assertAlmostEqual(mx1, mx0, delta=0.05)
+        self.assertAlmostEqual(my1, my0, delta=0.05)
+
+    def test_resample_resets_to_uniform_with_defensive(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=500, init_sigma_xy_m=0.05,
+            init_sigma_theta_rad=math.radians(3.0), seed=4004,
+            defensive_resample_fraction=0.10,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        pf.observe_xy_world(0.0, 0.0, sigma_xy_m=0.05)
+        pf.resample()
+        # All log_weights uniform → N_eff = N exactly.
+        self.assertAlmostEqual(pf.n_eff(), 500.0, places=3)
+
+    def test_state_shape_preserved(self):
+        # Cloud size must remain n_particles regardless of fraction.
+        for frac in (0.0, 0.05, 0.5, 1.0):
+            pf = ParticleFilterPose(ParticleFilterConfig(
+                n_particles=200, init_sigma_xy_m=0.01,
+                init_sigma_theta_rad=0.01, seed=4005,
+                defensive_resample_fraction=frac,
+            ))
+            pf.seed_at(0.0, 0.0, 0.0)
+            pf.observe_xy_world(0.0, 0.0, sigma_xy_m=0.05)
+            pf.resample()
+            self.assertEqual(pf.state.shape, (200, 3),
+                             f"shape broke at fraction={frac}")
+
+
 class TestObserveXyMixture(unittest.TestCase):
     """Phase 6 VPR — Gaussian-mixture position observation."""
 

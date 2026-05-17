@@ -216,6 +216,7 @@ class FuserController:
                 pf_config=ParticleFilterConfig(
                     device=config.pf_device,
                     n_particles=config.pf_n_particles,
+                    defensive_resample_fraction=config.pf_defensive_fraction,
                 ),
             )
         else:

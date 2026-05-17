@@ -63,6 +63,16 @@ class FuserConfig:
     pf_device: str = "cpu"
     pf_n_particles: int = 20000
 
+    # Phase 6.4.1 — defensive resample fraction. Diverts a fraction
+    # of particles at every resample to fresh draws from a wide
+    # Gaussian around the posterior mean, preserving tail support
+    # so observations like VPR (σ ~ 0.5 m) can actually discriminate
+    # among particles. Default 0.05 (5%) — first-cut experiment;
+    # the 6.4 shadow trace showed 100% of σ-gated rejections at
+    # 6 mm cloud spread, and defensive injection is the next lever.
+    # Set to 0.0 to disable.
+    pf_defensive_fraction: float = 0.05
+
     vote_margin: int = 2
     # Sum-bounded vote model ("FIFO of length vote_capacity"):
     # per cell, clear_votes + block_votes ≤ vote_capacity. New
