@@ -729,6 +729,28 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.1):** VPR scaffolding. New package
+  `desktop/world_map/vpr/` with `extractor.py` — a DINOv2 wrapper
+  (default `dinov2_vitb14`, 518×518 input, ImageNet-normalized,
+  L2-normalized 768-dim output, optional fp16 on CUDA). Model is
+  dependency-injected so tests use a stub backbone (no torch.hub
+  download); `load_default_extractor()` does the real torch.hub
+  fetch for runtime. New scripts:
+  - `scripts/vpr_record.py` — subscribes to `body/oakd/rgb` +
+    `body/world_map/status`, publishes `body/oakd/config`
+    capture_rgb requests at `--rate`, writes JPEGs + tagged
+    `frames.jsonl` + `meta.json` to a session directory. Drops
+    frames whose pose_world is older than `--max-pose-age`.
+  - `scripts/vpr_build_bank.py` — ingests a session dir, runs the
+    extractor, writes a `.pt` bank: `{features, poses, timestamps,
+    frame_idx, metadata}`. Schema versioned (v1). 15 extractor
+    tests (incl. 2 `@skipUnless(cuda)` CPU↔GPU parity) +
+    2 build-bank tests = 17 new, 131 desktop+scripts total passing.
+    Decisions locked per this-session Q&A: offline-from-saved-imagery
+    bank build; single-room loop closure validation first; gating
+    on `trace(cov)` + motion threshold. Next: 6.2 (bank query +
+    observation model wired through `observe_xy_world`).
+
 ---
 
 ## 10. Known loose ends (not blocking, track + revisit)

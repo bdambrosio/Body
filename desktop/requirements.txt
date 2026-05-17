@@ -19,3 +19,8 @@ torch>=2.4,<3
 # library (tag36h11 by default). pyyaml is for the calibration loader.
 pupil-apriltags>=1.0,<2
 pyyaml>=6.0,<7
+
+# Phase 6 — Visual place recognition. Pillow is the preferred image
+# resize path in the DINOv2 extractor (matches the upstream reference
+# preprocess); also used by the offline bank builder to decode JPEG.
+pillow>=10,<13
