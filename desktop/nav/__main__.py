@@ -154,33 +154,56 @@ def _parse_args(argv):
     )
     p.add_argument(
         "--vpr-shadow", metavar="PATH", default=None,
-        help="Phase 6.3 — run the VPR shadow observer and write a JSONL "
-             "trace of would-be filter updates to PATH. Requires "
-             "--vpr-bank. The live filter is NOT mutated; this is a "
-             "measurement phase. See desktop/world_map/vpr/shadow_driver.py.",
+        help="Phase 6.3 — run the VPR observer in shadow mode and write "
+             "a JSONL trace of would-be filter updates to PATH. The "
+             "live filter is NOT mutated. Mutually exclusive with "
+             "--vpr. Requires --vpr-bank. See desktop/world_map/vpr/.",
+    )
+    p.add_argument(
+        "--vpr", metavar="PATH", default=None,
+        help="Phase 6.4 — run the VPR observer in LIVE mode: same trace "
+             "as --vpr-shadow, plus the observation is applied to the "
+             "production particle filter when the anchor is calibrated "
+             "and the σ/distance gates pass. Requires --vpr-bank. "
+             "Mutually exclusive with --vpr-shadow.",
     )
     p.add_argument(
         "--vpr-bank", metavar="PATH", default=None,
-        help="Phase 6.3 — path to a DINOv2 feature bank built with "
-             "scripts/vpr_build_bank.py. Required by --vpr-shadow.",
+        help="Phase 6.3+ — path to a DINOv2 feature bank built with "
+             "scripts/vpr_build_bank.py. Required by --vpr / --vpr-shadow.",
     )
     p.add_argument(
         "--vpr-rate", type=float, default=1.0,
-        help="--vpr-shadow: rate at which to drive RGB captures via "
-             "body/oakd/config (Hz). 0 = passive (only consume captures "
-             "driven by others). Default 1.0 Hz.",
+        help="--vpr / --vpr-shadow: rate at which to drive RGB captures "
+             "via body/oakd/config (Hz). 0 = passive. Default 1.0 Hz.",
     )
     p.add_argument(
-        "--vpr-similarity-floor", type=float, default=0.40,
-        help="--vpr-shadow: reject queries whose top cosine similarity "
-             "is below this floor (no-match record emitted instead). "
-             "Default 0.40 is permissive; tune from 6.5 validation data.",
+        "--vpr-similarity-floor", type=float, default=0.80,
+        help="Reject queries whose top cosine similarity is below this "
+             "floor. Default 0.80 — Phase 6.3 trace showed clear "
+             "same-location matches at 0.85+ and noise below 0.80.",
     )
     p.add_argument(
         "--vpr-sigma-m", type=float, default=0.5,
-        help="--vpr-shadow: per-component Gaussian σ on (x, y) in meters "
-             "for the mixture observation. Default 0.5 m (room-scale "
-             "anchor).",
+        help="Per-component Gaussian σ on (x, y) in meters for the "
+             "mixture observation. Default 0.5 m (room-scale anchor).",
+    )
+    p.add_argument(
+        "--vpr-gate-sigma-ratio", type=float, default=0.5,
+        help="--vpr live gating: skip the observation when "
+             "sqrt(trace(cov_xy)) < ratio · sigma_m. Default 0.5 — VPR "
+             "can't usefully reweight a cloud already tighter than σ/2.",
+    )
+    p.add_argument(
+        "--vpr-gate-min-distance", type=float, default=0.3,
+        help="--vpr live gating: skip if the bot hasn't moved this far "
+             "(meters) since the last applied observation. Default 0.3 m.",
+    )
+    p.add_argument(
+        "--vpr-anchor-min-pairs", type=int, default=5,
+        help="Number of high-similarity (sim ≥ 0.85 by default) "
+             "matches required before fitting the bank↔session SE(2) "
+             "offset. Default 5.",
     )
     p.add_argument(
         "-v", "--verbose", action="store_true", help="debug logging",
@@ -344,20 +367,26 @@ def main(argv=None) -> int:
                 "live Pi, or restart after connecting via the UI.",
             )
 
-    # Phase 6.3 — VPR shadow observer. Pure measurement: extracts
-    # DINOv2 features from body/oakd/rgb, queries the bank, traces
-    # would-be filter updates. Never mutates the live filter.
-    vpr_shadow = None
-    if args.vpr_shadow:
+    # Phase 6.3 / 6.4 — VPR observer. Shadow mode (read-only trace) or
+    # live mode (also applies observe_xy_mixture, gated by anchor
+    # calibration + cloud-σ + motion). The two modes share all the
+    # plumbing — only ShadowVPRConfig.live differs.
+    if args.vpr and args.vpr_shadow:
+        log.error("--vpr and --vpr-shadow are mutually exclusive")
+        return 2
+    vpr_trace_path = args.vpr or args.vpr_shadow
+    vpr_live_mode = bool(args.vpr)
+    vpr_driver = None
+    if vpr_trace_path:
         if not args.vpr_bank:
-            log.error("--vpr-shadow requires --vpr-bank PATH")
+            log.error("--vpr / --vpr-shadow requires --vpr-bank PATH")
             return 2
         if fuser.connected and getattr(fuser, "pose_source", None) is not None \
                 and pose_source_type == "particle":
             try:
                 from desktop.world_map.vpr import (
-                    ShadowVPRConfig, ShadowVPRDriver, VPRBank,
-                    ExtractorConfig, load_default_extractor,
+                    AnchorOffsetConfig, ShadowVPRConfig, ShadowVPRDriver,
+                    VPRBank, ExtractorConfig, load_default_extractor,
                 )
                 bank = VPRBank.load(args.vpr_bank, device=pf_device)
                 extractor = load_default_extractor(ExtractorConfig(
@@ -368,41 +397,48 @@ def main(argv=None) -> int:
                 pf_source = fuser.pose_source
                 pf = pf_source._pf  # type: ignore[attr-defined]
                 pf_lock = pf_source._lock  # type: ignore[attr-defined]
-                vpr_shadow = ShadowVPRDriver(
+                vpr_driver = ShadowVPRDriver(
                     session=fuser.session,
                     pf=pf, pf_lock=pf_lock,
                     bank=bank, extractor=extractor,
-                    trace_path=Path(args.vpr_shadow),
+                    trace_path=Path(vpr_trace_path),
                     pose_source=fuser.pose_source,
                     config=ShadowVPRConfig(
                         request_hz=args.vpr_rate,
                         similarity_floor=args.vpr_similarity_floor,
                         sigma_m=args.vpr_sigma_m,
+                        live=vpr_live_mode,
+                        anchor=AnchorOffsetConfig(
+                            min_pairs=args.vpr_anchor_min_pairs,
+                        ),
+                        gate_sigma_floor_ratio=args.vpr_gate_sigma_ratio,
+                        gate_min_distance_m=args.vpr_gate_min_distance,
                     ),
                 )
-                vpr_shadow.connect()
+                vpr_driver.connect()
                 log.info(
-                    "vpr_shadow: tracing to %s (bank=%d frames, device=%s)",
-                    args.vpr_shadow, bank.n_frames, pf_device,
+                    "vpr: mode=%s tracing to %s (bank=%d frames, device=%s)",
+                    "live" if vpr_live_mode else "shadow",
+                    vpr_trace_path, bank.n_frames, pf_device,
                 )
             except Exception:
-                log.exception("vpr_shadow setup failed; continuing without it")
-                vpr_shadow = None
+                log.exception("vpr setup failed; continuing without it")
+                vpr_driver = None
         else:
             log.warning(
-                "vpr_shadow requires --pf (production pose source must "
-                "be the particle filter) and a connected fuser session; "
+                "vpr requires --pf (production pose source must be the "
+                "particle filter) and a connected fuser session; "
                 "driver not installed."
             )
 
     try:
         return run_app(fuser, fuser_config, chassis, chassis_config)
     finally:
-        if vpr_shadow is not None:
+        if vpr_driver is not None:
             try:
-                vpr_shadow.disconnect()
+                vpr_driver.disconnect()
             except Exception:
-                log.exception("vpr_shadow disconnect raised")
+                log.exception("vpr disconnect raised")
         # Shadow first — its subscribers live on the fuser's session.
         if pf_shadow is not None:
             try:

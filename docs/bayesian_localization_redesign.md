@@ -729,6 +729,70 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (Phase 6.4 + PF tuning):** VPR live mode behind `--vpr`
+  + PF defaults tuned in response to the 6.3 shadow trace evidence.
+
+  **Production PF tuning** (commit `cd42172`):
+  the 6.3 trace showed N_eff < 5 on 63% of 1 Hz VPR ticks — the cloud
+  collapses between scan-tick resamples because 50 Hz IMU observations
+  at σ=5 mrad accumulate ≈ exp(-50) for a 10-mrad-error particle in
+  the 500 ms window. Two mitigations: `ParticleFilterConfig.imu_sigma_rad`
+  5e-3 → 15e-3 (per-obs ratio drops from ≈exp(2) to ≈exp(0.22)); and
+  `FuserConfig.pf_n_particles` + launcher `--pf-particles` default
+  1000 → 20000 (per Phase 4, cycle cost is flat to 100k on the RTX 6000).
+  Proper fix (drop IMU obs rate to ~5 Hz at calibrated σ) is a future
+  architectural change.
+
+  **Phase 6.4 — live VPR**:
+
+  - `desktop/world_map/vpr/anchor.py` — `AnchorOffsetEstimator` solves
+    a closed-form Procrustes SE(2) fit (`_fit_se2`: atan2-of-cross-
+    product-over-dot-product rotation, centroid-aligned translation)
+    from the first K confident matches (default K=5, sim≥0.85,
+    pairwise bank-pose spread ≥ 0.5 m, residual RMS ≤ 0.25 m). One-shot
+    calibration — `apply_xy(positions)` transforms bank XY into the
+    live session's world frame.
+    *Why this matters:* `rebind_world_to_current` at every nav launch
+    creates a fresh world frame, so the bank's world poses are in the
+    *recording* session's frame; without the offset, even a perfect
+    cosine match (e.g. 0.884 in the trace) maps to a pose 60+ cm from
+    the live cloud and the observation cancels in softmax.
+
+  - `ShadowVPRConfig` gains `live`, `anchor` (an AnchorOffsetConfig),
+    `gate_sigma_floor_ratio` (default 0.5), `gate_min_distance_m`
+    (default 0.3). Similarity floor default bumped 0.40 → 0.80 to
+    match what the 6.3 trace showed as the noise/signal threshold.
+
+  - `ShadowVPRDriver` extended: every frame feeds the top-1 match to
+    the anchor estimator (no-op once calibrated), applies the offset
+    to mixture positions when calibrated, evaluates the σ + distance
+    gates against a single locked snapshot of `pf.state / pf._log_w
+    / pf.posterior_cov() / pf.posterior_mean()`, and in `live` mode
+    calls `observe_xy_mixture` under `pf_lock` iff anchor is
+    calibrated AND gates pass. Trace records carry `anchor` and
+    `gating` blocks plus an `applied: bool` field so post-hoc
+    analysis can see why suppressed observations didn't fire.
+    Refactored `current_pose` to come from `pf.posterior_mean()`
+    instead of `pose_source.pose_at()` — the PF's own posterior is
+    the right answer for "where does the filter think we are."
+
+  - Launcher: new `--vpr PATH` (live mode) mutually exclusive with
+    `--vpr-shadow PATH`. Plus `--vpr-gate-sigma-ratio`,
+    `--vpr-gate-min-distance`, `--vpr-anchor-min-pairs`.
+
+  Tests: 13 anchor (`_fit_se2` translation/rotation/noisy/residual,
+  spatial-spread guard, similarity-floor drop, idempotency, apply_xy
+  correctness, raises-when-uncalibrated, rejects-high-residual)
+  + 7 Phase 6.4 integration (anchor calibrates after high-sim
+  matches, record carries anchor payload, gating fields present,
+  cloud-too-tight gate fires, live=False ⇒ no mutation, live=True
+  ⇒ applies when calibrated+gated, live=True skipped when anchor
+  uncalibrated). 184 desktop tests passing.
+
+  Next: 6.5 — single-room loop closure validation against a live
+  drive. Drive the recorded loop with `--vpr`, confirm at closure
+  the posterior snaps back near the bank's start pose.
+
 - **2026-05-17 (Phase 6.3):** Shadow VPR driver. New
   `desktop/world_map/vpr/shadow_driver.py` — `ShadowVPRDriver`
   subscribes to `body/oakd/rgb`, runs DINOv2 extractor + bank

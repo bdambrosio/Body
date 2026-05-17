@@ -222,7 +222,10 @@ class TestProcessFrame(unittest.TestCase):
             self.assertEqual(c["frames_observed"], 4)
             self.assertEqual(c["frames_no_match"], 0)
 
-    def test_pose_source_annotation(self):
+    def test_current_pose_prefers_pf_posterior_when_seeded(self):
+        # When the PF is seeded, current_pose comes from posterior_mean,
+        # not pose_source — the PF's own posterior is the right answer
+        # for "where does the filter think we are right now."
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             drv, _, imgs, _ = self._setup_driver(tmp_dir=tmp)
@@ -231,7 +234,12 @@ class TestProcessFrame(unittest.TestCase):
                     return (0.5, -0.3, 0.1)
             drv._pose_source = _Pose()
             rec = drv.process_frame(imgs[0])
-            self.assertEqual(rec["current_pose"], [0.5, -0.3, 0.1])
+            self.assertEqual(len(rec["current_pose"]), 3)
+            # PF was seeded at origin, so the posterior mean should be
+            # near (0, 0, 0) — NOT the pose_source's (0.5, -0.3, 0.1).
+            self.assertNotEqual(rec["current_pose"], [0.5, -0.3, 0.1])
+            self.assertLess(abs(rec["current_pose"][0]), 0.1)
+            self.assertLess(abs(rec["current_pose"][1]), 0.1)
 
     def test_on_trace_callback_fires(self):
         seen = []
@@ -242,6 +250,156 @@ class TestProcessFrame(unittest.TestCase):
             drv.process_frame(imgs[0])
             self.assertEqual(len(seen), 1)
             self.assertEqual(seen[0]["type"], "vpr_obs")
+
+
+class TestPhase64Integration(unittest.TestCase):
+    """Anchor + gating + live application — the 6.4 additions."""
+
+    def _build(self, *, tmp_dir, live: bool, **cfg_overrides):
+        ext = _stub_extractor(embed_dim=32, seed=42)
+        # Bank: 4 frames at well-separated poses so the SE(2) fit has
+        # geometric diversity (spread = 1.4 m diagonal).
+        poses = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+                 (0.0, 1.0, 0.0), (1.0, 1.0, 0.0)]
+        imgs = [_checker_rgb(64 + i, 80 + i) for i in range(4)]
+        bank = _build_bank_from_extractor(ext, poses, imgs)
+        pf, pf_lock = _seeded_pf(n_particles=2000, sigma=0.5)
+        from desktop.world_map.vpr.anchor import AnchorOffsetConfig
+        cfg = ShadowVPRConfig(
+            request_hz=0.0,
+            top_k=3,
+            similarity_floor=cfg_overrides.pop("similarity_floor", 0.0),
+            softmax_temperature=0.05,
+            sigma_m=cfg_overrides.pop("sigma_m", 0.5),
+            trace_flush_every=1,
+            live=live,
+            anchor=AnchorOffsetConfig(
+                min_similarity=cfg_overrides.pop("anchor_min_sim", 0.85),
+                min_pairs=cfg_overrides.pop("anchor_min_pairs", 3),
+                min_spatial_spread_m=cfg_overrides.pop("anchor_spread_m", 0.5),
+                max_residual_m=10.0,  # generous in tests
+            ),
+            gate_sigma_floor_ratio=cfg_overrides.pop("gate_sigma_ratio", 0.5),
+            gate_min_distance_m=cfg_overrides.pop("gate_min_dist", 0.0),
+            **cfg_overrides,
+        )
+        drv = ShadowVPRDriver(
+            session=_FakeSession(),
+            pf=pf, pf_lock=pf_lock, bank=bank, extractor=ext,
+            trace_path=Path(tmp_dir) / "trace.jsonl",
+            config=cfg,
+        )
+        drv._trace_path.parent.mkdir(parents=True, exist_ok=True)
+        drv._trace_fp = drv._trace_path.open("a", buffering=1)
+        self.addCleanup(lambda: drv._trace_fp and drv._trace_fp.close())
+        return drv, imgs, poses
+
+    def test_anchor_calibrates_after_enough_high_sim_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            drv, imgs, _ = self._build(
+                tmp_dir=tmp, live=False, anchor_min_pairs=3, anchor_min_sim=0.5,
+            )
+            # The 4 bank images map to themselves with sim=1; running
+            # all 4 gives the estimator 4 perfect pairs.
+            for img in imgs:
+                drv.process_frame(img)
+            self.assertEqual(drv._anchor.state, "calibrated")
+            self.assertIsNotNone(drv._anchor.calibration)
+            self.assertEqual(drv.counters()["anchor_calibrations"], 1)
+
+    def test_record_carries_anchor_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            drv, imgs, _ = self._build(
+                tmp_dir=tmp, live=False, anchor_min_pairs=3, anchor_min_sim=0.5,
+            )
+            for img in imgs:
+                rec = drv.process_frame(img)
+            self.assertIn("anchor", rec)
+            self.assertEqual(rec["anchor"]["state"], "calibrated")
+            self.assertIn("offset", rec["anchor"])
+            for k in ("dx", "dy", "dtheta_rad"):
+                self.assertIn(k, rec["anchor"]["offset"])
+
+    def test_gating_records_present_in_vpr_obs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            drv, imgs, _ = self._build(tmp_dir=tmp, live=False)
+            rec = drv.process_frame(imgs[0])
+            self.assertIn("gating", rec)
+            for k in ("passed", "reason", "sigma_xy_m", "dist_since_last_m"):
+                self.assertIn(k, rec["gating"])
+
+    def test_gate_cloud_too_tight(self):
+        # Tight init σ → cov small → gate should fail.
+        ext = _stub_extractor(embed_dim=32, seed=42)
+        poses = [(0.0, 0.0, 0.0)]
+        bank = _build_bank_from_extractor(
+            ext, poses, [_checker_rgb()],
+        )
+        # Seed with very tight cloud (1 mm σ).
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=500, init_sigma_xy_m=0.001,
+            init_sigma_theta_rad=math.radians(0.1), seed=7,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = ShadowVPRConfig(
+                request_hz=0.0, top_k=1, similarity_floor=0.0,
+                sigma_m=0.5, gate_sigma_floor_ratio=0.5,
+                gate_min_distance_m=0.0, live=False,
+            )
+            drv = ShadowVPRDriver(
+                session=_FakeSession(),
+                pf=pf, pf_lock=threading.RLock(),
+                bank=bank, extractor=ext,
+                trace_path=Path(tmp) / "t.jsonl", config=cfg,
+            )
+            drv._trace_fp = (Path(tmp) / "t.jsonl").open("a", buffering=1)
+            self.addCleanup(lambda: drv._trace_fp and drv._trace_fp.close())
+            rec = drv.process_frame(_checker_rgb())
+            self.assertFalse(rec["gating"]["passed"])
+            self.assertEqual(rec["gating"]["reason"], "cloud_too_tight")
+
+    def test_live_mode_off_does_not_apply(self):
+        # Even with everything else green, live=False ⇒ no mutation.
+        with tempfile.TemporaryDirectory() as tmp:
+            drv, imgs, _ = self._build(
+                tmp_dir=tmp, live=False, anchor_min_pairs=3, anchor_min_sim=0.5,
+            )
+            log_w_before = drv._pf._log_w.clone()
+            for img in imgs:
+                rec = drv.process_frame(img)
+            self.assertFalse(rec["applied"])
+            self.assertTrue(torch.equal(drv._pf._log_w, log_w_before))
+            self.assertEqual(drv.counters()["live_obs_applied"], 0)
+
+    def test_live_mode_applies_when_calibrated_and_gated_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            drv, imgs, _ = self._build(
+                tmp_dir=tmp, live=True, anchor_min_pairs=3, anchor_min_sim=0.5,
+            )
+            # First 3 calibrate the anchor; subsequent ones can apply.
+            for img in imgs:
+                drv.process_frame(img)
+            # After the loop, the anchor must be calibrated and at
+            # least one live application should have fired (sims for
+            # bank's own images are ~1.0, gate-cloud spread is healthy).
+            self.assertEqual(drv._anchor.state, "calibrated")
+            self.assertGreater(drv.counters()["live_obs_applied"], 0)
+
+    def test_live_skipped_when_anchor_not_calibrated(self):
+        # Set anchor threshold so high we never calibrate. live=True
+        # but observations should be gated on "anchor not ready."
+        with tempfile.TemporaryDirectory() as tmp:
+            drv, imgs, _ = self._build(
+                tmp_dir=tmp, live=True,
+                anchor_min_pairs=99, anchor_min_sim=0.5,
+            )
+            for img in imgs:
+                rec = drv.process_frame(img)
+            self.assertEqual(drv._anchor.state, "uncalibrated")
+            self.assertFalse(rec["applied"])
+            self.assertEqual(drv.counters()["live_obs_applied"], 0)
+            self.assertGreater(drv.counters()["live_obs_gated_anchor"], 0)
 
 
 class TestRgbCallback(unittest.TestCase):

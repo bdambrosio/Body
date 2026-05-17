@@ -49,6 +49,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -59,6 +60,7 @@ from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
 import numpy as np
 import torch
 
+from .anchor import AnchorOffsetConfig, AnchorOffsetEstimator
 from .bank import VPRBank, mixture_observation_from_query
 from .extractor import DinoV2Extractor
 
@@ -71,8 +73,9 @@ OAKD_CONFIG_TOPIC = "body/oakd/config"
 
 @dataclass
 class ShadowVPRConfig:
-    """Tunables for the shadow observer. Defaults are conservative —
-    sized for a first-look measurement run, not for being load-bearing."""
+    """Tunables for the observer. Defaults are tuned from the
+    Phase 6.3 shadow trace (2026-05-17, 126 vpr_obs over a 125 s
+    drive)."""
 
     # 0 = passive (consume captures driven elsewhere). >0 = publisher
     # drives body/oakd/config at this rate, same mechanism AprilTag uses.
@@ -82,11 +85,12 @@ class ShadowVPRConfig:
     # represent ambiguity without dominating the trace size.
     top_k: int = 5
 
-    # Drop any match below this cosine. DINOv2 same-room views typically
-    # sit in 0.5–0.8; 0.4 is a permissive floor that rejects clearly
-    # off-bank frames (other rooms, sudden occlusion) without throwing
-    # away soft matches. Tune from 6.5 validation data.
-    similarity_floor: float = 0.40
+    # Drop any match below this cosine. In the Phase 6.3 trace, clear
+    # same-location matches sit at 0.85+; the 0.40 first-cut floor let
+    # too much noise through (52% of matches were <0.80, mostly weak).
+    # 0.80 is a defensible production floor; below it, an observation
+    # is more likely to inject noise than to anchor.
+    similarity_floor: float = 0.80
 
     # Softmax temperature on cosine similarity → mixture weights.
     # Smaller = sharper (top-1 dominates); larger = flatter.
@@ -102,6 +106,35 @@ class ShadowVPRConfig:
 
     # Buffered writes amortize syscalls; flushed on disconnect anyway.
     trace_flush_every: int = 20
+
+    # ── Phase 6.4 — live mode + gating ────────────────────────────
+
+    # When True, after computing the would-be record, also apply
+    # the observation to the production filter via
+    # ParticleFilterPose.observe_xy_mixture. False = pure shadow
+    # (the original 6.3 behavior, useful for measurement).
+    # Live mode additionally requires the anchor offset to be
+    # calibrated and the gating checks to pass.
+    live: bool = False
+
+    # Bank↔session SE(2) calibration knobs. See anchor.py.
+    anchor: AnchorOffsetConfig = field(default_factory=AnchorOffsetConfig)
+
+    # σ gate: skip the observation when the cloud is already so
+    # concentrated that no observation at sigma_m can discriminate
+    # among particles. Condition: skip if
+    #     sqrt(trace(cov[:2, :2])) < gate_sigma_floor_ratio * sigma_m
+    # The intuition: VPR with σ=0.5 m can't usefully reweight a
+    # cloud whose XY spread is 5 cm — every particle gets ≈ the
+    # same log-likelihood. Setting the ratio to 0.5 means we fire
+    # VPR only when the cloud spread is at least σ/2.
+    gate_sigma_floor_ratio: float = 0.5
+
+    # Motion gate: skip the observation if the bot hasn't moved at
+    # least this far since the last applied observation. Avoids
+    # double-anchoring at one physical location which would
+    # over-concentrate the cloud at the bank pose.
+    gate_min_distance_m: float = 0.3
 
 
 class ShadowVPRDriver:
@@ -158,7 +191,21 @@ class ShadowVPRDriver:
             "frames_observed": 0,
             "would_be_updates_logged": 0,
             "capture_requests_sent": 0,
+            # 6.4 additions
+            "anchor_pairs_collected": 0,
+            "anchor_calibrations": 0,
+            "live_obs_applied": 0,
+            "live_obs_gated_anchor": 0,
+            "live_obs_gated_sigma": 0,
+            "live_obs_gated_distance": 0,
         }
+
+        # 6.4 — bank↔session SE(2) calibration. Always constructed;
+        # only consulted in live mode. In shadow mode the trace still
+        # carries the calibration state so post-hoc analysis can use it.
+        self._anchor = AnchorOffsetEstimator(self._config.anchor)
+        # 6.4 — gating bookkeeping.
+        self._last_applied_xy: Optional[Tuple[float, float]] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -306,9 +353,9 @@ class ShadowVPRDriver:
         rgb_recv_ts: Optional[float] = None,
         rgb_ts: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Extract → query → would-be math → trace. Returns the written
-        record (also written to disk + on_trace callback). Useful as a
-        unit-test entry that doesn't go through Zenoh."""
+        """Extract → query → (anchor feed) → would-be math → gate →
+        (live apply) → trace. Returns the written record (also written
+        to disk + on_trace callback)."""
         rgb_recv_ts = rgb_recv_ts if rgb_recv_ts is not None else time.time()
         rgb_ts = rgb_ts if rgb_ts is not None else rgb_recv_ts
 
@@ -327,13 +374,39 @@ class ShadowVPRDriver:
             }
             for i in range(result.indices.shape[0])
         ]
-        current_pose = self._snapshot_current_pose(rgb_ts)
+        # Snapshot the filter for would-be math, anchor pair, gating.
+        snapshot = self._snapshot_pf()
+        current_pose_pf = snapshot["mean"] if snapshot else None
+        current_pose = (
+            list(current_pose_pf) if current_pose_pf else
+            self._snapshot_current_pose(rgb_ts)
+        )
+
+        # Feed the top-1 match to the anchor estimator (no-op once
+        # calibrated; also no-op for low-similarity matches).
+        if top_k_records and current_pose_pf:
+            top = top_k_records[0]
+            before = self._anchor.n_pairs_collected
+            self._anchor.observe(
+                bank_xy=(top["pose_xytheta"][0], top["pose_xytheta"][1]),
+                current_xy=(current_pose_pf[0], current_pose_pf[1]),
+                similarity=top["sim"],
+            )
+            if self._anchor.n_pairs_collected > before:
+                self._counters["anchor_pairs_collected"] += 1
+            new_cal = self._anchor.calibrate_if_ready()
+            if new_cal is not None and self._counters["anchor_calibrations"] == 0:
+                self._counters["anchor_calibrations"] += 1
+
         mixture = mixture_observation_from_query(
             result,
             temperature=self._config.softmax_temperature,
             sigma_m=self._config.sigma_m,
             min_components=self._config.min_components,
         )
+
+        anchor_state, anchor_payload = self._anchor_payload()
+
         record: Dict[str, Any]
         if mixture is None:
             self._counters["frames_no_match"] += 1
@@ -341,15 +414,34 @@ class ShadowVPRDriver:
                 "type": "no_match",
                 "rgb_recv_ts": rgb_recv_ts,
                 "rgb_ts": rgb_ts,
-                "top_k": top_k_records,  # rejected matches still logged
+                "top_k": top_k_records,
                 "current_pose": current_pose,
+                "anchor": anchor_payload,
             }
         else:
-            positions_xy, weights, sigma_m = mixture
-            would_be = self._compute_would_be(positions_xy, weights, sigma_m)
+            raw_positions_xy, weights, sigma_m = mixture
+            # Apply the anchor offset if calibrated, so mixture
+            # positions are in the live session's frame.
+            calib = self._anchor.calibration
+            if calib is not None:
+                positions_xy = calib.apply_xy(raw_positions_xy)
+            else:
+                positions_xy = raw_positions_xy
+
+            would_be = self._compute_would_be(
+                positions_xy, weights, sigma_m, snapshot=snapshot,
+            )
             self._counters["frames_observed"] += 1
             if would_be is not None:
                 self._counters["would_be_updates_logged"] += 1
+
+            gate = self._evaluate_gate(snapshot, sigma_m)
+            applied = False
+            if self._config.live:
+                applied = self._maybe_apply_live(
+                    positions_xy, weights, sigma_m, snapshot, gate,
+                )
+
             record = {
                 "type": "vpr_obs",
                 "rgb_recv_ts": rgb_recv_ts,
@@ -357,11 +449,15 @@ class ShadowVPRDriver:
                 "top_k": top_k_records,
                 "mixture": {
                     "positions_xy": positions_xy.cpu().tolist(),
+                    "positions_xy_bank_frame": raw_positions_xy.cpu().tolist(),
                     "weights": weights.cpu().tolist(),
                     "sigma_m": float(sigma_m),
                 },
                 "current_pose": current_pose,
                 "would_be": would_be,
+                "anchor": anchor_payload,
+                "gating": gate,
+                "applied": applied,
             }
         self._write_trace(record)
         if self._on_trace is not None:
@@ -371,44 +467,58 @@ class ShadowVPRDriver:
                 logger.exception("shadow_vpr: on_trace callback raised")
         return record
 
-    # ── Would-be update math (no mutation) ───────────────────────────
+    # ── Snapshot, gating, would-be, apply ────────────────────────────
 
-    def _compute_would_be(
-        self, positions_xy: torch.Tensor, weights: torch.Tensor,
-        sigma_m: float,
-    ) -> Optional[Dict[str, Any]]:
-        """Return the posterior shift the live filter *would* see if we
-        applied this observation. Reads state + log_w under pf_lock,
-        does the math off-lock, no writes to pf."""
+    def _snapshot_pf(self) -> Optional[Dict[str, Any]]:
+        """Clone filter state under lock; do all heavy math off-lock.
+
+        Returns ``{state, log_w, cov_xy, mean}`` or ``None`` if the
+        filter isn't seeded yet. ``cov_xy`` is (2, 2), ``mean`` is the
+        full SE(2) posterior mean tuple.
+        """
         try:
             with self._pf_lock:
-                # Private fields, but more stable than is_seeded() —
-                # ParticleFilterPose stores them lazily via seed_at().
                 if getattr(self._pf, "_state", None) is None:
                     return None
                 state = self._pf.state.clone().detach()
                 log_w = self._pf._log_w.clone().detach()
+                cov = self._pf.posterior_cov().clone().detach()
+                mean = self._pf.posterior_mean()
         except Exception:
             logger.exception("shadow_vpr: pf snapshot failed")
             return None
+        return {
+            "state": state,
+            "log_w": log_w,
+            "cov_xy": cov[:2, :2],
+            "mean": mean,
+        }
 
+    def _compute_would_be(
+        self,
+        positions_xy: torch.Tensor, weights: torch.Tensor,
+        sigma_m: float,
+        *, snapshot: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Per-particle log-likelihood + posterior-shift stats. Does
+        not mutate pf — uses the off-lock snapshot."""
+        if snapshot is None:
+            return None
+        state = snapshot["state"]
+        log_w = snapshot["log_w"]
         device = state.device
         pos = positions_xy.to(device, dtype=state.dtype)
         w = weights.to(device, dtype=state.dtype)
         w = w / w.sum().clamp_min(1e-30)
-        # (N, K) squared distances.
         diff = state[:, None, :2] - pos[None, :, :]
         sq = (diff * diff).sum(dim=-1)
         eps = torch.finfo(state.dtype).tiny
         log_terms = torch.log(w.clamp_min(eps))[None, :] - 0.5 * sq / (sigma_m * sigma_m)
-        log_lik = torch.logsumexp(log_terms, dim=-1)  # (N,)
+        log_lik = torch.logsumexp(log_terms, dim=-1)
 
-        # Posterior before this observation.
         w_before = torch.softmax(log_w, dim=0)
         mean_before = (state[:, :2] * w_before[:, None]).sum(dim=0)
         n_eff_before = float(1.0 / (w_before * w_before).sum().clamp_min(eps))
-
-        # Posterior after (without mutating pf).
         new_log_w = log_w + log_lik.to(log_w.dtype)
         w_after = torch.softmax(new_log_w, dim=0)
         mean_after = (state[:, :2] * w_after[:, None]).sum(dim=0)
@@ -416,9 +526,9 @@ class ShadowVPRDriver:
 
         return {
             "mean_xy_before": [float(mean_before[0]), float(mean_before[1])],
-            "mean_xy_after": [float(mean_after[0]), float(mean_after[1])],
-            "n_eff_before": n_eff_before,
-            "n_eff_after": n_eff_after,
+            "mean_xy_after":  [float(mean_after[0]),  float(mean_after[1])],
+            "n_eff_before":   n_eff_before,
+            "n_eff_after":    n_eff_after,
             "log_lik_stats": {
                 "mean": float(log_lik.mean()),
                 "std":  float(log_lik.std(unbiased=False)),
@@ -426,6 +536,90 @@ class ShadowVPRDriver:
                 "max":  float(log_lik.max()),
             },
         }
+
+    def _evaluate_gate(
+        self, snapshot: Optional[Dict[str, Any]], sigma_m: float,
+    ) -> Dict[str, Any]:
+        """Decide whether a live application would fire. Returns a dict
+        always written to the trace, so post-hoc analysis can see why
+        an observation was suppressed."""
+        if snapshot is None:
+            return {"passed": False, "reason": "no_pf_snapshot",
+                    "sigma_xy_m": None, "dist_since_last_m": None}
+        cov_xy = snapshot["cov_xy"]
+        sigma_xy = float(torch.sqrt(cov_xy.diagonal().sum()).item())
+        mean = snapshot["mean"]
+        dist = (
+            math.hypot(mean[0] - self._last_applied_xy[0],
+                       mean[1] - self._last_applied_xy[1])
+            if self._last_applied_xy is not None else float("inf")
+        )
+        threshold_sigma = self._config.gate_sigma_floor_ratio * sigma_m
+        gate_sigma_ok = sigma_xy >= threshold_sigma
+        gate_dist_ok = dist >= self._config.gate_min_distance_m
+        passed = gate_sigma_ok and gate_dist_ok
+        if not gate_sigma_ok:
+            reason = "cloud_too_tight"
+        elif not gate_dist_ok:
+            reason = "too_close_to_last"
+        else:
+            reason = "passed"
+        return {
+            "passed": passed,
+            "reason": reason,
+            "sigma_xy_m": sigma_xy,
+            "dist_since_last_m": dist if math.isfinite(dist) else None,
+        }
+
+    def _maybe_apply_live(
+        self,
+        positions_xy: torch.Tensor, weights: torch.Tensor,
+        sigma_m: float,
+        snapshot: Optional[Dict[str, Any]],
+        gate: Dict[str, Any],
+    ) -> bool:
+        """Apply the mixture observation to the live filter, IFF
+        anchor is calibrated AND gates pass. Returns whether it fired."""
+        if self._anchor.calibration is None:
+            self._counters["live_obs_gated_anchor"] += 1
+            return False
+        if not gate["passed"]:
+            if gate["reason"] == "cloud_too_tight":
+                self._counters["live_obs_gated_sigma"] += 1
+            elif gate["reason"] == "too_close_to_last":
+                self._counters["live_obs_gated_distance"] += 1
+            return False
+        try:
+            with self._pf_lock:
+                if getattr(self._pf, "_state", None) is None:
+                    return False
+                self._pf.observe_xy_mixture(
+                    positions_xy=positions_xy,
+                    weights=weights,
+                    sigma_xy_m=sigma_m,
+                )
+        except Exception:
+            logger.exception("shadow_vpr: live observe_xy_mixture failed")
+            return False
+        if snapshot is not None:
+            self._last_applied_xy = (snapshot["mean"][0], snapshot["mean"][1])
+        self._counters["live_obs_applied"] += 1
+        return True
+
+    def _anchor_payload(self) -> Tuple[str, Dict[str, Any]]:
+        """Trace-friendly snapshot of anchor state."""
+        state = self._anchor.state
+        payload: Dict[str, Any] = {
+            "state": state,
+            "n_pairs_collected": self._anchor.n_pairs_collected,
+        }
+        cal = self._anchor.calibration
+        if cal is not None:
+            payload["offset"] = {
+                "dx": cal.dx, "dy": cal.dy, "dtheta_rad": cal.dtheta_rad,
+                "n_pairs": cal.n_pairs, "residual_rms_m": cal.residual_rms_m,
+            }
+        return state, payload
 
     def _snapshot_current_pose(self, ts: float) -> Optional[List[float]]:
         if self._pose_source is None:

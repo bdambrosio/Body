@@ -8,6 +8,11 @@ Module layout:
 See ``docs/bayesian_localization_redesign.md`` §"Phase 6" for the plan.
 """
 
+from .anchor import (
+    AnchorOffsetConfig,
+    AnchorOffsetEstimator,
+    CalibrationResult,
+)
 from .bank import (
     QueryResult,
     VPRBank,
@@ -24,6 +29,9 @@ from .shadow_driver import (
 )
 
 __all__ = [
+    "AnchorOffsetConfig",
+    "AnchorOffsetEstimator",
+    "CalibrationResult",
     "DinoV2Extractor",
     "ExtractorConfig",
     "QueryResult",
