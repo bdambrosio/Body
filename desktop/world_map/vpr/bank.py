@@ -169,7 +169,8 @@ class VPRBank:
     @classmethod
     def load(cls, path: str | Path, *, device: str = "cpu") -> "VPRBank":
         """Load a bank from a Phase 6.1 ``.pt`` file."""
-        path = Path(path)
+        import os as _os
+        path = Path(_os.path.expanduser(str(path)))
         # weights_only=False because the metadata field is a plain dict.
         raw = torch.load(path, weights_only=False, map_location="cpu")
         if not isinstance(raw, dict):
