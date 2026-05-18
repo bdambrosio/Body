@@ -729,6 +729,63 @@ just ship the divergence.
   particle_filter_pose.py::predict against α priors. Ready for live
   Pi shadow-mode trace capture and offline analysis before Phase 3.
 
+- **2026-05-17 (end of session — shutdown note):** Long day. Built
+  Phase 6 (VPR) end-to-end through 6.4.4, watched it fail to pay
+  for itself live, and pivoted to the architecturally-simpler
+  saved-map + scan-match `relocate()` approach which now serves
+  the cross-session global-anchoring use case VPR was meant to
+  cover.
+
+  **17 commits** today (`bfa9a43` → `732b2c5`); **net 222 desktop
+  tests passing** (started the day at 184). VPR subpackage stays
+  in tree as functional dead end / diagnostic + future starting
+  point.
+
+  **Production stack as of session end:**
+  - `--pf` is default ON (since `01ddf63`)
+  - 20 000 particles, IMU σ=8 mrad, IMU obs rate 5 Hz, defensive
+    resample fraction 0.05 (XY only — yaw σ forced to 0)
+  - Dual filter (Phase 6.4.4): nav filter handles VPR (when
+    enabled), mapping filter never sees VPR
+  - `relocate()` works for `--pf` (commit `0d7fe08`)
+  - `--load-map PATH` + `--relocate-on-load` exposed as CLI
+    flags (commit `732b2c5`)
+  - VPR off by default; `--vpr-shadow` still works as diagnostic
+
+  **End-to-end workflow (new):**
+  ```
+  # Mapping run (one time per house):
+  python -m desktop.nav --router tcp/<pi>:7447
+  # drive every corridor, File → Save Snapshot
+
+  # Every subsequent session:
+  python -m desktop.nav --router tcp/<pi>:7447 \
+      --load-map ~/Body/maps/house.npz \
+      --relocate-on-load
+  ```
+
+  **Remaining work after today:**
+  1. **Phase 8 cleanup** — remove `ImuPlusScanMatchPose`,
+     `_apply_correction`, slew clamps, `OdomPose.to_world` hack.
+     The legacy stack was the comparison baseline; production
+     has settled on PF. Estimated ~200 LOC removed. **Highest
+     priority of remaining items.**
+  2. **LPR (Lidar Place Recognition)** — added as future TODO.
+     Same architectural pattern as VPR (bank + query + observation)
+     but geometry-based (Scan Context, M2DP, etc.) rather than
+     appearance-based, so the cosine-vs-geographic mismatch that
+     killed VPR doesn't apply. **Defer until a concrete use case
+     emerges that saved-map + relocate can't cover** (dynamic
+     environments, multi-floor, large outdoor spaces).
+  3. Phase 5 (full) and Phase 7 (full) remain as before — both
+     polish work, neither blocking.
+
+  No new tests required for Phase 8 cleanup beyond verifying the
+  existing PF test suite still passes after legacy removal. LPR,
+  if undertaken, would mirror the VPR test layout (extractor,
+  bank query, observation model, shadow driver, opportunistic
+  scoring) — most of the framework is already in tree and reusable.
+
 - **2026-05-17 (Phase 6 closeout — experiment dead-ended):** After
   the day's full Phase 6.1 → 6.4.4 build-out, the VPR live-mode
   experiment is closed. **Summary verdict: VPR works as a measurement
