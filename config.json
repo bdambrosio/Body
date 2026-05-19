@@ -104,7 +104,7 @@
     "driveable_floor_band_m": 0.04,
     "driveable_floor_min_pixels": 2,
     "driveable_slab_min_pixels": 2,
-    "driveable_clear_frames": 4,
+    "driveable_clear_frames": 1,
     "driveable_unobs_decay_frames": 1,
     "floor_fit_enabled": false,
     "floor_fit_interval_s": 0.5,

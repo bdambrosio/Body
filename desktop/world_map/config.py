@@ -93,7 +93,7 @@ class FuserConfig:
     #
     # Override cost: ~vote_capacity contradicting observations to
     # flip a fully saturated cell.
-    vote_capacity: float = 20.0
+    vote_capacity: float = 6.0
     # Per-fusion vote weights. Pi-side block classification is
     # asymmetric — a single slab pixel flips a cell to block
     # instantly, while clear requires `driveable_clear_frames`
