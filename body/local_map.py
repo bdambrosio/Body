@@ -506,7 +506,14 @@ def main() -> None:
                     sample_d = (
                         np.arange(1, max_samples + 1, dtype=np.float64) * res
                     )[None, :]  # (1, S)
-                    valid_samp = sample_d < (rs_clear[:, None] - 0.5 * res)
+                    # Stop clearing 2 cells short of the hit (was 0.5).
+                    # The buffer band prevents PF pose jitter (a few cm
+                    # perpendicular to a wall) from clearing cells just
+                    # past the wall surface in world frame, where lidar
+                    # never gets a block return. Cost: a thin unknown
+                    # ring inside each wall — acceptable because the
+                    # body footprint can't enter it anyway.
+                    valid_samp = sample_d < (rs_clear[:, None] - 2.0 * res)
                     sx = lidar_x + sample_d * cos_t[:, None]
                     sy = lidar_y + sample_d * sin_t[:, None]
                     ix_s = np.floor((sx - origin_x) / res).astype(np.int32)

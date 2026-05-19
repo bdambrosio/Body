@@ -94,14 +94,17 @@ class FuserConfig:
     # Override cost: ~vote_capacity contradicting observations to
     # flip a fully saturated cell.
     vote_capacity: float = 6.0
-    # Per-fusion vote weights. Pi-side block classification is
-    # asymmetric — a single slab pixel flips a cell to block
-    # instantly, while clear requires `driveable_clear_frames`
-    # consecutive observations. Weighting block votes < 1.0 here
-    # restores symmetry so dust speckle / single-frame returns
-    # don't out-vote a 4-frame clear streak.
+    # Per-fusion vote weights. Historically asymmetric (block=0.5)
+    # to compensate for the depth-driven clear regime where clear
+    # required 4 consecutive frames vs. single-frame block. Since
+    # 842b7c3 lidar is the clear source (single-ray = clear evidence)
+    # and lidar terminal hits dominate blocks, both sides are now
+    # single-frame, so symmetric weights are right. Asymmetry was
+    # also letting phantom clears (from PF jitter past walls) beat
+    # the rare block votes those cells see — symmetrizing reduces
+    # smear-through-walls.
     clear_vote_weight: float = 1.0
-    block_vote_weight: float = 0.5
+    block_vote_weight: float = 1.0
     traversal_stamp_hz: float = 10.0
     traversal_vote_weight: int = 3
     footprint_radius_m: float = 0.15
