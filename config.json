@@ -124,7 +124,9 @@
     "lidar_slab_min_range_m": 0.15,
     "lidar_slab_block_frames": 2,
     "lidar_slab_min_hits": 1,
-    "depth_slab_block_frames": 2
+    "depth_slab_block_frames": 2,
+    "depth_max_range_m": 1.5,
+    "lidar_max_clear_range_m": 6.0
   },
   "watchdog": {
     "heartbeat_timeout_ms": 2000,

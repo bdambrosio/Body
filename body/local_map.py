@@ -303,6 +303,15 @@ def main() -> None:
     lidar_slab_block_frames = max(1, int(lm.get("lidar_slab_block_frames", 2)))
     lidar_slab_min_hits = max(1, int(lm.get("lidar_slab_min_hits", 1)))
     depth_slab_block_frames = max(1, int(lm.get("depth_slab_block_frames", 2)))
+    # Depth horizontal range cap (m). Stereo σ ∝ z² makes returns past ~1.5 m
+    # noisy; the hazard layer only needs local reaction range. Points with
+    # sqrt(px²+py²) above this in body frame are dropped before z_acc/slab_count.
+    depth_max_range_m = float(lm.get("depth_max_range_m", 1.5))
+    # Lidar ray-trace clear authority. For each lidar ray, cells from the
+    # robot to (hit − 1 cell) are marked observed-clear. No-return rays
+    # clear out to this fallback range. Lidar is the sole source of "clear"
+    # evidence — depth contributes only "blocked" (with its 2-frame gate).
+    lidar_max_clear_range_m = float(lm.get("lidar_max_clear_range_m", 6.0))
     if not driveable_on or clearance_m <= 0.0:
         driveable_on = False
 
@@ -364,6 +373,7 @@ def main() -> None:
         slab_count = np.zeros((nx, ny), dtype=np.int32) if driveable_on else None
         floor_count = np.zeros((nx, ny), dtype=np.int32) if driveable_on else None
         lidar_slab_count = np.zeros((nx, ny), dtype=np.int32)
+        lidar_cleared = np.zeros((nx, ny), dtype=bool)
         lidar_ts: float | None = None
         depth_ts: float | None = None
 
@@ -430,31 +440,80 @@ def main() -> None:
             amin = float(lmsg.get("angle_min", 0.0))
             ainc = float(lmsg.get("angle_increment", 0.0))
             ranges = lmsg.get("ranges")
-            if isinstance(ranges, list):
-                lidar_xy = np.array([lidar_x, lidar_y], dtype=np.float64)
-                for i, rv in enumerate(ranges):
-                    if rv is None:
-                        continue
-                    r = float(rv)
-                    if not math.isfinite(r) or r <= 0.0:
-                        continue
-                    th = amin + i * ainc
-                    c, s = math.cos(th + lidar_yaw), math.sin(th + lidar_yaw)
-                    px = lidar_xy[0] + r * c
-                    py = lidar_xy[1] + r * s
-                    pz = lidar_z
-                    if pz <= ground_z:
-                        continue
-                    ix = int(math.floor((px - origin_x) / res))
-                    iy = int(math.floor((py - origin_y) / res))
-                    if 0 <= ix < nx and 0 <= iy < ny:
-                        np.maximum.at(z_acc, (ix, iy), pz)
-                        if driveable_on and r >= lidar_slab_min_range:
-                            h_ab = float(
-                                floor_n[0] * px + floor_n[1] * py + floor_n[2] * pz + floor_d
+            if isinstance(ranges, list) and len(ranges) > 0:
+                n_rays = len(ranges)
+                rs_raw = np.array(
+                    [
+                        float(rv) if isinstance(rv, (int, float)) and math.isfinite(float(rv)) else 0.0
+                        for rv in ranges
+                    ],
+                    dtype=np.float64,
+                )
+                valid_ray = rs_raw > 0.0
+                thetas = amin + np.arange(n_rays, dtype=np.float64) * ainc + lidar_yaw
+                cos_t = np.cos(thetas)
+                sin_t = np.sin(thetas)
+
+                # Hit stamping (terminal cell of each valid ray).
+                if lidar_z > ground_z and np.any(valid_ray):
+                    rs_v = rs_raw[valid_ray]
+                    hx = lidar_x + rs_v * cos_t[valid_ray]
+                    hy = lidar_y + rs_v * sin_t[valid_ray]
+                    ix_h = np.floor((hx - origin_x) / res).astype(np.int32)
+                    iy_h = np.floor((hy - origin_y) / res).astype(np.int32)
+                    inside_h = (ix_h >= 0) & (ix_h < nx) & (iy_h >= 0) & (iy_h < ny)
+                    if np.any(inside_h):
+                        ix_in = ix_h[inside_h]
+                        iy_in = iy_h[inside_h]
+                        np.maximum.at(z_acc, (ix_in, iy_in), lidar_z)
+                        if driveable_on:
+                            rs_in = rs_v[inside_h]
+                            hx_in = hx[inside_h]
+                            hy_in = hy[inside_h]
+                            h_ab = (
+                                floor_n[0] * hx_in
+                                + floor_n[1] * hy_in
+                                + floor_n[2] * lidar_z
+                                + floor_d
                             )
-                            if floor_band_m < h_ab <= clearance_m:
-                                lidar_slab_count[ix, iy] += 1
+                            slab_ok = (
+                                (rs_in >= lidar_slab_min_range)
+                                & (h_ab > floor_band_m)
+                                & (h_ab <= clearance_m)
+                            )
+                            if np.any(slab_ok):
+                                np.add.at(
+                                    lidar_slab_count,
+                                    (ix_in[slab_ok], iy_in[slab_ok]),
+                                    1,
+                                )
+
+                # Ray-trace clear: walk cells from robot to (hit − ½ cell) for
+                # every ray. No-return rays clear out to lidar_max_clear_range_m.
+                rs_clear = np.where(
+                    valid_ray,
+                    np.minimum(rs_raw, lidar_max_clear_range_m),
+                    lidar_max_clear_range_m,
+                )
+                max_samples = int(math.ceil(lidar_max_clear_range_m / res))
+                if max_samples > 0:
+                    sample_d = (
+                        np.arange(1, max_samples + 1, dtype=np.float64) * res
+                    )[None, :]  # (1, S)
+                    valid_samp = sample_d < (rs_clear[:, None] - 0.5 * res)
+                    sx = lidar_x + sample_d * cos_t[:, None]
+                    sy = lidar_y + sample_d * sin_t[:, None]
+                    ix_s = np.floor((sx - origin_x) / res).astype(np.int32)
+                    iy_s = np.floor((sy - origin_y) / res).astype(np.int32)
+                    inside_s = (
+                        (ix_s >= 0)
+                        & (ix_s < nx)
+                        & (iy_s >= 0)
+                        & (iy_s < ny)
+                        & valid_samp
+                    )
+                    if np.any(inside_s):
+                        lidar_cleared[ix_s[inside_s], iy_s[inside_s]] = True
 
         if dmsg is not None:
             depth_ts = float(dmsg.get("ts", 0.0))
@@ -478,8 +537,11 @@ def main() -> None:
                     pz = pb[:, 2]
                     ix = np.floor((px - origin_x) / res).astype(np.int32)
                     iy = np.floor((py - origin_y) / res).astype(np.int32)
+                    # Drop returns past depth_max_range_m — stereo σ ∝ z².
+                    r_xy2 = px * px + py * py
+                    in_range = r_xy2 <= (depth_max_range_m * depth_max_range_m)
                     inside_xy = (
-                        (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+                        (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny) & in_range
                     )
                     h_ab = (
                         px * floor_n[0]
@@ -527,27 +589,28 @@ def main() -> None:
                 else np.zeros((nx, ny), dtype=bool)
             )
             instant_block = slab_hit | lidar_blocked
-            # Height grid ignores floor (pz <= ground_z); driveable still needs
-            # "observed" when depth classifies samples as on the fitted floor.
-            observed = ~np.isnan(grid) | floor_seen
+            # Clear authority belongs to lidar only — depth contributes
+            # blocked evidence (with 2-frame gate) but never "clear" on its
+            # own. Lidar ray-trace marks cells the ray swept through.
             new_streak = clear_streak.copy()
             new_streak[instant_block] = 0
-            inc = observed & ~instant_block
+            inc = lidar_cleared & ~instant_block
             new_streak[inc] = clear_streak[inc] + 1
-            # Memoryless decay: cells not observed this frame forget clear
-            # evidence so speckle-induced "green" does not stick forever.
-            unobs = ~observed & ~instant_block
+            # Cells the lidar did not sweep this frame decay so stale
+            # clears do not stick forever.
+            unobs = ~lidar_cleared & ~instant_block
             new_streak[unobs] = np.maximum(0, clear_streak[unobs] - unobs_decay)
             clear_streak = new_streak
             ok_mask = clear_streak >= clear_frames_need
+            # Trichotomy is now driven by evidence layers directly:
+            # blocked iff depth/lidar slab; clear iff lidar accumulated
+            # enough clear frames; otherwise unknown. Depth-only-observed
+            # cells stay unknown until lidar verifies — they no longer
+            # masquerade as blocked just because they lack clear evidence.
             d_now = np.where(
                 instant_block,
                 _D_BLOCK,
-                np.where(
-                    observed,
-                    np.where(ok_mask, _D_OK, _D_BLOCK),
-                    _D_NONE,
-                ),
+                np.where(ok_mask, _D_OK, _D_NONE),
             )
             driveable_rows = []
             for ix in range(nx):
