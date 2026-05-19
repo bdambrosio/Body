@@ -71,10 +71,18 @@ class CostmapConfig:
     inflation_decay_m: float = 0.15
     halo_max: float = 100.0
 
-    # Cost assigned to cells that have never been observed. Low enough
-    # to plan through if no observed-clear path exists; high enough
-    # that "go through observed clear" is preferred.
+    # Cost assigned to cells that have never been observed. Used only
+    # when `unknown_is_lethal=False`. Low enough to plan through if no
+    # observed-clear path exists; high enough that "go through observed
+    # clear" is preferred.
     unknown_cost: float = 25.0
+
+    # When True, unknown cells are folded into the lethal mask — the
+    # planner refuses to enter them. Safer for indoor nav: the robot
+    # won't drive blind into unmapped space when a known-clear route
+    # is missing; it stops instead. Flip to False for exploration
+    # missions where reaching an unmapped goal is the whole point.
+    unknown_is_lethal: bool = True
 
     # Speckle filter on the blocked layer before inflation. Drops
     # blocked cells whose number of blocked 8-neighbors is below
@@ -164,8 +172,11 @@ def build_costmap(
     dist_cells = _wavefront_distance(blocked, max_cells=max_cells)
     dist_m = (dist_cells * res).astype(np.float32)
 
-    # Lethal: blocked plus footprint-radius dilation.
+    # Lethal: blocked plus footprint-radius dilation. Optionally folds
+    # in unknown so the planner won't route through unmapped cells.
     lethal = blocked | (dist_m < lethal_radius_m)
+    if cfg.unknown_is_lethal:
+        lethal = lethal | unknown
 
     # Cost field. Inside the safety band (lethal_radius..lethal_radius
     # + safety_margin) the halo is at full halo_max — strongly avoided
