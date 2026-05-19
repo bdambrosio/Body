@@ -307,10 +307,12 @@ def main() -> None:
     # noisy; the hazard layer only needs local reaction range. Points with
     # sqrt(px²+py²) above this in body frame are dropped before z_acc/slab_count.
     depth_max_range_m = float(lm.get("depth_max_range_m", 1.5))
-    # Lidar ray-trace clear authority. For each lidar ray, cells from the
-    # robot to (hit − 1 cell) are marked observed-clear. No-return rays
-    # clear out to this fallback range. Lidar is the sole source of "clear"
-    # evidence — depth contributes only "blocked" (with its 2-frame gate).
+    # Lidar ray-trace clear authority. For each valid ray, cells from the
+    # robot to (hit − ½ cell) are marked observed-clear. No-return rays
+    # contribute nothing. This value caps how far a single valid ray
+    # clears (a return longer than the cap is clipped at the cap) and
+    # bounds the per-frame sample buffer size. Lidar is the sole source
+    # of "clear" evidence — depth contributes only "blocked".
     lidar_max_clear_range_m = float(lm.get("lidar_max_clear_range_m", 6.0))
     if not driveable_on or clearance_m <= 0.0:
         driveable_on = False
@@ -488,12 +490,16 @@ def main() -> None:
                                     1,
                                 )
 
-                # Ray-trace clear: walk cells from robot to (hit − ½ cell) for
-                # every ray. No-return rays clear out to lidar_max_clear_range_m.
+                # Ray-trace clear: walk cells from robot to (hit − ½ cell)
+                # for every *valid* ray. No-return rays (NaN/0/None) carry
+                # no evidence — they could mean out-of-range, bad surface,
+                # or dropped packet — so they contribute nothing to clear.
+                # rs_clear = 0 makes valid_samp uniformly False for those
+                # rows, leaving their directions unknown.
                 rs_clear = np.where(
                     valid_ray,
                     np.minimum(rs_raw, lidar_max_clear_range_m),
-                    lidar_max_clear_range_m,
+                    0.0,
                 )
                 max_samples = int(math.ceil(lidar_max_clear_range_m / res))
                 if max_samples > 0:
