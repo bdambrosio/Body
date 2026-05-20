@@ -236,6 +236,7 @@ class FuserController:
             vote_capacity=config.vote_capacity,
             clear_vote_weight=config.clear_vote_weight,
             block_vote_weight=config.block_vote_weight,
+            block_lock_threshold=config.block_lock_threshold,
         )
 
         # Zenoh handles

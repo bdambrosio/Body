@@ -105,6 +105,14 @@ class FuserConfig:
     # smear-through-walls.
     clear_vote_weight: float = 1.0
     block_vote_weight: float = 1.0
+    # Block-lock threshold. Once a cell's block_votes reach this
+    # value, further clear votes from fuse_local_map are refused
+    # (the cell is treated as a confirmed wall). Set above
+    # vote_margin+1 so a cell only locks after it has confidently
+    # displayed as blocked. stamp_traversal still adds clears
+    # directly — driving over a cell breaks the lock, so a chair
+    # pulled away from a wall is still recoverable.
+    block_lock_threshold: float = 4.0
     traversal_stamp_hz: float = 10.0
     traversal_vote_weight: int = 3
     footprint_radius_m: float = 0.15

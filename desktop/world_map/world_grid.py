@@ -46,6 +46,7 @@ class WorldGrid:
         vote_capacity: float = 10.0,
         clear_vote_weight: float = 1.0,
         block_vote_weight: float = 1.0,
+        block_lock_threshold: float = 4.0,
     ):
         if resolution_m <= 0:
             raise ValueError("resolution_m must be > 0")
@@ -71,6 +72,9 @@ class WorldGrid:
         # the Pi local_map's instant-block vs 4-frame-clear bias.
         self._clear_vote_weight = float(clear_vote_weight)
         self._block_vote_weight = float(block_vote_weight)
+        # One-way ratchet against phantom clears from PF pose jitter.
+        # See FuserConfig.block_lock_threshold.
+        self._block_lock_threshold = float(block_lock_threshold)
 
         # Pre-compute footprint cell offsets (square mask, then circular).
         r_cells = int(math.ceil(self._footprint_radius_m / self._res))
@@ -252,11 +256,25 @@ class WorldGrid:
                 # np.add.at handles repeated indices correctly when several
                 # source cells map to the same target cell.
                 if np.any(clear_mask) and clear_w > 0.0:
-                    np.add.at(
-                        self.clear_votes,
-                        (iw_v[clear_mask], jw_v[clear_mask]),
-                        clear_w,
+                    iw_c = iw_v[clear_mask]
+                    jw_c = jw_v[clear_mask]
+                    # Block-lock ratchet: cells whose block_votes have
+                    # already reached the lock threshold refuse further
+                    # clear votes from local-map fusion (phantom clears
+                    # from PF pose jitter would otherwise erode confirmed
+                    # walls cell-by-cell). stamp_traversal bypasses this
+                    # gate, so genuinely-cleared cells (robot drove over)
+                    # still recover.
+                    not_locked = (
+                        self.block_votes[iw_c, jw_c]
+                        < self._block_lock_threshold
                     )
+                    if np.any(not_locked):
+                        np.add.at(
+                            self.clear_votes,
+                            (iw_c[not_locked], jw_c[not_locked]),
+                            clear_w,
+                        )
                 if np.any(block_mask) and block_w > 0.0:
                     np.add.at(
                         self.block_votes,
