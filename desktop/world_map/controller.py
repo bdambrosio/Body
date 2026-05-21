@@ -278,6 +278,17 @@ class FuserController:
         self._on_session_change: Optional[Callable[[str], None]] = None
         self._on_grid_update: Optional[Callable[[], None]] = None
 
+        # Pose-jitter diagnostic: rolling window of stamping poses
+        # (the pose passed into fuse_local_map). Used to test whether
+        # PF posterior wobble at stamp time is large enough to smear
+        # walls in the world grid. Logged once every 5 s, sliding 5 s
+        # window. range_xy (max-min) tells you if the robot was moving;
+        # σ_xy / σ_θ are only meaningful if range is small.
+        self._stamp_pose_window: Deque[Tuple[float, float, float, float]] = deque(
+            maxlen=128
+        )
+        self._stamp_jitter_next_log_ts: float = 0.0
+
     # ── UI hooks ─────────────────────────────────────────────────────
 
     def set_on_session_change(self, cb: Optional[Callable[[str], None]]) -> None:
@@ -603,6 +614,7 @@ class FuserController:
                     with self._lock:
                         self._notes = "world_bounds_exceeded"
                 if n_in > 0:
+                    self._record_stamp_pose(cap_ts, pose)
                     cb = self._on_grid_update
                     if cb is not None:
                         try:
@@ -693,6 +705,50 @@ class FuserController:
                     or dth >= cfg.pose_trail_min_dtheta_rad
                     or dt >= cfg.pose_trail_min_period_s):
                 self._pose_trail.append((pose[0], pose[1], pose[2], now))
+
+    def _record_stamp_pose(
+        self, cap_ts: float, pose: Tuple[float, float, float],
+    ) -> None:
+        """Record the pose used for a successful fuse_local_map, and
+        every 5 s emit σ_xy / σ_θ over the trailing 5 s window. Cheap:
+        deque append + ~100-element std once per 5 s. Read by the
+        operator when investigating wall-leakage: small range_xy + large
+        σ → pose is wobbling at stamp time. Large range_xy → robot was
+        moving and σ is dominated by motion (not jitter).
+        """
+        win = self._stamp_pose_window
+        win.append((cap_ts, pose[0], pose[1], pose[2]))
+        now_mono = time.monotonic()
+        if now_mono < self._stamp_jitter_next_log_ts:
+            return
+        self._stamp_jitter_next_log_ts = now_mono + 5.0
+        # Trim to last 5 s by capture ts.
+        if not win:
+            return
+        latest_ts = win[-1][0]
+        cutoff = latest_ts - 5.0
+        recent = [s for s in win if s[0] >= cutoff]
+        if len(recent) < 3:
+            return
+        xs = np.array([s[1] for s in recent], dtype=np.float64)
+        ys = np.array([s[2] for s in recent], dtype=np.float64)
+        ths = np.array([s[3] for s in recent], dtype=np.float64)
+        # Unwrap θ around the mean before taking std (avoid ±π wrap).
+        th_mean = float(np.arctan2(np.sin(ths).mean(), np.cos(ths).mean()))
+        th_dev = np.array(
+            [_wrap_pi(float(t) - th_mean) for t in ths], dtype=np.float64
+        )
+        range_xy = float(
+            math.hypot(xs.max() - xs.min(), ys.max() - ys.min())
+        )
+        sigma_x = float(xs.std())
+        sigma_y = float(ys.std())
+        sigma_th_deg = float(math.degrees(th_dev.std()))
+        logger.info(
+            "stamp_pose jitter (5s, n=%d): range_xy=%.3f m, "
+            "σ_x=%.3f m, σ_y=%.3f m, σ_θ=%.2f°",
+            len(recent), range_xy, sigma_x, sigma_y, sigma_th_deg,
+        )
 
     def _publish_loop(self) -> None:
         publish_period = 1.0 / max(0.1, self.config.publish_hz)
