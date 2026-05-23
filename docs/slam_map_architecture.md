@@ -65,3 +65,5 @@ During nav, the same **EkfPoseTracker** config drives MCL motion prediction betw
 The online `WorldGrid` fusion loop (`FuserController`, dual particle filters, scan-match vs `block_votes`) is superseded for production navigation. It remains under `desktop/world_map/` for reference and migration tooling.
 
 See the redesign plan in `.cursor/plans/` and the original critique in [bayesian_localization_redesign.md](bayesian_localization_redesign.md).
+
+**Live progress (2026-05-22):** First post-cutover mapping shows much improved map stability; desktop UI/teleop lag is severe and needs profiling. See [ekf_pose_graph_slam_progress.md](ekf_pose_graph_slam_progress.md).

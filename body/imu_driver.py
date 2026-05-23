@@ -243,6 +243,9 @@ def main() -> None:
     grv_accuracy_constant_rad = float(imu_cfg.get("game_rotation_vector_accuracy_rad", 0.175))
     settle_time_s = float(imu_cfg.get("settle_time_s", 2.0))
     linear_accel_enabled = bool(imu_cfg.get("linear_accel_enabled", False))
+    mag_when_idle_enabled = bool(imu_cfg.get("mag_when_idle_enabled", False))
+    mag_idle_pwm_threshold = float(imu_cfg.get("mag_idle_pwm_threshold", 0.02))
+    mag_idle_settle_ms = float(imu_cfg.get("mag_idle_settle_ms", 300.0))
     reset_gpio = int(imu_cfg.get("reset_gpio", 25))
     gpio_chip = int(imu_cfg.get("gpio_chip", 0))
 
@@ -287,17 +290,38 @@ def main() -> None:
     _enable(bno, features["accel"], "accelerometer")
     _enable(bno, features["gyro"], "gyroscope")
     _enable(bno, features[active_mode], active_mode)
+    if mag_when_idle_enabled and active_mode == "game_rotation_vector":
+        _enable(bno, features["rotation_vector"], "rotation_vector (mag-when-idle)")
     if linear_accel_enabled:
         _enable(bno, features["linear_accel"], "linear_acceleration")
 
     print(
         f"imu_driver: BNO085 ready at 0x{address:02x}, mode={active_mode}, "
-        f"publish_hz={publish_hz:.0f}, linear_accel={'on' if linear_accel_enabled else 'off'}.",
+        f"publish_hz={publish_hz:.0f}, linear_accel={'on' if linear_accel_enabled else 'off'}, "
+        f"mag_when_idle={'on' if mag_when_idle_enabled else 'off'}.",
         flush=True,
     )
 
     session = zenoh_helpers.open_session(body_cfg)
     cal_actions: queue.Queue[str] = queue.Queue()
+    motor_ref: dict[str, float] = {
+        "left_pwm": 0.0,
+        "right_pwm": 0.0,
+        "last_motion_mono": time.monotonic(),
+        "seen": 0.0,
+    }
+
+    def on_motor_state(_key: str, msg: dict[str, Any]) -> None:
+        left_pwm = abs(float(msg.get("left_pwm", 0.0)))
+        right_pwm = abs(float(msg.get("right_pwm", 0.0)))
+        motor_ref["left_pwm"] = left_pwm
+        motor_ref["right_pwm"] = right_pwm
+        motor_ref["seen"] = 1.0
+        if left_pwm > mag_idle_pwm_threshold or right_pwm > mag_idle_pwm_threshold:
+            motor_ref["last_motion_mono"] = time.monotonic()
+
+    if mag_when_idle_enabled:
+        zenoh_helpers.declare_subscriber_json(session, "body/motor_state", on_motor_state)
 
     def on_calibrate(_key: str, msg: dict[str, Any]) -> None:
         action = str(msg.get("action", "")).strip().lower()
@@ -329,6 +353,15 @@ def main() -> None:
     fallback_count = 0
     fallback_done = False
     next_tick = time.monotonic()
+    mag_idle_settle_s = max(0.0, mag_idle_settle_ms / 1000.0)
+
+    def _motors_idle() -> bool:
+        if (
+            motor_ref["left_pwm"] > mag_idle_pwm_threshold
+            or motor_ref["right_pwm"] > mag_idle_pwm_threshold
+        ):
+            return False
+        return (time.monotonic() - motor_ref["last_motion_mono"]) >= mag_idle_settle_s
 
     try:
         while not stop:
@@ -433,6 +466,23 @@ def main() -> None:
                         float(lin_accel[1]),
                         float(lin_accel[2]),
                     )
+                mag_quat_wxyz: tuple[float, float, float, float] | None = None
+                mag_accuracy: float | None = None
+                mag_valid: bool | None = None
+                if mag_when_idle_enabled and active_mode == "game_rotation_vector":
+                    mag_valid = settled and _motors_idle()
+                    if mag_valid:
+                        rv_quat = _read_quat(bno, "rotation_vector")
+                        if rv_quat is not None:
+                            i_rv, j_rv, k_rv, real_rv = rv_quat
+                            mag_quat_wxyz = (real_rv, i_rv, j_rv, k_rv)
+                            mag_accuracy = _read_accuracy_rad(
+                                bno,
+                                "rotation_vector",
+                                mag_accuracy_fallback_rad,
+                            )
+                        else:
+                            mag_valid = False
                 msg = schemas.imu_report(
                     ts=now_wall,
                     accel_xyz=(ax, ay, az),
@@ -442,6 +492,9 @@ def main() -> None:
                     fusion_accuracy_rad=accuracy_rad,
                     linear_accel_xyz=lin_tuple,
                     calibration_status=calib,
+                    mag_quat_wxyz=mag_quat_wxyz,
+                    mag_accuracy_rad=mag_accuracy,
+                    mag_valid=mag_valid,
                 )
                 zenoh_helpers.publish_json(session, "body/imu", msg)
 

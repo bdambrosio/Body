@@ -167,6 +167,9 @@ def imu_report(
     fusion_accuracy_rad: float,
     linear_accel_xyz: tuple[float, float, float] | None = None,
     calibration_status: int | None = None,
+    mag_quat_wxyz: tuple[float, float, float, float] | None = None,
+    mag_accuracy_rad: float | None = None,
+    mag_valid: bool | None = None,
 ) -> dict[str, Any]:
     """Build body/imu JSON per docs/imu_integration_spec.md §2 (body frame).
 
@@ -198,6 +201,18 @@ def imu_report(
         }
     if calibration_status is not None:
         msg["fusion"]["calibration_status"] = int(calibration_status)
+    if mag_valid is not None:
+        mag_block: dict[str, Any] = {"valid": bool(mag_valid)}
+        if mag_quat_wxyz is not None:
+            mag_block["orientation"] = {
+                "w": mag_quat_wxyz[0],
+                "x": mag_quat_wxyz[1],
+                "y": mag_quat_wxyz[2],
+                "z": mag_quat_wxyz[3],
+            }
+        if mag_accuracy_rad is not None:
+            mag_block["accuracy_rad"] = float(mag_accuracy_rad)
+        msg["mag"] = mag_block
     return msg
 
 

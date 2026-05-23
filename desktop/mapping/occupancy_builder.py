@@ -17,8 +17,12 @@ from desktop.reference_map.reference_map import (
 )
 
 
-def _clamp_log_odds(v: np.ndarray) -> None:
-    np.clip(v, LOG_ODDS_MIN, LOG_ODDS_MAX, out=v)
+def _clamp_cell(log_odds: np.ndarray, i: int, j: int) -> None:
+    v = log_odds[i, j]
+    if v < LOG_ODDS_MIN:
+        log_odds[i, j] = LOG_ODDS_MIN
+    elif v > LOG_ODDS_MAX:
+        log_odds[i, j] = LOG_ODDS_MAX
 
 
 class OccupancyBuilder:
@@ -102,13 +106,14 @@ class OccupancyBuilder:
         for i, j in free_cells:
             if 0 <= i < n and 0 <= j < n:
                 self.log_odds[i, j] += LOG_ODDS_FREE
+                _clamp_cell(self.log_odds, i, j)
                 count += 1
         if hit:
             i, j = cells[-1]
             if 0 <= i < n and 0 <= j < n:
                 self.log_odds[i, j] += LOG_ODDS_OCC
+                _clamp_cell(self.log_odds, i, j)
                 count += 1
-        _clamp_log_odds(self.log_odds)
         return count
 
     def occupied_mask(self, threshold: float = 0.5) -> np.ndarray:

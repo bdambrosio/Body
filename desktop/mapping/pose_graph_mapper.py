@@ -120,11 +120,11 @@ class PoseGraphMapper:
         with self._lock:
             if not self._nodes:
                 self._add_node(ts, prior, ranges_m, angles_rad)
-                self._rebuild_display_map()
+                self._integrate_display_node(self._nodes[-1])
                 self._trajectory.append((ts, prior[0], prior[1], prior[2]))
                 return True
 
-            submap, evidence_count = self._build_submap()
+            submap, evidence_count = self._match_evidence()
             if evidence_count >= self.slam_config.min_submap_evidence_cells:
                 result = self._matcher.search(
                     scan_xy,
@@ -169,12 +169,17 @@ class PoseGraphMapper:
                 ),
             )
             self._try_loop_closure(new_id, scan_xy, corrected)
+            did_optimize = False
             if (
                 len(self._nodes) % max(1, self.slam_config.graph_optimize_every_n_nodes) == 0
                 or self._loop_closure_count > self._optimize_count
             ):
                 self._optimize_graph()
-            self._rebuild_display_map()
+                did_optimize = True
+            if did_optimize:
+                self._rebuild_display_map()
+            else:
+                self._integrate_display_node(self._nodes[-1])
             self._trajectory.append((ts, corrected[0], corrected[1], corrected[2]))
             return True
 
@@ -247,17 +252,10 @@ class PoseGraphMapper:
         )
         return node_id
 
-    def _build_submap(self) -> Tuple[np.ndarray, int]:
+    def _match_evidence(self) -> Tuple[np.ndarray, int]:
+        """Occupancy evidence for scan match — reuses the display grid."""
         assert self._display_builder is not None
-        n_keep = max(3, self.slam_config.submap_node_count)
-        nodes = self._nodes[-n_keep:]
-        sub = OccupancyBuilder(
-            extent_m=self.slam_config.extent_m,
-            resolution_m=self.slam_config.resolution_m,
-        )
-        for node in nodes:
-            sub.integrate_scan(node.ranges, node.angles, (node.x, node.y, node.theta))
-        evidence = np.maximum(sub.log_odds, 0.0).astype(np.float32)
+        evidence = np.maximum(self._display_builder.log_odds, 0.0).astype(np.float32)
         count = int((evidence > 0.05).sum())
         return evidence, count
 
@@ -278,7 +276,7 @@ class PoseGraphMapper:
         if not candidates:
             return
 
-        sub, evidence_count = self._build_submap()
+        sub, evidence_count = self._match_evidence()
         if evidence_count < self.slam_config.min_submap_evidence_cells:
             return
 
@@ -342,14 +340,18 @@ class PoseGraphMapper:
             node.theta = float(poses[i, 2])
         self._optimize_count += 1
 
+    def _integrate_display_node(self, node: GraphNode) -> None:
+        assert self._display_builder is not None
+        self._display_builder.integrate_scan(
+            node.ranges,
+            node.angles,
+            (node.x, node.y, node.theta),
+        )
+
     def _rebuild_display_map(self) -> None:
         self._display_builder = OccupancyBuilder(
             extent_m=self.slam_config.extent_m,
             resolution_m=self.slam_config.resolution_m,
         )
         for node in self._nodes:
-            self._display_builder.integrate_scan(
-                node.ranges,
-                node.angles,
-                (node.x, node.y, node.theta),
-            )
+            self._integrate_display_node(node)
