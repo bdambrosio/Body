@@ -14,9 +14,19 @@ import uuid
 from body.lib import schemas, zenoh_helpers
 
 
+def _body_cfg_with_router(router: str | None) -> dict:
+    body_cfg = zenoh_helpers.load_body_config()
+    if not router:
+        return body_cfg
+    body_cfg = dict(body_cfg)
+    body_cfg["zenoh"] = dict(body_cfg.get("zenoh", {}))
+    body_cfg["zenoh"]["connect_endpoints"] = [router]
+    return body_cfg
+
+
 def _cmd_oakd_capture(args: argparse.Namespace) -> int:
     request_id = str(uuid.uuid4())
-    body_cfg = zenoh_helpers.load_body_config()
+    body_cfg = _body_cfg_with_router(getattr(args, "router", None))
     session = zenoh_helpers.open_session(body_cfg)
     result: dict | None = None
 
@@ -66,13 +76,19 @@ def _cmd_imu_calibrate(args: argparse.Namespace) -> int:
     if action not in ("start", "save", "status"):
         print(f"imu calibrate: unknown action {action!r}", file=sys.stderr)
         return 2
-    body_cfg = zenoh_helpers.load_body_config()
+    body_cfg = _body_cfg_with_router(getattr(args, "router", None))
     session = zenoh_helpers.open_session(body_cfg)
     try:
         zenoh_helpers.publish_json(session, "body/imu/calibrate", {"action": action})
     finally:
         session.close()
     print(f"imu calibrate: sent {{'action': {action!r}}} on body/imu/calibrate")
+    if action == "status":
+        print(
+            "imu calibrate: status is printed on the Pi imu_driver stdout "
+            "(e.g. launcher terminal), not returned here.",
+            flush=True,
+        )
     return 0
 
 
@@ -113,6 +129,11 @@ def main() -> None:
         "action",
         choices=["start", "save", "status"],
         help="start = begin mag+accel+gyro calibration; save = persist DCD to flash; status = print mag accuracy level",
+    )
+    cal_p.add_argument(
+        "--router",
+        default=None,
+        help="Zenoh connect endpoint (default: config.json zenoh.connect_endpoints)",
     )
     cal_p.set_defaults(_handler=_cmd_imu_calibrate)
 

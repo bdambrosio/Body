@@ -124,14 +124,27 @@ class Collector:
         return None
 
 
+def _prompt(msg: str) -> None:
+    print()
+    print("=" * 72)
+    print(msg)
+    print("=" * 72)
+    input("Press Enter to continue (or Ctrl-C to abort)... ")
+
+
 def _phase_stats(samples: list[Sample], label: str) -> dict[str, Any]:
     if not samples:
         print(f"  {label}: no samples")
         return {"ok": False}
     mag_valid = [s for s in samples if s.mag_valid]
+    mag_present = [s for s in samples if s.mag_present]
     mag_frac = len(mag_valid) / len(samples)
     acc_deg: list[float] = []
+    idle_acc_deg: list[float] = []
     game_mag_delta_deg: list[float] = []
+    for s in mag_present:
+        if s.mag_accuracy_rad is not None:
+            idle_acc_deg.append(_deg(s.mag_accuracy_rad))
     for s in mag_valid:
         if s.mag_accuracy_rad is not None:
             acc_deg.append(_deg(s.mag_accuracy_rad))
@@ -139,15 +152,21 @@ def _phase_stats(samples: list[Sample], label: str) -> dict[str, Any]:
             game_mag_delta_deg.append(_deg(_wrap_pi(s.game_yaw - s.mag_yaw)))
     acc_max = max(acc_deg) if acc_deg else float("nan")
     acc_med = sorted(acc_deg)[len(acc_deg) // 2] if acc_deg else float("nan")
+    idle_acc_max = max(idle_acc_deg) if idle_acc_deg else float("nan")
     delta_med = sorted(game_mag_delta_deg)[len(game_mag_delta_deg) // 2] if game_mag_delta_deg else float("nan")
     delta_abs_med = abs(delta_med) if game_mag_delta_deg else float("nan")
     print(
         f"  {label}: n={len(samples)}  mag_valid={len(mag_valid)} ({100.0 * mag_frac:.0f}%)"
     )
-    if mag_valid:
+    if mag_present and not mag_valid and idle_acc_max >= 90.0:
+        print(
+            f"           mag accuracy ~{idle_acc_max:.0f}° while idle → magnetometer not calibrated.\n"
+            "           Run figure-8 cal (motors off): body.cli imu calibrate start/save"
+        )
+    elif mag_valid:
         print(
             f"           mag accuracy max={acc_max:.2f}° median={acc_med:.2f}°  "
-            f"|game−mag| median={delta_abs_med:.2f}°"
+            f"|game−mag| median={delta_abs_med:.2f}° (offset expected; game RV is relative)"
         )
     return {
         "ok": True,
@@ -183,6 +202,7 @@ def _run_phase(
     session: Any | None = None,
     duty: float = 0.0,
     status_ref: dict[str, Any] | None = None,
+    rotate_in_place: bool = True,
 ) -> list[Sample]:
     print(f"\n--- {label} ({duration_s:.0f} s) ---", flush=True)
     if duty > 0.0:
@@ -195,10 +215,12 @@ def _run_phase(
     end = t_start + duration_s
     while time.time() < end:
         if duty > 0.0 and session is not None:
+            left = duty
+            right = -duty if rotate_in_place else duty
             zenoh_helpers.publish_json(
                 session,
                 "body/cmd_direct",
-                schemas.cmd_direct(left=duty, right=duty, timeout_ms=500),
+                schemas.cmd_direct(left=left, right=right, timeout_ms=500),
             )
         time.sleep(0.1)
     if duty > 0.0 and session is not None:
@@ -214,9 +236,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Mag-when-idle BNO085 validation harness.")
     ap.add_argument("--router", default=None, help="Zenoh connect endpoint, e.g. tcp/192.168.8.60:7447")
     ap.add_argument("--idle-s", type=float, default=8.0, help="Idle phase duration (default: 8).")
-    ap.add_argument("--motor-s", type=float, default=6.0, help="Motor spin duration (default: 6).")
-    ap.add_argument("--motor-duty", type=float, default=0.3, help="Spin duty (default: 0.3).")
+    ap.add_argument("--motor-s", type=float, default=4.0, help="Motor spin duration (default: 4).")
+    ap.add_argument("--motor-duty", type=float, default=0.12, help="Spin duty (default: 0.12).")
+    ap.add_argument(
+        "--motor-forward",
+        action="store_true",
+        help="Drive both wheels forward (default: rotate in place).",
+    )
     ap.add_argument("--skip-motor", action="store_true", help="Skip motor spin phase.")
+    ap.add_argument("--no-prompt", action="store_true", help="Skip Enter prompt before motor phase.")
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     body_cfg = zenoh_helpers.load_body_config()
@@ -289,17 +317,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.skip_motor:
             print("\n(skipping motor spin per --skip-motor)")
             spin: list[Sample] = []
+            results["spin_mag_invalid"] = True
         else:
+            motion = "forward drive" if args.motor_forward else "rotate in place"
+            if not args.no_prompt:
+                _prompt(
+                    f"MOTOR PHASE — {motion} for {args.motor_s:.0f} s at duty {args.motor_duty}.\n"
+                    "Clear space around the robot. Wheels-up is safest.\n"
+                    "Default is rotate-in-place (not forward drive)."
+                )
             spin = _run_phase(
-                f"MOTOR SPIN duty={args.motor_duty}",
+                f"MOTOR {motion} duty={args.motor_duty}",
                 args.motor_s,
                 collector,
                 session=session,
                 duty=args.motor_duty,
                 status_ref=status_ref,
+                rotate_in_place=not args.motor_forward,
             )
-        s_spin = _phase_stats(spin, "spin")
-        results["spin_mag_invalid"] = s_spin.get("mag_frac", 1.0) <= 0.05
+        if not args.skip_motor:
+            s_spin = _phase_stats(spin, "spin")
+            results["spin_mag_invalid"] = s_spin.get("mag_frac", 1.0) <= 0.05
 
         idle2 = _run_phase("IDLE (after spin)", args.idle_s, collector)
         s2 = _phase_stats(idle2, "idle-2")
@@ -348,11 +386,37 @@ def main(argv: list[str] | None = None) -> int:
             "corrections only when mag.valid (optional follow-up)."
         )
     else:
-        print(
-            "\nIf idle mag fails but spin passes: check figure-8 cal (body/imu/calibrate)\n"
-            "or increase mag_idle_settle_ms. If spin still shows mag_valid, PWM threshold\n"
-            "may be too low or motor_state not reaching imu_driver."
+        spin_ok = results.get("spin_mag_invalid", False)
+        acc_ok = results.get("idle1_mag_accuracy", False) and results.get(
+            "idle2_mag_accuracy", False
         )
+        stable_ok = results.get("mag_stable_across_stop", False)
+        print()
+        if spin_ok and not args.skip_motor:
+            print("Motor gating: PASS — mag suppressed during spin.")
+        elif args.skip_motor:
+            print("Motor gating: skipped (--skip-motor). Re-run without it to verify.")
+        if stable_ok:
+            print(
+                "Mag yaw stability: PASS — rotation_vector heading barely moved while idle.\n"
+                "  This is the useful signal even when accuracy_rad looks bad."
+            )
+        if not acc_ok:
+            print(
+                "Mag accuracy estimate: FAIL — BNO085 reports ~90° uncertainty (want <5°).\n"
+                "  Causes: mag not fully calibrated, or indoor field distortion.\n"
+                "  If mag_valid stays true at ~92°, sync imu_driver.py to the Pi (accuracy gate\n"
+                "  should set mag.valid=false until accuracy ≤ 5°)."
+            )
+            print(
+                "\nRe-calibrate (motors OFF):\n"
+                "  PYTHONPATH=. desktop/.venv/bin/python -m body.cli imu calibrate start \\\n"
+                "    --router tcp/192.168.8.60:7447\n"
+                "  (figure-8 ~15 s)\n"
+                "  PYTHONPATH=. desktop/.venv/bin/python -m body.cli imu calibrate save \\\n"
+                "    --router tcp/192.168.8.60:7447\n"
+                "  Check Pi launcher for: mag calibration_status=3 (high)"
+            )
     return 0 if all_ok else 1
 
 

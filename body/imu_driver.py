@@ -246,6 +246,9 @@ def main() -> None:
     mag_when_idle_enabled = bool(imu_cfg.get("mag_when_idle_enabled", False))
     mag_idle_pwm_threshold = float(imu_cfg.get("mag_idle_pwm_threshold", 0.02))
     mag_idle_settle_ms = float(imu_cfg.get("mag_idle_settle_ms", 300.0))
+    mag_idle_max_accuracy_rad = float(
+        imu_cfg.get("mag_idle_max_accuracy_rad", mag_accuracy_fallback_rad)
+    )
     reset_gpio = int(imu_cfg.get("reset_gpio", 25))
     gpio_chip = int(imu_cfg.get("gpio_chip", 0))
 
@@ -470,8 +473,8 @@ def main() -> None:
                 mag_accuracy: float | None = None
                 mag_valid: bool | None = None
                 if mag_when_idle_enabled and active_mode == "game_rotation_vector":
-                    mag_valid = settled and _motors_idle()
-                    if mag_valid:
+                    mag_valid = False
+                    if settled and _motors_idle():
                         rv_quat = _read_quat(bno, "rotation_vector")
                         if rv_quat is not None:
                             i_rv, j_rv, k_rv, real_rv = rv_quat
@@ -481,8 +484,7 @@ def main() -> None:
                                 "rotation_vector",
                                 mag_accuracy_fallback_rad,
                             )
-                        else:
-                            mag_valid = False
+                            mag_valid = mag_accuracy <= mag_idle_max_accuracy_rad
                 msg = schemas.imu_report(
                     ts=now_wall,
                     accel_xyz=(ax, ay, az),

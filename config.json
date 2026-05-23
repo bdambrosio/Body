@@ -50,6 +50,7 @@
     "mag_when_idle_enabled": true,
     "mag_idle_pwm_threshold": 0.02,
     "mag_idle_settle_ms": 300,
+    "mag_idle_max_accuracy_rad": 0.087,
     "mag_accuracy_fallback_rad": 0.087,
     "mag_accuracy_fallback_count": 20,
     "calibration_stable_threshold_rad": 0.18,
