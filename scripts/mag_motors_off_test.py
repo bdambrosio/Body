@@ -344,16 +344,24 @@ def main(argv: list[str] | None = None) -> int:
         results["idle2_mag_valid"] = s2.get("mag_frac", 0.0) >= 0.8
         results["idle2_mag_accuracy"] = s2.get("acc_max_deg", 999.0) < 5.0
 
-        # Compare first valid mag yaw in idle-1 vs idle-2 against game yaw drift.
+        # Compare yaw at start of idle-1 vs start of idle-2.
         mag1 = next((s for s in idle1 if s.mag_valid and s.mag_yaw is not None), None)
         mag2 = next((s for s in idle2 if s.mag_valid and s.mag_yaw is not None), None)
         if mag1 and mag2:
-            mag_drift_deg = _deg(_wrap_pi(mag2.mag_yaw - mag1.mag_yaw))
-            game_drift_deg = _deg(_wrap_pi(mag2.game_yaw - mag1.game_yaw))
+            mag_delta_deg = _deg(_wrap_pi(mag2.mag_yaw - mag1.mag_yaw))
+            game_delta_deg = _deg(_wrap_pi(mag2.game_yaw - mag1.game_yaw))
+            agree_deg = abs(mag_delta_deg - game_delta_deg)
+            if agree_deg > 180.0:
+                agree_deg = 360.0 - agree_deg
             print(
-                f"\n  cross-idle drift: mag={mag_drift_deg:+.2f}°  game={game_drift_deg:+.2f}°"
+                f"\n  cross-idle yaw change: mag={mag_delta_deg:+.2f}°  game={game_delta_deg:+.2f}°  "
+                f"|Δmag−Δgame|={agree_deg:.2f}°"
             )
-            results["mag_stable_across_stop"] = abs(mag_drift_deg) < 2.0
+            if args.skip_motor:
+                results["mag_stable_across_stop"] = abs(mag_delta_deg) < 2.0
+            else:
+                # After intentional rotation, mag and game should change by similar amounts.
+                results["mag_stable_across_stop"] = agree_deg < 5.0
         else:
             results["mag_stable_across_stop"] = False
     except KeyboardInterrupt:

@@ -253,11 +253,13 @@ class MCLPoseSource(PoseSource):
         )
         return {
             "success": True,
+            "method": "mcl",
             "dx": float(new_pose[0] - prior[0]),
             "dy": float(new_pose[1] - prior[1]),
             "dtheta": float(_wrap(new_pose[2] - prior[2])),
             "prior_pose": list(prior),
             "best_pose": list(new_pose),
+            "particle_count": int(self._mcl.filter.n_particles()),
         }
 
     def connect(self, session: Any) -> None:

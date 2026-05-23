@@ -38,6 +38,9 @@ class FusionNoiseConfig:
     odom_obs_hz: float = 50.0
     wheel_base_m: float = 0.181
     imu_settle_time_s: float = 2.0
+    mag_idle_fusion_enabled: bool = True
+    mag_sigma_rad: float = 0.035
+    mag_update_min_interval_s: float = 0.2
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,11 @@ def load_slam_config(path: Optional[Path] = None) -> SlamFusionConfig:
         odom_obs_hz=_float(fusion_sec, "odom_obs_hz", 50.0),
         wheel_base_m=_float(motor, "wheel_base_m", 0.181),
         imu_settle_time_s=_float(imu, "settle_time_s", 2.0),
+        mag_idle_fusion_enabled=bool(fusion_sec.get("mag_idle_fusion_enabled", True)),
+        mag_sigma_rad=_float(fusion_sec, "mag_sigma_rad", 0.035),
+        mag_update_min_interval_s=_float(
+            fusion_sec, "mag_update_min_interval_s", 0.2,
+        ),
     )
     slam = SlamConfig(
         match_hz=_float(slam_sec, "match_hz", 2.0),

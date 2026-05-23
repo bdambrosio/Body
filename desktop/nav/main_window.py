@@ -55,7 +55,7 @@ from .safety import (
     rear_arc_blocked_local,
 )
 from .tracing import (
-    CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
+    CAT_FOLLOW, CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
 )
 
 from .camera_panels import CameraPanels, build_camera_snapshot
@@ -69,6 +69,14 @@ logger = logging.getLogger(__name__)
 # fires. Transient cross-overs (a person walking past) shouldn't burn
 # disk; a real "stuck looking at an obstacle" should.
 _SUSTAINED_BLOCK_S = 3.0
+
+# Go stuck: rotate-in-place / forward-blocked with no progress. After
+# a couple of lidar scans, auto MCL relocate before recovery kicks in.
+_STUCK_RELOCATE_MIN_S = 1.5
+_STUCK_RELOCATE_SCANS = 2
+_STUCK_RELOCATE_COOLDOWN_S = 15.0
+_STUCK_RELOCATE_MAX_PER_MISSION = 2
+_STUCK_PROGRESS_M = 0.08
 
 # Patrol waypoint adaptation: when a saved waypoint sits in a lethal
 # cell or deep in inflation halo, snap to the nearest accessible cell
@@ -300,6 +308,12 @@ class NavMainWindow(QMainWindow):
         self._last_safety_blocked: Optional[bool] = None
         self._safety_block_started_at: Optional[float] = None
         self._safety_block_snapped: bool = False
+        self._stuck_episode_active: bool = False
+        self._stuck_started_at: Optional[float] = None
+        self._stuck_start_dist_m: Optional[float] = None
+        self._stuck_start_scan_count: int = 0
+        self._stuck_relocate_cooldown_until: float = 0.0
+        self._stuck_relocate_mission_count: int = 0
         self._mission_was_active: bool = False
         # Patrol execution state. Populated by `_on_go` when a patrol
         # with waypoints is loaded; None for single-goal missions.
@@ -966,6 +980,119 @@ class NavMainWindow(QMainWindow):
         omega_cmd = self._omega_limiter.limit(omega_cmd, time.monotonic())
         self.chassis.set_cmd_vel(v_cmd, omega_cmd)
         self._update_safety_block_trace(blocked)
+        self._update_stuck_relocate(out, blocked, v_cmd)
+
+    def _reset_stuck_relocate_state(self) -> None:
+        self._stuck_episode_active = False
+        self._stuck_started_at = None
+        self._stuck_start_dist_m = None
+        self._stuck_start_scan_count = 0
+
+    def _scan_obs_count(self) -> int:
+        try:
+            summary = self.fuser.pose_source.match_summary()
+            return int(summary.get("scan_obs_run", 0))
+        except Exception:
+            return 0
+
+    def _is_go_stuck(
+        self, out: FollowerOutput, blocked: bool, v_cmd: float,
+    ) -> bool:
+        """True when the follower cannot translate toward goal."""
+        if out.distance_to_goal_m <= self.follower.config.arrival_tolerance_m + 0.25:
+            return False
+        if abs(v_cmd) > 0.02:
+            return False
+        return blocked or out.status == STATUS_ROTATING
+
+    def _update_stuck_relocate(
+        self, out: FollowerOutput, blocked: bool, v_cmd: float,
+    ) -> None:
+        if not self._is_go_stuck(out, blocked, v_cmd):
+            self._reset_stuck_relocate_state()
+            return
+
+        now = time.time()
+        scan_count = self._scan_obs_count()
+        if not self._stuck_episode_active:
+            self._stuck_episode_active = True
+            self._stuck_started_at = now
+            self._stuck_start_dist_m = out.distance_to_goal_m
+            self._stuck_start_scan_count = scan_count
+            return
+
+        if (
+            self._stuck_start_dist_m is not None
+            and out.distance_to_goal_m <= self._stuck_start_dist_m - _STUCK_PROGRESS_M
+        ):
+            self._reset_stuck_relocate_state()
+            return
+
+        if self._stuck_started_at is None:
+            return
+        if now < self._stuck_relocate_cooldown_until:
+            return
+        if now - self._stuck_started_at < _STUCK_RELOCATE_MIN_S:
+            return
+        if scan_count - self._stuck_start_scan_count < _STUCK_RELOCATE_SCANS:
+            return
+
+        self._reset_stuck_relocate_state()
+        self._escalate_relocate_for_stuck(out.distance_to_goal_m)
+
+    def _escalate_relocate_for_stuck(self, dist_to_goal_m: float) -> None:
+        if self._stuck_relocate_mission_count >= _STUCK_RELOCATE_MAX_PER_MISSION:
+            logger.warning(
+                "stuck relocate exhausted (%d); pausing for recovery",
+                _STUCK_RELOCATE_MAX_PER_MISSION,
+            )
+            self.chassis.set_cmd_vel(0.0, 0.0)
+            self._mission.pause("stuck:unresolved")
+            return
+
+        self._stuck_relocate_mission_count += 1
+        self._stuck_relocate_cooldown_until = (
+            time.time() + _STUCK_RELOCATE_COOLDOWN_S
+        )
+        self.chassis.set_cmd_vel(0.0, 0.0)
+        result = self._run_relocate(reason="stuck_escalation")
+        self._tracer.emit(
+            CAT_FOLLOW, "stuck_relocate",
+            {
+                "success": bool(result.get("success")),
+                "dist_to_goal_m": dist_to_goal_m,
+                "attempt": self._stuck_relocate_mission_count,
+                **{
+                    k: result[k]
+                    for k in ("dx", "dy", "dtheta", "reason")
+                    if k in result
+                },
+            },
+            level=LEVEL_WARN,
+        )
+        if result.get("success"):
+            logger.info(
+                "stuck escalate: MCL relocate ok dx=%+.2f dy=%+.2f dθ=%+.1f°",
+                float(result.get("dx", 0.0)),
+                float(result.get("dy", 0.0)),
+                math.degrees(float(result.get("dtheta", 0.0))),
+            )
+            self._omega_limiter.reset()
+            return
+
+        logger.warning("stuck escalate: relocate failed: %s", result)
+        self._mission.pause("stuck:relocate_failed")
+
+    def _run_relocate(self, *, reason: str) -> dict:
+        """MCL relocate without canceling an active mission."""
+        self.chassis.set_cmd_vel(0.0, 0.0)
+        result = dict(self.fuser.request_relocate(reason=reason))
+        if result.get("success"):
+            result["shift_count"] = self._apply_relocate_to_patrol(result)
+            self._snapped_wp_xys.clear()
+        else:
+            result["shift_count"] = 0
+        return result
 
     def _update_safety_block_trace(self, blocked: bool) -> None:
         """Edge-triggered safety.* emits + sustained-block auto-snap.
@@ -1401,23 +1528,27 @@ class NavMainWindow(QMainWindow):
         if self._mission.is_active():
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._mission.cancel()
-        result = self.fuser.request_relocate(reason="ui_relocate")
+        result = self._run_relocate(reason="ui_relocate")
         if result.get("success"):
-            # Phase B: apply the same SE(2) transform to the patrol's
-            # waypoints + the single goal pin so they stay glued to the
-            # physical environment, not the drifting world frame. The
-            # world map cells are NOT transformed here (deferred); the
-            # sum-bounded vote model will reconcile old votes with new
-            # observations as the bot drives.
-            shift = self._apply_relocate_to_patrol(result)
-            self._snapped_wp_xys.clear()
+            shift = int(result.get("shift_count", 0))
+            detail = ""
+            if "improvement" in result and "evidence_cells" in result:
+                detail = (
+                    f"(improvement {result['improvement']:.0f} over "
+                    f"{result['evidence_cells']} evidence cells)."
+                )
+            elif result.get("method") == "mcl":
+                n_particles = result.get("particle_count")
+                if n_particles is not None:
+                    detail = f"(MCL snap, {n_particles} particles)."
+                else:
+                    detail = "(MCL particle snap)."
             QMessageBox.information(
                 self, "Re-localize",
                 f"Snapped pose by "
                 f"dx={result['dx']:+.2f} m, dy={result['dy']:+.2f} m, "
                 f"dθ={math.degrees(result['dtheta']):+.1f}° "
-                f"(improvement {result['improvement']:.0f} over "
-                f"{result['evidence_cells']} evidence cells)."
+                f"{detail}"
                 + (
                     f"\n\nShifted {shift} waypoint(s) / goal pin to "
                     f"match the new frame." if shift > 0 else ""
@@ -1586,6 +1717,9 @@ class NavMainWindow(QMainWindow):
         self._patrol_runner = patrol_runner
         self._active_rotation = None
         self._pending_advance = None
+        self._reset_stuck_relocate_state()
+        self._stuck_relocate_mission_count = 0
+        self._stuck_relocate_cooldown_until = 0.0
         self._mission_was_active = True
         self._patrol_dock.set_mission_active(True)
         self._mission.start()

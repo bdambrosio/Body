@@ -65,6 +65,9 @@ class ImuReading:
     quat_wxyz: Optional[Tuple[float, float, float, float]]
     fusion_mode: FusionMode
     accuracy_rad: float         # per-report orientation σ from BNO085
+    mag_valid: bool = False
+    mag_quat_wxyz: Optional[Tuple[float, float, float, float]] = None
+    mag_accuracy_rad: Optional[float] = None
 
     @classmethod
     def from_payload(cls, msg: dict) -> Optional["ImuReading"]:
@@ -92,9 +95,34 @@ class ImuReading:
             fusion = msg.get("fusion") or {}
             mode = FusionMode.from_str(fusion.get("mode"))
             acc = float(fusion.get("accuracy_rad", 0.0))
+
+            mag_valid = False
+            mag_quat: Optional[Tuple[float, float, float, float]] = None
+            mag_acc: Optional[float] = None
+            mag_raw = msg.get("mag")
+            if isinstance(mag_raw, dict):
+                mag_valid = bool(mag_raw.get("valid", False))
+                mq = mag_raw.get("orientation")
+                if isinstance(mq, dict):
+                    try:
+                        mag_quat = (
+                            float(mq["w"]), float(mq["x"]),
+                            float(mq["y"]), float(mq["z"]),
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        mag_quat = None
+                if "accuracy_rad" in mag_raw:
+                    try:
+                        mag_acc = float(mag_raw["accuracy_rad"])
+                    except (TypeError, ValueError):
+                        mag_acc = None
+
             return cls(
                 ts=ts, gyro_z=gz, quat_wxyz=quat,
                 fusion_mode=mode, accuracy_rad=acc,
+                mag_valid=mag_valid,
+                mag_quat_wxyz=mag_quat,
+                mag_accuracy_rad=mag_acc,
             )
         except Exception:
             return None

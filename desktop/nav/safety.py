@@ -257,3 +257,7 @@ class OmegaRateLimiter:
         self._last_sign = sign
         self._zero_emit_started = None
         return omega
+
+    def reset(self) -> None:
+        self._last_sign = 0
+        self._zero_emit_started = None

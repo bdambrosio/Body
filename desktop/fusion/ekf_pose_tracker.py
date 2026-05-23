@@ -1,4 +1,8 @@
-"""2D EKF pose tracker — IMU predict, encoder odom + IMU yaw update."""
+"""2D EKF pose tracker — IMU predict, encoder odom + IMU yaw update.
+
+When ``mag_idle_fusion_enabled``, applies an additional θ update from
+``body/imu.mag`` while the Pi marks ``mag.valid`` (motors-off snapshots).
+"""
 
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ import numpy as np
 
 from desktop.fusion.load_slam_config import FusionNoiseConfig
 from desktop.nav.slam.imu_yaw import ImuYawTracker
-from desktop.nav.slam.types import ImuReading
+from desktop.nav.slam.types import ImuReading, quaternion_to_yaw
 from desktop.world_map.pose_source import OdomPose, Pose
 
 PoseTuple = Tuple[float, float, float]
@@ -59,6 +63,9 @@ class EkfPoseTracker:
             min_settle_samples=max(20, int(self._noise.imu_settle_time_s * 100)),
         )
         self._yaw_offset = 0.0
+        self._mag_yaw_offset: Optional[float] = None
+        self._last_mag_update_ts = -1.0
+        self._last_mag_valid = False
         self._seeded = False
         self._yaw_at_misses = 0
         self._last_heading_source = "none"
@@ -72,9 +79,12 @@ class EkfPoseTracker:
 
         self._predict_count = 0
         self._imu_update_count = 0
+        self._mag_update_count = 0
 
     def update_imu(self, reading: ImuReading) -> None:
+        self._last_mag_valid = reading.mag_valid
         self._imu.update(reading)
+        self._maybe_update_mag(reading)
 
     def update_odom(self, ts: float, x: float, y: float, theta: float) -> None:
         self._odom.update(ts, x, y, theta)
@@ -94,6 +104,9 @@ class EkfPoseTracker:
                 self._yaw_offset = yaw
             else:
                 self._yaw_offset = 0.0
+            self._mag_yaw_offset = None
+            self._last_mag_update_ts = -1.0
+            self._last_mag_valid = False
             self._seeded = True
             self._yaw_at_misses = 0
             self._last_heading_source = "none"
@@ -168,7 +181,37 @@ class EkfPoseTracker:
                 "cov_trace": float(np.trace(p)),
                 "predict_count": self._predict_count,
                 "imu_update_count": self._imu_update_count,
+                "mag_update_count": self._mag_update_count,
             }
+
+    def _maybe_update_mag(self, reading: ImuReading) -> None:
+        if not self._noise.mag_idle_fusion_enabled:
+            return
+        if not self._seeded or not reading.mag_valid or reading.mag_quat_wxyz is None:
+            return
+        if (
+            self._last_mag_update_ts >= 0.0
+            and reading.ts - self._last_mag_update_ts
+            < self._noise.mag_update_min_interval_s
+        ):
+            return
+
+        reported = reading.mag_accuracy_rad
+        if reported is None or reported <= 0.0:
+            sigma = self._noise.mag_sigma_rad
+        else:
+            sigma = max(reported, self._noise.mag_sigma_rad)
+
+        raw_mag = quaternion_to_yaw(reading.mag_quat_wxyz)
+        with self._lock:
+            if self._mag_yaw_offset is None:
+                self._mag_yaw_offset = _wrap(raw_mag - self._theta)
+            yaw = _wrap(raw_mag - self._mag_yaw_offset)
+            self._update_yaw_observation(yaw, sigma)
+            self._append_state(reading.ts)
+            self._last_mag_update_ts = reading.ts
+            self._mag_update_count += 1
+            self._last_heading_source = "mag_idle"
 
     def _integrate_odom(
         self, ts: float, x: float, y: float, theta: float,
@@ -195,20 +238,31 @@ class EkfPoseTracker:
                 self._last_raw_odom = (ts, x, y, theta)
                 return
 
-            self._predict_motion(ds, dth_enc, yaw)
-            self._update_imu_yaw(yaw)
+            use_game_yaw = not (
+                self._noise.mag_idle_fusion_enabled and self._last_mag_valid
+            )
+            self._predict_motion(ds, dth_enc, yaw, adopt_imu_yaw=use_game_yaw)
+            if use_game_yaw:
+                self._update_yaw_observation(yaw, self._noise.imu_sigma_rad)
+                self._imu_update_count += 1
+                self._last_heading_source = "imu"
+            else:
+                self._last_heading_source = "mag_idle"
             self._append_state(ts)
             self._last_raw_odom = (ts, x, y, theta)
-            self._last_heading_source = "imu"
             self._trim_state_buf()
 
-    def _predict_motion(self, ds: float, dth_enc: float, yaw: float) -> None:
-        """Propagate (x,y) with ds along IMU yaw; grow covariance."""
-        c = math.cos(yaw)
-        s = math.sin(yaw)
+    def _predict_motion(
+        self, ds: float, dth_enc: float, yaw: float, *, adopt_imu_yaw: bool = True,
+    ) -> None:
+        """Propagate (x,y) with ds along heading; grow covariance."""
+        heading = yaw if adopt_imu_yaw else self._theta
+        c = math.cos(heading)
+        s = math.sin(heading)
         self._x += ds * c
         self._y += ds * s
-        self._theta = yaw
+        if adopt_imu_yaw:
+            self._theta = yaw
 
         n = self._noise
         sigma_trans = n.alpha_trans_per_m * abs(ds) + n.alpha_rot_per_m * abs(dth_enc)
@@ -221,11 +275,11 @@ class EkfPoseTracker:
         self._P = G @ self._P @ G.T + Q
         self._predict_count += 1
 
-    def _update_imu_yaw(self, yaw: float) -> None:
-        """Kalman update: θ observation from IMU (tight R)."""
+    def _update_yaw_observation(self, yaw: float, sigma_rad: float) -> None:
+        """Kalman update: θ observation (IMU game RV or idle mag)."""
         z = yaw
         H = np.array([[0.0, 0.0, 1.0]])
-        R = np.array([[self._noise.imu_sigma_rad ** 2]])
+        R = np.array([[max(sigma_rad, 1e-6) ** 2]])
         innov = _wrap(z - self._theta)
         S = H @ self._P @ H.T + R
         K = self._P @ H.T @ np.linalg.inv(S)
@@ -235,7 +289,6 @@ class EkfPoseTracker:
         self._theta = _wrap(self._theta + float(delta[2, 0]))
         I = np.eye(3)
         self._P = (I - K @ H) @ self._P
-        self._imu_update_count += 1
 
     def _append_state(self, ts: float) -> None:
         p = self._P
