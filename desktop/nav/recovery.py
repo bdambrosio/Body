@@ -56,6 +56,7 @@ REASON_GOAL_IN_LETHAL_HALO = "no_path:goal_in_lethal_halo"
 REASON_BOXED_IN = "no_path:boxed_in"
 REASON_START_UNREACHABLE = "no_path:start_unreachable"
 REASON_NO_PATH_OTHER = "no_path:other"
+REASON_STUCK_UNRESOLVED = "stuck:unresolved"
 
 
 def classify_replan_failure(
@@ -259,6 +260,13 @@ class RecoveryPolicy:
             return rotate if attempts == 0 else back
         if reason == REASON_START_UNREACHABLE:
             return back if attempts == 0 else rotate
+        if reason == REASON_STUCK_UNRESOLVED or reason.startswith("stuck:"):
+            # Short back-up first — clears local_map person/obstacle wedges.
+            if attempts == 0:
+                return back
+            if attempts == 1:
+                return rotate
+            return back
         # NO_PATH_OTHER, recovery_failed:*, anything else.
         return rotate if attempts == 0 else wait
 

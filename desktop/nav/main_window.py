@@ -45,7 +45,8 @@ from .planner import AStarConfig, PlanResult, plan_path
 from .primitives import RotateToHeading
 from .recovery import (
     PRIM_ABORTED, PRIM_DONE, PRIM_RUNNING,
-    REASON_NO_LIVE_CMD, REASON_NO_POSE, RecoveryPolicy, RecoveryPrimitive,
+    REASON_NO_LIVE_CMD, REASON_NO_POSE, RecoveryPolicy, RecoveryPolicyConfig,
+    RecoveryPrimitive,
     classify_replan_failure,
 )
 from .safety import (
@@ -70,13 +71,14 @@ logger = logging.getLogger(__name__)
 # disk; a real "stuck looking at an obstacle" should.
 _SUSTAINED_BLOCK_S = 3.0
 
-# Go stuck: rotate-in-place / forward-blocked with no progress. After
-# a couple of lidar scans, auto MCL relocate before recovery kicks in.
-_STUCK_RELOCATE_MIN_S = 1.5
+# Go stuck: forward local_map block with no progress — not mere
+# rotate-in-place (normal at corners). Short thresholds while moving.
+_STUCK_RELOCATE_MIN_S = 1.0
 _STUCK_RELOCATE_SCANS = 2
 _STUCK_RELOCATE_COOLDOWN_S = 15.0
 _STUCK_RELOCATE_MAX_PER_MISSION = 2
 _STUCK_PROGRESS_M = 0.08
+_STUCK_GRACE_AFTER_RECOVERY_S = 2.0
 
 # Patrol waypoint adaptation: when a saved waypoint sits in a lethal
 # cell or deep in inflation halo, snap to the nearest accessible cell
@@ -275,12 +277,15 @@ class NavMainWindow(QMainWindow):
         # Recovery policy + currently-running primitive (None unless
         # mission is RECOVERING). Phase 1c ships the stub policy
         # (WaitAndResume for every reason); Phase 2c upgrades.
-        self._recovery_policy = RecoveryPolicy()
+        self._recovery_policy = RecoveryPolicy(
+            RecoveryPolicyConfig(back_up_distance_m=0.12),
+        )
         self._active_recovery: Optional[RecoveryPrimitive] = None
         # Stage 5b: forward-arc lethal-cell check overrides cmd_vel
         # to zero when an obstacle appears between replans. Mission
         # stays FOLLOWING so we resume when the arc clears.
-        self._safety_config = SafetyConfig()
+        self._safety_config = SafetyConfig(arc_distance_m=0.35)
+        self._local_fwd_blocked: bool = False
         self._safety_blocked: bool = False
         # Rate-limit ω before sending to chassis. 15 dps cap + 500 ms
         # inter-reversal hold prevents wheel slip during left/right
@@ -314,6 +319,7 @@ class NavMainWindow(QMainWindow):
         self._stuck_start_scan_count: int = 0
         self._stuck_relocate_cooldown_until: float = 0.0
         self._stuck_relocate_mission_count: int = 0
+        self._stuck_relocate_grace_until: float = 0.0
         self._mission_was_active: bool = False
         # Patrol execution state. Populated by `_on_go` when a patrol
         # with waypoints is loaded; None for single-goal missions.
@@ -768,6 +774,16 @@ class NavMainWindow(QMainWindow):
         elif f is None or f.status == STATUS_NO_PATH:
             self._follow_lbl.setText("follow: —")
             self._follow_lbl.setStyleSheet("color: #ccc;")
+        elif active and self._local_fwd_blocked:
+            rot_hint = (
+                f"  α={math.degrees(f.heading_error_rad):>+4.0f}°"
+                if f.status == STATUS_ROTATING else ""
+            )
+            self._follow_lbl.setText(
+                f"follow: GO LOCAL BLOCK{rot_hint}  "
+                f"goal={f.distance_to_goal_m:>5.2f}m"
+            )
+            self._follow_lbl.setStyleSheet("color: #e8a;")
         elif active and self._safety_blocked:
             self._follow_lbl.setText(
                 f"follow: GO BLOCKED  goal={f.distance_to_goal_m:>5.2f}m"
@@ -949,6 +965,7 @@ class NavMainWindow(QMainWindow):
         if lm_drive is None or lm_meta is None or lm_age_s > lm_stale_threshold_s:
             fwd_blocked = True
             rear_blocked = True
+            self._local_fwd_blocked = True
         else:
             fwd_blocked = forward_arc_blocked_local(
                 lm_drive, lm_meta, self._safety_config,
@@ -956,6 +973,7 @@ class NavMainWindow(QMainWindow):
             rear_blocked = rear_arc_blocked_local(
                 lm_drive, lm_meta, self._safety_config,
             )
+        self._local_fwd_blocked = fwd_blocked
         # Clip the *commanded translation* by the direction-appropriate
         # arc, but always pass ω through. Rotation in place doesn't
         # advance the body, so an obstacle in the forward arc must not
@@ -998,16 +1016,19 @@ class NavMainWindow(QMainWindow):
     def _is_go_stuck(
         self, out: FollowerOutput, blocked: bool, v_cmd: float,
     ) -> bool:
-        """True when the follower cannot translate toward goal."""
-        if out.distance_to_goal_m <= self.follower.config.arrival_tolerance_m + 0.25:
+        """True when local_map blocks forward motion with no progress."""
+        if out.distance_to_goal_m <= self._follower.config.arrival_tolerance_m + 0.25:
             return False
         if abs(v_cmd) > 0.02:
             return False
-        return blocked or out.status == STATUS_ROTATING
+        # Rotate-in-place alone is normal; only escalate on local block.
+        return blocked and out.v_mps > 0.02
 
     def _update_stuck_relocate(
         self, out: FollowerOutput, blocked: bool, v_cmd: float,
     ) -> None:
+        if time.time() < self._stuck_relocate_grace_until:
+            return
         if not self._is_go_stuck(out, blocked, v_cmd):
             self._reset_stuck_relocate_state()
             return
@@ -1078,6 +1099,7 @@ class NavMainWindow(QMainWindow):
                 math.degrees(float(result.get("dtheta", 0.0))),
             )
             self._omega_limiter.reset()
+            self._stuck_relocate_grace_until = time.time() + 1.0
             return
 
         logger.warning("stuck escalate: relocate failed: %s", result)
@@ -1209,6 +1231,11 @@ class NavMainWindow(QMainWindow):
         self.chassis.set_cmd_vel(0.0, 0.0)
         self._active_recovery = None
         self._mission.end_recovery(success=(out.status == PRIM_DONE))
+        if out.status == PRIM_DONE:
+            self._stuck_relocate_grace_until = (
+                time.time() + _STUCK_GRACE_AFTER_RECOVERY_S
+            )
+            self._reset_stuck_relocate_state()
 
     # ── Patrol arrival / rotation ───────────────────────────────────
 
@@ -1720,6 +1747,7 @@ class NavMainWindow(QMainWindow):
         self._reset_stuck_relocate_state()
         self._stuck_relocate_mission_count = 0
         self._stuck_relocate_cooldown_until = 0.0
+        self._stuck_relocate_grace_until = 0.0
         self._mission_was_active = True
         self._patrol_dock.set_mission_active(True)
         self._mission.start()
