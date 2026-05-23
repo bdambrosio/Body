@@ -53,11 +53,15 @@ class MappingConfig:
         extent_m: float = 40.0,
         resolution_m: float = 0.05,
         scan_match_hz: float = 2.0,
+        map_stale_s: float = 2.0,
+        ui_redraw_hz: float = 5.0,
     ):
         self.router = router
         self.extent_m = extent_m
         self.resolution_m = resolution_m
         self.scan_match_hz = scan_match_hz
+        self.map_stale_s = map_stale_s
+        self.ui_redraw_hz = ui_redraw_hz
 
 
 class MappingController:
@@ -147,8 +151,9 @@ class MappingController:
             return
         ts, x, y, theta = triple
         self.pose_tracker.update_odom(ts, x, y, theta)
-        pose = self.pose_tracker.pose()
-        self._trajectory.append((ts, pose[0], pose[1], pose[2]))
+        pose = self.pose_tracker.pose_at(ts)
+        if pose is not None:
+            self._trajectory.append((ts, pose[0], pose[1], pose[2]))
 
     def _on_imu(self, sample: Any) -> None:
         msg = _decode_json(self._payload_bytes(sample))
@@ -166,6 +171,9 @@ class MappingController:
         msg = _decode_json(self._payload_bytes(sample))
         if msg is None:
             return
+        if not self.pose_tracker.is_ready():
+            return
+        ts = float(msg.get("ts") or _now())
         ranges = msg.get("ranges")
         angle_min = float(msg.get("angle_min", 0.0))
         angle_inc = float(msg.get("angle_increment", 0.0))
@@ -176,8 +184,9 @@ class MappingController:
             [r if isinstance(r, (int, float)) else np.nan for r in ranges],
             dtype=np.float64,
         )
-        self.pose_tracker.try_scan_match(ranges_arr, angles, self.builder)
-        pose = self.pose_tracker.pose()
+        pose = self.pose_tracker.pose_at(ts)
+        if pose is None:
+            return
         self.builder.integrate_scan(ranges_arr, angles, pose)
         cb = self._on_update
         if cb is not None:
@@ -199,10 +208,14 @@ class MappingController:
 
     def status_summary(self) -> Dict[str, Any]:
         pose = self.pose_tracker.pose()
+        diag = self.pose_tracker.diagnostics()
         return {
             "session_id": self._session_id,
             "pose": pose,
             "pose_source": "mapping",
+            "imu_settled": diag.get("imu_settled"),
+            "heading_source": diag.get("heading_source"),
+            "yaw_at_misses": diag.get("yaw_at_misses"),
         }
 
     def finalize_map(self) -> ReferenceMap:
@@ -226,7 +239,7 @@ class MappingController:
             extent_m=self.config.extent_m,
             resolution_m=self.config.resolution_m,
         )
-        self.pose_tracker = MappingPoseTracker()
+        self.pose_tracker.rebind_world_to_current()
         self._session_id = uuid.uuid4().hex[:12]
         self._trajectory.clear()
 

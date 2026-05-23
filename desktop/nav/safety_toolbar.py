@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from typing import Optional, Union
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
@@ -24,6 +24,10 @@ from PyQt6.QtWidgets import (
 
 from desktop.chassis.controller import StubController
 from desktop.localization.controller import LocalizationController
+from desktop.mapping.controller import MappingController
+
+# Mapping and nav localizers share connect/disconnect/router config.
+SessionController = Union[LocalizationController, MappingController]
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +69,7 @@ class SafetyToolbar(QToolBar):
     def __init__(
         self,
         chassis: StubController,
-        fuser: LocalizationController,
+        fuser: SessionController,
         *,
         parent: Optional[QWidget] = None,
     ) -> None:

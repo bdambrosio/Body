@@ -23,6 +23,10 @@ desktop/.venv/bin/python -m desktop.nav --router tcp/PI:7447 --map path/to/refer
 - `desktop/localization/` — MCL particle filter against a read-only reference map
 - `desktop/nav/` — autonomy shell (planner, follower, safety); Pi `local_2p5d` stays body-frame only
 
+## Mapping pose
+
+During a mapping session, lidar scans are integrated at **`pose_at(scan_ts)`**: translation from `body/odom` (encoder ring buffer + interpolation) and heading from `body/imu` (BNO085 yaw via `ImuYawTracker`). There is **no online scan match** against the map being built — that path fought rotation and smeared walls. Map integration waits until IMU is settled. The mapping UI status strip shows heading source (`imu` vs `enc` vs `wait imu`).
+
 ## Deprecated for nav
 
 The online `WorldGrid` fusion loop (`FuserController`, dual particle filters, scan-match vs `block_votes`) is superseded for production navigation. It remains under `desktop/world_map/` for reference and migration tooling.

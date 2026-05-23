@@ -1,96 +1,102 @@
-"""Pose tracking during mapping sessions (odom + IMU + scan vs building map)."""
+"""Pose tracking during mapping sessions (odom translation + IMU yaw)."""
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+import threading
+from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
-
-from desktop.mapping.occupancy_builder import OccupancyBuilder
 from desktop.nav.slam.imu_yaw import ImuYawTracker
-from desktop.nav.slam.scan_matcher import ScanMatcher, ScanMatcherConfig, lidar_scan_to_xy
-from desktop.nav.slam.types import Pose2D
+from desktop.nav.slam.types import ImuReading
+from desktop.world_map.pose_source import OdomPose, Pose
+
+PoseTuple = Tuple[float, float, float]
 
 
 class MappingPoseTracker:
-    """Point-estimate pose for mapping-only ray casting."""
+    """IMU yaw + encoder translation for mapping ray casts.
+
+    Mirrors the pose half of ImuPlusScanMatchPose without online scan
+    matching — scan match against a map being built fights rotation.
+    """
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._odom = OdomPose()
         self._imu = ImuYawTracker()
-        self._matcher = ScanMatcher(ScanMatcherConfig(
-            xy_half_m=0.25,
-            theta_half_rad=math.radians(10.0),
-            min_improvement=3.0,
-        ))
-        self._x = 0.0
-        self._y = 0.0
-        self._theta = 0.0
         self._yaw_offset = 0.0
-        self._off_x = 0.0
-        self._off_y = 0.0
-        self._off_theta = 0.0
         self._seeded = False
-        self._last_odom: Optional[Tuple[float, float, float, float]] = None
+        self._yaw_at_misses = 0
+        self._last_heading_source = "none"
 
-    def update_imu(self, reading) -> None:
+    def update_imu(self, reading: ImuReading) -> None:
         self._imu.update(reading)
 
     def update_odom(self, ts: float, x: float, y: float, theta: float) -> None:
-        if not self._seeded:
-            imu = self._imu.yaw_at(ts)
-            if imu is None:
-                return
-            self._off_x, self._off_y, self._off_theta = x, y, theta
-            self._yaw_offset = imu[0]
-            self._x, self._y, self._theta = 0.0, 0.0, 0.0
+        self._odom.update(ts, x, y, theta)
+        if not self._seeded and self._imu.is_settled() and self._odom.latest_pose() is not None:
+            self.rebind_world_to_current()
+
+    def rebind_world_to_current(self) -> Optional[Pose]:
+        """Anchor world frame at the current robot pose."""
+        with self._lock:
+            self._odom.rebind_world_to_current()
+            latest_imu = self._imu.latest()
+            if latest_imu is not None:
+                _ts, yaw, _sigma = latest_imu
+                self._yaw_offset = yaw
+            else:
+                self._yaw_offset = 0.0
             self._seeded = True
-            self._last_odom = (ts, x, y, theta)
-            return
-        assert self._last_odom is not None
-        _, lx, ly, lth = self._last_odom
-        dx = x - lx
-        dy = y - ly
-        dth = _wrap(theta - lth)
-        th_mid = lth + 0.5 * dth
-        ds = dx * math.cos(th_mid) + dy * math.sin(th_mid)
-        c, s = math.cos(self._theta), math.sin(self._theta)
-        self._x += ds * c
-        self._y += ds * s
-        imu = self._imu.yaw_at(ts)
-        if imu is not None:
-            self._theta = _wrap(imu[0] - self._yaw_offset)
-        else:
-            self._theta = _wrap(self._theta + dth)
-        self._last_odom = (ts, x, y, theta)
+            self._yaw_at_misses = 0
+            self._last_heading_source = "none"
+        latest = self._odom.latest_pose()
+        return latest[0] if latest is not None else None
 
-    def pose(self) -> Tuple[float, float, float]:
-        return (self._x, self._y, self._theta)
+    def is_ready(self) -> bool:
+        with self._lock:
+            return self._seeded and self._imu.is_settled()
 
-    def try_scan_match(
-        self,
-        ranges_m: np.ndarray,
-        angles_rad: np.ndarray,
-        builder: OccupancyBuilder,
-    ) -> None:
-        if not self._seeded:
-            return
-        occ = builder.occupied_mask()
-        if int(occ.sum()) < 50:
-            return
-        evidence = occ.astype(np.float32)
-        points = lidar_scan_to_xy(ranges_m, angles_rad)
-        if points.shape[0] < 10:
-            return
-        prior = Pose2D(*self.pose())
-        result = self._matcher.search(
-            points, prior, evidence,
-            builder.origin_x_m, builder.origin_y_m, builder.resolution_m,
-        )
-        if result.accepted and not result.search_exhausted:
-            self._x = result.pose.x
-            self._y = result.pose.y
-            self._theta = result.pose.theta
+    def pose_at(self, ts: float) -> Optional[Pose]:
+        odom_pose = self._odom.pose_at(ts)
+        if odom_pose is None:
+            return None
+        x_w, y_w, theta_enc = odom_pose
+        yaw = self._yaw_at_world(ts)
+        if yaw is None:
+            with self._lock:
+                self._yaw_at_misses += 1
+                self._last_heading_source = "encoder"
+            return (x_w, y_w, theta_enc)
+        with self._lock:
+            self._last_heading_source = "imu"
+        return (x_w, y_w, yaw)
+
+    def pose(self) -> PoseTuple:
+        latest = self._odom.latest_pose()
+        if latest is None:
+            return (0.0, 0.0, 0.0)
+        (_x, _y, _th), ts = latest
+        at = self.pose_at(ts)
+        return at if at is not None else (_x, _y, _th)
+
+    def diagnostics(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "imu_settled": self._imu.is_settled(),
+                "seeded": self._seeded,
+                "heading_source": self._last_heading_source,
+                "yaw_at_misses": self._yaw_at_misses,
+            }
+
+    def _yaw_at_world(self, ts: float) -> Optional[float]:
+        if not self._imu.is_settled():
+            return None
+        result = self._imu.yaw_at(ts)
+        if result is None:
+            return None
+        yaw_imu, _sigma = result
+        return _wrap(yaw_imu - self._yaw_offset)
 
 
 def _wrap(a: float) -> float:
