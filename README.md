@@ -218,30 +218,23 @@ With the stack running, subscribe to `body/**` with Zenoh tooling (e.g. `zenoh-p
 
 ## Navigation UI (`desktop.nav`)
 
-A unified navigation shell that composes the chassis controller and the world-map fuser into one Qt process, with autonomous-mission support (set goal, plan path, drive, arrive). Three production pose-source modes:
+Map-and-localize stack: build a reference map once, then navigate with MCL against the frozen occupancy grid.
+
+Use the **desktop venv** ([Install (desktop)](#install-once-per-machine)): `desktop/.venv/bin/python`, with `PYTHONPATH` set to the repo root.
 
 ```bash
-# Encoder-only (simplest, no SLAM)
-python -m desktop.nav --router tcp/PI_IP:7447
+# 1. Mapping session (teleop drive, save reference_map.npz)
+desktop/.venv/bin/python -m desktop.mapping --router tcp/PI_IP:7447
 
-# Classical SLAM: encoder + BNO085 yaw + lidar scan-match snap corrections
-python -m desktop.nav --router tcp/PI_IP:7447 --slam
-
-# Bayesian particle filter (current default for autonomous nav)
-python -m desktop.nav --router tcp/PI_IP:7447 --pf
+# 2. Navigation (requires --map)
+desktop/.venv/bin/python -m desktop.nav --router tcp/PI_IP:7447 \
+  --map ~/Body/maps/<session>/map_*/reference_map.npz \
+  --relocate-on-load
 ```
 
-Optional diagnostics flags layered on top:
+Run tests: `desktop/.venv/bin/python -m unittest discover -s desktop/reference_map -p 'test_*.py'` (same pattern for `desktop/localization`, `desktop/mapping`).
 
-```bash
-# Shadow-mode JSONL trace alongside whatever production pose source is active
-... --pf-shadow ~/pf_traces/run.jsonl
-
-# AprilTag observations (opportunistic global anchoring, --pf-shadow only)
-... --pf-shadow ~/pf_traces/run.jsonl --apriltag-config config/apriltag_poses.yaml
-```
-
-The particle filter and its supporting infrastructure are documented in [docs/bayesian_localization_redesign.md](docs/bayesian_localization_redesign.md); pose-source / scan-matcher / detector unit tests live next to the modules under `desktop/world_map/` and `desktop/nav/slam/`.
+Legacy online fusion (`desktop.world_map` fuser, `--pf`, `--slam`) remains in tree for comparison but is no longer used by `desktop.nav`. See [docs/slam_map_architecture.md](docs/slam_map_architecture.md).
 
 ## Network (Pi side)
 
@@ -250,7 +243,7 @@ The Pi runs Body services as `body-launcher.service`. The Pi's WiFi should be on
 ## Layout
 
 - [body/](body/) — Pi-side package: `launcher`, drivers (`motor_controller`, `lidar_driver`, `oakd_driver`, `watchdog`, `imu_driver`), `local_map`, `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`, `host_metrics`).
-- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis) (low-level monitoring + manual command UI), [`world_map`](desktop/world_map) (world-frame fuser + particle filter), [`nav`](desktop/nav) (autonomous navigation shell + SLAM helpers), `vision_service.py` (VLM client), `utils/` (shared helpers).
+- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis), [`mapping`](desktop/mapping) (reference map builder), [`localization`](desktop/localization) (MCL), [`nav`](desktop/nav), [`world_map`](desktop/world_map) (legacy online fuser), `vision_service.py`, `utils/`.
 - [docs/](docs/) — specs and design docs, including [bayesian_localization_redesign.md](docs/bayesian_localization_redesign.md) (Phase 0–8 plan and status log) and [noise_models.md](docs/noise_models.md) (Phase 0 motion-model calibration).
 - [scripts/](scripts/) — calibration + analysis tools (`phase0_*.py`, `phase1_likelihood_field_demo.py`, `record_body_topics.py`).
 - [deploy/](deploy/) — ops files (`zenohd-router.json`, `body-launcher.service`, `99-pwm.rules`, `NETWORK.md`).

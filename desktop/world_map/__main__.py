@@ -1,5 +1,9 @@
 """Entry point: python -m desktop.world_map [--router tcp/HOST:PORT]
 
+Legacy online fusion fuser. For new workflows use:
+  - ``python -m desktop.mapping`` to build maps
+  - ``python -m desktop.nav --map PATH`` to navigate
+
 Precedence for router: --router > $ZENOH_CONNECT > tcp/127.0.0.1:7447.
 
 Spec: docs/world_map_spec.md.

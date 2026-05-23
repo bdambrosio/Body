@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from desktop.chassis.controller import StubController
-from desktop.world_map.controller import FuserController
+from desktop.localization.controller import LocalizationController
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class SafetyToolbar(QToolBar):
     def __init__(
         self,
         chassis: StubController,
-        fuser: FuserController,
+        fuser: LocalizationController,
         *,
         parent: Optional[QWidget] = None,
     ) -> None:

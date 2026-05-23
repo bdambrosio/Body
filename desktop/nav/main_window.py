@@ -26,8 +26,8 @@ from PyQt6.QtCore import QUrl
 
 from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
-from desktop.world_map.config import FuserConfig
-from desktop.world_map.controller import FuserController
+from desktop.localization.config import LocalizationConfig
+from desktop.localization.controller import LocalizationController
 from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
@@ -86,8 +86,8 @@ _WP_SNAP_TRIVIAL_M = 0.05
 class NavMainWindow(QMainWindow):
     def __init__(
         self,
-        fuser: FuserController,
-        fuser_config: FuserConfig,
+        fuser: LocalizationController,
+        fuser_config: LocalizationConfig,
         chassis: StubController,
         chassis_config: StubConfig,
     ) -> None:
@@ -1863,8 +1863,8 @@ class NavMainWindow(QMainWindow):
 
 
 def run_app(
-    fuser: FuserController,
-    fuser_config: FuserConfig,
+    fuser: LocalizationController,
+    fuser_config: LocalizationConfig,
     chassis: StubController,
     chassis_config: StubConfig,
 ) -> int:

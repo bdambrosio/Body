@@ -1,10 +1,7 @@
-"""Entry point: python -m desktop.nav [--router tcp/HOST:PORT]
+"""Entry point: python -m desktop.nav [--router tcp/HOST:PORT] --map PATH
 
-Launches the nav shell: one Qt process, two controllers (world_map
-fuser + chassis driver) each owning their own Zenoh session against the
-same router.
-
-Precedence for router: --router > $ZENOH_CONNECT > tcp/127.0.0.1:7447.
+Launches the nav shell with MCL localization against a frozen reference
+map plus chassis teleop on the same Zenoh router.
 """
 from __future__ import annotations
 
@@ -13,36 +10,13 @@ import logging
 import math
 import os
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Optional
 
-# Force the Qt platform to xcb before any Qt import. The default on
-# this workstation is Wayland (Mutter); under load it has been seen to
-# hang nav's UI thread, with the side-effect of stalling the chassis
-# heartbeat publisher and freezing the bot via watchdog timeout
-# (run_20260516_115649). xcb is rock-solid here and the previous
-# stack has shipped on it for months. `setdefault` preserves a manual
-# override if you really want Wayland.
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-
-# Restrict CUDA to a single GPU before any torch import. Bruce's
-# workstation has two GPUs and another workload (vLLM) pinned to one
-# of them. `CUDA_VISIBLE_DEVICES=0` together with CUDA's default
-# CUDA_DEVICE_ORDER=FASTEST_FIRST selects the higher-compute-
-# capability device, leaving the second GPU free for whatever's
-# already on it. Single-GPU users are unaffected (cuda:0 is the only
-# device and the env var is a no-op). Override with
-# CUDA_VISIBLE_DEVICES=1 or 0,1 in the shell if you want both
-# devices visible to the body stack.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
-# Support both `python -m desktop.nav` (from Body/) and `python -m nav`
-# (from Body/desktop/, where the .venv lives). The second form puts
-# Body/desktop/ on sys.path but not Body/, so `from desktop.*` would
-# fail. Also make sure desktop/ itself is on sys.path so bare imports
-# like `import vision_service` (used from chassis.ui_qt._VisionWorker)
-# resolve — chassis.__main__ does the same.
 _NAV_DIR = Path(__file__).resolve().parent
 _DESKTOP = _NAV_DIR.parent
 _BODY_ROOT = _DESKTOP.parent
@@ -52,196 +26,71 @@ for _p in (_BODY_ROOT, _DESKTOP):
 
 from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
-from desktop.world_map.config import ENV_VAR, FuserConfig, resolve_router
-from desktop.world_map.controller import FuserController
+from desktop.localization.config import LocalizationConfig, resolve_router
+from desktop.localization.controller import LocalizationController
+from desktop.reference_map.legacy_convert import load_map_auto
 
 from .main_window import run_app
-from .slam.shadow_driver import ShadowSlamDriver
 
 
 def _parse_args(argv):
     p = argparse.ArgumentParser(
         prog="nav",
-        description="Body nav shell: composes world_map (fusion + map "
-                    "views) and chassis (Pi driver + teleop).",
+        description="Body nav: MCL localization + chassis teleop.",
     )
     p.add_argument(
         "--router", default=None,
-        help=f"Zenoh router endpoint (overrides ${ENV_VAR}); "
-             f"e.g. tcp/192.168.1.50:7447",
+        help="Zenoh router endpoint (overrides $ZENOH_CONNECT)",
     )
     p.add_argument(
-        "--world-extent-m", type=float, default=40.0,
-        help="Square world side length in meters (default 40).",
-    )
-    p.add_argument(
-        "--world-resolution-m", type=float, default=0.08,
-        help="Cell size; must match Pi local_map.resolution_m (default 0.08).",
-    )
-    p.add_argument(
-        "--publish-hz", type=float, default=2.0,
-        help="World-driveable publish rate cap (default 2 Hz).",
-    )
-    p.add_argument(
-        "--heartbeat-hz", type=float, default=5.0,
-        help="chassis heartbeat rate (default 5 Hz).",
-    )
-    p.add_argument(
-        "--map-stale-s", type=float, default=2.0,
-        help="local_map staleness threshold in seconds (default 2.0).",
-    )
-    p.add_argument(
-        "--no-autoconnect", action="store_true",
-        help="Don't connect on startup; wait for the user to click Connect.",
-    )
-    p.add_argument(
-        "--shadow-slam", action="store_true",
-        help="Enable the shadow SLAM driver: subscribes to body/imu + "
-             "body/lidar/scan and logs candidate pose corrections. Does "
-             "not write to the fuser's pose — purely observational.",
-    )
-    p.add_argument(
-        "--slam", action="store_true",
-        help="Promote classical SLAM to the production pose source. "
-             "Replaces OdomPose with ImuPlusScanMatchPose: encoder "
-             "translation + BNO085 yaw + lidar scan-match corrections "
-             "against the world grid. See docs/slam_pi_contract.md. "
-             "Mutually exclusive with --pf.",
-    )
-    p.add_argument(
-        "--pf", action=argparse.BooleanOptionalAction, default=True,
-        help="Use the Bayesian particle filter as the production pose "
-             "source (encoder predict + IMU obs + scan-likelihood obs, "
-             "MMSE posterior). Default ON since 2026-05-17 — Phase 6.4 "
-             "live validation showed the filter performing comparably "
-             "or better than the legacy stacks across all tested drives. "
-             "Use --no-pf to revert to the legacy OdomPose / --slam path. "
-             "See docs/bayesian_localization_redesign.md.",
-    )
-    p.add_argument(
-        "--pf-shadow", metavar="PATH", default=None,
-        help="Run the Phase 2 particle filter in shadow mode and write "
-             "a JSONL trace to PATH (one record per scan tick comparing "
-             "legacy pose to filter posterior). Does not write to the "
-             "fuser's pose. See desktop/world_map/shadow_pf_driver.py.",
-    )
-    p.add_argument(
-        "--apriltag-config", metavar="PATH", default=None,
-        help="Phase 3 — path to an AprilTag calibration YAML (see "
-             "config/apriltag_poses.yaml.example). Attaches the AprilTag "
-             "observer to the --pf-shadow filter, treating each detection "
-             "as a Gaussian (x, y, θ) observation. Filter still converges "
-             "without tags; this is opportunistic global anchoring.",
-    )
-    p.add_argument(
-        "--apriltag-request-hz", type=float, default=1.0,
-        help="--apriltag-config: rate at which to drive RGB captures via "
-             "body/oakd/config. 0 = passive (only consume captures driven "
-             "by others); default 1.0 Hz.",
-    )
-    p.add_argument(
-        "--pf-device", choices=("auto", "cpu", "cuda"), default="auto",
-        help="Particle-filter compute device (Phase 4). 'auto' = cuda if "
-             "available else cpu. Affects both --pf and --pf-shadow. CPU "
-             "is fast enough at 1k particles; GPU buys headroom for "
-             "10k–100k particles.",
-    )
-    p.add_argument(
-        "--pf-imu-obs-hz", type=float, default=5.0,
-        help="Phase 6.4.1.5 — rate at which IMU yaw observations are "
-             "applied to the particle filter (Hz). 50 Hz (one per odom "
-             "tick) over-counts because BNO085 samples are correlated. "
-             "Default 5 Hz puts observations ~200 ms apart, past the "
-             "gyro's correlation time. 0 = disable IMU obs entirely.",
-    )
-    p.add_argument(
-        "--pf-defensive-fraction", type=float, default=0.05,
-        help="Phase 6.4.1 — at every resample, divert this fraction of "
-             "particles to fresh draws from a wide Gaussian around the "
-             "posterior mean (preserves tail support for observations "
-             "like VPR to discriminate against). Default 0.05 (5%%). "
-             "Set to 0.0 to disable.",
-    )
-    p.add_argument(
-        "--pf-particles", type=int, default=20000,
-        help="Particle-filter cloud size (default 20000). Bumped from "
-             "the original 1000 after the Phase 6.3 shadow trace showed "
-             "N_eff thrashing below 5 between 2 Hz scan-tick resamples. "
-             "On GPU the cycle cost is flat from 10k to 100k particles "
-             "(RTX 6000: 0.13 ms/cycle at 10k), so the budget is free. "
-             "Drop to 1000 on CPU-only systems if you see filter latency.",
-    )
-    p.add_argument(
-        "--vpr-shadow", metavar="PATH", default=None,
-        help="Phase 6.3 — run the VPR observer in shadow mode and write "
-             "a JSONL trace of would-be filter updates to PATH. The "
-             "live filter is NOT mutated. Mutually exclusive with "
-             "--vpr. Requires --vpr-bank. See desktop/world_map/vpr/.",
-    )
-    p.add_argument(
-        "--vpr", metavar="PATH", default=None,
-        help="Phase 6.4 — run the VPR observer in LIVE mode: same trace "
-             "as --vpr-shadow, plus the observation is applied to the "
-             "production particle filter when the anchor is calibrated "
-             "and the σ/distance gates pass. Requires --vpr-bank. "
-             "Mutually exclusive with --vpr-shadow.",
-    )
-    p.add_argument(
-        "--vpr-bank", metavar="PATH", default=None,
-        help="Phase 6.3+ — path to a DINOv2 feature bank built with "
-             "scripts/vpr_build_bank.py. Required by --vpr / --vpr-shadow.",
-    )
-    p.add_argument(
-        "--vpr-rate", type=float, default=1.0,
-        help="--vpr / --vpr-shadow: rate at which to drive RGB captures "
-             "via body/oakd/config (Hz). 0 = passive. Default 1.0 Hz.",
-    )
-    p.add_argument(
-        "--vpr-similarity-floor", type=float, default=0.80,
-        help="Reject queries whose top cosine similarity is below this "
-             "floor. Default 0.80 — Phase 6.3 trace showed clear "
-             "same-location matches at 0.85+ and noise below 0.80.",
-    )
-    p.add_argument(
-        "--vpr-sigma-m", type=float, default=0.5,
-        help="Per-component Gaussian σ on (x, y) in meters for the "
-             "mixture observation. Default 0.5 m (room-scale anchor).",
-    )
-    p.add_argument(
-        "--vpr-gate-sigma-ratio", type=float, default=0.5,
-        help="--vpr live gating: skip the observation when "
-             "sqrt(trace(cov_xy)) < ratio · sigma_m. Default 0.5 — VPR "
-             "can't usefully reweight a cloud already tighter than σ/2.",
-    )
-    p.add_argument(
-        "--vpr-gate-min-distance", type=float, default=0.3,
-        help="--vpr live gating: skip if the bot hasn't moved this far "
-             "(meters) since the last applied observation. Default 0.3 m.",
-    )
-    p.add_argument(
-        "--vpr-anchor-min-pairs", type=int, default=5,
-        help="Number of high-similarity (sim ≥ 0.85 by default) "
-             "matches required before fitting the bank↔session SE(2) "
-             "offset. Default 5.",
-    )
-    p.add_argument(
-        "--load-map", metavar="PATH", default=None,
-        help="Load a saved map snapshot (layers.npz from "
-             "controller.save_snapshot_bundle) into the live WorldGrid "
-             "at startup. Equivalent to UI File → Load Snapshot, but "
-             "deterministic and scriptable.",
+        "--map", "--load-map", dest="map_path", required=True,
+        metavar="PATH",
+        help="Reference map (reference_map.npz or legacy layers.npz). Required.",
     )
     p.add_argument(
         "--relocate-on-load", action="store_true",
-        help="--load-map: automatically fire relocate() once a scan has "
-             "arrived after startup (≈2 s typical). Wide scan-match "
-             "against the loaded grid → bot finds itself within the "
-             "map without operator intervention.",
+        help="Run global localization once the first scan arrives.",
     )
     p.add_argument(
-        "-v", "--verbose", action="store_true", help="debug logging",
+        "--pf-device", choices=("auto", "cpu", "cuda"), default="auto",
+        help="MCL particle filter device.",
     )
+    p.add_argument(
+        "--pf-particles", type=int, default=5000,
+        help="MCL particle count (default 5000).",
+    )
+    p.add_argument(
+        "--pf-imu-obs-hz", type=float, default=5.0,
+        help="IMU yaw observation rate cap (Hz).",
+    )
+    p.add_argument(
+        "--publish-hz", type=float, default=2.0,
+        help="World map publish rate cap.",
+    )
+    p.add_argument(
+        "--heartbeat-hz", type=float, default=5.0,
+        help="Chassis heartbeat rate.",
+    )
+    p.add_argument(
+        "--map-stale-s", type=float, default=2.0,
+        help="Local map staleness threshold (safety).",
+    )
+    p.add_argument(
+        "--no-autoconnect", action="store_true",
+        help="Wait for Connect in the UI.",
+    )
+    p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
+
+
+def _resolve_device(choice: str) -> str:
+    if choice != "auto":
+        return choice
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
 
 
 def main(argv=None) -> int:
@@ -250,46 +99,25 @@ def main(argv=None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    router = resolve_router(args.router)
     log = logging.getLogger(__name__)
-    log.info(f"nav starting; router={router} (override via --router or ${ENV_VAR})")
+    router = resolve_router(args.router)
+    map_path = os.path.expanduser(args.map_path)
+    log.info("nav starting router=%s map=%s", router, map_path)
 
-    # --slam wins if explicitly set — assumed intentional override of
-    # the --pf default. --no-pf with no --slam falls back to OdomPose.
-    if args.slam:
-        pose_source_type = "slam"
-    elif args.pf:
-        pose_source_type = "particle"
-    else:
-        pose_source_type = "odom"
+    try:
+        reference_map = load_map_auto(map_path)
+    except Exception:
+        log.exception("failed to load map %s", map_path)
+        return 1
 
-    # Resolve particle-filter device. "auto" = cuda if torch sees a
-    # device, else cpu. Imported lazily so non-pf paths don't pay the
-    # torch import cost.
-    if args.pf_device == "auto":
-        try:
-            import torch
-            pf_device = "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            pf_device = "cpu"
-    else:
-        pf_device = args.pf_device
-    if args.pf or args.pf_shadow:
-        log.info(
-            "pf: device=%s, particles=%d", pf_device, args.pf_particles,
-        )
-
-    fuser_config = FuserConfig(
+    pf_device = _resolve_device(args.pf_device)
+    loc_config = LocalizationConfig(
         router=router,
-        world_extent_m=args.world_extent_m,
-        world_resolution_m=args.world_resolution_m,
+        map_path=map_path,
         publish_hz=args.publish_hz,
         map_stale_s=args.map_stale_s,
-        pose_source_type=pose_source_type,
-        slam_enabled=args.slam,  # back-compat; ignored when pose_source_type != "odom"
         pf_device=pf_device,
         pf_n_particles=args.pf_particles,
-        pf_defensive_fraction=args.pf_defensive_fraction,
         pf_imu_obs_hz=args.pf_imu_obs_hz,
     )
     chassis_config = StubConfig(
@@ -298,279 +126,51 @@ def main(argv=None) -> int:
         map_stale_s=args.map_stale_s,
     )
 
-    fuser = FuserController(fuser_config)
+    localizer = LocalizationController(loc_config, reference_map)
     chassis = StubController(chassis_config)
 
     if not args.no_autoconnect:
-        for name, ctrl in (("fuser", fuser), ("chassis", chassis)):
+        for name, ctrl in (("localizer", localizer), ("chassis", chassis)):
             ok, err = ctrl.connect()
             if not ok:
-                log.warning(f"{name} autoconnect failed ({err}); retry via UI")
+                log.warning("%s autoconnect failed (%s)", name, err)
 
-    # --load-map: restore a saved snapshot into the live WorldGrid.
-    # Run after the fuser is connected so the grid exists; before
-    # shadow drivers / VPR so any pose-source initialization sees
-    # the loaded evidence.
-    if args.load_map:
-        if not fuser.connected:
-            log.warning("--load-map requires fuser to be connected; skipping")
-        else:
-            map_path = os.path.expanduser(args.load_map)
+    if args.relocate_on_load and localizer.connected:
+        def _deferred_relocate():
+            deadline = time.time() + 5.0
+            ps = localizer.pose_source
+            while time.time() < deadline:
+                if getattr(ps, "_last_scan_ts", 0.0) > 0.0:
+                    break
+                time.sleep(0.1)
             try:
-                summary = fuser.load_snapshot(map_path)
+                result = ps.relocate()
+            except Exception:
+                log.exception("relocate-on-load failed")
+                return
+            if result.get("success"):
                 log.info(
-                    "loaded map %s — %d observed cells (session_id=%s)",
-                    map_path,
-                    summary.get("cells_loaded", "?"),
-                    summary.get("source_session_id", "?"),
+                    "relocate-on-load ok dx=%+.2f dy=%+.2f",
+                    result["dx"], result["dy"],
                 )
-            except Exception:
-                log.exception("--load-map failed; continuing with empty grid")
+            else:
+                log.warning("relocate-on-load failed: %s", result)
 
-    # --relocate-on-load: fire relocate() once a scan has arrived.
-    # The PF source caches scans in _on_scan; we wait up to 5 s for
-    # the first cached scan, then call relocate. Best-effort: any
-    # failure (no scan, sparse grid, low improvement) is logged but
-    # doesn't block the rest of startup.
-    if args.relocate_on_load:
-        if not args.load_map:
-            log.warning("--relocate-on-load has no effect without --load-map")
-        elif fuser.connected and fuser.pose_source is not None:
-            import threading as _t
-            def _deferred_relocate():
-                deadline = time.time() + 5.0
-                ps = fuser.pose_source
-                while time.time() < deadline:
-                    has_scan = getattr(ps, "_last_scan_ts", 0.0) > 0.0
-                    if has_scan:
-                        break
-                    time.sleep(0.1)
-                try:
-                    result = ps.relocate()
-                except Exception:
-                    log.exception("--relocate-on-load: relocate raised")
-                    return
-                if result.get("success"):
-                    log.info(
-                        "relocate-on-load: succeeded — dx=%+.2f dy=%+.2f "
-                        "dθ=%+.1f° improvement=%.1f",
-                        result["dx"], result["dy"],
-                        math.degrees(result["dtheta"]),
-                        result.get("improvement", 0.0),
-                    )
-                else:
-                    log.warning(
-                        "relocate-on-load: failed (%s) — %s",
-                        result.get("reason", "?"), result,
-                    )
-            _t.Thread(
-                target=_deferred_relocate, name="relocate-on-load",
-                daemon=True,
-            ).start()
-
-    # Shadow SLAM: only wires if the fuser already has a live session
-    # (i.e. autoconnect succeeded). Post-launch reconnects via the
-    # safety toolbar don't re-install the driver; restart nav if the
-    # fuser was reconnected and you want shadow SLAM going again.
-    shadow: Optional[ShadowSlamDriver] = None
-    if args.shadow_slam and args.slam:
-        log.info(
-            "--slam already promotes the SLAM pose source; "
-            "ignoring redundant --shadow-slam.",
-        )
-    elif args.shadow_slam:
-        if fuser.connected:
-            shadow = ShadowSlamDriver(
-                session=fuser.session,
-                grid=fuser.grid,
-                pose_source=fuser.pose_source,
-            )
-            try:
-                shadow.connect()
-            except Exception:
-                log.exception("shadow_slam connect failed; continuing without it")
-                shadow = None
-        else:
-            log.warning(
-                "shadow_slam requested but fuser not connected; "
-                "driver not installed. Launch with --router pointing at a "
-                "live Pi, or restart after connecting via the UI.",
-            )
-
-    # Phase 2.4 particle-filter shadow driver. Pure observer; runs
-    # alongside whatever production pose source is active.
-    pf_shadow = None
-    if args.pf_shadow:
-        if fuser.connected:
-            from desktop.world_map.shadow_pf_driver import (
-                ShadowParticleFilterDriver,
-            )
-
-            # Phase 3 — optional AprilTag observer.
-            apriltag_calibration = None
-            apriltag_obs_config = None
-            if args.apriltag_config:
-                from desktop.world_map.apriltag_calibration import (
-                    AprilTagCalibration,
-                )
-                from desktop.world_map.apriltag_observer import (
-                    AprilTagObserverConfig,
-                )
-                try:
-                    apriltag_calibration = AprilTagCalibration.from_yaml(
-                        Path(args.apriltag_config),
-                    )
-                    apriltag_obs_config = AprilTagObserverConfig(
-                        request_hz=args.apriltag_request_hz,
-                    )
-                    log.info(
-                        "apriltag: loaded %d tag(s) from %s, request_hz=%.2f",
-                        len(apriltag_calibration.tags),
-                        args.apriltag_config,
-                        args.apriltag_request_hz,
-                    )
-                except Exception:
-                    log.exception(
-                        "apriltag config load failed; continuing without tags",
-                    )
-                    apriltag_calibration = None
-
-            # Shadow driver uses its own ParticleFilterPose instance —
-            # we pass the same device + particle-count choices the
-            # production source would, so --pf-shadow benches the same
-            # config you'd actually run with --pf.
-            from desktop.world_map.particle_filter_pose import ParticleFilterConfig
-            pf_shadow = ShadowParticleFilterDriver(
-                session=fuser.session,
-                grid=fuser.grid,
-                pose_source=fuser.pose_source,
-                trace_path=Path(args.pf_shadow),
-                pf_config=ParticleFilterConfig(
-                    device=pf_device,
-                    n_particles=args.pf_particles,
-                    defensive_resample_fraction=args.pf_defensive_fraction,
-                ),
-                apriltag_calibration=apriltag_calibration,
-                apriltag_config=apriltag_obs_config,
-            )
-            try:
-                pf_shadow.connect()
-                log.info("pf_shadow: tracing to %s", args.pf_shadow)
-            except Exception:
-                log.exception("pf_shadow connect failed; continuing without it")
-                pf_shadow = None
-        else:
-            log.warning(
-                "pf_shadow requested but fuser not connected; "
-                "driver not installed. Launch with --router pointing at a "
-                "live Pi, or restart after connecting via the UI.",
-            )
-
-    # Phase 6.3 / 6.4 — VPR observer. Shadow mode (read-only trace) or
-    # live mode (also applies observe_xy_mixture, gated by anchor
-    # calibration + cloud-σ + motion). The two modes share all the
-    # plumbing — only ShadowVPRConfig.live differs.
-    if args.vpr and args.vpr_shadow:
-        log.error("--vpr and --vpr-shadow are mutually exclusive")
-        return 2
-    vpr_trace_path = args.vpr or args.vpr_shadow
-    vpr_live_mode = bool(args.vpr)
-    vpr_driver = None
-    if vpr_trace_path:
-        if not args.vpr_bank:
-            log.error("--vpr / --vpr-shadow requires --vpr-bank PATH")
-            return 2
-        if fuser.connected and getattr(fuser, "pose_source", None) is not None \
-                and pose_source_type == "particle":
-            try:
-                from desktop.world_map.vpr import (
-                    AnchorOffsetConfig, ShadowVPRConfig, ShadowVPRDriver,
-                    VPRBank, ExtractorConfig, load_default_extractor,
-                )
-                bank = VPRBank.load(args.vpr_bank, device=pf_device)
-                extractor = load_default_extractor(ExtractorConfig(
-                    device=pf_device,
-                ))
-                # The shadow shares the production filter's lock so its
-                # read-only snapshot can't race against ongoing predicts.
-                pf_source = fuser.pose_source
-                # 6.4.4 — pf_for_vpr() returns the nav filter; the
-                # mapping filter never sees VPR observations.
-                pf = pf_source.pf_for_vpr()
-                pf_lock = pf_source._lock  # type: ignore[attr-defined]
-                vpr_driver = ShadowVPRDriver(
-                    session=fuser.session,
-                    pf=pf, pf_lock=pf_lock,
-                    bank=bank, extractor=extractor,
-                    trace_path=Path(vpr_trace_path),
-                    pose_source=fuser.pose_source,
-                    config=ShadowVPRConfig(
-                        request_hz=args.vpr_rate,
-                        similarity_floor=args.vpr_similarity_floor,
-                        sigma_m=args.vpr_sigma_m,
-                        live=vpr_live_mode,
-                        anchor=AnchorOffsetConfig(
-                            min_pairs=args.vpr_anchor_min_pairs,
-                        ),
-                        gate_sigma_floor_ratio=args.vpr_gate_sigma_ratio,
-                        gate_min_distance_m=args.vpr_gate_min_distance,
-                    ),
-                )
-                vpr_driver.connect()
-                log.info(
-                    "vpr: mode=%s tracing to %s (bank=%d frames, device=%s)",
-                    "live" if vpr_live_mode else "shadow",
-                    vpr_trace_path, bank.n_frames, pf_device,
-                )
-                # Note: Phase 6.4.2's auto-sweep is intentionally NOT
-                # fired here. The sweep produced geometrically degenerate
-                # pairs (constant current_xy with varied bank_xy) which
-                # poisoned the SE(2) fit. See bayesian_localization_
-                # redesign.md "Phase 6.4.3" for the analysis. The
-                # VPRCalibrationSweep module stays in tree as a starting
-                # point for a future drive-based calibration mission.
-                # Opportunistic accumulation in the shadow driver
-                # produces the anchor — same path as 6.4 runs that
-                # actually worked.
-            except Exception:
-                log.exception("vpr setup failed; continuing without it")
-                vpr_driver = None
-        else:
-            log.warning(
-                "vpr requires --pf (production pose source must be the "
-                "particle filter) and a connected fuser session; "
-                "driver not installed."
-            )
+        threading.Thread(
+            target=_deferred_relocate, name="relocate-on-load", daemon=True,
+        ).start()
 
     try:
-        return run_app(fuser, fuser_config, chassis, chassis_config)
+        return run_app(localizer, loc_config, chassis, chassis_config)
     finally:
-        if vpr_driver is not None:
-            try:
-                vpr_driver.disconnect()
-            except Exception:
-                log.exception("vpr disconnect raised")
-        # Shadow first — its subscribers live on the fuser's session.
-        if pf_shadow is not None:
-            try:
-                pf_shadow.disconnect()
-            except Exception:
-                log.exception("pf_shadow disconnect raised")
-        if shadow is not None:
-            try:
-                shadow.disconnect()
-            except Exception:
-                log.exception("shadow_slam disconnect raised")
-        # Order matters: chassis publishes zero commands on disconnect,
-        # fuser doesn't touch motors, so tear chassis down first.
         try:
             chassis.shutdown()
         except Exception:
-            log.exception("chassis shutdown raised")
+            log.exception("chassis shutdown failed")
         try:
-            fuser.shutdown()
+            localizer.shutdown()
         except Exception:
-            log.exception("fuser shutdown raised")
+            log.exception("localizer shutdown failed")
 
 
 if __name__ == "__main__":
