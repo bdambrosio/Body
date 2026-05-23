@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from desktop.fusion.ekf_pose_tracker import EkfPoseTracker
+from desktop.fusion.load_slam_config import load_slam_config
 from desktop.localization.mcl_localizer import MCLConfig, MCLLocalizer
 from desktop.localization.pose_buffer import PoseBuffer
 from desktop.nav.slam.imu_yaw import ImuYawTracker
@@ -47,6 +49,7 @@ class MCLPoseSource(PoseSource):
         self._map = reference_map
         self._mcl = MCLLocalizer(reference_map, pf_config=pf_config, config=mcl_config)
         self._config = config or MCLPoseSourceConfig()
+        self._ekf = EkfPoseTracker(noise=load_slam_config().fusion)
         self._imu_tracker = ImuYawTracker()
         self._pose_buffer = PoseBuffer()
         self._lock = threading.RLock()
@@ -54,6 +57,7 @@ class MCLPoseSource(PoseSource):
 
         self._seeded = False
         self._last_odom: Optional[Tuple[float, float, float, float]] = None
+        self._last_ekf_pose: Optional[Pose] = None
         self._off_x = 0.0
         self._off_y = 0.0
         self._off_theta = 0.0
@@ -82,16 +86,21 @@ class MCLPoseSource(PoseSource):
 
     def update(self, ts: float, x: float, y: float, theta: float) -> None:
         self._counters["odom_seen"] += 1
+        self._ekf.update_odom(ts, x, y, theta)
         with self._lock:
             if not self._seeded:
-                imu = self._imu_tracker.yaw_at(ts)
-                if imu is None:
+                if not self._ekf.is_ready():
                     return
-                imu_yaw, _ = imu
+                ekf_pose = self._ekf.pose_at(ts)
+                if ekf_pose is None:
+                    return
                 self._mcl.seed_at(0.0, 0.0, 0.0)
-                self._yaw_offset = _wrap(imu_yaw)
                 self._off_x, self._off_y, self._off_theta = x, y, theta
+                imu = self._imu_tracker.yaw_at(ts)
+                if imu is not None:
+                    self._yaw_offset = _wrap(imu[0])
                 self._last_odom = (ts, x, y, theta)
+                self._last_ekf_pose = ekf_pose
                 self._seeded = True
                 self._record_pose(ts)
                 logger.info("mcl_pose: seeded at odom (%+.2f, %+.2f)", x, y)
@@ -106,11 +115,20 @@ class MCLPoseSource(PoseSource):
                     or abs(dth) > self._config.teleport_rotation_rad):
                 self._counters["teleports"] += 1
                 self._last_odom = (ts, x, y, theta)
+                self._last_ekf_pose = self._ekf.pose_at(ts)
                 return
 
-            th_mid = last_tho + 0.5 * dth
-            ds = dx * math.cos(th_mid) + dy * math.sin(th_mid)
-            self._mcl.predict(ds, dth)
+            ekf_pose = self._ekf.pose_at(ts)
+            if ekf_pose is None or self._last_ekf_pose is None:
+                self._last_odom = (ts, x, y, theta)
+                return
+
+            edx = ekf_pose[0] - self._last_ekf_pose[0]
+            edy = ekf_pose[1] - self._last_ekf_pose[1]
+            edth = _wrap(ekf_pose[2] - self._last_ekf_pose[2])
+            th_mid = self._last_ekf_pose[2] + 0.5 * edth
+            ds = edx * math.cos(th_mid) + edy * math.sin(th_mid)
+            self._mcl.predict(ds, edth)
 
             imu = self._imu_tracker.yaw_at(ts)
             if imu is not None:
@@ -124,6 +142,7 @@ class MCLPoseSource(PoseSource):
 
             self._counters["predicts_run"] += 1
             self._last_odom = (ts, x, y, theta)
+            self._last_ekf_pose = ekf_pose
             self._record_pose(ts)
 
     def _record_pose(self, ts: float) -> None:
@@ -162,10 +181,12 @@ class MCLPoseSource(PoseSource):
                 return None
             ts, x, y, theta = self._last_odom
             imu = self._imu_tracker.yaw_at(ts)
+            self._ekf.rebind_world_to_current()
             self._mcl.seed_at(0.0, 0.0, 0.0)
             self._off_x, self._off_y, self._off_theta = x, y, theta
             if imu is not None:
                 self._yaw_offset = _wrap(imu[0])
+            self._last_ekf_pose = self._ekf.pose_at(ts)
             self._pose_buffer.clear()
             self._record_pose(ts)
             self._correction_total_m = 0.0
@@ -270,6 +291,7 @@ class MCLPoseSource(PoseSource):
         reading = ImuReading.from_payload(msg)
         if reading is not None:
             self._imu_tracker.update(reading)
+            self._ekf.update_imu(reading)
 
     def _on_scan(self, sample: Any) -> None:
         self._counters["scan_received"] += 1

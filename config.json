@@ -128,6 +128,27 @@
     "depth_max_range_m": 1.5,
     "lidar_max_clear_range_m": 6.0
   },
+  "fusion": {
+    "alpha_trans_per_m": 0.04,
+    "alpha_rot_per_m": 0.017,
+    "alpha_rot_per_rad": 0.01,
+    "imu_sigma_rad": 0.00123,
+    "imu_obs_hz": 50.0,
+    "odom_obs_hz": 50.0
+  },
+  "slam": {
+    "match_hz": 2.0,
+    "scan_match_xy_half_m": 0.30,
+    "scan_match_theta_half_deg": 8.0,
+    "min_improvement": 10.0,
+    "loop_closure_search_radius_m": 2.0,
+    "loop_closure_min_response": 0.35,
+    "graph_optimize_every_n_nodes": 5,
+    "submap_node_count": 20,
+    "min_submap_evidence_cells": 200,
+    "resolution_m": 0.05,
+    "extent_m": 40.0
+  },
   "watchdog": {
     "heartbeat_timeout_ms": 2000,
     "process_timeout_ms": 5000,

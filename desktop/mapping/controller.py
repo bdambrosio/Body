@@ -1,21 +1,20 @@
-"""Mapping session controller — builds ReferenceMap from lidar."""
+"""Mapping session controller — EKF + pose-graph SLAM."""
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import threading
 import time
 import uuid
-from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from desktop.fusion.ekf_pose_tracker import EkfPoseTracker
+from desktop.fusion.load_slam_config import load_slam_config
 from desktop.mapping.export import export_mapping_session
-from desktop.mapping.mapping_pose_tracker import MappingPoseTracker
-from desktop.mapping.occupancy_builder import OccupancyBuilder
+from desktop.mapping.pose_graph_mapper import PoseGraphMapper
 from desktop.nav.slam.types import ImuReading
 from desktop.reference_map.reference_map import ReferenceMap
 from desktop.world_map.transport import open_session
@@ -65,22 +64,23 @@ class MappingConfig:
 
 
 class MappingController:
-    """Builds occupancy during a teleop mapping drive."""
+    """Builds a pose-graph map during a teleop mapping drive."""
 
     def __init__(self, config: MappingConfig):
         self.config = config
-        self.builder = OccupancyBuilder(
-            extent_m=config.extent_m,
-            resolution_m=config.resolution_m,
+        slam_cfg = load_slam_config()
+        self._slam_cfg = slam_cfg
+        self.ekf = EkfPoseTracker(noise=slam_cfg.fusion)
+        self.mapper = PoseGraphMapper(
+            slam_config=slam_cfg.slam,
+            fusion_config=slam_cfg.fusion,
+            ekf=self.ekf,
         )
-        self.pose_tracker = MappingPoseTracker()
         self._session_id = uuid.uuid4().hex[:12]
         self.reference_map: Optional[ReferenceMap] = None
-        self._trajectory: Deque[Tuple[float, float, float, float]] = deque(maxlen=4096)
         self._lock = threading.RLock()
         self._session: Optional[Any] = None
         self._subs: List[Any] = []
-        self._last_scan_mono = 0.0
         self._on_update: Optional[Callable[[], None]] = None
 
     @property
@@ -150,10 +150,7 @@ class MappingController:
         if triple is None:
             return
         ts, x, y, theta = triple
-        self.pose_tracker.update_odom(ts, x, y, theta)
-        pose = self.pose_tracker.pose_at(ts)
-        if pose is not None:
-            self._trajectory.append((ts, pose[0], pose[1], pose[2]))
+        self.ekf.update_odom(ts, x, y, theta)
 
     def _on_imu(self, sample: Any) -> None:
         msg = _decode_json(self._payload_bytes(sample))
@@ -161,17 +158,11 @@ class MappingController:
             return
         reading = ImuReading.from_payload(msg)
         if reading is not None:
-            self.pose_tracker.update_imu(reading)
+            self.ekf.update_imu(reading)
 
     def _on_scan(self, sample: Any) -> None:
-        now_mono = time.monotonic()
-        if now_mono - self._last_scan_mono < 1.0 / max(0.5, self.config.scan_match_hz):
-            return
-        self._last_scan_mono = now_mono
         msg = _decode_json(self._payload_bytes(sample))
         if msg is None:
-            return
-        if not self.pose_tracker.is_ready():
             return
         ts = float(msg.get("ts") or _now())
         ranges = msg.get("ranges")
@@ -184,48 +175,53 @@ class MappingController:
             [r if isinstance(r, (int, float)) else np.nan for r in ranges],
             dtype=np.float64,
         )
-        pose = self.pose_tracker.pose_at(ts)
-        if pose is None:
-            return
-        self.builder.integrate_scan(ranges_arr, angles, pose)
-        cb = self._on_update
-        if cb is not None:
-            try:
-                cb()
-            except Exception:
-                logger.exception("on_grid_update failed")
+        added = self.mapper.add_scan(ts, ranges_arr, angles)
+        if added:
+            cb = self._on_update
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("on_grid_update failed")
 
     def snapshot_for_ui(self) -> Optional[Dict[str, Any]]:
-        snap = self.builder.snapshot_for_ui()
+        snap = self.mapper.snapshot_for_ui()
+        if snap is None:
+            return None
         snap["session_id"] = self._session_id
         drive = snap["driveable"]
         snap["grid"] = np.full(drive.shape, np.nan, dtype=np.float32)
         return snap
 
     def pose_trail(self) -> List[Tuple[float, float, float]]:
-        with self._lock:
-            return [(x, y, th) for (_t, x, y, th) in self._trajectory]
+        return self.mapper.trajectory()
 
     def status_summary(self) -> Dict[str, Any]:
-        pose = self.pose_tracker.pose()
-        diag = self.pose_tracker.diagnostics()
+        pose = self.mapper.display_pose()
+        ekf_diag = self.ekf.diagnostics()
+        slam_diag = self.mapper.diagnostics()
+        cov = self.ekf.cov_at(_now())
+        cov_xy = None
+        if cov is not None:
+            cov_xy = float(cov[0, 0] + cov[1, 1])
         return {
             "session_id": self._session_id,
             "pose": pose,
-            "pose_source": "mapping",
-            "imu_settled": diag.get("imu_settled"),
-            "heading_source": diag.get("heading_source"),
-            "yaw_at_misses": diag.get("yaw_at_misses"),
+            "pose_source": "pose_graph",
+            "imu_settled": ekf_diag.get("imu_settled"),
+            "heading_source": ekf_diag.get("heading_source"),
+            "yaw_at_misses": ekf_diag.get("yaw_at_misses"),
+            "ekf_cov_trace_xy": cov_xy,
+            "graph_nodes": slam_diag.get("node_count"),
+            "graph_edges": slam_diag.get("edge_count"),
+            "last_match_improvement": slam_diag.get("last_match_improvement"),
+            "loop_closures": slam_diag.get("loop_closure_count"),
         }
 
     def finalize_map(self) -> ReferenceMap:
-        traj = None
-        if self._trajectory:
-            traj = np.array(list(self._trajectory), dtype=np.float64)
-        ref = self.builder.to_reference_map(
+        ref = self.mapper.to_reference_map(
             session_id=self._session_id,
-            trajectory=traj,
-            metadata={"mapping_version": 1},
+            metadata={"mapping_version": 2},
         )
         self.reference_map = ref
         return ref
@@ -235,13 +231,10 @@ class MappingController:
         return export_mapping_session(self, base_dir=base_dir)
 
     def request_reset(self, *, reason: str = "ui_reset") -> None:
-        self.builder = OccupancyBuilder(
-            extent_m=self.config.extent_m,
-            resolution_m=self.config.resolution_m,
-        )
-        self.pose_tracker.rebind_world_to_current()
+        self.ekf.rebind_world_to_current()
+        self.mapper.reset()
         self._session_id = uuid.uuid4().hex[:12]
-        self._trajectory.clear()
+        self.reference_map = None
 
     def request_relocate(self, *, reason: str = "ui_relocate") -> dict:
         return {"success": False, "reason": "not_supported_in_mapping"}

@@ -128,6 +128,7 @@ class MappingMainWindow(QMainWindow):
         small.setPointSize(max(7, small.pointSize() - 1))
         self._pose_lbl = self._mk_status_label("pose: —", 220, small)
         self._heading_lbl = self._mk_status_label("heading: —", 180, small)
+        self._slam_lbl = self._mk_status_label("slam: —", 260, small)
         self._cells_lbl = self._mk_status_label("cells: —", 180, small)
         self._session_lbl = self._mk_status_label("session: —", 210, small)
         self._chassis_lbl = self._mk_status_label("chassis: —", 200, small)
@@ -141,7 +142,7 @@ class MappingMainWindow(QMainWindow):
         row1 = QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
         row1.setSpacing(8)
-        for w in (self._pose_lbl, self._heading_lbl, self._cells_lbl, self._session_lbl):
+        for w in (self._pose_lbl, self._heading_lbl, self._slam_lbl, self._cells_lbl, self._session_lbl):
             row1.addWidget(w)
         row1.addStretch(1)
         status.addLayout(row1)
@@ -259,7 +260,8 @@ class MappingMainWindow(QMainWindow):
 
     def _refresh_map_panel(self) -> None:
         snap = self.controller.snapshot_for_ui()
-        pose = self.controller.pose_tracker.pose()
+        st = self.controller.status_summary()
+        pose = st.get("pose")
         trail = self.controller.pose_trail()
         ts = time.time()
         if snap is None:
@@ -290,14 +292,25 @@ class MappingMainWindow(QMainWindow):
 
         imu_settled = st.get("imu_settled")
         heading_src = st.get("heading_source") or "none"
-        if pose is not None and imu_settled:
+        if pose is not None and imu_settled and heading_src == "imu":
             deg = math.degrees(pose[2])
-            tag = "imu" if heading_src == "imu" else "enc"
-            self._heading_lbl.setText(f"heading: {tag} {deg:+5.1f}°")
+            self._heading_lbl.setText(f"heading: imu {deg:+5.1f}°")
         elif not imu_settled:
             self._heading_lbl.setText("heading: wait imu")
         else:
-            self._heading_lbl.setText("heading: —")
+            self._heading_lbl.setText("heading: no imu")
+
+        nodes = st.get("graph_nodes")
+        match_imp = st.get("last_match_improvement")
+        cov_xy = st.get("ekf_cov_trace_xy")
+        if nodes is not None:
+            cov_s = f"{cov_xy:.3f}" if cov_xy is not None else "—"
+            imp_s = f"{match_imp:.1f}" if match_imp is not None else "—"
+            self._slam_lbl.setText(
+                f"slam: nodes={nodes}  Σ_xy={cov_s}  match+{imp_s}",
+            )
+        else:
+            self._slam_lbl.setText("slam: —")
 
         snap = self.controller.snapshot_for_ui()
         bounds = snap.get("bounds_ij") if snap else None

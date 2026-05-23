@@ -41,12 +41,41 @@ class TestMappingPoseTracker(unittest.TestCase):
         t.update_odom(0.0, 0.0, 0.0, 0.0)
         for i in range(25):
             t.update_imu(_imu_reading(0.0 + i * 0.01, math.pi / 2))
-        t.update_odom(0.1, 1.0, 0.0, 0.5)
+        t.update_odom(0.1, 1.0, 0.0, 0.0)
         out = t.pose_at(0.1)
         self.assertIsNotNone(out)
         x, y, theta = out
-        self.assertAlmostEqual(x, 1.0, places=5)
+        self.assertAlmostEqual(x, 0.0, places=4)
+        self.assertAlmostEqual(y, 1.0, places=4)
         self.assertAlmostEqual(theta, math.pi / 2, places=2)
+
+    def test_imu_projects_forward_distance_not_encoder_xy(self):
+        """Encoder reports +x motion after IMU rotation; world motion follows IMU."""
+        t = MappingPoseTracker()
+        _settle_imu(t, base_ts=-1.0, yaw_rad=0.0)
+        t.update_odom(0.0, 0.0, 0.0, 0.0)
+        for i in range(25):
+            t.update_imu(_imu_reading(0.0 + i * 0.01, math.pi / 2))
+        t.update_odom(0.1, 2.0, 0.0, 0.0)
+        out = t.pose_at(0.1)
+        self.assertIsNotNone(out)
+        x, y, theta = out
+        self.assertAlmostEqual(x, 0.0, places=4)
+        self.assertAlmostEqual(y, 2.0, places=3)
+
+    def test_encoder_lateral_slip_does_not_move_world_xy(self):
+        """Lateral encoder drift with no forward component → no world motion."""
+        t = MappingPoseTracker()
+        _settle_imu(t, base_ts=-1.0, yaw_rad=0.0)
+        t.update_odom(0.0, 0.0, 0.0, 0.0)
+        t.update_imu(_imu_reading(0.0, 0.0))
+        t.update_odom(0.1, 0.0, 0.5, 0.0)
+        t.update_imu(_imu_reading(0.1, 0.0))
+        out = t.pose_at(0.1)
+        self.assertIsNotNone(out)
+        x, y, _theta = out
+        self.assertAlmostEqual(x, 0.0, places=4)
+        self.assertAlmostEqual(y, 0.0, places=4)
 
     def test_pose_at_scan_timestamp_interpolates_yaw(self):
         t = MappingPoseTracker()
@@ -65,6 +94,7 @@ class TestMappingPoseTracker(unittest.TestCase):
         _settle_imu(t, base_ts=-1.0, yaw_rad=2.0)
         t.update_odom(0.0, 0.0, 0.0, 0.0)
         t.update_odom(0.1, 0.5, 0.0, 0.0)
+        t.update_imu(_imu_reading(0.1, 2.0))
         t.rebind_world_to_current()
         out = t.pose_at(0.1)
         self.assertIsNotNone(out)
@@ -100,11 +130,18 @@ class TestMappingPoseTracker(unittest.TestCase):
     def test_auto_rebind_on_first_odom_after_settle(self):
         t = MappingPoseTracker()
         _settle_imu(t, base_ts=-1.0, yaw_rad=1.5)
+        t.update_imu(_imu_reading(0.0, 1.5))
         t.update_odom(0.0, 0.0, 0.0, 0.0)
         out = t.pose_at(0.0)
         self.assertIsNotNone(out)
         _x, _y, theta = out
         self.assertAlmostEqual(theta, 0.0, places=3)
+
+    def test_pose_at_none_without_imu(self):
+        t = MappingPoseTracker()
+        _settle_imu(t, base_ts=-1.0, yaw_rad=0.0)
+        t.update_odom(0.0, 0.0, 0.0, 0.0)
+        self.assertIsNone(t.pose_at(-5.0))
 
 
 if __name__ == "__main__":

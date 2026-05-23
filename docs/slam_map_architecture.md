@@ -19,13 +19,46 @@ desktop/.venv/bin/python -m desktop.nav --router tcp/PI:7447 --map path/to/refer
 ## Packages
 
 - `desktop/reference_map/` — frozen map schema, load/save, legacy `layers.npz` converter
-- `desktop/mapping/` — log-odds occupancy builder during teleop mapping drives
+- `desktop/mapping/` — EKF + pose-graph SLAM during teleop mapping drives
+- `desktop/fusion/` — shared EKF pose tracker and `config.json` fusion/slam loader
 - `desktop/localization/` — MCL particle filter against a read-only reference map
 - `desktop/nav/` — autonomy shell (planner, follower, safety); Pi `local_2p5d` stays body-frame only
 
-## Mapping pose
+## Mapping pipeline (EKF + pose graph)
 
-During a mapping session, lidar scans are integrated at **`pose_at(scan_ts)`**: translation from `body/odom` (encoder ring buffer + interpolation) and heading from `body/imu` (BNO085 yaw via `ImuYawTracker`). There is **no online scan match** against the map being built — that path fought rotation and smeared walls. Map integration waits until IMU is settled. The mapping UI status strip shows heading source (`imu` vs `enc` vs `wait imu`).
+```mermaid
+flowchart LR
+  Odom["body/odom"] --> EKF["EkfPoseTracker"]
+  Imu["body/imu"] --> EKF
+  Scan["body/lidar/scan"] --> PG["PoseGraphMapper"]
+  EKF -->|"pose_at(scan_ts)"| PG
+  PG -->|"optimized poses"| Map["Occupancy export"]
+```
+
+**Phase 0 noise priors** (`α₁`, `α₃`, `α₄`, IMU σ) live in `config.json` → `fusion` and are documented in [noise_models.md](noise_models.md). **SLAM tuning** (`match_hz`, scan-match window, loop-closure radius) lives in `config.json` → `slam`.
+
+During mapping:
+
+1. **EkfPoseTracker** fuses IMU yaw (tight) with encoder forward motion (`ds` only, IMU-projected). Maintains `(x, y, θ)` covariance for diagnostics.
+2. **PoseGraphMapper** (slam_toolbox pattern) rate-limits scans, scan-matches against a rolling **submap** of recent optimized nodes (not the live integrating grid), adds pose-graph nodes/edges, attempts **loop closure**, and runs sparse **SE(2) optimization**.
+3. **Occupancy** is ray-cast **only from graph-optimized node poses** — never from raw EKF priors alone. Export via `reference_map.npz`.
+
+The mapping UI status strip shows EKF Σ_xy, graph node count, and last scan-match improvement. Operator pose and trail share the optimized graph frame.
+
+## Navigation fusion
+
+During nav, the same **EkfPoseTracker** config drives MCL motion prediction between scan updates (replacing raw odom deltas). MCL scan likelihood uses the frozen reference map.
+
+## Deprecated mapping path
+
+`MappingPoseTracker` (direct log-odds integration at live EKF pose, no loop closure) is superseded by the pose-graph pipeline above. It remains in the tree for reference/tests.
+
+## Manual verification (hallway)
+
+1. Status: `heading: imu`, EKF Σ reasonable; graph nodes incrementing
+2. Slow 360° spin: no red fan; arrow rotates with IMU
+3. Corridor out-and-back: **single** wall lines; trail folds back
+4. Save map → nav with `--map` + MCL converges on return leg
 
 ## Deprecated for nav
 
