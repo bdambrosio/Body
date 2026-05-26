@@ -13,11 +13,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from desktop.fusion.ekf_pose_tracker import EkfPoseTracker
-from desktop.fusion.load_slam_config import load_slam_config
+from desktop.fusion.load_slam_config import load_slam_config, scan_matcher_config_from_slam
 from desktop.localization.mcl_localizer import MCLConfig, MCLLocalizer
 from desktop.localization.pose_buffer import PoseBuffer
 from desktop.nav.slam.imu_yaw import ImuYawTracker
-from desktop.nav.slam.types import ImuReading
+from desktop.nav.slam.scan_matcher import (
+    ScanMatcher,
+    ScanMatcherConfig,
+    lidar_scan_to_xy,
+)
+from desktop.nav.slam.types import ImuReading, Pose2D
 from desktop.reference_map.reference_map import ReferenceMap
 from desktop.world_map.particle_filter_pose import ParticleFilterConfig
 from desktop.world_map.pose_source import Pose, PoseSource
@@ -27,11 +32,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MCLPoseSourceConfig:
-    scan_hz: float = 5.0
+    scan_hz: float = 10.0
     imu_obs_hz: float = 5.0
     teleport_distance_m: float = 0.5
     teleport_rotation_rad: float = math.radians(45.0)
     relocate_max_scan_age_s: float = 2.0
+    min_evidence_cells: int = 200
+    relocate_min_improvement: float = 30.0
 
 
 class MCLPoseSource(PoseSource):
@@ -45,10 +52,17 @@ class MCLPoseSource(PoseSource):
         pf_config: Optional[ParticleFilterConfig] = None,
         mcl_config: Optional[MCLConfig] = None,
         config: Optional[MCLPoseSourceConfig] = None,
+        scan_matcher_config: Optional[ScanMatcherConfig] = None,
     ) -> None:
         self._map = reference_map
         self._mcl = MCLLocalizer(reference_map, pf_config=pf_config, config=mcl_config)
         self._config = config or MCLPoseSourceConfig()
+        slam = load_slam_config().slam
+        self._matcher = ScanMatcher(
+            scan_matcher_config or scan_matcher_config_from_slam(slam),
+        )
+        self._slam = slam
+        self._evidence = self._build_evidence(reference_map)
         self._ekf = EkfPoseTracker(noise=load_slam_config().fusion)
         self._imu_tracker = ImuYawTracker()
         self._pose_buffer = PoseBuffer()
@@ -79,10 +93,25 @@ class MCLPoseSource(PoseSource):
             "imu_obs_applied": 0,
             "scan_received": 0,
             "scan_obs_run": 0,
+            "scan_match_run": 0,
+            "scan_obs_skipped_sparse": 0,
+            "scan_obs_skipped_malformed": 0,
             "resamples_fired": 0,
         }
         self._correction_total_m = 0.0
+        self._correction_total_rad = 0.0
         self._correction_n_applied = 0
+        self._last_scan_match: Dict[str, Any] = {
+            "valid": False,
+        }
+
+    @staticmethod
+    def _build_evidence(reference_map: ReferenceMap) -> np.ndarray:
+        return (reference_map.occupancy_log_odds > 0.0).astype(np.float32)
+
+    def _refresh_map(self, reference_map: ReferenceMap) -> None:
+        self._map = reference_map
+        self._evidence = self._build_evidence(reference_map)
 
     def update(self, ts: float, x: float, y: float, theta: float) -> None:
         self._counters["odom_seen"] += 1
@@ -190,7 +219,9 @@ class MCLPoseSource(PoseSource):
             self._pose_buffer.clear()
             self._record_pose(ts)
             self._correction_total_m = 0.0
+            self._correction_total_rad = 0.0
             self._correction_n_applied = 0
+            self._last_scan_match = {"valid": False}
             return (x, y, theta)
 
     def to_world(self, x_o: float, y_o: float, th_o: float) -> Pose:
@@ -203,18 +234,161 @@ class MCLPoseSource(PoseSource):
         return (x_w, y_w, th_w)
 
     def source_name(self) -> str:
-        return "mcl"
+        return "mcl+scan_match"
 
     def match_summary(self) -> dict:
-        return dict(self._counters)
+        out = dict(self._counters)
+        out.update(self.scan_match_summary())
+        return out
+
+    def scan_match_summary(self) -> dict:
+        with self._lock:
+            return dict(self._last_scan_match)
 
     def correction_summary(self) -> dict:
         with self._lock:
             return {
                 "total_m": float(self._correction_total_m),
-                "total_rad": 0.0,
+                "total_rad": float(self._correction_total_rad),
                 "n_applied": int(self._correction_n_applied),
             }
+
+    def _relocate_matcher(self) -> ScanMatcher:
+        slam = self._slam
+        return ScanMatcher(
+            ScanMatcherConfig(
+                xy_half_m=slam.relocate_xy_half_m,
+                xy_step_m=0.10,
+                theta_half_rad=math.radians(slam.relocate_theta_half_deg),
+                theta_step_rad=math.radians(5.0),
+                min_improvement=self._config.relocate_min_improvement,
+            ),
+        )
+
+    def _scan_points(
+        self,
+        ranges: np.ndarray,
+        angles: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        try:
+            points = lidar_scan_to_xy(ranges, angles)
+        except Exception:
+            return None
+        if points.shape[0] < 10:
+            return None
+        return points
+
+    def _store_scan_match(
+        self,
+        *,
+        result: Any,
+        prior_pose: Pose2D,
+        posterior_pose: Tuple[float, float, float],
+        evidence_cells: int,
+        n_points: int,
+        elapsed_ms: float,
+        n_eff_before: float,
+        n_eff_after: float,
+        resampled: bool,
+    ) -> None:
+        best = result.pose
+        shift_m = math.hypot(best.x - prior_pose.x, best.y - prior_pose.y)
+        dtheta = _wrap(best.theta - prior_pose.theta)
+        post_shift_m = math.hypot(
+            posterior_pose[0] - prior_pose.x,
+            posterior_pose[1] - prior_pose.y,
+        )
+        self._last_scan_match = {
+            "valid": True,
+            "prior_pose": [prior_pose.x, prior_pose.y, prior_pose.theta],
+            "best_pose": [best.x, best.y, best.theta],
+            "posterior_pose": list(posterior_pose),
+            "shift_m": float(shift_m),
+            "post_shift_m": float(post_shift_m),
+            "dx": float(best.x - prior_pose.x),
+            "dy": float(best.y - prior_pose.y),
+            "dtheta_rad": float(dtheta),
+            "dtheta_deg": float(math.degrees(dtheta)),
+            "improvement": float(result.improvement),
+            "score_prior": float(result.score_prior),
+            "score_best": float(result.score),
+            "accepted": bool(result.accepted),
+            "search_exhausted": bool(result.search_exhausted),
+            "elapsed_ms": float(elapsed_ms),
+            "evidence_cells": int(evidence_cells),
+            "n_points": int(n_points),
+            "n_eff_before": float(n_eff_before),
+            "n_eff_after": float(n_eff_after),
+            "resampled": bool(resampled),
+        }
+
+    def _apply_scan_match_observation(
+        self,
+        points_xy: np.ndarray,
+        *,
+        matcher: Optional[ScanMatcher] = None,
+    ) -> bool:
+        matcher = matcher or self._matcher
+        evidence_count = int(self._evidence.sum())
+        if evidence_count < self._config.min_evidence_cells:
+            self._counters["scan_obs_skipped_sparse"] += 1
+            return False
+
+        with self._lock:
+            prior_tuple = self._mcl.posterior_mean()
+        prior_pose = Pose2D(*prior_tuple)
+        n_eff_before = self._mcl.n_eff()
+
+        t0 = time.monotonic()
+        try:
+            result = matcher.search(
+                points_xy,
+                prior_pose,
+                self._evidence,
+                self._map.origin_x_m,
+                self._map.origin_y_m,
+                self._map.resolution_m,
+                return_field=True,
+            )
+        except Exception:
+            logger.exception("mcl_pose: scan_match crashed; continuing")
+            return False
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+        with self._lock:
+            if result.score_field is not None:
+                self._mcl.observe_scan_match_field(result.score_field, prior_pose)
+            resampled = self._mcl.maybe_resample()
+            if resampled:
+                self._counters["resamples_fired"] += 1
+            posterior = self._mcl.posterior_mean()
+            n_eff_after = self._mcl.n_eff()
+            if self._last_odom is not None:
+                self._record_pose(self._last_odom[0])
+
+            shift_m = math.hypot(
+                result.pose.x - prior_pose.x,
+                result.pose.y - prior_pose.y,
+            )
+            dtheta = abs(_wrap(result.pose.theta - prior_pose.theta))
+            self._correction_total_m += shift_m
+            self._correction_total_rad += dtheta
+            self._correction_n_applied += 1
+
+            self._store_scan_match(
+                result=result,
+                prior_pose=prior_pose,
+                posterior_pose=posterior,
+                evidence_cells=evidence_count,
+                n_points=int(points_xy.shape[0]),
+                elapsed_ms=elapsed_ms,
+                n_eff_before=n_eff_before,
+                n_eff_after=n_eff_after,
+                resampled=resampled,
+            )
+            self._counters["scan_match_run"] += 1
+            self._counters["scan_obs_run"] += 1
+        return True
 
     def relocate(self) -> dict:
         with self._lock:
@@ -223,42 +397,95 @@ class MCLPoseSource(PoseSource):
             ranges = self._last_ranges
             angles = self._last_angles
             scan_ts = self._last_scan_ts
-            prior = self._mcl.posterior_mean()
+            prior_tuple = self._mcl.posterior_mean()
         if ranges is None or angles is None or scan_ts <= 0:
             return {"success": False, "reason": "no_scan_cached"}
         if time.time() - scan_ts > self._config.relocate_max_scan_age_s:
             return {"success": False, "reason": "scan_too_stale"}
 
-        self._mcl.spray_particles(
-            prior[0], prior[1], prior[2],
-            sigma_xy_m=self._mcl._config.relocate_seed_sigma_xy_m,
-            sigma_theta_rad=self._mcl._config.relocate_seed_sigma_theta_rad,
-        )
+        points = self._scan_points(ranges, angles)
+        if points is None:
+            return {"success": False, "reason": "scan_malformed"}
+
+        evidence_count = int(self._evidence.sum())
+        if evidence_count < self._config.min_evidence_cells:
+            return {"success": False, "reason": "sparse_map"}
+
+        prior_pose = Pose2D(*prior_tuple)
+        wide = self._relocate_matcher()
+        t0 = time.monotonic()
+        try:
+            result = wide.search(
+                points,
+                prior_pose,
+                self._evidence,
+                self._map.origin_x_m,
+                self._map.origin_y_m,
+                self._map.resolution_m,
+                return_field=False,
+            )
+        except Exception:
+            logger.exception("mcl_pose.relocate: scan_match crashed")
+            return {"success": False, "reason": "scan_match_error"}
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+        if result.improvement < self._config.relocate_min_improvement:
+            logger.info(
+                "mcl_pose.relocate: rejected improv=%.1f (need %.1f)",
+                result.improvement,
+                self._config.relocate_min_improvement,
+            )
+            return {
+                "success": False,
+                "reason": "low_improvement",
+                "improvement": float(result.improvement),
+            }
+
+        best = result.pose
         with self._lock:
-            self._mcl.observe_scan_ranges(ranges, angles)
-            resampled = self._mcl.maybe_resample()
-            if resampled:
-                self._counters["resamples_fired"] += 1
-            new_pose = self._mcl.posterior_mean()
-            dx = new_pose[0] - prior[0]
-            dy = new_pose[1] - prior[1]
-            self._correction_total_m += math.hypot(dx, dy)
-            self._correction_n_applied += 1
+            self._mcl.seed_at(
+                best.x, best.y, best.theta,
+                sigma_xy_m=0.05,
+                sigma_theta_rad=math.radians(3.0),
+            )
             if self._last_odom is not None:
                 self._record_pose(self._last_odom[0])
+            new_pose = self._mcl.posterior_mean()
+            dx = new_pose[0] - prior_tuple[0]
+            dy = new_pose[1] - prior_tuple[1]
+            dth = _wrap(new_pose[2] - prior_tuple[2])
+            self._correction_total_m += math.hypot(dx, dy)
+            self._correction_total_rad += abs(dth)
+            self._correction_n_applied += 1
+            self._store_scan_match(
+                result=result,
+                prior_pose=prior_pose,
+                posterior_pose=new_pose,
+                evidence_cells=evidence_count,
+                n_points=int(points.shape[0]),
+                elapsed_ms=elapsed_ms,
+                n_eff_before=float(self._mcl.filter.n_particles()),
+                n_eff_after=float(self._mcl.n_eff()),
+                resampled=False,
+            )
 
         logger.info(
-            "mcl_pose.relocate: dx=%+.2f dy=%+.2f",
-            new_pose[0] - prior[0], new_pose[1] - prior[1],
+            "mcl_pose.relocate: dx=%+.2f dy=%+.2f dθ=%+.1f° improv=%.1f (%.0fms)",
+            new_pose[0] - prior_tuple[0],
+            new_pose[1] - prior_tuple[1],
+            math.degrees(dth),
+            result.improvement,
+            elapsed_ms,
         )
         return {
             "success": True,
-            "method": "mcl",
-            "dx": float(new_pose[0] - prior[0]),
-            "dy": float(new_pose[1] - prior[1]),
-            "dtheta": float(_wrap(new_pose[2] - prior[2])),
-            "prior_pose": list(prior),
+            "method": "scan_match",
+            "dx": float(new_pose[0] - prior_tuple[0]),
+            "dy": float(new_pose[1] - prior_tuple[1]),
+            "dtheta": float(dth),
+            "prior_pose": list(prior_tuple),
             "best_pose": list(new_pose),
+            "improvement": float(result.improvement),
             "particle_count": int(self._mcl.filter.n_particles()),
         }
 
@@ -325,12 +552,14 @@ class MCLPoseSource(PoseSource):
             self._last_scan_ts = scan_ts
             self._last_ranges = ranges_arr
             self._last_angles = angles
-            self._mcl.observe_scan_ranges(ranges_arr, angles)
-            if self._mcl.maybe_resample():
-                self._counters["resamples_fired"] += 1
-            if self._last_odom is not None:
-                self._record_pose(self._last_odom[0])
-            self._counters["scan_obs_run"] += 1
+
+        points = self._scan_points(ranges_arr, angles)
+        if points is None:
+            with self._lock:
+                self._counters["scan_obs_skipped_malformed"] += 1
+            return
+
+        self._apply_scan_match_observation(points)
 
 
 def _wrap(a: float) -> float:

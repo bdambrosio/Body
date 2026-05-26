@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from desktop.nav.slam.scan_matcher import lidar_scan_to_xy
+from desktop.nav.slam.types import Pose2D, ScoreField
 from desktop.reference_map.reference_map import ReferenceMap
 from desktop.world_map.particle_filter_pose import (
     ParticleFilterConfig,
@@ -100,6 +101,18 @@ class MCLLocalizer:
 
     def posterior_cov(self) -> np.ndarray:
         return self._pf.posterior_cov().detach().cpu().numpy()
+
+    def observe_scan_match_field(
+        self,
+        score_field: ScoreField,
+        prior_pose: Pose2D,
+        *,
+        temperature: Optional[float] = None,
+    ) -> None:
+        """Bayesian reweight from a ScanMatcher correlation field."""
+        self._pf.update_from_scan_likelihood(
+            score_field, prior_pose, temperature=temperature,
+        )
 
     def observe_scan_ranges(
         self,

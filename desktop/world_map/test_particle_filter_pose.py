@@ -149,6 +149,25 @@ class TestPredictNoiseGrowth(unittest.TestCase):
         # And not exploded.
         self.assertLess(float(d.max()), 0.05)
 
+    def test_odom_process_blur_spreads_cloud(self):
+        pf = ParticleFilterPose(ParticleFilterConfig(
+            n_particles=800,
+            init_sigma_xy_m=0.0,
+            init_sigma_theta_rad=0.0,
+            sigma_floor_trans_m=0.0,
+            sigma_floor_rot_rad=0.0,
+            odom_process_blur_xy_m=0.004,
+            odom_process_blur_theta_rad=0.001,
+            seed=17,
+        ))
+        pf.seed_at(0.0, 0.0, 0.0)
+        s0 = pf.state.clone()
+        for _ in range(20):
+            pf.predict(0.0, 0.0)
+        d = (pf.state[:, :2] - s0[:, :2]).norm(dim=1)
+        self.assertGreater(float(d.std()), 0.003)
+        self.assertLess(float(d.max()), 0.08)
+
 
 class TestObserveImuYaw(unittest.TestCase):
     def test_observation_concentrates_theta_marginal(self):

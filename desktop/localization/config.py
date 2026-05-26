@@ -32,7 +32,13 @@ class LocalizationConfig:
     pf_device: str = "cpu"
     pf_n_particles: int = 5000
     pf_imu_obs_hz: float = 5.0
-    scan_hz: float = 5.0
+    # Lidar scan-match rate cap. Pi publishes ~10 Hz; match every scan.
+    scan_hz: float = 10.0
+    # Scan reweight strength: lower → scan match moves posterior faster.
+    pf_scan_temperature_log_ratio: float = 1.5
+    # Per-odom-tick process blur (correlated odom uncertainty).
+    pf_odom_blur_xy_m: float = 0.004
+    pf_odom_blur_theta_rad: float = 0.001
 
     teleport_distance_m: float = 0.5
     teleport_rotation_rad: float = 3.14159 / 4.0

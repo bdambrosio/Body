@@ -72,6 +72,9 @@ class LocalizationController:
                 device=config.pf_device,
                 n_particles=config.pf_n_particles,
                 defensive_resample_fraction=0.0,
+                scan_temperature_log_ratio=config.pf_scan_temperature_log_ratio,
+                odom_process_blur_xy_m=config.pf_odom_blur_xy_m,
+                odom_process_blur_theta_rad=config.pf_odom_blur_theta_rad,
             ),
             config=MCLPoseSourceConfig(
                 scan_hz=config.scan_hz,
@@ -385,6 +388,11 @@ class LocalizationController:
             "pose_source": self.pose_source.source_name(),
             "correction_summary": self.pose_source.correction_summary(),
             "pose_unavail_streak": 0,
+            "scan_match": (
+                self.pose_source.scan_match_summary()
+                if hasattr(self.pose_source, "scan_match_summary")
+                else {}
+            ),
         }
 
     def save_snapshot_bundle(self, base_dir: Optional[str] = None) -> str:
@@ -395,7 +403,7 @@ class LocalizationController:
         """Restore a saved map into the live localizer."""
         self.reference_map = load_map_auto(npz_path)
         if isinstance(self.pose_source, MCLPoseSource):
-            self.pose_source._map = self.reference_map
+            self.pose_source._refresh_map(self.reference_map)
             self.pose_source._mcl.set_reference_map(self.reference_map)
         drive = self.reference_map.driveable_int8()
         cells = int(np.count_nonzero(drive >= 0))

@@ -371,7 +371,7 @@ class NavMainWindow(QMainWindow):
         self._rates_lbl = self._mk_status_label("rates: —", 250, small)
         self._cells_lbl = self._mk_status_label("cells: —", 180, small)
         self._session_lbl = self._mk_status_label("session: —", 210, small)
-        self._slam_lbl = self._mk_status_label("slam: —", 270, small)
+        self._slam_lbl = self._mk_status_label("slam: —", 360, small)
         self._plan_lbl = self._mk_status_label("plan: —", 220, small)
         self._follow_lbl = self._mk_status_label("follow: —", 360, small)
         self._chassis_lbl = self._mk_status_label("chassis: —", 200, small)
@@ -554,6 +554,13 @@ class NavMainWindow(QMainWindow):
         if self._patrol_dock.is_visible():
             self._patrol_dock.refresh()
 
+    def _update_scan_match_overlay(self, st: dict) -> None:
+        sm = st.get("scan_match") or {}
+        if sm.get("valid"):
+            self._shared_view.set_scan_match_overlay(sm)
+        else:
+            self._shared_view.set_scan_match_overlay(None)
+
     def _refresh_fuser_panel(self) -> None:
         snap = self.fuser.snapshot_for_ui()
         latest = self.fuser.pose_source.latest_pose()
@@ -585,6 +592,7 @@ class NavMainWindow(QMainWindow):
                 cm, snap["meta"], ts, pose=pose,
                 pose_history=trail, bounds_ij=snap.get("bounds_ij"),
             )
+            self._update_scan_match_overlay(st)
             # Cache for replanning when goal changes; if a goal is
             # already set, replan against the freshly-built costmap
             # so the path keeps up as the map fills in. Skip during
@@ -610,6 +618,7 @@ class NavMainWindow(QMainWindow):
                 None, None, 0.0, pose=pose,
                 pose_history=trail, bounds_ij=None,
             )
+            self._update_scan_match_overlay(st)
 
         # Run the follower whenever a path exists and we have a
         # live pose. The output renders on the map either way; in
@@ -697,10 +706,17 @@ class NavMainWindow(QMainWindow):
         corr_m = float(corr.get("total_m") or 0.0)
         corr_deg = math.degrees(float(corr.get("total_rad") or 0.0))
         n_corr = int(corr.get("n_applied") or 0)
+        sm = st.get("scan_match") or {}
+        sm_hint = ""
+        if sm.get("valid"):
+            sm_hint = (
+                f"  sm Δ={float(sm.get('shift_m', 0.0)):>4.2f}m/"
+                f"{float(sm.get('improvement', 0.0)):>4.0f}"
+            )
         self._slam_lbl.setText(
             f"slam: lost={unavail:>2d}  "
             f"corr={corr_m:>5.2f}m/{corr_deg:>+5.0f}°  "
-            f"n={n_corr:>3d}"
+            f"n={n_corr:>3d}{sm_hint}"
         )
         if unavail >= 10:
             self._slam_lbl.setStyleSheet("color: #e8a;")

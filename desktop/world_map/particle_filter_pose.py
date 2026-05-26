@@ -129,7 +129,20 @@ class ParticleFilterConfig:
     # delta in one observation, which was the failure mode the first
     # live trace exposed). Phase 2.2 used field.std() which is far too
     # peaky for realistic correlation scores.
+    #
+    # Nav MCL on a frozen map overrides to ~2.0 so scan match can
+    # pull the posterior toward lidar evidence faster than odom+IMU
+    # drift it away — still soft reweighting, not snapping.
     scan_temperature_log_ratio: float = 5.0
+
+    # Extra isotropic diffusion applied after every motion-model predict.
+    # Odom integration error is correlated over time; per-step α noise
+    # alone treats increments as independent and lets the cloud stay
+    # overconfident in a stale mean. A small process blur re-spreads
+    # particles each odom tick so scan observations can move mass.
+    # Nav MCL sets non-zero values; default 0 preserves legacy behavior.
+    odom_process_blur_xy_m: float = 0.0
+    odom_process_blur_theta_rad: float = 0.0
 
     # Post-resample roughening: small Gaussian jitter added to every
     # particle immediately after the systematic resample step. Without
@@ -426,6 +439,18 @@ class ParticleFilterPose:
         self._state[:, 0] += ds * torch.cos(theta_mid)
         self._state[:, 1] += ds * torch.sin(theta_mid)
         self._state[:, 2] = _wrap_torch(theta_curr + dth)
+
+        blur_xy = self.cfg.odom_process_blur_xy_m
+        blur_th = self.cfg.odom_process_blur_theta_rad
+        if blur_xy > 0.0 or blur_th > 0.0:
+            eps = self._randn((self.cfg.n_particles, 3))
+            if blur_xy > 0.0:
+                self._state[:, 0] += blur_xy * eps[:, 0]
+                self._state[:, 1] += blur_xy * eps[:, 1]
+            if blur_th > 0.0:
+                self._state[:, 2] = _wrap_torch(
+                    self._state[:, 2] + blur_th * eps[:, 2],
+                )
 
     # ── IMU yaw observation ──────────────────────────────────────────
 

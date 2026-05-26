@@ -64,6 +64,25 @@ def _parse_args(argv):
         help="IMU yaw observation rate cap (Hz).",
     )
     p.add_argument(
+        "--scan-hz", type=float, default=10.0,
+        help="Scan-match observation rate cap (Hz, default 10).",
+    )
+    p.add_argument(
+        "--pf-scan-temp-log-ratio", type=float, default=1.5,
+        help=(
+            "Scan-match temperature log-ratio (lower = stronger scan "
+            "reweight, default 1.5)."
+        ),
+    )
+    p.add_argument(
+        "--pf-odom-blur-xy-m", type=float, default=0.004,
+        help="Per-odom-tick XY process blur σ (m, default 4 mm).",
+    )
+    p.add_argument(
+        "--pf-odom-blur-theta-rad", type=float, default=0.001,
+        help="Per-odom-tick yaw process blur σ (rad, default 0.001).",
+    )
+    p.add_argument(
         "--publish-hz", type=float, default=2.0,
         help="World map publish rate cap.",
     )
@@ -119,6 +138,10 @@ def main(argv=None) -> int:
         pf_device=pf_device,
         pf_n_particles=args.pf_particles,
         pf_imu_obs_hz=args.pf_imu_obs_hz,
+        scan_hz=args.scan_hz,
+        pf_scan_temperature_log_ratio=args.pf_scan_temp_log_ratio,
+        pf_odom_blur_xy_m=args.pf_odom_blur_xy_m,
+        pf_odom_blur_theta_rad=args.pf_odom_blur_theta_rad,
     )
     chassis_config = StubConfig(
         router=router,

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, Qt
@@ -76,6 +76,9 @@ class SharedMapView:
         # Follower visualization: the pure-pursuit lookahead point
         # (None when no follower is active).
         self._lookahead_world: Optional[Tuple[float, float]] = None
+        # Scan-match debug overlay: prior pose, correlation argmax,
+        # rendered as an orange marker + dashed correction chord.
+        self._scan_match_overlay: Optional[Dict[str, Any]] = None
         # Patrol overlay state. `_patrol` is a duck-typed Patrol from
         # `desktop.nav.patrol` (held loosely so this module doesn't
         # import from `desktop.nav`). When set, all attached views
@@ -187,6 +190,17 @@ class SharedMapView:
     def set_lookahead(self, xy: Optional[Tuple[float, float]]) -> None:
         self._lookahead_world = (
             (float(xy[0]), float(xy[1])) if xy is not None else None
+        )
+        self._notify()
+
+    def scan_match_overlay(self) -> Optional[Dict[str, Any]]:
+        return self._scan_match_overlay
+
+    def set_scan_match_overlay(
+        self, overlay: Optional[Dict[str, Any]],
+    ) -> None:
+        self._scan_match_overlay = (
+            dict(overlay) if overlay is not None else None
         )
         self._notify()
 
@@ -494,6 +508,9 @@ class _WorldViewBase(QWidget):
                     color=QColor(255, 255, 255), label=None,
                 )
 
+            # Scan-match argmax (correlation peak) vs prior chord.
+            self._draw_scan_match_overlay(p, ox, oy, side_px)
+
             # Patrol overlay (numbered pins + connecting polyline).
             # Drawn under the goal pin so the active waypoint's goal
             # pin reads as the operator's primary target while the
@@ -680,6 +697,34 @@ class _WorldViewBase(QWidget):
         p.setPen(QPen(QColor(80, 200, 255, 220), 2.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+        p.restore()
+
+    def _draw_scan_match_overlay(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+    ) -> None:
+        ov = self._shared.scan_match_overlay()
+        if ov is None or not ov.get("valid"):
+            return
+        prior = ov.get("prior_pose")
+        best = ov.get("best_pose")
+        if prior is None or best is None:
+            return
+        if len(prior) < 3 or len(best) < 3:
+            return
+        px, py, _ = float(prior[0]), float(prior[1]), float(prior[2])
+        bx, by, bth = float(best[0]), float(best[1]), float(best[2])
+        rx_p, ry_p = self._world_to_widget(px, py)
+        rx_b, ry_b = self._world_to_widget(bx, by)
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        chord = QPen(QColor(255, 160, 60, 190), 1.5, Qt.PenStyle.DashLine)
+        p.setPen(chord)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(rx_p, ry_p), QPointF(rx_b, ry_b))
+        self._draw_world_marker(
+            p, bx, by, bth, ox, oy, side_px,
+            color=QColor(255, 150, 50), label="match",
+        )
         p.restore()
 
     def _draw_lookahead(
