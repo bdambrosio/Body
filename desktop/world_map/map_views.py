@@ -95,6 +95,15 @@ class SharedMapView:
             Callable[[float, float], None]
         ] = None
 
+        # `_locate_mode` toggles LEFT-click semantics — when True, a
+        # left-click asserts the robot's true (x, y) at the clicked point
+        # via `_locate_callback` (the localizer then recovers yaw); when
+        # False, left-click pans the view as usual.
+        self._locate_mode: bool = False
+        self._locate_callback: Optional[
+            Callable[[float, float], None]
+        ] = None
+
     # ── Subscriptions ───────────────────────────────────────────────
 
     def attach(self, view: "_WorldViewBase") -> None:
@@ -251,6 +260,32 @@ class SharedMapView:
         if not self._patrol_edit_mode:
             return False
         cb = self._patrol_append_callback
+        if cb is None:
+            return False
+        cb(x_w, y_w)
+        return True
+
+    def locate_mode(self) -> bool:
+        return self._locate_mode
+
+    def set_locate_mode(self, on: bool) -> None:
+        self._locate_mode = bool(on)
+        self._notify()
+
+    def set_locate_callback(
+        self, cb: Optional[Callable[[float, float], None]],
+    ) -> None:
+        """Register the function called when a view detects a left-click
+        WHILE `locate_mode` is on. Receives the world (x, y) of the click.
+        """
+        self._locate_callback = cb
+
+    def request_locate(self, x_w: float, y_w: float) -> bool:
+        """Left-click handler dispatch. Returns True if the click was
+        consumed as a set-location override, False otherwise."""
+        if not self._locate_mode:
+            return False
+        cb = self._locate_callback
         if cb is None:
             return False
         cb(x_w, y_w)
@@ -987,6 +1022,18 @@ class _WorldViewBase(QWidget):
                 return
             if self._shared.has_goal_callback():
                 self._shared.request_goal(x_w, y_w)
+                event.accept()
+                return
+
+        # Left-click while locate mode is on → assert true (x, y) here
+        # (consumes the click so it does not start a pan drag).
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._paint_geom is not None):
+            x_w, y_w = self._widget_to_world(
+                float(event.position().x()),
+                float(event.position().y()),
+            )
+            if self._shared.request_locate(x_w, y_w):
                 event.accept()
                 return
 

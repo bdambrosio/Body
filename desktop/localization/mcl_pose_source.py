@@ -39,6 +39,9 @@ class MCLPoseSourceConfig:
     relocate_max_scan_age_s: float = 2.0
     min_evidence_cells: int = 200
     relocate_min_improvement: float = 30.0
+    # Operator "set location" override (relocate_at): trust the clicked
+    # (x, y) within this small window and sweep the full 360° of yaw.
+    relocate_at_xy_half_m: float = 0.10
 
 
 class MCLPoseSource(PoseSource):
@@ -486,6 +489,108 @@ class MCLPoseSource(PoseSource):
             "prior_pose": list(prior_tuple),
             "best_pose": list(new_pose),
             "improvement": float(result.improvement),
+            "particle_count": int(self._mcl.filter.n_particles()),
+        }
+
+    def relocate_at(self, x: float, y: float) -> dict:
+        """Operator override: trust the clicked world (x, y); recover yaw.
+
+        Unlike relocate(), the search is locked to a small window around
+        the clicked point and sweeps the full 360° of heading. There is
+        no improvement gate — the operator is asserting position, so we
+        always seed at the best-scoring yaw and report match quality. Use
+        when relocate() snapped to the wrong place.
+        """
+        with self._lock:
+            if not self._seeded:
+                return {"success": False, "reason": "not_seeded"}
+            ranges = self._last_ranges
+            angles = self._last_angles
+            scan_ts = self._last_scan_ts
+            prior_tuple = self._mcl.posterior_mean()
+        if ranges is None or angles is None or scan_ts <= 0:
+            return {"success": False, "reason": "no_scan_cached"}
+        if time.time() - scan_ts > self._config.relocate_max_scan_age_s:
+            return {"success": False, "reason": "scan_too_stale"}
+
+        points = self._scan_points(ranges, angles)
+        if points is None:
+            return {"success": False, "reason": "scan_malformed"}
+
+        evidence_count = int(self._evidence.sum())
+        if evidence_count < self._config.min_evidence_cells:
+            return {"success": False, "reason": "sparse_map"}
+
+        # Small xy window around the click, full yaw sweep at a fine step.
+        prior_pose = Pose2D(x, y, prior_tuple[2])
+        matcher = ScanMatcher(
+            ScanMatcherConfig(
+                xy_half_m=self._config.relocate_at_xy_half_m,
+                xy_step_m=0.02,
+                theta_half_rad=math.pi,
+                theta_step_rad=math.radians(2.0),
+                min_improvement=0.0,
+            ),
+        )
+        t0 = time.monotonic()
+        try:
+            result = matcher.search(
+                points,
+                prior_pose,
+                self._evidence,
+                self._map.origin_x_m,
+                self._map.origin_y_m,
+                self._map.resolution_m,
+                return_field=False,
+            )
+        except Exception:
+            logger.exception("mcl_pose.relocate_at: scan_match crashed")
+            return {"success": False, "reason": "scan_match_error"}
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+        best = result.pose
+        with self._lock:
+            self._mcl.seed_at(
+                best.x, best.y, best.theta,
+                sigma_xy_m=0.05,
+                sigma_theta_rad=math.radians(3.0),
+            )
+            if self._last_odom is not None:
+                self._record_pose(self._last_odom[0])
+            new_pose = self._mcl.posterior_mean()
+            dx = new_pose[0] - prior_tuple[0]
+            dy = new_pose[1] - prior_tuple[1]
+            dth = _wrap(new_pose[2] - prior_tuple[2])
+            self._correction_total_m += math.hypot(dx, dy)
+            self._correction_total_rad += abs(dth)
+            self._correction_n_applied += 1
+            self._store_scan_match(
+                result=result,
+                prior_pose=prior_pose,
+                posterior_pose=new_pose,
+                evidence_cells=evidence_count,
+                n_points=int(points.shape[0]),
+                elapsed_ms=elapsed_ms,
+                n_eff_before=float(self._mcl.filter.n_particles()),
+                n_eff_after=float(self._mcl.n_eff()),
+                resampled=False,
+            )
+
+        logger.info(
+            "mcl_pose.relocate_at: click=(%.2f,%.2f) -> yaw=%.1f° "
+            "improv=%.1f (%.0fms)",
+            x, y, math.degrees(new_pose[2]), result.improvement, elapsed_ms,
+        )
+        return {
+            "success": True,
+            "method": "relocate_at",
+            "dx": float(dx),
+            "dy": float(dy),
+            "dtheta": float(dth),
+            "prior_pose": list(prior_tuple),
+            "best_pose": list(new_pose),
+            "improvement": float(result.improvement),
+            "evidence_cells": evidence_count,
             "particle_count": int(self._mcl.filter.n_particles()),
         }
 

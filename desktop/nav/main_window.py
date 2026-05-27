@@ -210,6 +210,19 @@ class NavMainWindow(QMainWindow):
         self._patrol_edit_act.toggled.connect(self._on_patrol_edit_action)
         self._map_toolbar.addAction(self._patrol_edit_act)
 
+        self._locate_act = QAction("Set location", self)
+        self._locate_act.setCheckable(True)
+        self._locate_act.setChecked(False)
+        self._locate_act.setToolTip(
+            "Manual relocalize override: while on, LEFT-click a map to "
+            "assert the robot's true (x, y) there. The localizer keeps "
+            "that point and recovers heading via a full 360° scan-match. "
+            "Use when Re-localize snaps to the wrong place. One-shot — "
+            "the mode turns off after a click."
+        )
+        self._locate_act.toggled.connect(self._on_locate_action)
+        self._map_toolbar.addAction(self._locate_act)
+
         self._stream_rgb_act = QAction("Stream RGB", self)
         self._stream_rgb_act.setCheckable(True)
         self._stream_rgb_act.setChecked(False)
@@ -265,6 +278,7 @@ class NavMainWindow(QMainWindow):
         self._last_plan: Optional[PlanResult] = None
         self._last_costmap = None  # cached for replanning when goal changes
         self._shared_view.set_goal_callback(self._on_goal_requested)
+        self._shared_view.set_locate_callback(self._on_locate_requested)
         # Stage 4: pure-pursuit follower computes the cmd_vel that
         # *would* be published. Stage 5: when self._mission is in
         # FOLLOWING, the redraw tick pushes the follower output to
@@ -413,19 +427,26 @@ class NavMainWindow(QMainWindow):
     def _mk_status_label(
         self, initial_text: str, width_px: int, font,
     ) -> QLabel:
-        """Build a status-strip label with a fixed pixel width and an
-        Ignored horizontal size policy, so per-tick text changes don't
-        pump the layout's width-hint. width_px is the maximum the label
-        will need at any point in its lifetime — see _refresh_fuser_panel
-        for the width-stable formatters that keep content within this.
+        """Build a status-strip label that caps at width_px but can
+        shrink, with an Ignored horizontal size policy so per-tick text
+        changes don't pump the layout's width-hint. width_px is the
+        maximum the label will need at any point in its lifetime — see
+        _refresh_fuser_panel for the width-stable formatters that keep
+        content within this.
+
+        Capping with setMaximumWidth (not setFixedWidth) + Ignored policy
+        is deliberate: setFixedWidth pins min=max, which sums across the
+        status rows into a ~1160 px hard floor on the window width and
+        stops the operator shrinking the window to fit smaller screens.
+        Ignored policy gives the same jitter immunity without the floor.
         """
         from PyQt6.QtWidgets import QSizePolicy
         lbl = QLabel(initial_text)
         lbl.setStyleSheet("color: #ccc;")
         lbl.setFont(font)
-        lbl.setFixedWidth(width_px)
+        lbl.setMaximumWidth(width_px)
         lbl.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
         )
         return lbl
 
@@ -1563,6 +1584,55 @@ class NavMainWindow(QMainWindow):
         self._mission.reset()
         self._shared_view.set_goal(None)
         self._last_plan = None
+
+    def _on_locate_action(self, checked: bool) -> None:
+        """Toolbar toggle → arm left-click 'set location' on the maps."""
+        self._shared_view.set_locate_mode(bool(checked))
+        if checked:
+            self._notes_lbl.setText(
+                "Set-location armed: left-click the robot's true position."
+            )
+
+    def _on_locate_requested(self, x_w: float, y_w: float) -> None:
+        """Left-click in locate mode → assert true (x, y), recover yaw."""
+        # One-shot: disarm immediately without re-entering the handler.
+        if self._locate_act.isChecked():
+            blk = self._locate_act.blockSignals(True)
+            self._locate_act.setChecked(False)
+            self._locate_act.blockSignals(blk)
+        self._shared_view.set_locate_mode(False)
+
+        # relocate_at rewrites the pose frame, like relocate — stop motion.
+        self.chassis.set_cmd_vel(0.0, 0.0)
+        if self._mission.is_active():
+            self._mission.cancel()
+
+        result = dict(self.fuser.request_relocate_at(x_w, y_w, reason="ui_locate"))
+        if result.get("success"):
+            result["shift_count"] = self._apply_relocate_to_patrol(result)
+            self._snapped_wp_xys.clear()
+            shift = int(result.get("shift_count", 0))
+            yaw_deg = math.degrees(float(result["best_pose"][2]))
+            QMessageBox.information(
+                self, "Set location",
+                f"Placed robot at ({x_w:+.2f}, {y_w:+.2f}) m; recovered "
+                f"heading {yaw_deg:+.1f}° (scan-match improvement "
+                f"{result.get('improvement', 0.0):.0f} over "
+                f"{result.get('evidence_cells', 0)} evidence cells)."
+                + (
+                    f"\n\nShifted {shift} waypoint(s) / goal pin to match "
+                    f"the new frame." if shift > 0 else ""
+                ),
+            )
+        else:
+            QMessageBox.warning(
+                self, "Set location failed",
+                f"reason: {result.get('reason', 'unknown')}\n"
+                + "\n".join(
+                    f"{k}: {v}" for k, v in result.items()
+                    if k not in ("success", "reason")
+                ),
+            )
 
     def _on_relocate(self) -> None:
         # Wide global scan-match snap. Zero cmd_vel first — relocate

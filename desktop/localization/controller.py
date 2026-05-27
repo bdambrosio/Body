@@ -253,6 +253,26 @@ class LocalizationController:
             logger.warning("localization relocate failed reason=%s %s", reason, result)
         return result
 
+    def request_relocate_at(
+        self, x: float, y: float, *, reason: str = "ui_locate",
+    ) -> dict:
+        """Operator override: trust world (x, y), recover yaw only."""
+        fn = getattr(self.pose_source, "relocate_at", None)
+        if fn is None:
+            return {"success": False, "reason": "not_supported"}
+        result = fn(x, y)
+        if result.get("success"):
+            logger.info(
+                "localization relocate_at ok reason=%s (%.2f,%.2f) %s",
+                reason, x, y, result,
+            )
+        else:
+            logger.warning(
+                "localization relocate_at failed reason=%s (%.2f,%.2f) %s",
+                reason, x, y, result,
+            )
+        return result
+
     def _maybe_record_pose(
         self, pose: Tuple[float, float, float], sample_ts: float,
     ) -> None:
