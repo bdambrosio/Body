@@ -11,6 +11,7 @@ import numpy as np
 
 from desktop.reference_map.reference_map import (
     ReferenceMap,
+    _hysteresis_occupied,
     build_distance_field,
     build_likelihood_field,
     build_reference_map_from_log_odds,
@@ -34,6 +35,33 @@ class TestLikelihoodField(unittest.TestCase):
         occ = np.zeros((10, 10), dtype=bool)
         field = build_likelihood_field(occ, resolution_m=0.05)
         self.assertEqual(float(field.max()), 0.0)
+
+
+class TestHysteresisOccupied(unittest.TestCase):
+    def test_connected_faint_promoted_isolated_dropped(self):
+        # A confident wall cell (0.9) with a faint neighbour (0.3) that
+        # continues it, plus an isolated faint cell elsewhere (0.3).
+        lo = np.zeros((10, 10), dtype=np.float32)
+        lo[5, 5] = 0.9    # seed
+        lo[5, 6] = 0.3    # faint, 8-connected to seed -> promoted
+        lo[1, 1] = 0.3    # faint, isolated -> dropped
+        occ = _hysteresis_occupied(lo, high_thresh=0.5, low_thresh=0.25)
+        self.assertTrue(bool(occ[5, 5]))
+        self.assertTrue(bool(occ[5, 6]))
+        self.assertFalse(bool(occ[1, 1]))
+
+    def test_no_seed_yields_empty(self):
+        lo = np.full((6, 6), 0.3, dtype=np.float32)  # all faint, no seed
+        occ = _hysteresis_occupied(lo, high_thresh=0.5, low_thresh=0.25)
+        self.assertEqual(int(occ.sum()), 0)
+
+    def test_low_ge_high_disables_growth(self):
+        lo = np.zeros((6, 6), dtype=np.float32)
+        lo[2, 2] = 0.9
+        lo[2, 3] = 0.3
+        occ = _hysteresis_occupied(lo, high_thresh=0.5, low_thresh=0.5)
+        self.assertTrue(bool(occ[2, 2]))
+        self.assertFalse(bool(occ[2, 3]))
 
 
 class TestReferenceMapRoundTrip(unittest.TestCase):

@@ -49,7 +49,7 @@ class MappingConfig:
         self,
         *,
         router: str = "tcp/127.0.0.1:7447",
-        extent_m: float = 40.0,
+        extent_m: float = 33.0,
         resolution_m: float = 0.05,
         scan_match_hz: float = 2.0,
         map_stale_s: float = 2.0,

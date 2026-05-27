@@ -27,7 +27,7 @@ from desktop.mapping.ui_qt import run_mapping_app
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Body mapping session")
     p.add_argument("--router", default=None)
-    p.add_argument("--extent-m", type=float, default=40.0)
+    p.add_argument("--extent-m", type=float, default=33.0)
     p.add_argument("--resolution-m", type=float, default=0.05)
     p.add_argument(
         "--heartbeat-hz", type=float, default=5.0,

@@ -22,8 +22,16 @@ LOG_ODDS_FREE = -0.4
 LOG_ODDS_MIN = -4.0
 LOG_ODDS_MAX = 4.0
 
-# Occupied threshold when exporting from log-odds.
+# Occupied threshold when exporting from log-odds (the hysteresis "high"
+# seed threshold).
 OCCUPIED_LOG_ODDS_THRESHOLD = 0.5
+
+# Hysteresis "low" threshold. Faint cells between this and the occupied
+# threshold are promoted to occupied only where 8-connected to a confident
+# (seed) cell. Pairs with the range-scaled OccupancyBuilder, which leaves
+# one-off far hits faint on purpose: this recovers faint-but-connected wall
+# continuations while leaving isolated faint returns out.
+OCCUPIED_LOG_ODDS_LOW_THRESHOLD = 0.25
 
 # Likelihood field Gaussian σ as multiple of cell size.
 LIKELIHOOD_SIGMA_CELLS = 2.0
@@ -246,6 +254,37 @@ def _shift_bool(arr: np.ndarray, di: int, dj: int) -> np.ndarray:
     return out
 
 
+def _hysteresis_occupied(
+    log_odds: np.ndarray,
+    *,
+    high_thresh: float,
+    low_thresh: float,
+) -> np.ndarray:
+    """Two-threshold (Canny-style) occupied mask via morphological reconstruction.
+
+    Cells above ``high_thresh`` are confident seeds. Faint cells above
+    ``low_thresh`` are kept only where 8-connected to a seed; everything else
+    is dropped. ``seed`` is a subset of the candidates because
+    ``low_thresh < high_thresh``, so the seed always survives.
+    """
+    seed = log_odds > high_thresh
+    if low_thresh >= high_thresh or not seed.any():
+        return seed
+    candidates = log_odds > low_thresh
+    marker = seed
+    while True:
+        grown = marker.copy()
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                grown |= _shift_bool(marker, di, dj)
+        grown &= candidates
+        if np.array_equal(grown, marker):
+            return marker
+        marker = grown
+
+
 def build_reference_map_from_log_odds(
     log_odds: np.ndarray,
     *,
@@ -256,8 +295,17 @@ def build_reference_map_from_log_odds(
     metadata: Optional[Dict[str, Any]] = None,
     trajectory: Optional[np.ndarray] = None,
     denoise_min_neighbors: int = 2,
+    occupied_low_log_odds: float = OCCUPIED_LOG_ODDS_LOW_THRESHOLD,
 ) -> ReferenceMap:
-    occupied = log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
+    # Hysteresis sharpening: promote faint-but-connected wall cells, drop
+    # isolated faint returns. Feeds the MCL likelihood/distance fields only;
+    # the raw occupancy_log_odds (and occupied_mask/driveable_int8, which
+    # re-threshold it) are left untouched — same scope as _drop_speckle.
+    occupied = _hysteresis_occupied(
+        log_odds,
+        high_thresh=OCCUPIED_LOG_ODDS_THRESHOLD,
+        low_thresh=occupied_low_log_odds,
+    )
     if denoise_min_neighbors > 0:
         occupied = _drop_speckle(occupied, min_neighbors=denoise_min_neighbors)
     lik = build_likelihood_field(occupied, resolution_m=resolution_m)

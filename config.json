@@ -156,7 +156,7 @@
     "submap_node_count": 10,
     "min_submap_evidence_cells": 200,
     "resolution_m": 0.05,
-    "extent_m": 40.0
+    "extent_m": 33.0
   },
   "watchdog": {
     "heartbeat_timeout_ms": 2000,

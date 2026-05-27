@@ -55,7 +55,7 @@ class SlamConfig:
     submap_node_count: int = 20
     min_submap_evidence_cells: int = 200
     resolution_m: float = 0.05
-    extent_m: float = 40.0
+    extent_m: float = 33.0
     relocate_xy_half_m: float = 3.0
     relocate_theta_half_deg: float = 180.0
 
@@ -120,7 +120,7 @@ def load_slam_config(path: Optional[Path] = None) -> SlamFusionConfig:
             slam_sec, "min_submap_evidence_cells", 200,
         ),
         resolution_m=_float(slam_sec, "resolution_m", 0.05),
-        extent_m=_float(slam_sec, "extent_m", 40.0),
+        extent_m=_float(slam_sec, "extent_m", 33.0),
         relocate_xy_half_m=_float(slam_sec, "relocate_xy_half_m", 3.0),
         relocate_theta_half_deg=_float(
             slam_sec, "relocate_theta_half_deg", 180.0,
