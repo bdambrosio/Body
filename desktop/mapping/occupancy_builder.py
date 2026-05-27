@@ -34,6 +34,7 @@ class OccupancyBuilder:
         extent_m: float,
         resolution_m: float,
         max_range_m: float = 5.0,
+        occ_range_falloff: float = 0.4,
     ):
         self._res = float(resolution_m)
         self._extent = float(extent_m)
@@ -42,6 +43,15 @@ class OccupancyBuilder:
         self._origin_x = -extent_m / 2.0
         self._origin_y = -extent_m / 2.0
         self._max_range = float(max_range_m)
+        # Endpoint-uncertainty model (cheap, deterministic): the true hit
+        # smears across more cells the farther the beam, because a fixed
+        # pose/heading error projects to a cross-range spread of ~r·σθ. We
+        # don't splat that spread; instead we down-weight a single far hit so
+        # it commits less log-odds per observation. A near hit gets the full
+        # LOG_ODDS_OCC; a hit at max_range gets occ_range_falloff× that.
+        # Walls seen repeatedly still saturate to LOG_ODDS_MAX — just slower
+        # at range — while a one-off far return stays faint instead of hard.
+        self._occ_range_falloff = float(occ_range_falloff)
         self.log_odds = np.zeros((n, n), dtype=np.float32)
 
     @property
@@ -83,8 +93,18 @@ class OccupancyBuilder:
             by = r * math.sin(a)
             wx = x0 + cos_t * bx - sin_t * by
             wy = y0 + sin_t * bx + cos_t * by
-            updated += self._cast_ray(x0, y0, wx, wy, hit=True)
+            updated += self._cast_ray(
+                x0, y0, wx, wy, hit=True, occ_weight=self._occ_weight(r),
+            )
         return updated
+
+    def _occ_weight(self, r: float) -> float:
+        """Confidence weight for an occupied hit, tapering with range.
+
+        Linear from 1.0 at r=0 down to ``occ_range_falloff`` at max_range.
+        """
+        frac = min(1.0, max(0.0, r / self._max_range))
+        return 1.0 - (1.0 - self._occ_range_falloff) * frac
 
     def _cast_ray(
         self,
@@ -94,6 +114,7 @@ class OccupancyBuilder:
         y1: float,
         *,
         hit: bool,
+        occ_weight: float = 1.0,
     ) -> int:
         i0, j0 = self.world_to_cell(x0, y0)
         i1, j1 = self.world_to_cell(x1, y1)
@@ -111,7 +132,7 @@ class OccupancyBuilder:
         if hit:
             i, j = cells[-1]
             if 0 <= i < n and 0 <= j < n:
-                self.log_odds[i, j] += LOG_ODDS_OCC
+                self.log_odds[i, j] += LOG_ODDS_OCC * occ_weight
                 _clamp_cell(self.log_odds, i, j)
                 count += 1
         return count
