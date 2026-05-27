@@ -160,10 +160,6 @@ def plan_path(
     waypoints_world = [_cell_to_world(c, res, ox, oy) for c in cells]
     distance_m = _path_distance_m(waypoints_world)
 
-    logger.debug(
-        f"plan_path: ok cells={len(cells)} dist={distance_m:.2f} m "
-        f"expansions={n_expansions} elapsed={elapsed_ms:.1f} ms"
-    )
     return PlanResult(
         ok=True, msg="ok",
         waypoints_world=waypoints_world,
