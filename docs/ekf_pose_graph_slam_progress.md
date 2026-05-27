@@ -20,7 +20,7 @@ The plan in `.cursor/plans/ekf_and_graph_slam_*.plan.md` was implemented on the 
 | Mapping wire-up | `desktop/mapping/controller.py`, `ui_qt.py` | Replaced direct `MappingPoseTracker` + live `integrate_scan` path |
 | Nav wire-up | `desktop/localization/mcl_pose_source.py` | MCL predict uses EKF motion deltas |
 
-Unit tests pass for config loader, EKF, pose-graph optimizer, and synthetic corridor mapping. Legacy `MappingPoseTracker` tests still pass; that module is deprecated but kept for reference.
+Unit tests pass for config loader, EKF, pose-graph optimizer, and synthetic corridor mapping. The legacy `MappingPoseTracker` module and its tests were removed (2026-05-27).
 
 ---
 
@@ -86,7 +86,7 @@ Mapping UI also uses `MappingConfig.ui_redraw_hz` (default 5 Hz) in `desktop/map
 1. **Profile and fix desktop lag** (highest priority for operator usability).
 2. Complete manual hallway checklist in [slam_map_architecture.md](slam_map_architecture.md).
 3. Tune loop-closure gates if false positives appear in symmetric corridors.
-4. Optional: remove or thin `MappingPoseTracker` once nav-on-saved-map is confirmed.
+4. ~~Optional: remove or thin `MappingPoseTracker` once nav-on-saved-map is confirmed.~~ Done — module removed 2026-05-27.
 
 ---
 

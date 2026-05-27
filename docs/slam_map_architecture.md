@@ -51,7 +51,7 @@ During nav, the same **EkfPoseTracker** config drives MCL motion prediction betw
 
 ## Deprecated mapping path
 
-`MappingPoseTracker` (direct log-odds integration at live EKF pose, no loop closure) is superseded by the pose-graph pipeline above. It remains in the tree for reference/tests.
+`MappingPoseTracker` (direct log-odds integration at live EKF pose, no loop closure) was superseded by the pose-graph pipeline above and removed from the tree (2026-05-27).
 
 ## Manual verification (hallway)
 
