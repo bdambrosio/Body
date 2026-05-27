@@ -28,7 +28,7 @@ class Topics:
 class FuserConfig:
     router: str = DEFAULT_ROUTER
 
-    world_extent_m: float = 40.0
+    world_extent_m: float = 33.0
     world_resolution_m: float = 0.08
     publish_hz: float = 2.0
     publish_margin_cells: int = 4

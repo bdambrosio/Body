@@ -32,8 +32,8 @@ def _parse_args(argv):
              f"e.g. tcp/192.168.1.50:7447",
     )
     p.add_argument(
-        "--world-extent-m", type=float, default=40.0,
-        help="Square world side length in meters (default 40).",
+        "--world-extent-m", type=float, default=33.0,
+        help="Square world side length in meters (default 33).",
     )
     p.add_argument(
         "--world-resolution-m", type=float, default=0.08,
