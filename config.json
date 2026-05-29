@@ -132,6 +132,34 @@
     "depth_max_range_m": 1.5,
     "lidar_max_clear_range_m": 6.0
   },
+  "local_drive": {
+    "enabled": true,
+    "control_hz": 10.0,
+    "v_max": 0.18,
+    "omega_max": 0.6,
+    "v_min_mps": 0.08,
+    "arrival_tol_m": 0.12,
+    "rotate_in_place_thresh_rad": 0.61,
+    "k_omega": 1.5,
+    "slowdown_distance_m": 0.4,
+    "no_progress_timeout_s": 4.0,
+    "no_progress_eps_m": 0.03,
+    "odom_stale_s": 0.5,
+    "footprint_radius_m": 0.22,
+    "preview_distance_m": 0.35,
+    "preview_min_distance_m": 0.15,
+    "preview_time_s": 1.5,
+    "block_on_unknown": true,
+    "unknown_block_range_m": 0.25,
+    "min_observed_cells": 3,
+    "scan": {
+      "resolution_m": 0.08,
+      "half_extent_m": 2.5,
+      "scan_stale_s": 0.5,
+      "max_clear_range_m": 6.0,
+      "clear_buffer_cells": 2.0
+    }
+  },
   "fusion": {
     "alpha_trans_per_m": 0.04,
     "alpha_rot_per_m": 0.017,

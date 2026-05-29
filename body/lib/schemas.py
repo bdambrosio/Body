@@ -19,6 +19,76 @@ def cmd_direct(ts: float | None = None, left: float = 0.0, right: float = 0.0, t
     return {"ts": now_ts() if ts is None else ts, "left": left, "right": right, "timeout_ms": timeout_ms}
 
 
+def drive_goto(
+    *,
+    ts: float | None = None,
+    cmd_id: int,
+    frame: str = "odom",
+    x_m: float = 0.0,
+    y_m: float = 0.0,
+    final_heading_rad: float | None = None,
+    arrival_tol_m: float | None = None,
+    v_max: float | None = None,
+    kind: str = "goto",
+) -> dict[str, Any]:
+    """body/drive/goto — Tier-3 drive command (see docs/drive_tier3_spec.md).
+
+    A single subgoal for the Pi-side reactive driver. ``frame`` is "odom":
+    the goal is a point in the Pi's odom frame, so it stays fixed in the
+    world as the robot moves (the sender converts a body-frame click via
+    the local_map ``anchor_pose``). ``kind`` is "goto" | "cancel" | "stop".
+    ``cmd_id`` correlates status; a higher cmd_id supersedes a lower one.
+    """
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "cmd_id": int(cmd_id),
+        "frame": frame,
+        "x_m": float(x_m),
+        "y_m": float(y_m),
+        "kind": kind,
+    }
+    if final_heading_rad is not None:
+        msg["final_heading_rad"] = float(final_heading_rad)
+    if arrival_tol_m is not None:
+        msg["arrival_tol_m"] = float(arrival_tol_m)
+    if v_max is not None:
+        msg["v_max"] = float(v_max)
+    return msg
+
+
+def drive_status(
+    *,
+    ts: float | None = None,
+    cmd_id: int,
+    state: str,
+    goal_body_xy: tuple[float, float] | list[float] | None = None,
+    dist_remaining_m: float = 0.0,
+    v_mps: float = 0.0,
+    omega_radps: float = 0.0,
+    blocked_reason: str | None = None,
+) -> dict[str, Any]:
+    """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
+
+    ``state`` is one of IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT.
+    ``goal_body_xy`` is the active goal transformed into the *live* body
+    frame, for the operator UI to draw. ``blocked_reason`` is set only when
+    state==BLOCKED/FAULT: swept_block | no_progress | odom_stale | out_of_local_map.
+    """
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "cmd_id": int(cmd_id),
+        "state": state,
+        "dist_remaining_m": float(dist_remaining_m),
+        "v_mps": float(v_mps),
+        "omega_radps": float(omega_radps),
+    }
+    if goal_body_xy is not None:
+        msg["goal_body_xy"] = [float(goal_body_xy[0]), float(goal_body_xy[1])]
+    if blocked_reason is not None:
+        msg["blocked_reason"] = blocked_reason
+    return msg
+
+
 def odom(
     ts: float | None = None,
     x: float = 0.0,

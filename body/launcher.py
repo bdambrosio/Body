@@ -20,6 +20,7 @@ PROCESSES: list[dict[str, Any]] = [
     {"name": "imu_driver", "cmd": [sys.executable, "-m", "body.imu_driver"]},
     {"name": "oakd_driver", "cmd": [sys.executable, "-m", "body.oakd_driver"]},
     {"name": "local_map", "cmd": [sys.executable, "-m", "body.local_map"]},
+    {"name": "local_drive", "cmd": [sys.executable, "-m", "body.local_drive"]},
 ]
 
 
