@@ -240,8 +240,19 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
-        # No-progress watchdog.
-        if best_dist is None or dist < best_dist - no_progress_eps_m:
+        v, omega, _, _ = steer_to_body_point((bx, by), gp)
+
+        # No-progress watchdog — only while actually translating. Rotating
+        # in place to acquire heading (large bearing → steer returns v=0)
+        # legitimately doesn't reduce distance-to-goal, so it must not count
+        # as "stuck"; otherwise a goal more than ~90° away trips the timer
+        # before the robot finishes turning to face it. Reset the timer
+        # whenever we're not translating so a fresh window starts once the
+        # robot begins to drive.
+        if v < 1e-3:
+            best_dist = dist
+            best_dist_at = now_mono
+        elif best_dist is None or dist < best_dist - no_progress_eps_m:
             best_dist = dist
             best_dist_at = now_mono
         elif now_mono - best_dist_at > no_progress_timeout_s:
@@ -250,8 +261,6 @@ def main() -> None:
                            dist=dist, reason="no_progress")
             next_tick = _sleep_to(next_tick, period)
             continue
-
-        v, omega, _, _ = steer_to_body_point((bx, by), gp)
 
         # Swept-footprint safety on the live lidar scan, rasterized this tick.
         if scan is None or (now_wall - float(scan.get("ts", 0.0))) > scan_stale_s:
