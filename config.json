@@ -39,7 +39,8 @@
     "range_min_m": 0.05,
     "range_max_m": 12.0,
     "include_intensities": true,
-    "height_above_ground_m": 0.10
+    "height_above_ground_m": 0.10,
+    "self_mask_sectors_deg": [[80, 170, 0.2]]
   },
   "imu": {
     "enabled": true,

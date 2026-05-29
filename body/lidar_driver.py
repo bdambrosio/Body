@@ -8,8 +8,6 @@ import threading
 import time
 from typing import Any
 
-import serial
-
 from body.lib import schemas, zenoh_helpers
 from body.lib.ldrobot_ldpacket import LdPacketDecoder, packet_to_points_deg
 
@@ -61,7 +59,47 @@ def _bin_revolution(
     return ranges, intensities
 
 
+def _parse_self_mask(
+    sectors_deg: Any, num_bins: int,
+) -> list[tuple[set[int], float]]:
+    """Parse self-occlusion sectors into ``[(bin_indices, max_range_m), ...]``.
+
+    Each sector is ``[lo_deg, hi_deg]`` or ``[lo_deg, hi_deg, max_range_m]``
+    in the *published* scan frame (bin i is at bearing ``i * 360/num_bins``
+    degrees, 0 = +x forward, CCW; ``lo > hi`` wraps through 0). Without a
+    range, the whole sector is dropped; with one, only returns within
+    ``max_range_m`` are dropped — the right tool for a fixed near-body
+    return (e.g. the WiFi antenna), whose *bearing* is unstable at short
+    range but whose *range* is small and stable. Masking happens before
+    publish, so every consumer (Tier-3, local_map, PF, mapping) ignores it.
+    """
+    parsed: list[tuple[set[int], float]] = []
+    for sec in sectors_deg or []:
+        try:
+            lo, hi = float(sec[0]), float(sec[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        rng = float("inf")
+        if len(sec) >= 3:
+            try:
+                v = float(sec[2])
+                if v > 0:
+                    rng = v
+            except (TypeError, ValueError):
+                pass
+        bins = set()
+        for bi in range(num_bins):
+            ang = bi * 360.0 / num_bins
+            inside = (lo <= ang <= hi) if lo <= hi else (ang >= lo or ang <= hi)
+            if inside:
+                bins.add(bi)
+        parsed.append((bins, rng))
+    return parsed
+
+
 def _run_serial(session: Any, lidar_cfg: dict[str, Any]) -> None:
+    import serial  # Pi-only dep; imported lazily so the module loads for tests
+
     port = str(lidar_cfg.get("serial_port", "/dev/ttyUSB0"))
     baud = int(lidar_cfg.get("baud_rate", 230400))
     num_bins = int(lidar_cfg.get("num_points", 360))
@@ -70,6 +108,12 @@ def _run_serial(session: Any, lidar_cfg: dict[str, Any]) -> None:
     include_intensities = bool(lidar_cfg.get("include_intensities", True))
     read_chunk = int(lidar_cfg.get("serial_read_size", 4096))
     timeout_s = float(lidar_cfg.get("serial_timeout_s", 0.05))
+    # Fixed body-mounted occlusions (e.g. WiFi antenna): drop these returns
+    # so they never reach any consumer. Empty by default (no masking).
+    self_mask = _parse_self_mask(lidar_cfg.get("self_mask_sectors_deg", []), num_bins)
+    if self_mask:
+        n_bins = sum(len(b) for b, _ in self_mask)
+        print(f"[lidar] self-mask: {len(self_mask)} sector(s), {n_bins} bins", flush=True)
 
     stop = threading.Event()
 
@@ -103,6 +147,13 @@ def _run_serial(session: Any, lidar_cfg: dict[str, Any]) -> None:
                         ranges, intens = _bin_revolution(
                             acc, num_bins, range_min_m, range_max_m, include_intensities
                         )
+                        for bins, rng in self_mask:
+                            for bi in bins:
+                                r = ranges[bi]
+                                if r is not None and r <= rng:
+                                    ranges[bi] = None
+                                    if intens is not None:
+                                        intens[bi] = 0
                         zenoh_helpers.publish_json(
                             session,
                             "body/lidar/scan",
