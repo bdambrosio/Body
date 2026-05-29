@@ -22,14 +22,20 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from desktop.world_map.costmap import Costmap
 
 from .recovery import (
     PRIM_ABORTED, PRIM_DONE, PRIM_RUNNING, PrimitiveOutput,
 )
-from .safety import SafetyConfig, rear_arc_blocked
+from .safety import SafetyConfig, rear_arc_blocked, swept_path_blocked_local
+
+
+# Returns the body-frame (driveable int8, meta dict) of the freshest
+# trusted local_map, or None when it's missing/stale. Lets BackUp do a
+# drift-immune rear check instead of trusting the world-frame costmap.
+LocalMapProvider = Callable[[], Optional[Tuple[Any, dict]]]
 
 
 Pose = Tuple[float, float, float]
@@ -194,15 +200,25 @@ class BackUpConfig:
     distance_m: float = 0.30
     speed_mps: float = 0.10           # absolute value; commanded as -v
     safety: SafetyConfig = None       # type: ignore[assignment]
+    # When supplied, BackUp does its rear obstacle check against the
+    # body-frame local_map (drift-immune) instead of the world-frame
+    # costmap. This matters during pose-loss recovery: a back-up
+    # executed with a wrong pose would otherwise check the costmap at
+    # the wrong place and could reverse into a real obstacle. Falls
+    # back to the world-frame costmap check when the provider returns
+    # None (local_map missing/stale).
+    local_map_provider: Optional[LocalMapProvider] = None
 
 
 class BackUp:
     """Drive straight back until either `distance_m` is covered or the
-    rear safety arc reports a lethal cell.
+    rear safety check reports an obstacle.
 
     Position-integrated from pose deltas; the commanded speed is the
-    target step. The rear-arc check uses the same `SafetyConfig` shape
-    as the forward arc, so the wedge geometry stays consistent.
+    target step. The rear check prefers the body-frame local_map (via
+    `local_map_provider`) so it stays correct even when the pose has
+    drifted; it falls back to the world-frame costmap rear arc only when
+    no fresh local_map is available.
     """
 
     def __init__(self, config: Optional[BackUpConfig] = None):
@@ -212,6 +228,7 @@ class BackUp:
                 distance_m=cfg.distance_m,
                 speed_mps=cfg.speed_mps,
                 safety=SafetyConfig(),
+                local_map_provider=cfg.local_map_provider,
             )
         self.config = cfg
         self._start_xy: Optional[Tuple[float, float]] = None
@@ -231,13 +248,13 @@ class BackUp:
         if pose is None:
             return PrimitiveOutput.running(note="awaiting pose")
 
-        # Rear-arc safety: if there's a lethal cell behind us, refuse
-        # to keep going. ABORTED rather than DONE — the recovery flow
-        # treats this as failure-of-this-attempt and may pick a
-        # different action next time.
-        if costmap is not None and rear_arc_blocked(
-            costmap, pose, self.config.safety,
-        ):
+        # Rear safety: if there's an obstacle behind us, refuse to keep
+        # going. ABORTED rather than DONE — the recovery flow treats
+        # this as failure-of-this-attempt and may pick a different
+        # action next time. Prefer the drift-immune body-frame
+        # local_map; only fall back to the world-frame costmap when no
+        # fresh local_map is available.
+        if self._rear_blocked(pose, costmap):
             return PrimitiveOutput.aborted(
                 note="rear arc blocked"
             )
@@ -260,6 +277,26 @@ class BackUp:
             note=f"backing {self._traveled_m:.2f}/"
                  f"{self.config.distance_m:.2f} m",
         )
+
+    def _rear_blocked(
+        self, pose: Pose, costmap: Optional[Costmap],
+    ) -> bool:
+        """True when the rear is obstructed. Prefers the body-frame
+        local_map swept check (drift-immune); falls back to the
+        world-frame costmap rear arc when no fresh local_map exists.
+        """
+        if self.config.local_map_provider is not None:
+            lm = self.config.local_map_provider()
+            if lm is not None:
+                driveable, meta = lm
+                return swept_path_blocked_local(
+                    driveable, meta,
+                    v_mps=-self.config.speed_mps, omega_radps=0.0,
+                    config=self.config.safety,
+                )
+        if costmap is not None:
+            return rear_arc_blocked(costmap, pose, self.config.safety)
+        return False
 
     def cancel(self) -> None:
         self._canceled = True

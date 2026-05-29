@@ -49,11 +49,11 @@ from .recovery import (
     RecoveryPrimitive,
     classify_replan_failure,
 )
+from .pose_health import PoseHealthMonitor
 from .safety import (
     OmegaRateLimiter,
     SafetyConfig,
-    forward_arc_blocked_local,
-    rear_arc_blocked_local,
+    swept_path_blocked_local,
 )
 from .tracing import (
     CAT_FOLLOW, CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
@@ -79,6 +79,12 @@ _STUCK_RELOCATE_COOLDOWN_S = 15.0
 _STUCK_RELOCATE_MAX_PER_MISSION = 2
 _STUCK_PROGRESS_M = 0.08
 _STUCK_GRACE_AFTER_RECOVERY_S = 2.0
+
+# Pose-health halt: when scan-match quality stays collapsed (localization
+# has diverged), stop and force a relocate before the robot drives on a
+# wrong pose. Bounded per mission like the stuck escalation.
+_POSE_LOST_COOLDOWN_S = 15.0
+_POSE_LOST_MAX_PER_MISSION = 2
 
 # Patrol waypoint adaptation: when a saved waypoint sits in a lethal
 # cell or deep in inflation halo, snap to the nearest accessible cell
@@ -293,12 +299,18 @@ class NavMainWindow(QMainWindow):
         # (WaitAndResume for every reason); Phase 2c upgrades.
         self._recovery_policy = RecoveryPolicy(
             RecoveryPolicyConfig(back_up_distance_m=0.12),
+            local_map_provider=self._fresh_local_map,
         )
         self._active_recovery: Optional[RecoveryPrimitive] = None
-        # Stage 5b: forward-arc lethal-cell check overrides cmd_vel
-        # to zero when an obstacle appears between replans. Mission
-        # stays FOLLOWING so we resume when the arc clears.
-        self._safety_config = SafetyConfig(arc_distance_m=0.35)
+        # Stage 5b: swept-footprint check overrides cmd_vel to zero when
+        # the footprint, traced along the commanded arc, would sweep an
+        # obstacle. Mission stays FOLLOWING so we resume when it clears.
+        # footprint_radius_m is shared with the costmap so the live veto
+        # and the planner agree on how wide the robot is.
+        self._safety_config = SafetyConfig(
+            arc_distance_m=0.35,
+            footprint_radius_m=self.fuser_config.footprint_radius_m,
+        )
         self._local_fwd_blocked: bool = False
         self._safety_blocked: bool = False
         # Rate-limit ω before sending to chassis. 15 dps cap + 500 ms
@@ -334,6 +346,11 @@ class NavMainWindow(QMainWindow):
         self._stuck_relocate_cooldown_until: float = 0.0
         self._stuck_relocate_mission_count: int = 0
         self._stuck_relocate_grace_until: float = 0.0
+        # Pose-health divergence detector (Option 1). Fed each redraw
+        # from the scan matcher; drives the pre-collision relocate.
+        self._pose_health = PoseHealthMonitor()
+        self._pose_lost_cooldown_until: float = 0.0
+        self._pose_lost_mission_count: int = 0
         self._mission_was_active: bool = False
         # Patrol execution state. Populated by `_on_go` when a patrol
         # with waypoints is loaded; None for single-goal missions.
@@ -649,6 +666,17 @@ class NavMainWindow(QMainWindow):
         self._last_follower = out
         self._shared_view.set_lookahead(out.lookahead_world)
 
+        # Feed the pose-health monitor every tick (independent of mission
+        # state) so the rolling window is warm the moment a mission
+        # starts. `scan_obs_run` dedupes repeat reads of the same match.
+        try:
+            ms = self.fuser.pose_source.match_summary()
+            self._pose_health.ingest(
+                ms, time.time(), seq=int(ms.get("scan_obs_run", 0)),
+            )
+        except Exception:
+            logger.exception("pose-health ingest failed; skipping")
+
         # cmd_vel decision: hard gates → pose freshness → state dispatch.
         # Single helper so the per-state logic is readable.
         if self._mission.is_active():
@@ -951,6 +979,17 @@ class NavMainWindow(QMainWindow):
         ):
             self._mission.resume()
 
+        # Pose-health gate: a fresh-but-wrong pose passes the freshness
+        # check above, so before driving on it, halt if scan-match
+        # quality says localization has diverged. Only while actively
+        # driving (not while already paused/recovering — those own their
+        # own cmd_vel and a relocate is already in flight).
+        if (
+            self._mission.is_following()
+            or self._mission.is_rotating_to_next()
+        ) and self._handle_pose_loss():
+            return
+
         # Dispatch on state.
         if self._mission.is_following():
             self._tick_following(out, pose)
@@ -983,7 +1022,7 @@ class NavMainWindow(QMainWindow):
             self._mission.pause(reason)
             self._update_safety_block_trace(False)
             return
-        # FOLLOWING / ROTATING — forward / rear arc safety check.
+        # FOLLOWING / ROTATING — swept-footprint safety check.
         # Reads the body-frame local_map.driveable directly (the freshest
         # fused lidar+depth observation from the Pi), not the world-frame
         # costmap. Drift-immune: a pose error doesn't shift our view of
@@ -992,6 +1031,8 @@ class NavMainWindow(QMainWindow):
         # Staleness rule: if local_map is missing or older than 2× its
         # median publish period (fallback 1.0 s), treat as BLOCKED. We
         # would rather refuse to drive than drive blind on stale data.
+        # (An all-unknown but *fresh* local_map is caught separately by
+        # the swept check's min_observed_cells guard.)
         with self.chassis.state.lock:
             lm_drive = self.chassis.state.local_map_driveable
             lm_meta = self.chassis.state.local_map_meta
@@ -999,32 +1040,29 @@ class NavMainWindow(QMainWindow):
         lm_period = self.chassis.state.local_map_period_s() or 0.5
         lm_stale_threshold_s = max(1.0, 2.0 * lm_period)
         lm_age_s = time.time() - lm_ts if lm_ts > 0 else float("inf")
-        if lm_drive is None or lm_meta is None or lm_age_s > lm_stale_threshold_s:
-            fwd_blocked = True
-            rear_blocked = True
-            self._local_fwd_blocked = True
-        else:
-            fwd_blocked = forward_arc_blocked_local(
-                lm_drive, lm_meta, self._safety_config,
-            )
-            rear_blocked = rear_arc_blocked_local(
-                lm_drive, lm_meta, self._safety_config,
-            )
-        self._local_fwd_blocked = fwd_blocked
-        # Clip the *commanded translation* by the direction-appropriate
-        # arc, but always pass ω through. Rotation in place doesn't
-        # advance the body, so an obstacle in the forward arc must not
-        # prevent the bot from rotating to face a clear direction —
-        # rotation is precisely how it escapes. Zeroing ω here was a
-        # deadlock: facing a bookshelf, forward arc fires every tick,
-        # bot stuck unable to turn away. Direction-appropriate clip
-        # keeps the safety semantics (don't translate into obstacles)
-        # without making rotation impossible.
         v_cmd = out.v_mps
         omega_cmd = out.omega_radps
-        if v_cmd > 0.0 and fwd_blocked:
-            v_cmd = 0.0
-        elif v_cmd < 0.0 and rear_blocked:
+        stale = lm_drive is None or lm_meta is None or lm_age_s > lm_stale_threshold_s
+        # Clip the *commanded translation* when the footprint, traced
+        # along the commanded (v, ω) arc, would sweep an obstacle —
+        # but always pass ω through. Rotation in place sweeps no new
+        # ground for a circular footprint, so an obstacle ahead must
+        # not prevent the bot from rotating to face a clear direction;
+        # rotation is precisely how it escapes. Zeroing ω here was a
+        # deadlock: facing a bookshelf, the check fires every tick and
+        # the bot is stuck unable to turn away.
+        if abs(v_cmd) < 1e-3:
+            motion_blocked = False  # pure rotation / stationary
+        elif stale:
+            motion_blocked = True   # refuse to drive blind on stale data
+        else:
+            motion_blocked = swept_path_blocked_local(
+                lm_drive, lm_meta,
+                v_mps=v_cmd, omega_radps=omega_cmd,
+                config=self._safety_config,
+            )
+        self._local_fwd_blocked = motion_blocked
+        if motion_blocked:
             v_cmd = 0.0
         # `_safety_blocked` drives the GO BLOCKED status label and the
         # safety.* trace event. Edge on "the commanded forward motion
@@ -1142,6 +1180,83 @@ class NavMainWindow(QMainWindow):
         logger.warning("stuck escalate: relocate failed: %s", result)
         self._mission.pause("stuck:relocate_failed")
 
+    def _handle_pose_loss(self) -> bool:
+        """If localization has diverged (sustained low scan-match
+        quality), stop and force a relocate before the robot drives on a
+        wrong pose. Returns True when it handled the tick (caller should
+        stop further dispatch this tick).
+
+        Bounded per mission: after `_POSE_LOST_MAX_PER_MISSION` failed
+        attempts it pauses for operator intervention rather than looping.
+        """
+        now = time.time()
+        if now < self._pose_lost_cooldown_until:
+            return False
+        if not self._pose_health.is_lost(now):
+            return False
+
+        # Diverged. Stop immediately; don't drive another tick on a pose
+        # we no longer trust.
+        self.chassis.set_cmd_vel(0.0, 0.0)
+        self._safety_blocked = False
+        self._update_safety_block_trace(False)
+        median_q = self._pose_health.median_quality(now)
+
+        if self._pose_lost_mission_count >= _POSE_LOST_MAX_PER_MISSION:
+            logger.warning(
+                "pose-health: divergence unresolved after %d relocates; "
+                "pausing (median_quality=%.3f)",
+                _POSE_LOST_MAX_PER_MISSION,
+                median_q if median_q is not None else float("nan"),
+            )
+            self._mission.pause("pose_lost:unresolved")
+            return True
+
+        self._pose_lost_mission_count += 1
+        self._pose_lost_cooldown_until = now + _POSE_LOST_COOLDOWN_S
+        result = self._run_relocate(reason="pose_health")
+        self._tracer.emit(
+            CAT_FOLLOW, "pose_health_relocate",
+            {
+                "success": bool(result.get("success")),
+                "median_quality": median_q,
+                "attempt": self._pose_lost_mission_count,
+            },
+            level=LEVEL_WARN,
+        )
+        if result.get("success"):
+            logger.info(
+                "pose-health: relocate ok dx=%+.2f dy=%+.2f (median_q=%.3f)",
+                float(result.get("dx", 0.0)),
+                float(result.get("dy", 0.0)),
+                median_q if median_q is not None else float("nan"),
+            )
+            self._omega_limiter.reset()
+            return True
+
+        logger.warning("pose-health: relocate failed: %s", result)
+        self._mission.pause("pose_lost:relocate_failed")
+        return True
+
+    def _fresh_local_map(self):
+        """Return (driveable, meta) of the freshest trusted body-frame
+        local_map, or None when it's missing or stale. Used by BackUp's
+        drift-immune rear check. Same staleness gate as the per-tick
+        forward veto.
+        """
+        with self.chassis.state.lock:
+            drive = self.chassis.state.local_map_driveable
+            meta = self.chassis.state.local_map_meta
+            ts = self.chassis.state.local_map_ts
+        if drive is None or meta is None:
+            return None
+        period = self.chassis.state.local_map_period_s() or 0.5
+        stale_threshold_s = max(1.0, 2.0 * period)
+        age_s = time.time() - ts if ts > 0 else float("inf")
+        if age_s > stale_threshold_s:
+            return None
+        return drive, meta
+
     def _run_relocate(self, *, reason: str) -> dict:
         """MCL relocate without canceling an active mission."""
         self.chassis.set_cmd_vel(0.0, 0.0)
@@ -1149,6 +1264,9 @@ class NavMainWindow(QMainWindow):
         if result.get("success"):
             result["shift_count"] = self._apply_relocate_to_patrol(result)
             self._snapped_wp_xys.clear()
+            # Fresh fix — drop stale low-quality samples so the health
+            # monitor judges the new pose from scratch.
+            self._pose_health.reset()
         else:
             result["shift_count"] = 0
         return result
@@ -1834,6 +1952,9 @@ class NavMainWindow(QMainWindow):
         self._stuck_relocate_mission_count = 0
         self._stuck_relocate_cooldown_until = 0.0
         self._stuck_relocate_grace_until = 0.0
+        self._pose_health.reset()
+        self._pose_lost_mission_count = 0
+        self._pose_lost_cooldown_until = 0.0
         self._mission_was_active = True
         self._patrol_dock.set_mission_active(True)
         self._mission.start()

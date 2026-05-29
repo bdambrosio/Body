@@ -33,7 +33,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional, Protocol, Tuple
+from typing import Any, Callable, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -229,8 +229,17 @@ class RecoveryPolicy:
     PrimitiveOutput from here).
     """
 
-    def __init__(self, config: Optional[RecoveryPolicyConfig] = None):
+    def __init__(
+        self,
+        config: Optional[RecoveryPolicyConfig] = None,
+        *,
+        local_map_provider: Optional[Callable[[], Optional[Tuple[Any, dict]]]] = None,
+    ):
         self.config = config or RecoveryPolicyConfig()
+        # Forwarded to BackUp so its rear check can use the drift-immune
+        # body-frame local_map instead of the world-frame costmap. See
+        # BackUpConfig.local_map_provider.
+        self._local_map_provider = local_map_provider
 
     def select(
         self,
@@ -250,6 +259,7 @@ class RecoveryPolicy:
         back = BackUp(BackUpConfig(
             distance_m=self.config.back_up_distance_m,
             safety=SafetyConfig(),
+            local_map_provider=self._local_map_provider,
         ))
 
         if reason == REASON_GOAL_IN_UNKNOWN:

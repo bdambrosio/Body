@@ -44,12 +44,52 @@ class SafetyConfig:
     # Tune up if you want a longer preview horizon (the user asked
     # for ≥ 2 m in nav-safety discussion; trade-off is wider wedges
     # cause more spurious stops in tight corridors).
+    #
+    # NOTE: `arc_distance_m` / `arc_half_angle_rad` are the *fixed
+    # wedge* parameters used by the legacy `*_arc_blocked[_local]`
+    # functions (still consumed by world-frame planning/recovery
+    # checks). The per-tick motion veto in main_window now uses
+    # `swept_path_blocked_local`, which traces the actual footprint
+    # along the commanded (v, ω) arc — see the swept-* fields below.
     arc_distance_m: float = 0.50
 
     # Half-angle of the wedge. Wider = more conservative (catches
     # things off the heading axis) but more likely to spurious-stop
     # in tight corridors where walls run alongside the path.
     arc_half_angle_rad: float = math.radians(20.0)
+
+    # ── Swept-footprint check (body-frame per-tick veto) ────────────
+    # Radius of the robot's circular footprint. The swept check inflates
+    # every obstacle by this radius (equivalently: traces a disc of this
+    # radius along the path), so an obstacle at the robot's shoulder —
+    # outside the old ±20° wedge — now correctly blocks. Set from the
+    # localizer's footprint_radius_m at construction.
+    footprint_radius_m: float = 0.22
+
+    # Arc length the footprint center is traced along the predicted
+    # (v, ω) motion. Total reach ahead ≈ this + footprint_radius_m.
+    # Scales with speed (preview_time_s) between the min floor and this
+    # cap so slow creeping still previews a sane distance.
+    preview_distance_m: float = 0.35
+    preview_min_distance_m: float = 0.15
+    preview_time_s: float = 1.5
+
+    # Treat observed-`unknown` (-1) cells as blocking, but only within
+    # `unknown_block_range_m` of the body. Far-ahead unknown stays
+    # passable (the robot must be able to drive into never-observed
+    # space toward a goal); only an unknown cell right in front — the
+    # signature of an obstacle the sensors saw but couldn't classify —
+    # stops translation. Set block_on_unknown=False to restore the
+    # old "unknown is always passable" behavior.
+    block_on_unknown: bool = True
+    unknown_block_range_m: float = 0.25
+
+    # Empty-local_map guard. If the swept region contains fewer than
+    # this many *observed* (clear-or-blocked, != -1) cells, refuse to
+    # drive — an all-unknown local_map (e.g. the launcher startup race)
+    # is untrustworthy, and the staleness gate alone won't catch it
+    # because the data is "fresh", just empty.
+    min_observed_cells: int = 3
 
 
 def forward_arc_blocked(
@@ -204,6 +244,128 @@ def _arc_blocked_local(
 
     in_arc = (dist <= r_max) & (np.abs(angle_off) <= cfg.arc_half_angle_rad)
     return bool(np.any(blocked & in_arc))
+
+
+# ── Swept-footprint variant (body-frame, footprint- and curve-aware) ─
+
+
+def _arc_samples(
+    v_mps: float, omega_radps: float, reach_m: float, n: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Body-frame centers of the footprint traced along the constant-
+    (v, ω) arc, from the origin out to arc length `reach_m`. Returns
+    (cx, cy) arrays of length n+1. Unicycle integration; handles the
+    straight-line (ω≈0) and reverse (v<0) cases by sign.
+    """
+    speed = abs(v_mps)
+    ks = np.arange(n + 1, dtype=np.float64)
+    if speed < 1e-6:
+        return np.zeros(n + 1), np.zeros(n + 1)
+    t_total = reach_m / speed
+    t = t_total * ks / n
+    if abs(omega_radps) < 1e-6:
+        return v_mps * t, np.zeros(n + 1)
+    radius = v_mps / omega_radps
+    phi = omega_radps * t
+    cx = radius * np.sin(phi)
+    cy = radius * (1.0 - np.cos(phi))
+    return cx, cy
+
+
+def swept_path_blocked_local(
+    driveable: np.ndarray,
+    meta: Dict[str, Any],
+    *,
+    v_mps: float,
+    omega_radps: float,
+    config: Optional[SafetyConfig] = None,
+) -> bool:
+    """Body-frame swept-footprint obstacle check along the predicted arc.
+
+    The robot is a disc of radius `footprint_radius_m` at the body origin
+    (+x forward, +y left). We trace its center along the constant-(v, ω)
+    arc out to a short preview distance and flag a block when any cell in
+    the union of footprint discs is:
+
+      * observed-blocked (`== 0`), or
+      * observed-unknown (`== -1`) within `unknown_block_range_m` of the
+        body, when `block_on_unknown` is set, or
+      * the swept region holds fewer than `min_observed_cells` observed
+        (`!= -1`) cells — an empty / not-yet-populated local_map we refuse
+        to trust (fail-safe; the staleness gate misses this).
+
+    Pure rotation (v≈0) sweeps no new ground for a circular footprint, so
+    it returns False — rotation in place stays allowed (it's how the robot
+    turns away from a facing obstacle). Reads the body-frame local_map, so
+    it needs no pose transform and is immune to localization drift.
+
+    Fail-safe: malformed meta or a path that falls outside the local_map
+    coverage returns True (blocked) rather than driving blind.
+    """
+    cfg = config or SafetyConfig()
+    speed = abs(v_mps)
+    if speed < 1e-3:
+        return False  # not translating — rotation is always permitted
+
+    res = float(meta.get("resolution_m", 0.0))
+    if res <= 0:
+        return True  # malformed meta while moving — refuse to drive blind
+    ox = float(meta.get("origin_x_m", 0.0))
+    oy = float(meta.get("origin_y_m", 0.0))
+    nx, ny = driveable.shape
+
+    reach_m = min(
+        cfg.preview_distance_m,
+        max(cfg.preview_min_distance_m, speed * cfg.preview_time_s),
+    )
+    # Sample roughly one center per cell along the arc (≥3, capped).
+    n = int(max(3, min(25, math.ceil(reach_m / max(res, 1e-3)))))
+    cx, cy = _arc_samples(v_mps, omega_radps, reach_m, n)
+
+    # Inflate the footprint by half a cell so a disc edge that clips a
+    # cell without covering its center still counts (conservative).
+    r_foot = cfg.footprint_radius_m + 0.5 * res
+    pad = r_foot + res
+
+    i_lo = max(0, int(math.floor((float(cx.min()) - pad - ox) / res)))
+    i_hi = min(nx, int(math.ceil((float(cx.max()) + pad - ox) / res)) + 1)
+    j_lo = max(0, int(math.floor((float(cy.min()) - pad - oy) / res)))
+    j_hi = min(ny, int(math.ceil((float(cy.max()) + pad - oy) / res)) + 1)
+    if i_hi <= i_lo or j_hi <= j_lo:
+        return True  # arc falls outside local_map coverage — fail safe
+
+    sub = driveable[i_lo:i_hi, j_lo:j_hi]
+    ii = np.arange(i_lo, i_hi).reshape(-1, 1).astype(np.float64)
+    jj = np.arange(j_lo, j_hi).reshape(1, -1).astype(np.float64)
+    cell_x = ox + (ii + 0.5) * res    # (H, 1)
+    cell_y = oy + (jj + 0.5) * res    # (1, W)
+
+    # Union of footprint discs along the arc: a cell is "swept" if it
+    # lies within r_foot of any sampled center.
+    r2 = r_foot * r_foot
+    in_swept = np.zeros(sub.shape, dtype=bool)
+    for sx, sy in zip(cx, cy):
+        d2 = (cell_x - sx) ** 2 + (cell_y - sy) ** 2
+        in_swept |= d2 <= r2
+    if not np.any(in_swept):
+        return True  # nothing of the path is on the grid — fail safe
+
+    if np.any((sub == 0) & in_swept):
+        return True
+
+    if cfg.block_on_unknown:
+        dist_origin = np.hypot(cell_x, cell_y)
+        unknown_close = (
+            (sub == -1) & in_swept & (dist_origin <= cfg.unknown_block_range_m)
+        )
+        if np.any(unknown_close):
+            return True
+
+    observed_in_swept = int(np.count_nonzero((sub != -1) & in_swept))
+    if observed_in_swept < cfg.min_observed_cells:
+        return True  # local_map too empty here to trust "clear"
+
+    return False
 
 
 # ── Rotation rate limiter ──────────────────────────────────────────
