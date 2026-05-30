@@ -21,6 +21,7 @@ import time
 from typing import Any, Dict, Optional
 
 from body.lib import schemas, zenoh_helpers
+from body.lib.buildinfo import git_sha
 from body.lib.drive_safety import FootprintConfig, swept_path_blocked
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.local_costmap import LocalCostmapConfig
@@ -181,6 +182,8 @@ def main() -> None:
             schemas.cmd_vel(linear=v, angular=omega, timeout_ms=cmd_timeout_ms),
         )
 
+    build = git_sha()
+
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
                        dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
                        path_body=None) -> None:
@@ -190,6 +193,7 @@ def main() -> None:
                 cmd_id=cmd_id, state=state, goal_body_xy=goal_body,
                 dist_remaining_m=dist, v_mps=v, omega_radps=omega,
                 blocked_reason=reason, mode=mode, path_body_xy=path_body,
+                build=build,
             ),
         )
 

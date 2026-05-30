@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMainWindow, QPushButton, QVBoxLayout, QWidget,
 )
 
+from body.lib.buildinfo import git_sha
 from body.lib.local_drive_core import body_to_odom
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from desktop.world_map.map_views import SharedMapView, WorldDriveableView
@@ -64,7 +65,9 @@ class Tier2Window(QMainWindow):
             self._shared.set_goal_callback(self._on_world_target)
             self._shared.set_locate_callback(self._on_world_locate)
 
+        self._desktop_build = git_sha()
         self._conn_lbl = QLabel("conn: —")
+        self._build_lbl = QLabel(f"build: desk={self._desktop_build or '?'}")
         self._pose_lbl = QLabel("pose: —")
         self._t2_lbl = QLabel("tier2: —")
         self._t2_lbl.setWordWrap(True)
@@ -99,6 +102,7 @@ class Tier2Window(QMainWindow):
         panel = QGroupBox("tier-2 debug")
         pl = QVBoxLayout(panel)
         pl.addWidget(self._conn_lbl)
+        pl.addWidget(self._build_lbl)
         if self.localizer is not None:
             pl.addWidget(self._pose_lbl)
         pl.addWidget(self._t2_lbl)
@@ -315,6 +319,19 @@ class Tier2Window(QMainWindow):
                 f"v={float(status.get('v_mps',0)):+.2f} ω={float(status.get('omega_radps',0)):+.2f}"
                 + (f" [{status['blocked_reason']}]" if status.get("blocked_reason") else ""))
         self._estop_lbl.setText("estop: " + ("E-STOP" if e_stop else "clear"))
+
+        # Build stamp: flag when the Pi's running build ≠ this desktop's (i.e.
+        # a deploy that wasn't restarted — the cause of "old Tier-3 still runs").
+        pi_build = status.get("build") if isinstance(status, dict) else None
+        if pi_build is None:
+            self._build_lbl.setText(f"build: desk={self._desktop_build or '?'}  pi=? (no build in status)")
+            self._build_lbl.setStyleSheet("color: #e8a;")
+        elif pi_build != self._desktop_build:
+            self._build_lbl.setText(f"build: desk={self._desktop_build or '?'}  pi={pi_build}  ⚠ STALE PI")
+            self._build_lbl.setStyleSheet("color: #e8a;")
+        else:
+            self._build_lbl.setText(f"build: {pi_build} ✓")
+            self._build_lbl.setStyleSheet("color: #8f8;")
 
         for ev in tick.events:
             self._push_event(ev.level, ev.code, ev.detail)
