@@ -61,15 +61,23 @@ def furthest_free_point(
     meta: Dict[str, Any],
     bearing_rad: float,
     cfg: Optional[Tier2Config] = None,
+    max_dist_m: Optional[float] = None,
 ) -> Tier2Result:
-    """Furthest live-visible free point along ``bearing_rad`` in a body-frame grid.
+    """Live-visible free point along ``bearing_rad``, capped at the waypoint.
 
     March from the robot (body origin) outward along the bearing over the
-    int8 scan grid (-1 unknown / 0 blocked / 1 clear). The free run ends at
-    the first blocked cell, the first unknown cell (when ``require_clear``),
-    the grid edge, or the horizon. The sub-goal is the free distance backed
-    off by ``backoff_m`` so Tier-3's swept-footprint check has room. Returns
-    ``ok=False`` when the backed-off distance is below ``min_subgoal_m``.
+    int8 scan grid (-1 unknown / 0 blocked / 1 clear). The march stops at the
+    first blocked/unknown cell, the grid edge, the horizon, or ``max_dist_m``
+    (the distance to the waypoint) — whichever comes first. We never aim
+    *past* the waypoint.
+
+      * Path clear all the way to ``max_dist_m`` → the sub-goal IS the
+        waypoint (no backoff: it's a goal, not an obstacle).
+      * Stopped early by an obstacle/unknown/horizon → the sub-goal is the
+        clear distance backed off by ``backoff_m`` so Tier-3's swept-footprint
+        check has room.
+
+    ``ok=False`` when the resulting distance is below ``min_subgoal_m``.
     """
     cfg = cfg or Tier2Config()
     res = float(meta["resolution_m"])
@@ -81,18 +89,20 @@ def furthest_free_point(
     c = math.cos(bearing_rad)
     s = math.sin(bearing_rad)
 
-    clear_run = 0.0          # furthest distance confirmed clear from the origin
-    stop_value = 1           # cell value that ended the run (1 = reached horizon clear)
+    # Hard cap: the waypoint distance (if given), never beyond the horizon.
+    limit = cfg.horizon_m if max_dist_m is None else min(cfg.horizon_m, max_dist_m)
 
-    n_steps = int(math.floor(cfg.horizon_m / cfg.step_m))
+    clear_run = 0.0          # furthest distance confirmed clear from the origin
+    stop_value = 1           # cell value that ended the run (1 = reached the limit)
+    reached_limit = False    # ran out to `limit` with everything clear
+
+    n_steps = int(math.floor(limit / cfg.step_m))
     for k in range(1, n_steps + 1):
         d = k * cfg.step_m
-        bx = d * c
-        by = d * s
-        i = int(math.floor((bx - ox) / res))
-        j = int(math.floor((by - oy) / res))
+        i = int(math.floor((d * c - ox) / res))
+        j = int(math.floor((d * s - oy) / res))
         if i < 0 or i >= nx or j < 0 or j >= ny:
-            stop_value = 1   # off-grid → treat as open horizon
+            stop_value = 1   # off-grid → treat as open
             break
         v = int(grid[i, j])
         if v == 0 or (cfg.require_clear and v == -1):
@@ -100,9 +110,16 @@ def furthest_free_point(
             break
         clear_run = d        # clear (or unknown when not require_clear) → advance
     else:
-        clear_run = min(cfg.horizon_m, n_steps * cfg.step_m)
+        clear_run = limit
+        reached_limit = True
 
-    free_dist = clear_run - cfg.backoff_m
+    # Reached the waypoint with a clear path → aim AT it (no backoff). Any
+    # other stop (obstacle/unknown/horizon) → back off to leave Tier-3 room.
+    reached_waypoint = (
+        reached_limit and max_dist_m is not None and max_dist_m <= cfg.horizon_m
+    )
+    free_dist = clear_run if reached_waypoint else clear_run - cfg.backoff_m
+
     if free_dist >= cfg.min_subgoal_m:
         return Tier2Result(
             ok=True,

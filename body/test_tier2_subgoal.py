@@ -99,6 +99,23 @@ class TestFurthestFreePoint(unittest.TestCase):
         self.assertGreater(side.free_dist_m, straight.free_dist_m)
         self.assertTrue(side.ok)
 
+    def test_caps_at_waypoint_no_backoff(self):
+        # Clear path; waypoint at 1.0 m → sub-goal is the waypoint itself,
+        # NOT horizon-backoff and NOT past the waypoint.
+        r = furthest_free_point(_clear_grid(), META, 0.0, self.cfg, max_dist_m=1.0)
+        self.assertTrue(r.ok)
+        self.assertAlmostEqual(r.free_dist_m, 1.0, delta=RES)
+        self.assertAlmostEqual(r.body_xy[0], 1.0, delta=RES)
+
+    def test_obstacle_before_waypoint_backs_off(self):
+        # Waypoint at 1.5 m but a block at 0.8 m → stop short of the block.
+        grid = _clear_grid()
+        _block(grid, 0.8, 0.0)
+        r = furthest_free_point(grid, META, 0.0, self.cfg, max_dist_m=1.5)
+        self.assertTrue(r.ok)
+        self.assertLess(r.free_dist_m, 0.8)            # backed off the obstacle
+        self.assertAlmostEqual(r.body_xy[0], 0.8 - self.cfg.backoff_m, delta=2 * RES)
+
     def test_all_unknown_grid(self):
         r = furthest_free_point(_unknown_grid(), META, 0.0, self.cfg)
         self.assertFalse(r.ok)

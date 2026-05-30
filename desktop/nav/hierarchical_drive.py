@@ -208,8 +208,11 @@ class HierarchicalDrive:
             self._enter_blocked("no_scan")
             return
         grid, meta = grid_meta
+        wp_dist = _dist(pose, self._waypoint)
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
-        r = furthest_free_point(grid, meta, bearing, self._cfg.tier2_cfg)
+        # Cap the sub-goal at the waypoint — never aim past it.
+        r = furthest_free_point(grid, meta, bearing, self._cfg.tier2_cfg,
+                                max_dist_m=wp_dist)
         if not r.ok:
             logger.info("hier: tier2 no point (%s) bearing=%.2f wp_dist=%.2f",
                         r.reason, bearing, _dist(pose, self._waypoint))
