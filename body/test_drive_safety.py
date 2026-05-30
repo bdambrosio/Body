@@ -27,12 +27,22 @@ class TestForwardCone(unittest.TestCase):
         # Real robot ~7.5 cm half-width; modelled at 0.11 m + ½ cell ≈ 0.15 m.
         self.foot = FootprintConfig(footprint_radius_m=0.11)  # cone default 60°
 
-    def test_abeam_obstacle_allows_forward(self):
-        # Obstacle directly to the right (~90° abeam, ~10 cm), forward lane open.
+    def test_abeam_obstacle_beyond_hard_allows_forward(self):
+        # Obstacle abeam but BEYOND the hard radius (~15 cm) and outside the
+        # forward cone → the robot may drive past it (e.g. squeeze a gap).
         grid = _clear()
-        for y in (-0.10, -0.12, -0.14):
+        for y in (-0.15, -0.17, -0.19):
             _block(grid, 0.0, y)
         self.assertFalse(swept_path_blocked(
+            grid, META, v_mps=0.12, omega_radps=0.0, config=self.foot))
+
+    def test_abeam_obstacle_within_hard_blocks(self):
+        # Doorjamb abeam (~90°) but within the hard body radius (~7 cm) → a real
+        # clip; the hard-radius check vetoes even though it's outside the cone.
+        grid = _clear()
+        for y in (-0.06, -0.07, -0.08):
+            _block(grid, 0.0, y)
+        self.assertTrue(swept_path_blocked(
             grid, META, v_mps=0.12, omega_radps=0.0, config=self.foot))
 
     def test_head_on_obstacle_blocks(self):

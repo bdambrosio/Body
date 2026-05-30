@@ -81,6 +81,7 @@ def main() -> None:
         preview_min_distance_m=float(cfg.get("preview_min_distance_m", 0.15)),
         preview_time_s=float(cfg.get("preview_time_s", 1.5)),
         forward_cone_rad=math.radians(float(cfg.get("forward_cone_deg", 60.0))),
+        hard_radius_m=float(cfg.get("hard_radius_m", 0.07)),
         block_on_unknown=bool(cfg.get("block_on_unknown", True)),
         unknown_block_range_m=float(cfg.get("unknown_block_range_m", 0.25)),
         min_observed_cells=int(cfg.get("min_observed_cells", 3)),

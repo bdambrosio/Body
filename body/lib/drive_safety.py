@@ -27,11 +27,18 @@ class FootprintConfig:
     block_on_unknown: bool = True
     unknown_block_range_m: float = 0.25
     min_observed_cells: int = 3
-    # Half-angle of the forward cone that counts as "in the way" at each
-    # sample. π/2 (90°) = the full forward half-plane (legacy). Narrower (~60°)
-    # stops an obstacle that's abeam — beside the robot, not ahead of where the
-    # motion carries it — from vetoing forward/turning arcs that would clear it.
+    # Half-angle of the forward cone for the (larger) *preview* footprint: an
+    # obstacle must be within this cone of the velocity to veto via the preview
+    # radius. Narrow (~60°) lets the robot drive *past* an abeam obstacle that
+    # is beyond the body — e.g. squeeze through a gap.
     forward_cone_rad: float = math.radians(60.0)
+    # Hard body radius, checked over the *full forward half-plane* (not the
+    # narrow cone): an obstacle this close to the swept body is a real
+    # collision at any side angle, so it always vetoes. Sized to the true
+    # half-width plus a stopping margin — must stay BELOW the gaps you want to
+    # pass (clearance ≈ hard_radius_m − true_half_width). This is what stops the
+    # robot clipping a doorjamb that's abeam of the forward cone.
+    hard_radius_m: float = 0.07
 
 
 def _arc_samples(
@@ -111,19 +118,26 @@ def swept_path_blocked(
     # actually carries the body toward block. ``cone = π/2`` recovers the old
     # forward-half-plane behaviour.
     r2 = r_foot * r_foot
+    hard_r = cfg.hard_radius_m + 0.5 * res
+    hard_r2 = hard_r * hard_r
     cos2 = math.cos(cfg.forward_cone_rad) ** 2
     in_swept = np.zeros(sub.shape, dtype=bool)
     for sx, sy, th in zip(cx, cy, theta):
         dx = cell_x - sx                     # (H, 1)
         dy = cell_y - sy                     # (1, W)
         d2 = dx * dx + dy * dy               # (H, W)
-        near = d2 <= r2
         dirx = sgn * math.cos(th)
         diry = sgn * math.sin(th)
         dot = dx * dirx + dy * diry          # (H, W)
-        # angle(cell, dir) ≤ cone  ⇔  dot ≥ 0 and dot² ≥ cos²·|d|² (|d|=0 → in).
-        ahead = (dot >= 0.0) & (dot * dot >= cos2 * d2)
-        in_swept |= near & ahead
+        fwd = dot >= 0.0                     # in the forward half-plane of travel
+        # Preview footprint: within r_foot AND inside the narrow forward cone
+        # (angle ≤ cone ⇔ dot² ≥ cos²·|d|²). Lets the robot pass abeam obstacles
+        # that are beyond the body.
+        preview = fwd & (d2 <= r2) & (dot * dot >= cos2 * d2)
+        # Hard body: within the (smaller) hard radius anywhere in the forward
+        # half-plane — a real clip at any side angle (e.g. an abeam doorjamb).
+        hard = fwd & (d2 <= hard_r2)
+        in_swept |= preview | hard
     if not np.any(in_swept):
         return True
 
