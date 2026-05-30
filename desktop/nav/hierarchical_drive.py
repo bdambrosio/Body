@@ -228,9 +228,18 @@ class HierarchicalDrive:
         self._sent_bearing = bearing
         self._subgoal_body = r.body_xy
         self._block_reason = None
-        logger.info("hier: goto cmd=%d wp_dist=%.2f bearing=%.2f sub=(%.2f,%.2f) free=%.2f",
-                    cid, _dist(pose, self._waypoint), bearing,
-                    r.body_xy[0], r.body_xy[1], r.free_dist_m)
+        # Where the robot *thinks* the waypoint is relative to its own nose
+        # (+x fwd, +y left). Compare against where the obstacle/clear space
+        # actually is to tell a bad world->body bearing from a real obstacle.
+        dx, dy = wp.x_m - pose[0], wp.y_m - pose[1]
+        cw, sw = math.cos(-pose[2]), math.sin(-pose[2])
+        wp_bx, wp_by = dx * cw - dy * sw, dx * sw + dy * cw
+        logger.info(
+            "hier: goto cmd=%d pose=(%.2f,%.2f,%.0f°) wp=(%.2f,%.2f) "
+            "wp_body=(%.2f,%.2f) bearing=%.0f° free=%.2f sub=(%.2f,%.2f)",
+            cid, pose[0], pose[1], math.degrees(pose[2]), wp.x_m, wp.y_m,
+            wp_bx, wp_by, math.degrees(bearing), r.free_dist_m,
+            r.body_xy[0], r.body_xy[1])
         self._to(HierState.DRIVING_SUBGOAL)
 
     def _tick_driving(self) -> None:
