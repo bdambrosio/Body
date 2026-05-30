@@ -19,7 +19,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QSignalBlocker, pyqtSignal
 from PyQt6.QtWidgets import (
     QDockWidget, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QScrollArea, QVBoxLayout, QWidget,
+    QMainWindow, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from desktop.chassis.config import StubConfig
@@ -124,24 +124,29 @@ class CmdVelDock(QDockWidget):
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(6)
 
-        limits_row = QHBoxLayout()
-        limits_row.addWidget(QLabel("Max linear (m/s):"))
+        # Stack the two limit controls vertically so the dock can be narrow.
+        limits_col = QVBoxLayout()
+        lin_row = QHBoxLayout()
+        lin_row.addWidget(QLabel("Max linear (m/s):"))
         self.max_linear_box = QDoubleSpinBox()
         self.max_linear_box.setRange(0.05, 1.0)
         self.max_linear_box.setSingleStep(0.05)
         self.max_linear_box.setDecimals(2)
         self.max_linear_box.setValue(self.DEFAULT_MAX_LINEAR)
-        limits_row.addWidget(self.max_linear_box)
-        limits_row.addSpacing(12)
-        limits_row.addWidget(QLabel("Max angular (rad/s):"))
+        lin_row.addWidget(self.max_linear_box)
+        lin_row.addStretch(1)
+        limits_col.addLayout(lin_row)
+        ang_row = QHBoxLayout()
+        ang_row.addWidget(QLabel("Max angular (rad/s):"))
         self.max_angular_box = QDoubleSpinBox()
         self.max_angular_box.setRange(0.05, 3.0)
         self.max_angular_box.setSingleStep(0.1)
         self.max_angular_box.setDecimals(2)
         self.max_angular_box.setValue(self.DEFAULT_MAX_ANGULAR)
-        limits_row.addWidget(self.max_angular_box)
-        limits_row.addStretch(1)
-        v.addLayout(limits_row)
+        ang_row.addWidget(self.max_angular_box)
+        ang_row.addStretch(1)
+        limits_col.addLayout(ang_row)
+        v.addLayout(limits_col)
 
         self.pad = TwistPad(self.DEFAULT_MAX_LINEAR, self.DEFAULT_MAX_ANGULAR)
         pad_row = QHBoxLayout()
@@ -210,6 +215,9 @@ class TeleopPanels:
         window.addDockWidget(area, self.sweep_dock)
         window.tabifyDockWidget(self.cmd_vel_dock, self.motor_dock)
         window.tabifyDockWidget(self.cmd_vel_dock, self.sweep_dock)
+        # Vertical tab bar on the left edge so the three dock tabs stack
+        # instead of forcing the dock wide enough for three side-by-side tabs.
+        window.setTabPosition(area, QTabWidget.TabPosition.West)
         self.set_visible(False)
         self.cmd_vel_dock.raise_()
         self._installed = True

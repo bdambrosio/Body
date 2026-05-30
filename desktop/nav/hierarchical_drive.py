@@ -22,6 +22,7 @@ self-correcting because we re-pick each leg from fresh pose + scan.
 from __future__ import annotations
 
 import enum
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Tuple
@@ -29,6 +30,8 @@ from typing import Any, Dict, Optional, Protocol, Tuple
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.tier2_subgoal import Tier2Config, bearing_to_waypoint, furthest_free_point
 from desktop.nav.patrol import PatrolRunner
+
+logger = logging.getLogger(__name__)
 
 Pose = Tuple[float, float, float]   # world (x, y, theta)
 
@@ -117,12 +120,18 @@ class HierarchicalDrive:
 
     # ── Control ──────────────────────────────────────────────────────
 
+    def _to(self, state: HierState) -> None:
+        if state is not self._state:
+            logger.info("hier: %s -> %s", self._state.value, state.value)
+        self._state = state
+
     def start(self) -> None:
         self._blocked_repicks = 0
         self._block_reason = None
         self._cmd_id = None
         self._subgoal_body = None
-        self._state = (
+        logger.info("hier: start (%d waypoints)", self._runner.n)
+        self._to(
             HierState.ALIGNING if self._runner.current_target() is not None
             else HierState.FAILED
         )
@@ -130,7 +139,7 @@ class HierarchicalDrive:
     def stop(self) -> None:
         self._io.cancel()
         self._subgoal_body = None
-        self._state = HierState.IDLE
+        self._to(HierState.IDLE)
 
     # ── Introspection (for the UI overlay / status label) ────────────
 
@@ -166,33 +175,35 @@ class HierarchicalDrive:
     def _tick_aligning(self) -> None:
         # Re-alignment seam: today, just wait for a valid world pose.
         if self._pose.world_pose() is not None:
-            self._state = HierState.SELECT_SUBGOAL
+            self._to(HierState.SELECT_SUBGOAL)
 
     def _tick_select(self) -> None:
         pose = self._pose.world_pose()
         if pose is None:
-            self._state = HierState.ALIGNING
+            self._to(HierState.ALIGNING)
             return
         wp = self._runner.current_target()
         if wp is None:
-            self._state = HierState.FAILED
+            self._to(HierState.FAILED)
             return
         self._waypoint = (wp.x_m, wp.y_m)
         if _dist(pose, self._waypoint) <= self._cfg.waypoint_tol_m:
-            self._state = HierState.ADVANCE_WAYPOINT
+            self._to(HierState.ADVANCE_WAYPOINT)
             return
 
         grid_meta = self._raster()
         if grid_meta is None:
             self._block_reason = "no_scan"
-            self._state = HierState.BLOCKED
+            self._to(HierState.BLOCKED)
             return
         grid, meta = grid_meta
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
         r = furthest_free_point(grid, meta, bearing, self._cfg.tier2_cfg)
         if not r.ok:
             self._block_reason = r.reason
-            self._state = HierState.BLOCKED
+            logger.info("hier: tier2 no point (%s) bearing=%.2f wp_dist=%.2f",
+                        r.reason, bearing, _dist(pose, self._waypoint))
+            self._to(HierState.BLOCKED)
             return
 
         cid = self._io.send_goto_from_body(
@@ -202,14 +213,17 @@ class HierarchicalDrive:
         )
         if cid is None:
             self._block_reason = "send_failed"
-            self._state = HierState.BLOCKED
+            self._to(HierState.BLOCKED)
             return
         self._cmd_id = cid
         self._sent_bearing = bearing
         self._subgoal_body = r.body_xy
         self._blocked_repicks = 0
         self._block_reason = None
-        self._state = HierState.DRIVING_SUBGOAL
+        logger.info("hier: goto cmd=%d wp_dist=%.2f bearing=%.2f sub=(%.2f,%.2f) free=%.2f",
+                    cid, _dist(pose, self._waypoint), bearing,
+                    r.body_xy[0], r.body_xy[1], r.free_dist_m)
+        self._to(HierState.DRIVING_SUBGOAL)
 
     def _tick_driving(self) -> None:
         pose = self._pose.world_pose()
@@ -217,44 +231,49 @@ class HierarchicalDrive:
         if pose is not None and self._waypoint is not None:
             if _dist(pose, self._waypoint) <= self._cfg.waypoint_tol_m:
                 self._io.cancel()
-                self._state = HierState.ADVANCE_WAYPOINT
+                self._to(HierState.ADVANCE_WAYPOINT)
                 return
 
         st = self._io.latest_status()
         if st is not None and int(st.get("cmd_id", 0)) == self._cmd_id:
             state = st.get("state")
-            if state == "ARRIVED":
-                self._state = HierState.SELECT_SUBGOAL   # re-pick toward same wp
+            # ARRIVED is published for a single Tier-3 tick before it drops
+            # the goal and reverts to IDLE; at our slower poll we usually see
+            # the IDLE. Both mean "this sub-goal is done" → re-pick the next
+            # one toward the same waypoint.
+            if state in ("ARRIVED", "IDLE"):
+                self._to(HierState.SELECT_SUBGOAL)
                 return
             if state in ("BLOCKED", "FAULT"):
                 self._block_reason = st.get("blocked_reason") or state
-                self._state = HierState.BLOCKED
+                self._to(HierState.BLOCKED)
                 return
             if state == "CANCELED":
-                self._state = HierState.FAILED
+                self._to(HierState.FAILED)
                 return
 
         # Mid-leg drift: re-pick if the bearing to the waypoint has moved on.
         if pose is not None and self._waypoint is not None and self._sent_bearing is not None:
             b = bearing_to_waypoint(pose[0], pose[1], pose[2], self._waypoint[0], self._waypoint[1])
             if abs(b - self._sent_bearing) > self._cfg.repick_hysteresis_rad:
-                self._state = HierState.SELECT_SUBGOAL
+                self._to(HierState.SELECT_SUBGOAL)
 
     def _tick_advance(self) -> None:
         next_idx, _lap_done = self._runner.on_arrived()
+        logger.info("hier: waypoint reached -> next=%s", next_idx)
         if next_idx is None:
             self._io.cancel()
             self._subgoal_body = None
-            self._state = HierState.ARRIVED
+            self._to(HierState.ARRIVED)
         else:
-            self._state = HierState.SELECT_SUBGOAL
+            self._to(HierState.SELECT_SUBGOAL)
 
     def _tick_blocked(self) -> None:
         # rotate_repick: retry selection up to the cap (the scan may clear,
         # or Tier-3's own fan finds a way); then hold as a pause.
         if self._blocked_repicks < self._cfg.max_blocked_repicks:
             self._blocked_repicks += 1
-            self._state = HierState.SELECT_SUBGOAL
+            self._to(HierState.SELECT_SUBGOAL)
 
     # ── Helpers ──────────────────────────────────────────────────────
 

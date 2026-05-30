@@ -125,6 +125,17 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertGreaterEqual(io.cancels, 1)
         self.assertIsNone(hd.current_subgoal_body())
 
+    def test_subgoal_idle_repicks_same_waypoint(self):
+        # Tier-3 publishes ARRIVED for one tick then reverts to IDLE; at our
+        # slower poll we usually catch the IDLE. It must still re-pick.
+        hd, io, _ = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="IDLE")
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 2)
+        self.assertEqual(hd._runner.wp_index, 0)
+
     def test_tier3_blocked_sets_blocked(self):
         hd, io, _ = self._build(points=((5.0, 0.0),))
         self._drive_to_sending(hd)
