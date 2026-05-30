@@ -24,6 +24,7 @@ from desktop.chassis.controller import StubController
 
 from .drive_client import DriveClient
 from .main_window import PiDriveWindow
+from .tier2_window import Tier2Window
 
 
 def _parse_args(argv):
@@ -37,7 +38,13 @@ def _parse_args(argv):
     )
     p.add_argument(
         "--trace", default=None,
-        help="append drive/status JSONL to this path for offline leg review",
+        help="append JSONL to this path for offline review (drive/status, or "
+             "Tier-2 decisions with --tier2)",
+    )
+    p.add_argument(
+        "--tier2", action="store_true",
+        help="launch the Tier-2 debug console (manual target → sub-goal → "
+             "Tier-3) instead of the Tier-3 manual console",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p.parse_args(argv)
@@ -51,11 +58,16 @@ def main(argv=None) -> int:
     )
     router = resolve_router(args.router)
     controller = StubController(StubConfig(router=router))
-    drive = DriveClient(router, trace_path=args.trace)
+    # In --tier2 the window writes the richer Tier-2 decision trace; don't also
+    # let DriveClient write raw status to the same file.
+    drive = DriveClient(router, trace_path=None if args.tier2 else args.trace)
 
     app = QApplication.instance() or QApplication(sys.argv)
-    win = PiDriveWindow(controller, drive)
-    win.resize(900, 720)
+    if args.tier2:
+        win = Tier2Window(controller, drive, trace_path=args.trace)
+    else:
+        win = PiDriveWindow(controller, drive)
+    win.resize(980, 760)
     win.show()
     return app.exec()
 

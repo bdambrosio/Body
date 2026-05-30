@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Tuple
 
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
-from body.lib.tier2_subgoal import Tier2Config, bearing_to_waypoint, furthest_free_point
+from body.lib.tier2_subgoal import Tier2Config, bearing_to_waypoint, plan_tier2
 from desktop.nav.patrol import PatrolRunner
 
 logger = logging.getLogger(__name__)
@@ -210,12 +210,12 @@ class HierarchicalDrive:
         grid, meta = grid_meta
         wp_dist = _dist(pose, self._waypoint)
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
-        # Cap the sub-goal at the waypoint — never aim past it.
-        r = furthest_free_point(grid, meta, bearing, self._cfg.tier2_cfg,
-                                max_dist_m=wp_dist)
+        # Tier-2 step (shared with the debug console): furthest free point
+        # along the bearing, capped at the waypoint — never aim past it.
+        r = plan_tier2(grid, meta, bearing, wp_dist, self._cfg.tier2_cfg)
         if not r.ok:
             logger.info("hier: tier2 no point (%s) bearing=%.2f wp_dist=%.2f",
-                        r.reason, bearing, _dist(pose, self._waypoint))
+                        r.reason, bearing, wp_dist)
             self._enter_blocked(r.reason)
             return
 

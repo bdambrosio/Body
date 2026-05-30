@@ -45,6 +45,36 @@ class Tier2Result:
     reason: str                              # "ok"|"blocked_at_origin"|"all_unknown"|"too_short"
 
 
+@dataclass(frozen=True)
+class Tier2Decision:
+    """One Tier-2 step packaged for the orchestrator AND the debug console.
+
+    The single source of truth: ``plan_tier2`` produces this; production
+    (HierarchicalDrive) reads ``ok``/``body_xy``/``reason`` from it, and the
+    debug UI / JSONL trace render every field.
+    """
+    bearing_rad: float
+    max_dist_m: float                        # cap = distance to the target/waypoint
+    ok: bool
+    body_xy: Optional[Tuple[float, float]]
+    free_dist_m: float
+    reason: str
+    capped_at_target: bool                   # clear all the way → sub-goal IS the target
+    backoff_applied: bool                    # stopped short of an obstacle (backed off)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "bearing_rad": self.bearing_rad,
+            "max_dist_m": self.max_dist_m,
+            "ok": self.ok,
+            "body_xy": list(self.body_xy) if self.body_xy is not None else None,
+            "free_dist_m": self.free_dist_m,
+            "reason": self.reason,
+            "capped_at_target": self.capped_at_target,
+            "backoff_applied": self.backoff_applied,
+        }
+
+
 def bearing_to_waypoint(
     rx: float, ry: float, r_yaw: float, wx: float, wy: float,
 ) -> float:
@@ -133,3 +163,34 @@ def furthest_free_point(
     else:
         reason = "too_short"
     return Tier2Result(ok=False, body_xy=None, free_dist_m=free_dist, reason=reason)
+
+
+def plan_tier2(
+    grid: np.ndarray,
+    meta: Dict[str, Any],
+    bearing_rad: float,
+    max_dist_m: float,
+    cfg: Optional[Tier2Config] = None,
+) -> Tier2Decision:
+    """The Tier-2 step: furthest free point along ``bearing_rad`` capped at
+    ``max_dist_m`` (the target distance), packaged into a ``Tier2Decision``.
+
+    Shared by the orchestrator (production) and the debug console so both see
+    exactly the same decision. ``bearing_rad`` is the only world-derived input
+    (via ``bearing_to_waypoint``); everything else is the live body-frame scan.
+    """
+    cfg = cfg or Tier2Config()
+    r = furthest_free_point(grid, meta, bearing_rad, cfg, max_dist_m=max_dist_m)
+    # Reached the target clear → free_dist == cap (no backoff was applied).
+    capped = r.ok and abs(r.free_dist_m - max_dist_m) <= cfg.step_m
+    backoff = r.ok and not capped
+    return Tier2Decision(
+        bearing_rad=bearing_rad,
+        max_dist_m=max_dist_m,
+        ok=r.ok,
+        body_xy=r.body_xy,
+        free_dist_m=r.free_dist_m,
+        reason=r.reason,
+        capped_at_target=capped,
+        backoff_applied=backoff,
+    )

@@ -9,6 +9,7 @@ from body.lib.tier2_subgoal import (
     Tier2Config,
     bearing_to_waypoint,
     furthest_free_point,
+    plan_tier2,
 )
 
 RES = 0.08
@@ -147,6 +148,43 @@ class TestFurthestFreePoint(unittest.TestCase):
         for y in np.arange(-0.3, 0.31, RES / 2):
             _block(near, 0.3, float(y))
         self.assertTrue(swept_path_blocked(near, META, v_mps=0.18, omega_radps=0.0, config=foot))
+
+
+class TestPlanTier2(unittest.TestCase):
+    def setUp(self):
+        self.cfg = Tier2Config(horizon_m=2.0, backoff_m=0.30, min_subgoal_m=0.20)
+
+    def test_clear_to_target_capped_no_backoff(self):
+        d = plan_tier2(_clear_grid(), META, 0.0, 1.0, self.cfg)
+        self.assertTrue(d.ok)
+        self.assertTrue(d.capped_at_target)
+        self.assertFalse(d.backoff_applied)
+        self.assertAlmostEqual(d.free_dist_m, 1.0, delta=RES)
+        self.assertEqual(d.max_dist_m, 1.0)
+
+    def test_obstacle_before_target_backs_off(self):
+        grid = _clear_grid()
+        _block(grid, 0.8, 0.0)
+        d = plan_tier2(grid, META, 0.0, 1.5, self.cfg)
+        self.assertTrue(d.ok)
+        self.assertFalse(d.capped_at_target)
+        self.assertTrue(d.backoff_applied)
+        self.assertLess(d.free_dist_m, 0.8)
+
+    def test_blocked_close_not_ok(self):
+        grid = _clear_grid()
+        _block(grid, 0.0, 0.0)
+        d = plan_tier2(grid, META, 0.0, 1.0, self.cfg)
+        self.assertFalse(d.ok)
+        self.assertEqual(d.reason, "blocked_at_origin")
+        self.assertIsNone(d.body_xy)
+
+    def test_as_dict_roundtrips_fields(self):
+        d = plan_tier2(_clear_grid(), META, 0.0, 1.0, self.cfg)
+        j = d.as_dict()
+        self.assertEqual(j["reason"], "ok")
+        self.assertEqual(j["body_xy"][1], 0.0)
+        self.assertTrue(j["capped_at_target"])
 
 
 class TestBearingToWaypoint(unittest.TestCase):

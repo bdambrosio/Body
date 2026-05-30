@@ -9,6 +9,7 @@ pose).
 """
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional, Tuple
 
 import numpy as np
@@ -22,6 +23,9 @@ COLOR_BLOCKED = QColor(180, 60, 60)
 COLOR_BG = QColor(40, 40, 40)        # unknown / background
 COLOR_ROBOT = QColor(255, 255, 255)
 COLOR_GOAL = QColor(80, 160, 255)
+COLOR_TARGET = QColor(255, 220, 80)      # Tier-2 manual target
+COLOR_SUBGOAL = QColor(255, 170, 60)     # Tier-2 chosen sub-goal
+COLOR_RAY = QColor(120, 200, 255, 160)   # bearing ray
 MARGIN_PX = 8
 # Drawn footprint radius (m); match config.json:local_drive.footprint_radius_m.
 FOOTPRINT_M = 0.14
@@ -38,9 +42,28 @@ class BodyLocalMapView(QWidget):
         self._on_click: Optional[Callable[[float, float], None]] = None
         self._geom: Optional[Tuple[float, float, float, float, float]] = None
         # geom = (wc, hc, ppm, xc, yc): widget center px, m/px, body-center m
+        # Tier-2 debug overlay (target / bearing ray / sub-goal).
+        self._target_body: Optional[Tuple[float, float]] = None
+        self._subgoal_body: Optional[Tuple[float, float]] = None
+        self._bearing_rad: Optional[float] = None
+        self._free_dist_m: float = 0.0
 
     def set_click_callback(self, cb: Callable[[float, float], None]) -> None:
         self._on_click = cb
+
+    def set_overlay(
+        self,
+        target_body: Optional[Tuple[float, float]],
+        subgoal_body: Optional[Tuple[float, float]],
+        bearing_rad: Optional[float],
+        free_dist_m: float = 0.0,
+    ) -> None:
+        """Tier-2 debug markers: manual target, bearing ray, chosen sub-goal."""
+        self._target_body = target_body
+        self._subgoal_body = subgoal_body
+        self._bearing_rad = bearing_rad
+        self._free_dist_m = free_dist_m
+        self.update()
 
     def update_data(
         self,
@@ -134,12 +157,40 @@ class BodyLocalMapView(QWidget):
             p.setBrush(COLOR_GOAL)
             p.drawEllipse(QPointF(gx, gy), 6, 6)
 
+        self._draw_tier2_overlay(p)
+
         # Robot at origin, a triangle pointing forward (+x → up).
         self._draw_robot(p, ppm)
 
         if self._state_text:
             p.setPen(QColor(220, 220, 220))
             p.drawText(10, 18, self._state_text)
+
+    def _draw_tier2_overlay(self, p: QPainter) -> None:
+        rx, ry = self._body_to_px(0.0, 0.0)
+        # Bearing ray from the robot toward the target.
+        if self._bearing_rad is not None and self._target_body is not None:
+            d = max(0.3, math.hypot(*self._target_body))
+            ex, ey = self._body_to_px(d * math.cos(self._bearing_rad),
+                                      d * math.sin(self._bearing_rad))
+            p.setPen(QPen(COLOR_RAY, 1, Qt.PenStyle.DashLine))
+            p.drawLine(int(rx), int(ry), int(ex), int(ey))
+        # Manual target: hollow yellow circle + cross.
+        if self._target_body is not None:
+            tx, ty = self._body_to_px(*self._target_body)
+            p.setPen(QPen(COLOR_TARGET, 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(tx, ty), 7, 7)
+            p.drawLine(int(tx - 9), int(ty), int(tx + 9), int(ty))
+            p.drawLine(int(tx), int(ty - 9), int(tx), int(ty + 9))
+        # Tier-2 sub-goal: filled orange dot + free-dist annotation.
+        if self._subgoal_body is not None:
+            sx, sy = self._body_to_px(*self._subgoal_body)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(COLOR_SUBGOAL)
+            p.drawEllipse(QPointF(sx, sy), 4, 4)
+            p.setPen(COLOR_SUBGOAL)
+            p.drawText(QRectF(sx + 6, sy - 8, 90, 14), 0, f"free={self._free_dist_m:.2f}")
 
     def _draw_robot(self, p: QPainter, ppm: float) -> None:
         # Footprint circle = the Tier-3 swept-check radius. Keep in sync with
