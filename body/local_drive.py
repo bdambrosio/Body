@@ -105,10 +105,13 @@ def main() -> None:
     )
     lp = cfg.get("local_plan", {})
     lpcfg = LocalPlanConfig(
-        center_probe_m=float(lp.get("center_probe_m", 0.35)),
-        center_probe_rad=math.radians(float(lp.get("center_probe_deg", 30.0))),
-        center_trigger_m=float(lp.get("center_trigger_m", 0.45)),
-        k_center=float(lp.get("k_center", 1.0)),
+        center_range_m=float(lp.get("center_range_m", 0.8)),
+        center_back_margin_m=float(lp.get("center_back_margin_m", 0.2)),
+        center_target_clear_m=float(lp.get("center_target_clear_m", 0.3)),
+        k_center=float(lp.get("k_center", 1.5)),
+        gov_full_clear_m=float(lp.get("gov_full_clear_m", 0.7)),
+        gov_min_clear_m=float(lp.get("gov_min_clear_m", 0.3)),
+        gov_cone_rad=math.radians(float(lp.get("gov_cone_deg", 20.0))),
         fan_max_rad=math.radians(float(lp.get("fan_max_deg", 50.0))),
         fan_step_rad=math.radians(float(lp.get("fan_step_deg", 12.0))),
         nudge_v_floor=float(lp.get("nudge_v_floor", 0.4)),

@@ -114,14 +114,23 @@ def rotate_to_heading(
 
 @dataclass(frozen=True)
 class LocalPlanConfig:
-    # Proactive corridor centering: probe forward-left / forward-right for
-    # the nearest obstacle; when one is within `center_trigger_m`, bias the
-    # heading away from the closer side (so the body stays off the walls
-    # *before* it would clip — not after).
-    center_probe_m: float = 0.35
-    center_probe_rad: float = 0.52      # ~30° off the body axis
-    center_trigger_m: float = 0.45
-    k_center: float = 1.0               # rad/s per metre of L/R imbalance
+    # Proactive corridor centering: each frame, measure the nearest obstacle
+    # on the LEFT vs RIGHT of the heading within a forward+abeam window, and
+    # steer away from whichever side is closer than `center_target_clear_m`.
+    # Unlike a forward-only probe, this sees walls directly abeam (a doorjamb
+    # you're driving alongside) — which the hard veto deliberately ignores so
+    # you can pass them — so centering is what actually keeps side clearance.
+    center_range_m: float = 0.8         # consider obstacles within this radius
+    center_back_margin_m: float = 0.2   # include cells slightly behind abeam
+    center_target_clear_m: float = 0.3  # desired clearance from each side
+    k_center: float = 1.5               # rad/s per metre of clearance deficit
+    # Forward-clearance speed governor: ease v down as the nearest obstacle in
+    # the forward cone closes in, so the robot doesn't barrel into tight spots
+    # (and centering gets more ticks to act). Full speed ≥ full_clear, crawl
+    # at v_min by min_clear.
+    gov_full_clear_m: float = 1.1
+    gov_min_clear_m: float = 0.5        # ~ swept reach, so it's crawling by then
+    gov_cone_rad: float = 0.35          # ±20° forward cone
     # Reactive fan: when pursuit (even with centering) is blocked, search
     # arcs at growing turn offsets for a feasible one to steer around.
     fan_max_rad: float = 0.87           # ~50°
@@ -149,8 +158,26 @@ def _fan_offsets(max_rad: float, step_rad: float):
     return offs
 
 
-def _nearest_blocked(bxs, bys, px: float, py: float) -> float:
-    return float(np.min(np.hypot(bxs - px, bys - py)))
+def _side_clearances(bxs, bys, cfg):
+    """Nearest obstacle distance on the left (by>0) vs right (by<0) of the
+    heading, within a forward+abeam window. Returns (left_clear, right_clear);
+    math.inf when a side is clear. Sees abeam walls, not just forward ones."""
+    d = np.hypot(bxs, bys)
+    region = (bxs > -cfg.center_back_margin_m) & (d < cfg.center_range_m)
+    left = region & (bys > 0.0)
+    right = region & (bys < 0.0)
+    lc = float(d[left].min()) if np.any(left) else math.inf
+    rc = float(d[right].min()) if np.any(right) else math.inf
+    return lc, rc
+
+
+def _forward_clearance(bxs, bys, cfg):
+    """Nearest obstacle distance within a ±gov_cone_rad cone ahead of the body
+    (math.inf if none) — drives the speed governor."""
+    ang = np.arctan2(bys, bxs)
+    d = np.hypot(bxs, bys)
+    mask = (np.abs(ang) < cfg.gov_cone_rad) & (d < cfg.gov_full_clear_m + 0.3)
+    return float(d[mask].min()) if np.any(mask) else math.inf
 
 
 def _ray_clearance(grid, res, ox, oy, nx, ny, th, max_range):
@@ -228,23 +255,35 @@ def plan_drive(
     bxs = ox + (bi + 0.5) * res if has_blocked else None
     bys = oy + (bj + 0.5) * res if has_blocked else None
 
-    # Proactive centering bias from forward L/R clearance imbalance.
+    # Proactive centering: steer away from whichever side is closer than the
+    # target clearance, by how far below target it is (deficit). Sees abeam
+    # walls, and only acts when a side is actually tight (no wander in the open).
     omega_center = 0.0
     if has_blocked:
-        a = cfg.center_probe_rad
-        lc = cfg.center_probe_m
-        dl = _nearest_blocked(bxs, bys, lc * math.cos(a), lc * math.sin(a))
-        dr = _nearest_blocked(bxs, bys, lc * math.cos(-a), lc * math.sin(-a))
-        if min(dl, dr) < cfg.center_trigger_m:
-            # dl < dr → wall on the left → steer right (negative ω).
-            omega_center = _clip(
-                cfg.k_center * (dl - dr), -params.omega_max, params.omega_max
-            )
+        lc, rc = _side_clearances(bxs, bys, cfg)
+        left_def = max(0.0, cfg.center_target_clear_m - lc)
+        right_def = max(0.0, cfg.center_target_clear_m - rc)
+        # right closer (right_def larger) → steer left (positive ω).
+        omega_center = _clip(
+            cfg.k_center * (right_def - left_def), -params.omega_max, params.omega_max
+        )
+
+    # Forward-clearance speed governor: scale a forward speed by how much room
+    # is ahead (full ≥ full_clear, crawl at v_min by min_clear).
+    def _gov(v: float) -> float:
+        if v <= 1e-6 or not has_blocked:
+            return v
+        fc = _forward_clearance(bxs, bys, cfg)
+        if fc >= cfg.gov_full_clear_m:
+            return v
+        span = max(1e-6, cfg.gov_full_clear_m - cfg.gov_min_clear_m)
+        scale = min(1.0, max(0.0, (fc - cfg.gov_min_clear_m) / span))
+        return max(params.v_min_mps, v * scale)
 
     # Try pursuit (with centering) first.
     omega = _clip(omega_des + omega_center, -params.omega_max, params.omega_max)
     if not swept_path_blocked(grid, meta, v_mps=v_des, omega_radps=omega, config=foot):
-        return v_des, omega, ("center" if abs(omega_center) > 1e-3 else "pursue"), 0.0
+        return _gov(v_des), omega, ("center" if abs(omega_center) > 1e-3 else "pursue"), 0.0
 
     # Blocked → reactive fan: pure pursuit (0) first, then growing offsets.
     for d in [0.0] + _fan_offsets(cfg.fan_max_rad, cfg.fan_step_rad):
@@ -252,7 +291,7 @@ def plan_drive(
         om = _clip(params.k_omega * th, -params.omega_max, params.omega_max)
         v = max(params.v_min_mps, v_des * max(cfg.nudge_v_floor, math.cos(d)))
         if not swept_path_blocked(grid, meta, v_mps=v, omega_radps=om, config=foot):
-            return v, om, ("pursue" if abs(d) < 1e-9 else "nudge"), 0.0
+            return _gov(v), om, ("pursue" if abs(d) < 1e-9 else "nudge"), 0.0
 
     # Fan exhausted → gap-seek: is there an open corridor beyond the fan?
     th, off = _find_open_heading(grid, res, ox, oy, nx, ny, bearing, cfg)

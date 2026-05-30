@@ -192,16 +192,39 @@ class TestPlanDrive(unittest.TestCase):
         self.assertNotEqual(omega, 0.0)
 
     def test_centers_away_from_left_wall(self):
-        # Obstacle close on the left only; goal straight ahead. Should steer
-        # right (negative omega) proactively, before any block.
+        # Wall on the left within the target clearance; goal straight ahead.
+        # Should steer right (negative omega) proactively, before any block.
         g, m = _grid(fill=1), _meta()
-        for x in (0.25, 0.33, 0.41):
-            for y in (0.20, 0.28):
-                _set(g, m, x, y, 0)
+        for x in (0.0, 0.08, 0.16):
+            _set(g, m, x, 0.22, 0)             # lateral 0.22 < target 0.3
         v, omega, mode, _ = self._plan(g, m, (1.0, 0.0))
         self.assertEqual(mode, "center")
         self.assertLess(omega, 0.0)            # steering right, off the wall
         self.assertGreater(v, 0.0)
+
+    def test_centers_away_from_abeam_right_wall(self):
+        # The key fix: a wall directly ABEAM (a doorjamb you're alongside),
+        # not just forward — the old forward-only probe missed this. Should
+        # steer left (positive omega).
+        g, m = _grid(fill=1), _meta()
+        for x in (-0.04, 0.04, 0.12):
+            _set(g, m, x, -0.22, 0)            # right, ~abeam, lateral 0.22
+        v, omega, mode, _ = self._plan(g, m, (0.8, 0.0))
+        self.assertEqual(mode, "center")
+        self.assertGreater(omega, 0.0)         # steering left, off the jamb
+        self.assertGreater(v, 0.0)
+
+    def test_speed_governor_slows_for_obstacle_ahead(self):
+        # An obstacle ahead (beyond the swept reach but within the governor's
+        # window) should reduce commanded speed vs an open field.
+        g_open, m = _grid(fill=1), _meta()
+        v_open, _, mode_open, _ = self._plan(g_open, m, (1.5, 0.0))
+        g, _ = _grid(fill=1), _meta()
+        for y in (-0.08, 0.0, 0.08):
+            _set(g, m, 0.62, y, 0)
+        v_near, _, _, _ = self._plan(g, m, (1.5, 0.0))
+        self.assertEqual(mode_open, "pursue")
+        self.assertLess(v_near, v_open)        # governed down near the obstacle
 
     def test_dead_ahead_within_footprint_blocks(self):
         g, m = _grid(fill=1), _meta()
