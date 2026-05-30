@@ -45,7 +45,9 @@ def _block(grid, x, y):
 
 class TestFurthestFreePoint(unittest.TestCase):
     def setUp(self):
-        self.cfg = Tier2Config()   # horizon 2.0, backoff 0.30, min 0.20
+        # Pin the knobs the assertions below depend on, independent of the
+        # production defaults (which get tuned during bring-up).
+        self.cfg = Tier2Config(horizon_m=2.0, backoff_m=0.30, min_subgoal_m=0.20)
 
     def test_clear_lane_ahead(self):
         r = furthest_free_point(_clear_grid(), META, 0.0, self.cfg)

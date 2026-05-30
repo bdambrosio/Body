@@ -141,6 +141,18 @@ class HierarchicalDrive:
         self._subgoal_body = None
         self._to(HierState.IDLE)
 
+    def _enter_blocked(self, reason: str) -> None:
+        # Count *consecutive* blocks (only reset by real progress — a sub-goal
+        # done or a waypoint advance), NOT by a successful re-send. Otherwise a
+        # standstill that Tier-3 vetoes every time loops SELECT↔BLOCKED forever,
+        # re-issuing the identical futile goto.
+        self._block_reason = reason
+        self._blocked_repicks += 1
+        if self._blocked_repicks > self._cfg.max_blocked_repicks:
+            logger.warning("hier: blocked (%s) — gave up after %d retries, pausing",
+                           reason, self._cfg.max_blocked_repicks)
+        self._to(HierState.BLOCKED)
+
     # ── Introspection (for the UI overlay / status label) ────────────
 
     def state(self) -> HierState:
@@ -193,17 +205,15 @@ class HierarchicalDrive:
 
         grid_meta = self._raster()
         if grid_meta is None:
-            self._block_reason = "no_scan"
-            self._to(HierState.BLOCKED)
+            self._enter_blocked("no_scan")
             return
         grid, meta = grid_meta
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
         r = furthest_free_point(grid, meta, bearing, self._cfg.tier2_cfg)
         if not r.ok:
-            self._block_reason = r.reason
             logger.info("hier: tier2 no point (%s) bearing=%.2f wp_dist=%.2f",
                         r.reason, bearing, _dist(pose, self._waypoint))
-            self._to(HierState.BLOCKED)
+            self._enter_blocked(r.reason)
             return
 
         cid = self._io.send_goto_from_body(
@@ -212,13 +222,11 @@ class HierarchicalDrive:
             v_max=self._cfg.sub_v_max,
         )
         if cid is None:
-            self._block_reason = "send_failed"
-            self._to(HierState.BLOCKED)
+            self._enter_blocked("send_failed")
             return
         self._cmd_id = cid
         self._sent_bearing = bearing
         self._subgoal_body = r.body_xy
-        self._blocked_repicks = 0
         self._block_reason = None
         logger.info("hier: goto cmd=%d wp_dist=%.2f bearing=%.2f sub=(%.2f,%.2f) free=%.2f",
                     cid, _dist(pose, self._waypoint), bearing,
@@ -242,11 +250,11 @@ class HierarchicalDrive:
             # the IDLE. Both mean "this sub-goal is done" → re-pick the next
             # one toward the same waypoint.
             if state in ("ARRIVED", "IDLE"):
+                self._blocked_repicks = 0          # sub-goal progress
                 self._to(HierState.SELECT_SUBGOAL)
                 return
             if state in ("BLOCKED", "FAULT"):
-                self._block_reason = st.get("blocked_reason") or state
-                self._to(HierState.BLOCKED)
+                self._enter_blocked(st.get("blocked_reason") or state)
                 return
             if state == "CANCELED":
                 self._to(HierState.FAILED)
@@ -261,6 +269,7 @@ class HierarchicalDrive:
     def _tick_advance(self) -> None:
         next_idx, _lap_done = self._runner.on_arrived()
         logger.info("hier: waypoint reached -> next=%s", next_idx)
+        self._blocked_repicks = 0                  # fresh leg
         if next_idx is None:
             self._io.cancel()
             self._subgoal_body = None
@@ -269,10 +278,11 @@ class HierarchicalDrive:
             self._to(HierState.SELECT_SUBGOAL)
 
     def _tick_blocked(self) -> None:
-        # rotate_repick: retry selection up to the cap (the scan may clear,
-        # or Tier-3's own fan finds a way); then hold as a pause.
-        if self._blocked_repicks < self._cfg.max_blocked_repicks:
-            self._blocked_repicks += 1
+        # rotate_repick: retry selection up to the cap (the scan may clear, or
+        # Tier-3's own fan finds a way); past the cap, hold as a pause (the
+        # consecutive-block counter is only cleared by real progress) so we
+        # surface the block to the operator instead of thrashing gotos.
+        if self._blocked_repicks <= self._cfg.max_blocked_repicks:
             self._to(HierState.SELECT_SUBGOAL)
 
     # ── Helpers ──────────────────────────────────────────────────────

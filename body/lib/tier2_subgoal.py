@@ -27,7 +27,12 @@ from body.lib.local_drive_core import wrap_pi
 class Tier2Config:
     horizon_m: float = 2.0          # cap sub-goal distance (≤ scan half_extent)
     step_m: float = 0.04            # ray-march step (~half a cell)
-    backoff_m: float = 0.30         # pull the sub-goal back from the first block/unknown
+    # Pull the sub-goal back from the first block/unknown. Small on purpose:
+    # Tier-3 owns the real footprint safety gate (its own swept-footprint
+    # check at radius ~0.14 m), so this only keeps the sub-goal off the
+    # obstacle, not a full safety margin. Too large here makes waypoints near
+    # walls unreachable and forces tight vetoed arcs.
+    backoff_m: float = 0.15
     min_subgoal_m: float = 0.20     # below this → "no usable free point"
     require_clear: bool = True      # treat unknown (-1) as non-free (conservative)
 
