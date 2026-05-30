@@ -153,6 +153,15 @@
     "block_on_unknown": true,
     "unknown_block_range_m": 0.25,
     "min_observed_cells": 3,
+    "local_plan": {
+      "center_probe_m": 0.35,
+      "center_probe_deg": 30.0,
+      "center_trigger_m": 0.45,
+      "k_center": 1.0,
+      "fan_max_deg": 50.0,
+      "fan_step_deg": 12.0,
+      "nudge_v_floor": 0.4
+    },
     "scan": {
       "resolution_m": 0.08,
       "half_extent_m": 2.5,

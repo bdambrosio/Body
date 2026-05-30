@@ -8,8 +8,8 @@ from body.lib.drive_safety import (
     FootprintConfig, driveable_from_rows, swept_path_blocked,
 )
 from body.lib.local_drive_core import (
-    DriveParams, body_to_odom, odom_to_body, rotate_to_heading,
-    steer_to_body_point, wrap_pi,
+    DriveParams, LocalPlanConfig, body_to_odom, odom_to_body, plan_drive,
+    rotate_to_heading, steer_to_body_point, wrap_pi,
 )
 
 
@@ -166,6 +166,71 @@ class TestSweptSafety(unittest.TestCase):
         _set(g, m, 0.12, 0.0, 0)
         self.assertTrue(swept_path_blocked(
             g, m, v_mps=0.18, omega_radps=0.0, config=self.cfg))
+
+
+class TestPlanDrive(unittest.TestCase):
+    def setUp(self):
+        self.params = DriveParams()
+        self.foot = FootprintConfig(footprint_radius_m=0.14)
+        self.cfg = LocalPlanConfig()
+
+    def _plan(self, grid, meta, goal):
+        return plan_drive(grid, meta, goal, self.params, self.foot, self.cfg)
+
+    def test_open_field_goal_ahead_pursues(self):
+        g, m = _grid(fill=1), _meta()
+        v, omega, mode = self._plan(g, m, (0.8, 0.0))
+        self.assertEqual(mode, "pursue")
+        self.assertGreater(v, 0.0)
+        self.assertAlmostEqual(omega, 0.0, places=2)
+
+    def test_goal_behind_rotates(self):
+        g, m = _grid(fill=1), _meta()
+        v, omega, mode = self._plan(g, m, (-0.8, 0.1))  # ~173° bearing
+        self.assertEqual(mode, "rotate")
+        self.assertEqual(v, 0.0)
+        self.assertNotEqual(omega, 0.0)
+
+    def test_centers_away_from_left_wall(self):
+        # Obstacle close on the left only; goal straight ahead. Should steer
+        # right (negative omega) proactively, before any block.
+        g, m = _grid(fill=1), _meta()
+        for x in (0.25, 0.33, 0.41):
+            for y in (0.20, 0.28):
+                _set(g, m, x, y, 0)
+        v, omega, mode = self._plan(g, m, (1.0, 0.0))
+        self.assertEqual(mode, "center")
+        self.assertLess(omega, 0.0)            # steering right, off the wall
+        self.assertGreater(v, 0.0)
+
+    def test_dead_ahead_within_footprint_blocks(self):
+        g, m = _grid(fill=1), _meta()
+        _set(g, m, 0.10, 0.0, 0)               # inside the footprint, ahead
+        v, omega, mode = self._plan(g, m, (0.8, 0.0))
+        self.assertEqual(mode, "blocked")
+        self.assertEqual((v, omega), (0.0, 0.0))
+
+    def test_offcenter_obstacle_nudges_around(self):
+        # An obstacle just left of center blocks the straight path; a turn
+        # right curves clear → nudge (not stop), steering away from it.
+        g, m = _grid(fill=1), _meta()
+        for x in (0.30, 0.36):
+            _set(g, m, x, 0.06, 0)
+        v, omega, mode = self._plan(g, m, (0.8, 0.0))
+        self.assertEqual(mode, "nudge")
+        self.assertGreater(v, 0.0)
+        self.assertLess(omega, 0.0)            # turning right, around the obstacle
+
+    def test_wide_dead_ahead_blocks_for_escalation(self):
+        # A wide obstacle dead ahead can't be cleared within the preview
+        # horizon → blocked, so the caller escalates (Tier-2 picks a
+        # subgoal to the side) rather than the bottom tier path-finding.
+        g, m = _grid(fill=1), _meta()
+        for x in (0.30, 0.38):
+            for y in (-0.06, 0.02, 0.06):
+                _set(g, m, x, y, 0)
+        _, _, mode = self._plan(g, m, (0.8, 0.0))
+        self.assertEqual(mode, "blocked")
 
 
 class TestDriveableFromRows(unittest.TestCase):

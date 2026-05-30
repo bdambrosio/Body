@@ -17,6 +17,10 @@ import math
 from dataclasses import dataclass
 from typing import Tuple
 
+import numpy as np
+
+from body.lib.drive_safety import FootprintConfig, swept_path_blocked
+
 # Drive states (mirrored in body/drive/status).
 STATE_IDLE = "IDLE"
 STATE_DRIVING = "DRIVING"
@@ -103,3 +107,100 @@ def rotate_to_heading(
         return 0.0, True
     sign = 1.0 if err >= 0.0 else -1.0
     return sign * min(params.omega_max, params.k_omega * abs(err)), False
+
+
+# ── Proactive local steering (Tier-3 local planner) ──────────────────
+
+
+@dataclass(frozen=True)
+class LocalPlanConfig:
+    # Proactive corridor centering: probe forward-left / forward-right for
+    # the nearest obstacle; when one is within `center_trigger_m`, bias the
+    # heading away from the closer side (so the body stays off the walls
+    # *before* it would clip — not after).
+    center_probe_m: float = 0.35
+    center_probe_rad: float = 0.52      # ~30° off the body axis
+    center_trigger_m: float = 0.45
+    k_center: float = 1.0               # rad/s per metre of L/R imbalance
+    # Reactive fan: when pursuit (even with centering) is blocked, search
+    # arcs at growing turn offsets for a feasible one to steer around.
+    fan_max_rad: float = 0.87           # ~50°
+    fan_step_rad: float = 0.21          # ~12°
+    nudge_v_floor: float = 0.4          # min speed scale on a sharp nudge
+
+
+def _fan_offsets(max_rad: float, step_rad: float):
+    """[+s, -s, +2s, -2s, …] up to max_rad (0 handled separately)."""
+    offs = []
+    k = 1
+    while k * step_rad <= max_rad + 1e-9:
+        offs.append(k * step_rad)
+        offs.append(-k * step_rad)
+        k += 1
+    return offs
+
+
+def _nearest_blocked(bxs, bys, px: float, py: float) -> float:
+    return float(np.min(np.hypot(bxs - px, bys - py)))
+
+
+def plan_drive(
+    grid: np.ndarray,
+    meta: dict,
+    goal_body: Point2,
+    params: DriveParams,
+    foot: FootprintConfig,
+    cfg: LocalPlanConfig,
+) -> Tuple[float, float, str]:
+    """Proactive clearance-aware local steering toward `goal_body`.
+
+    Returns (v_mps, omega_radps, mode) where mode is one of
+    'rotate' | 'pursue' | 'center' | 'nudge' | 'blocked':
+      * rotate  — bearing too large; turn in place to face the goal.
+      * pursue  — straight pursuit, path clear.
+      * center  — pursuit + a clearance bias steering off a nearby wall.
+      * nudge   — pursuit blocked; a turning arc around the obstacle.
+      * blocked — no feasible forward arc (dead-end); caller stops/escalates.
+
+    The swept-footprint check (#3, directional) is the hard feasibility gate;
+    centering and the fan only ever choose among collision-free motions.
+    """
+    v_des, omega_des, dist, bearing = steer_to_body_point(goal_body, params)
+    if v_des < 1e-3:
+        return v_des, omega_des, "rotate"
+
+    res = float(meta["resolution_m"])
+    ox = float(meta["origin_x_m"])
+    oy = float(meta["origin_y_m"])
+    bi, bj = np.where(grid == 0)
+    has_blocked = bi.size > 0
+    bxs = ox + (bi + 0.5) * res if has_blocked else None
+    bys = oy + (bj + 0.5) * res if has_blocked else None
+
+    # Proactive centering bias from forward L/R clearance imbalance.
+    omega_center = 0.0
+    if has_blocked:
+        a = cfg.center_probe_rad
+        lc = cfg.center_probe_m
+        dl = _nearest_blocked(bxs, bys, lc * math.cos(a), lc * math.sin(a))
+        dr = _nearest_blocked(bxs, bys, lc * math.cos(-a), lc * math.sin(-a))
+        if min(dl, dr) < cfg.center_trigger_m:
+            # dl < dr → wall on the left → steer right (negative ω).
+            omega_center = _clip(
+                cfg.k_center * (dl - dr), -params.omega_max, params.omega_max
+            )
+
+    # Try pursuit (with centering) first.
+    omega = _clip(omega_des + omega_center, -params.omega_max, params.omega_max)
+    if not swept_path_blocked(grid, meta, v_mps=v_des, omega_radps=omega, config=foot):
+        return v_des, omega, ("center" if abs(omega_center) > 1e-3 else "pursue")
+
+    # Blocked → reactive fan: pure pursuit (0) first, then growing offsets.
+    for d in [0.0] + _fan_offsets(cfg.fan_max_rad, cfg.fan_step_rad):
+        th = bearing + d
+        om = _clip(params.k_omega * th, -params.omega_max, params.omega_max)
+        v = max(params.v_min_mps, v_des * max(cfg.nudge_v_floor, math.cos(d)))
+        if not swept_path_blocked(grid, meta, v_mps=v, omega_radps=om, config=foot):
+            return v, om, ("pursue" if abs(d) < 1e-9 else "nudge")
+
+    return 0.0, 0.0, "blocked"

@@ -13,6 +13,7 @@ timeout remain supreme; this process is just another cmd_vel producer.
 """
 from __future__ import annotations
 
+import math
 import signal
 import sys
 import threading
@@ -20,11 +21,11 @@ import time
 from typing import Any, Dict, Optional
 
 from body.lib import schemas, zenoh_helpers
-from body.lib.drive_safety import FootprintConfig, swept_path_blocked
+from body.lib.drive_safety import FootprintConfig
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.local_drive_core import (
     STATE_ARRIVED, STATE_BLOCKED, STATE_DRIVING, STATE_FAULT, STATE_IDLE,
-    DriveParams, odom_to_body, rotate_to_heading, steer_to_body_point,
+    DriveParams, LocalPlanConfig, odom_to_body, plan_drive, rotate_to_heading,
 )
 
 
@@ -100,6 +101,16 @@ def main() -> None:
             scan_cfg.get("max_clear_range_m", lm_cfg.get("lidar_max_clear_range_m", 6.0))
         ),
         clear_buffer_cells=float(scan_cfg.get("clear_buffer_cells", 2.0)),
+    )
+    lp = cfg.get("local_plan", {})
+    lpcfg = LocalPlanConfig(
+        center_probe_m=float(lp.get("center_probe_m", 0.35)),
+        center_probe_rad=math.radians(float(lp.get("center_probe_deg", 30.0))),
+        center_trigger_m=float(lp.get("center_trigger_m", 0.45)),
+        k_center=float(lp.get("k_center", 1.0)),
+        fan_max_rad=math.radians(float(lp.get("fan_max_deg", 50.0))),
+        fan_step_rad=math.radians(float(lp.get("fan_step_deg", 12.0))),
+        nudge_v_floor=float(lp.get("nudge_v_floor", 0.4)),
     )
     control_hz = float(cfg.get("control_hz", 10.0))
     period = 1.0 / max(1.0, control_hz)
@@ -240,15 +251,26 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
-        v, omega, _, _ = steer_to_body_point((bx, by), gp)
+        # Live obstacle field (rasterized scan) — the substrate for steering.
+        if scan is None or (now_wall - float(scan.get("ts", 0.0))) > scan_stale_s:
+            publish_cmd(0.0, 0.0)
+            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
+                           dist=dist, reason="no_scan")
+            next_tick = _sleep_to(next_tick, period)
+            continue
+        grid, meta = rasterize_scan(
+            scan.get("ranges"), float(scan.get("angle_min", 0.0)),
+            float(scan.get("angle_increment", 0.0)), raster,
+        )
+
+        # Proactive local steering: directional swept gate (#3), corridor
+        # centering, and a reactive nudge around obstacles.
+        v, omega, mode = plan_drive(grid, meta, (bx, by), gp, foot, lpcfg)
 
         # No-progress watchdog — only while actually translating. Rotating
-        # in place to acquire heading (large bearing → steer returns v=0)
-        # legitimately doesn't reduce distance-to-goal, so it must not count
-        # as "stuck"; otherwise a goal more than ~90° away trips the timer
-        # before the robot finishes turning to face it. Reset the timer
-        # whenever we're not translating so a fresh window starts once the
-        # robot begins to drive.
+        # in place (large bearing) or a blocked stop legitimately holds
+        # distance, so reset the timer whenever we're not translating; a
+        # fresh window starts once the robot begins to drive.
         if v < 1e-3:
             best_dist = dist
             best_dist_at = now_mono
@@ -262,18 +284,7 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
-        # Swept-footprint safety on the live lidar scan, rasterized this tick.
-        if scan is None or (now_wall - float(scan.get("ts", 0.0))) > scan_stale_s:
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="no_scan")
-            next_tick = _sleep_to(next_tick, period)
-            continue
-        grid, meta = rasterize_scan(
-            scan.get("ranges"), float(scan.get("angle_min", 0.0)),
-            float(scan.get("angle_increment", 0.0)), raster,
-        )
-        if swept_path_blocked(grid, meta, v_mps=v, omega_radps=omega, config=foot):
+        if mode == "blocked":
             publish_cmd(0.0, 0.0)
             publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
                            dist=dist, reason="swept_block")
