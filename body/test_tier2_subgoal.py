@@ -162,22 +162,41 @@ class TestPlanTier2(unittest.TestCase):
         self.assertAlmostEqual(d.free_dist_m, 1.0, delta=RES)
         self.assertEqual(d.max_dist_m, 1.0)
 
-    def test_obstacle_before_target_backs_off(self):
+    def test_obstacle_on_direct_line_routes_around(self):
+        # Wall segment on the straight line, open to the sides → the fan swings
+        # off the direct bearing and finds a clear lane that still progresses.
         grid = _clear_grid()
-        _block(grid, 0.8, 0.0)
+        for y in np.arange(-0.25, 0.26, RES / 2):
+            _block(grid, 0.6, float(y))
         d = plan_tier2(grid, META, 0.0, 1.5, self.cfg)
         self.assertTrue(d.ok)
-        self.assertFalse(d.capped_at_target)
-        self.assertTrue(d.backoff_applied)
-        self.assertLess(d.free_dist_m, 0.8)
+        self.assertGreater(abs(d.bearing_offset_rad), 0.1)        # swung off-line
+        # Sub-goal gets meaningfully closer to the target than the robot is now.
+        self.assertLess(math.hypot(d.body_xy[0] - 1.5, d.body_xy[1] - 0.0), 1.5)
 
-    def test_blocked_close_not_ok(self):
+    def test_prefers_straighter_of_two_lanes(self):
+        # Narrow wall → a small swing clears it; the fan takes the straightest.
         grid = _clear_grid()
-        _block(grid, 0.0, 0.0)
-        d = plan_tier2(grid, META, 0.0, 1.0, self.cfg)
+        for y in np.arange(-0.15, 0.16, RES / 2):
+            _block(grid, 0.6, float(y))
+        d = plan_tier2(grid, META, 0.0, 1.5, self.cfg)
+        self.assertTrue(d.ok)
+        self.assertLess(abs(d.bearing_offset_rad), math.radians(25))   # small swing
+
+    def test_arc_wall_boxes_in_not_ok(self):
+        # A blocked arc ~0.3 m across the whole forward fan → no clear bearing.
+        grid = _clear_grid()
+        for deg in range(-90, 91, 2):
+            a = math.radians(deg)
+            _block(grid, 0.3 * math.cos(a), 0.3 * math.sin(a))
+        d = plan_tier2(grid, META, 0.0, 1.5, self.cfg)
         self.assertFalse(d.ok)
-        self.assertEqual(d.reason, "blocked_at_origin")
         self.assertIsNone(d.body_xy)
+
+    def test_clear_direct_no_swing(self):
+        d = plan_tier2(_clear_grid(), META, 0.0, 1.0, self.cfg)
+        self.assertTrue(d.ok)
+        self.assertAlmostEqual(d.bearing_offset_rad, 0.0, places=6)   # straight shot
 
     def test_as_dict_roundtrips_fields(self):
         d = plan_tier2(_clear_grid(), META, 0.0, 1.0, self.cfg)

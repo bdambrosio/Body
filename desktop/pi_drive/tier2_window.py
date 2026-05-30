@@ -82,6 +82,14 @@ class Tier2Window(QMainWindow):
         self._drive_chk = QCheckBox("Drive (send gotos)")
         self._drive_chk.toggled.connect(self.session.set_drive)
 
+        # Armed "Set location": while checked, a LEFT-click on the world map is
+        # a relocate_at (assert true position); unchecked, left-click pans.
+        # map_views only routes left-clicks to _on_world_locate when locate_mode
+        # is on, so this toggle is required for left-click to do anything.
+        self._locate_chk = QCheckBox("Set location (left-click)")
+        if self.localizer is not None:
+            self._locate_chk.toggled.connect(self._shared.set_locate_mode)
+
         connect_btn = QPushButton("Connect"); connect_btn.clicked.connect(self._connect)
         clear_btn = QPushButton("Clear target"); clear_btn.clicked.connect(self._clear)
         stop_btn = QPushButton("STOP / Cancel"); stop_btn.clicked.connect(self._stop)
@@ -99,6 +107,8 @@ class Tier2Window(QMainWindow):
         row = QHBoxLayout(); row.addWidget(self._tol_spin); row.addWidget(self._vmax_spin)
         pl.addLayout(row)
         pl.addWidget(self._drive_chk)
+        if self.localizer is not None:
+            pl.addWidget(self._locate_chk)
         brow = QHBoxLayout(); brow.addWidget(connect_btn); brow.addWidget(clear_btn)
         pl.addLayout(brow)
         if self.localizer is not None:
@@ -182,11 +192,13 @@ class Tier2Window(QMainWindow):
         self._push_event("info", "target", f"world ({wx:+.2f}, {wy:+.2f})")
 
     def _on_world_locate(self, wx: float, wy: float) -> None:
-        """Left-click = assert true position; PF recovers heading by scan-match."""
+        """Left-click (while 'Set location' armed) = assert true position; PF
+        recovers heading by scan-match. One-shot: disarm after the click."""
         res = self.localizer.request_relocate_at(wx, wy)
         ok = bool(res.get("success"))
         self._push_event("info" if ok else "warn", "relocate_at",
                          f"({wx:+.2f},{wy:+.2f}) {'ok' if ok else res.get('reason','failed')}")
+        self._locate_chk.setChecked(False)
 
     def _on_relocate(self) -> None:
         res = self.localizer.request_relocate()
@@ -290,6 +302,7 @@ class Tier2Window(QMainWindow):
             sub = f"({d.body_xy[0]:+.2f},{d.body_xy[1]:+.2f})" if d.body_xy else "—"
             self._t2_lbl.setText(
                 f"tier2: {tags}{extra}  bearing={d.bearing_rad*57.3:+.0f}° "
+                f"off={d.bearing_offset_rad*57.3:+.0f}°  "
                 f"free={d.free_dist_m:.2f}/{d.max_dist_m:.2f}m  sub={sub}")
 
         if isinstance(status, dict):
