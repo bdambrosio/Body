@@ -92,8 +92,14 @@ class Tier2Session:
     # ── Operator controls ────────────────────────────────────────────
 
     def set_target_from_body(self, bx: float, by: float, odom_pose: Pose) -> None:
-        """Pin a target: convert the body-frame click to odom so it stays put."""
-        self._target_odom = body_to_odom((bx, by), odom_pose)
+        """Pin a target from a body-frame click: convert to the pose's frame
+        (odom in the body console) so it stays put as the robot drives."""
+        self.set_target_point(*body_to_odom((bx, by), odom_pose))
+
+    def set_target_point(self, px: float, py: float) -> None:
+        """Pin a target point already in the frame the tick pose is given in
+        (world in the map console, odom in the body console). No conversion."""
+        self._target_odom = (px, py)
         self._reached = False
         self._cmd_id = None
 
@@ -135,7 +141,7 @@ class Tier2Session:
         self,
         now: float,
         *,
-        odom_pose: Optional[Pose],
+        pose: Optional[Pose],
         grid: Optional[Any],
         meta: Optional[Dict[str, Any]],
         scan_age_s: Optional[float],
@@ -143,14 +149,17 @@ class Tier2Session:
         e_stop_active: bool,
         heartbeat_ok: bool,
     ) -> Tier2Tick:
+        # `pose` and the stored target must be in the SAME frame: odom in the
+        # body console, the PF world pose in the map console. The point→body
+        # transform is identical either way.
         evs: List[Event] = []
-        self._health_events(now, evs, odom_pose, scan_age_s, e_stop_active, heartbeat_ok)
+        self._health_events(now, evs, pose, scan_age_s, e_stop_active, heartbeat_ok)
         self._tier3_events(now, evs, tier3_status)
 
-        if self._target_odom is None or odom_pose is None:
+        if self._target_odom is None or pose is None:
             return Tier2Tick(now, self.has_target, None, 0.0, None, None, tier3_status, evs)
 
-        target_body = odom_to_body(self._target_odom, odom_pose)
+        target_body = odom_to_body(self._target_odom, pose)
         dist = math.hypot(target_body[0], target_body[1])
         bearing = math.atan2(target_body[1], target_body[0])
 

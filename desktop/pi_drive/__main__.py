@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 _DESKTOP = Path(__file__).resolve().parents[1]
@@ -46,8 +49,62 @@ def _parse_args(argv):
         help="launch the Tier-2 debug console (manual target → sub-goal → "
              "Tier-3) instead of the Tier-3 manual console",
     )
+    p.add_argument(
+        "--load-map", dest="map_path", default=None, metavar="PATH",
+        help="(with --tier2) reference map to localize against; enables the "
+             "PF + world-map panel so you can set a true world-frame target",
+    )
+    p.add_argument(
+        "--relocate-on-load", action="store_true",
+        help="run global relocalization once the first scan arrives",
+    )
+    p.add_argument("--pf-particles", type=int, default=5000)
+    p.add_argument("--pf-device", choices=("auto", "cpu", "cuda"), default="auto")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p.parse_args(argv)
+
+
+def _resolve_device(choice: str) -> str:
+    if choice != "auto":
+        return choice
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+def _build_localizer(router: str, args):
+    """Build + connect the PF localizer for the Tier-2 map console (or None)."""
+    from desktop.localization.config import LocalizationConfig
+    from desktop.localization.controller import LocalizationController
+    from desktop.reference_map.legacy_convert import load_map_auto
+
+    log = logging.getLogger(__name__)
+    map_path = os.path.expanduser(args.map_path)
+    reference_map = load_map_auto(map_path)
+    loc_cfg = LocalizationConfig(
+        router=router, map_path=map_path,
+        pf_device=_resolve_device(args.pf_device),
+        pf_n_particles=args.pf_particles,
+    )
+    localizer = LocalizationController(loc_cfg, reference_map)
+    ok, err = localizer.connect()
+    if not ok:
+        log.warning("localizer connect failed (%s)", err)
+    if args.relocate_on_load and localizer.connected:
+        def _deferred():
+            ps = localizer.pose_source
+            deadline = time.time() + 5.0
+            while time.time() < deadline and getattr(ps, "_last_scan_ts", 0.0) <= 0.0:
+                time.sleep(0.1)
+            try:
+                res = localizer.request_relocate(reason="relocate_on_load")
+                log.info("relocate-on-load: %s", res.get("success"))
+            except Exception:
+                log.exception("relocate-on-load failed")
+        threading.Thread(target=_deferred, name="relocate-on-load", daemon=True).start()
+    return localizer
 
 
 def main(argv=None) -> int:
@@ -64,10 +121,11 @@ def main(argv=None) -> int:
 
     app = QApplication.instance() or QApplication(sys.argv)
     if args.tier2:
-        win = Tier2Window(controller, drive, trace_path=args.trace)
+        localizer = _build_localizer(router, args) if args.map_path else None
+        win = Tier2Window(controller, drive, localizer=localizer, trace_path=args.trace)
     else:
         win = PiDriveWindow(controller, drive)
-    win.resize(980, 760)
+    win.resize(1280 if (args.tier2 and args.map_path) else 980, 760)
     win.show()
     return app.exec()
 

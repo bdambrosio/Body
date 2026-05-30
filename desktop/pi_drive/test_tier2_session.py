@@ -4,6 +4,7 @@ import unittest
 
 import numpy as np
 
+from body.lib.tier2_subgoal import bearing_to_waypoint
 from desktop.pi_drive.tier2_session import Tier2Session, Tier2SessionConfig
 
 RES, HALF = 0.08, 2.5
@@ -36,7 +37,7 @@ class FakeIO:
 
 
 def _kw(**over):
-    kw = dict(odom_pose=(0.0, 0.0, 0.0), grid=_clear(), meta=META, scan_age_s=0.05,
+    kw = dict(pose=(0.0, 0.0, 0.0), grid=_clear(), meta=META, scan_age_s=0.05,
               tier3_status=None, e_stop_active=False, heartbeat_ok=True)
     kw.update(over)
     return kw
@@ -123,6 +124,29 @@ class TestTier2Session(unittest.TestCase):
         self.assertIn("target_reached", _codes(t))
         self.assertIsNone(t.decision)
         self.assertGreaterEqual(s._io.cancels, 1)
+
+    def test_world_target_bearing_matches_translation(self):
+        # Map console: a WORLD target + a PF world pose with non-zero yaw.
+        # The decision bearing must equal bearing_to_waypoint (the Tier-1→2 step).
+        s = self._sess()
+        rx, ry, ryaw = 1.0, 2.0, 0.6
+        wx, wy = 3.0, 2.5
+        s.set_target_point(wx, wy)                       # world target, no conversion
+        t = s.tick(0.0, **_kw(pose=(rx, ry, ryaw)))
+        self.assertIsNotNone(t.decision)
+        self.assertAlmostEqual(
+            t.decision.bearing_rad, bearing_to_waypoint(rx, ry, ryaw, wx, wy), places=6)
+
+    def test_world_target_yaw_error_rotates_subgoal(self):
+        # The PF-yaw seam this tool exists to expose: a heading error rotates
+        # the body-frame sub-goal by (about) that error.
+        s = self._sess()
+        s.set_target_point(2.0, 0.0)
+        good = s.tick(0.0, **_kw(pose=(0.0, 0.0, 0.0))).decision
+        s2 = self._sess()
+        s2.set_target_point(2.0, 0.0)
+        bad = s2.tick(0.0, **_kw(pose=(0.0, 0.0, 0.5))).decision   # 0.5 rad yaw error
+        self.assertAlmostEqual(bad.bearing_rad - good.bearing_rad, -0.5, places=6)
 
     def test_clear_target_cancels(self):
         s = self._sess()

@@ -25,7 +25,9 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMainWindow, QPushButton, QVBoxLayout, QWidget,
 )
 
+from body.lib.local_drive_core import body_to_odom
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
+from desktop.world_map.map_views import SharedMapView, WorldDriveableView
 
 from .drive_client import DriveClient
 from .local_map_view import BodyLocalMapView
@@ -39,18 +41,31 @@ _LEVEL_COLOR = {"info": QColor(180, 200, 220), "warn": QColor(230, 200, 90),
 
 class Tier2Window(QMainWindow):
     def __init__(self, controller, drive: DriveClient, *,
+                 localizer=None,
                  trace_path: Optional[str] = None, redraw_hz: float = 10.0):
         super().__init__()
         self.setWindowTitle("Body — Tier-2 Debug Console")
         self.controller = controller
         self.drive = drive
+        self.localizer = localizer       # PF; None → body-only mode
         self._raster = ScanRasterConfig()
         self.session = Tier2Session(drive, Tier2SessionConfig())
 
         self._view = BodyLocalMapView(self)
         self._view.set_click_callback(self._on_map_click)
 
+        # World map (map mode only): right-click = world Tier-2 target,
+        # left-click = relocate-at (assert true position).
+        self._world_view = None
+        if self.localizer is not None:
+            self._shared = SharedMapView()
+            self._world_view = WorldDriveableView(
+                stale_s=2.0, shared=self._shared)
+            self._shared.set_goal_callback(self._on_world_target)
+            self._shared.set_locate_callback(self._on_world_locate)
+
         self._conn_lbl = QLabel("conn: —")
+        self._pose_lbl = QLabel("pose: —")
         self._t2_lbl = QLabel("tier2: —")
         self._t2_lbl.setWordWrap(True)
         self._t3_lbl = QLabel("tier3: —")
@@ -76,6 +91,8 @@ class Tier2Window(QMainWindow):
         panel = QGroupBox("tier-2 debug")
         pl = QVBoxLayout(panel)
         pl.addWidget(self._conn_lbl)
+        if self.localizer is not None:
+            pl.addWidget(self._pose_lbl)
         pl.addWidget(self._t2_lbl)
         pl.addWidget(self._t3_lbl)
         pl.addWidget(self._estop_lbl)
@@ -84,13 +101,20 @@ class Tier2Window(QMainWindow):
         pl.addWidget(self._drive_chk)
         brow = QHBoxLayout(); brow.addWidget(connect_btn); brow.addWidget(clear_btn)
         pl.addLayout(brow)
+        if self.localizer is not None:
+            reloc_btn = QPushButton("Relocate"); reloc_btn.clicked.connect(self._on_relocate)
+            pl.addWidget(reloc_btn)
         pl.addWidget(stop_btn)
-        pl.addWidget(QLabel("click the map to set a target"))
+        pl.addWidget(QLabel(
+            "right-click world map = target; left-click = set location"
+            if self.localizer is not None else "click the map to set a target"))
         pl.addWidget(QLabel("events:"))
         pl.addWidget(self._events, stretch=1)
 
         central = QWidget()
         lay = QHBoxLayout(central)
+        if self._world_view is not None:
+            lay.addWidget(self._world_view, stretch=1)
         lay.addWidget(self._view, stretch=1)
         lay.addWidget(panel)
         self.setCentralWidget(central)
@@ -126,6 +150,9 @@ class Tier2Window(QMainWindow):
     def _clear(self) -> None:
         self.session.clear_target()
         self._view.set_overlay(None, None, None, 0.0)
+        if self._world_view is not None:
+            self._shared.set_goal(None)
+            self._shared.set_lookahead(None)
 
     def _stop(self) -> None:
         self._drive_chk.setChecked(False)
@@ -136,14 +163,41 @@ class Tier2Window(QMainWindow):
             pass
 
     def _on_map_click(self, bx: float, by: float) -> None:
+        # Body-view click sets the target only in body-only mode; in map mode
+        # the world map (right-click) is the sole target input.
+        if self.localizer is not None:
+            return
         pose = self.drive.odom_pose()
         if pose is None:
             self._push_event("warn", "no_odom", "click ignored — no odom yet")
             return
+        self._apply_tunables()
+        self.session.set_target_from_body(bx, by, pose)
+
+    def _on_world_target(self, wx: float, wy: float) -> None:
+        """Right-click on the world map = the true Tier-2 world target."""
+        self._apply_tunables()
+        self.session.set_target_point(wx, wy)
+        self._shared.set_goal((wx, wy))
+        self._push_event("info", "target", f"world ({wx:+.2f}, {wy:+.2f})")
+
+    def _on_world_locate(self, wx: float, wy: float) -> None:
+        """Left-click = assert true position; PF recovers heading by scan-match."""
+        res = self.localizer.request_relocate_at(wx, wy)
+        ok = bool(res.get("success"))
+        self._push_event("info" if ok else "warn", "relocate_at",
+                         f"({wx:+.2f},{wy:+.2f}) {'ok' if ok else res.get('reason','failed')}")
+
+    def _on_relocate(self) -> None:
+        res = self.localizer.request_relocate()
+        ok = bool(res.get("success"))
+        self._push_event("info" if ok else "warn", "relocate",
+                         "ok" if ok else str(res.get("reason", "failed")))
+
+    def _apply_tunables(self) -> None:
         self.session.set_tunables(
             subgoal_arrival_tol_m=self._tol_spin.value(),
             sub_v_max=self._vmax_spin.value())
-        self.session.set_target_from_body(bx, by, pose)
 
     # ── Tick ─────────────────────────────────────────────────────────
 
@@ -159,16 +213,39 @@ class Tier2Window(QMainWindow):
                 grid, meta = rasterize_scan(
                     scan.get("ranges"), float(scan.get("angle_min", 0.0)),
                     float(scan.get("angle_increment", 0.0)), self._raster)
-        odom_pose = self.drive.odom_pose()
         status = self.drive.latest_status()
         e_stop, hb_ok = self._chassis_flags()
 
+        # Pose frame must match the target frame: PF world pose in map mode
+        # (target is world), odom pose in body-only mode (target is odom).
+        if self.localizer is not None:
+            pose = self._update_world_view(now)
+        else:
+            pose = self.drive.odom_pose()
+
         tick = self.session.tick(
-            now, odom_pose=odom_pose, grid=grid, meta=meta, scan_age_s=scan_age,
+            now, pose=pose, grid=grid, meta=meta, scan_age_s=scan_age,
             tier3_status=status, e_stop_active=e_stop, heartbeat_ok=hb_ok)
 
-        self._render(tick, grid, meta, status, e_stop)
+        self._render(tick, grid, meta, status, e_stop, pose)
         self._trace_write(tick)
+
+    def _update_world_view(self, now: float):
+        """Refresh the world map from the PF; return the world pose (or None)."""
+        lp = self.localizer.pose_source.latest_pose()
+        pose = lp[0] if lp is not None else None
+        snap = self.localizer.snapshot_for_ui()
+        if snap is not None and self._world_view is not None:
+            self._world_view.update_map(
+                snap["driveable"], snap["meta"], now, pose=pose,
+                pose_history=self.localizer.pose_trail(),
+                bounds_ij=snap.get("bounds_ij"))
+        if pose is not None:
+            self._pose_lbl.setText(
+                f"pose: x={pose[0]:+.2f} y={pose[1]:+.2f} θ={pose[2]*57.3:+.0f}°")
+        else:
+            self._pose_lbl.setText("pose: — (not localized — Relocate)")
+        return pose
 
     def _chassis_flags(self) -> Tuple[bool, bool]:
         st = self.controller.state
@@ -183,7 +260,7 @@ class Tier2Window(QMainWindow):
             e_stop = bool(status["e_stop_active"])
         return e_stop, connected
 
-    def _render(self, tick, grid, meta, status, e_stop) -> None:
+    def _render(self, tick, grid, meta, status, e_stop, pose) -> None:
         # Tier-3's serviced goal (blue) + the Tier-2 overlay (target/ray/sub-goal).
         goal_body = None
         if isinstance(status, dict):
@@ -196,6 +273,12 @@ class Tier2Window(QMainWindow):
         self._view.set_overlay(
             tick.target_body, d.body_xy if d else None,
             d.bearing_rad if d else None, d.free_dist_m if d else 0.0)
+
+        # World map: project the body sub-goal back to world (display only).
+        if self._world_view is not None:
+            sub_w = (body_to_odom(d.body_xy, pose)
+                     if (d and d.body_xy and pose is not None) else None)
+            self._shared.set_lookahead(sub_w)
 
         if not tick.has_target:
             self._t2_lbl.setText("tier2: (click a target)")
@@ -239,7 +322,10 @@ class Tier2Window(QMainWindow):
             pass
 
     def closeEvent(self, event) -> None:
-        for fn in (self.drive.shutdown, self.controller.shutdown):
+        fns = [self.drive.shutdown, self.controller.shutdown]
+        if self.localizer is not None:
+            fns.append(self.localizer.shutdown)
+        for fn in fns:
             try:
                 fn()
             except Exception:
