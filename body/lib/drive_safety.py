@@ -27,6 +27,11 @@ class FootprintConfig:
     block_on_unknown: bool = True
     unknown_block_range_m: float = 0.25
     min_observed_cells: int = 3
+    # Half-angle of the forward cone that counts as "in the way" at each
+    # sample. π/2 (90°) = the full forward half-plane (legacy). Narrower (~60°)
+    # stops an obstacle that's abeam — beside the robot, not ahead of where the
+    # motion carries it — from vetoing forward/turning arcs that would clear it.
+    forward_cone_rad: float = math.radians(60.0)
 
 
 def _arc_samples(
@@ -98,21 +103,26 @@ def swept_path_blocked(
     cell_x = ox + (ii + 0.5) * res
     cell_y = oy + (jj + 0.5) * res
 
-    # Directional swept region: a cell counts only if it is within r_foot of
-    # a sample AND in the *forward* half-plane of the body's velocity at that
-    # sample. This drops the trailing/lateral hemisphere of the (stationary)
-    # origin footprint, so an obstacle beside or behind the robot no longer
-    # vetoes motion that drives past or away from it — only obstacles the
-    # motion actually carries the body toward block.
+    # Directional swept region: a cell counts only if it is within r_foot of a
+    # sample AND inside the forward *cone* (half-angle ``forward_cone_rad``) of
+    # the body's velocity at that sample. This drops the trailing/lateral part
+    # of the (stationary) origin footprint, so an obstacle beside the robot no
+    # longer vetoes motion that drives past it — only obstacles the motion
+    # actually carries the body toward block. ``cone = π/2`` recovers the old
+    # forward-half-plane behaviour.
     r2 = r_foot * r_foot
+    cos2 = math.cos(cfg.forward_cone_rad) ** 2
     in_swept = np.zeros(sub.shape, dtype=bool)
     for sx, sy, th in zip(cx, cy, theta):
         dx = cell_x - sx                     # (H, 1)
         dy = cell_y - sy                     # (1, W)
-        near = dx * dx + dy * dy <= r2       # (H, W)
+        d2 = dx * dx + dy * dy               # (H, W)
+        near = d2 <= r2
         dirx = sgn * math.cos(th)
         diry = sgn * math.sin(th)
-        ahead = dx * dirx + dy * diry >= 0.0  # (H, W)
+        dot = dx * dirx + dy * diry          # (H, W)
+        # angle(cell, dir) ≤ cone  ⇔  dot ≥ 0 and dot² ≥ cos²·|d|² (|d|=0 → in).
+        ahead = (dot >= 0.0) & (dot * dot >= cos2 * d2)
         in_swept |= near & ahead
     if not np.any(in_swept):
         return True
