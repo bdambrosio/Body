@@ -285,6 +285,9 @@ class Tier2Window(QMainWindow):
         self._view.set_overlay(
             tick.target_body, d.body_xy if d else None,
             d.bearing_rad if d else None, d.free_dist_m if d else 0.0)
+        # Tier-3's local A* path (published in status) — the actual route.
+        self._view.set_planned_path(
+            status.get("path_body_xy") if isinstance(status, dict) else None)
 
         # World map: project the body sub-goal back to world (display only).
         if self._world_view is not None:

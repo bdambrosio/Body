@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from body.lib.astar import nearest_non_lethal
 from body.lib.local_drive_core import wrap_pi
 
 
@@ -182,63 +183,42 @@ def plan_tier2(
     max_dist_m: float,
     cfg: Optional[Tier2Config] = None,
 ) -> Tier2Decision:
-    """The Tier-2 step: **angular search** for a body-frame sub-goal toward the
-    target, packaged into a ``Tier2Decision``.
+    """The Tier-2 step: **project** the target onto the local map.
 
-    ``bearing_rad`` is the *direct* bearing to the target (the only world-derived
-    input, via ``bearing_to_waypoint``); ``max_dist_m`` its distance. We fan
-    across nearby bearings, ray-cast each (``furthest_free_point``, capped at the
-    target, backed off obstacles), and pick the clear one whose sub-goal lands
-    closest to the target — with a small swing penalty so a near-straight option
-    wins ties. When the direct line is open this is just the straight shot; when
-    it's blocked, the chosen bearing swings off-line to route around. Re-picking
-    each leg walks the robot around the obstacle. ok=False only when no clear
-    bearing makes progress.
+    Since the redesign, the Pi's local A* (``body/lib/local_planner.py``) is the
+    single local-routing authority — it inflates by the footprint and routes
+    *around* obstacles. So Tier-2 no longer does geometry: it just clamps the
+    target to within sensor range along ``bearing_rad`` (capped at the scan
+    horizon), nudged off any not-clear cell onto the nearest clear one so the
+    goal we hand Tier-3 is a sane point on the live grid. Tier-3 A* then snaps
+    + routes (or reports no path). ``max_dist_m`` is the target distance.
     """
     cfg = cfg or Tier2Config()
-    # Target point in body frame (along the direct bearing at the cap distance).
-    tx, ty = max_dist_m * math.cos(bearing_rad), max_dist_m * math.sin(bearing_rad)
+    d = min(max_dist_m, cfg.horizon_m)
+    capped = d < max_dist_m - 1e-9
+    res = float(meta["resolution_m"]); ox = float(meta["origin_x_m"]); oy = float(meta["origin_y_m"])
+    nx = int(meta["nx"]); ny = int(meta["ny"])
+    c, s = math.cos(bearing_rad), math.sin(bearing_rad)
+    bx, by = d * c, d * s
+    i = int(math.floor((bx - ox) / res))
+    j = int(math.floor((by - oy) / res))
+    if not (0 <= i < nx and 0 <= j < ny):
+        return Tier2Decision(bearing_rad, d, False, None, d, "out_of_map", capped, False)
 
-    # Candidate offsets: 0, +s, -s, +2s, -2s, … up to fan_max (straightest first).
-    offsets = [0.0]
-    k = 1
-    while k * cfg.fan_step_rad <= cfg.fan_max_rad + 1e-9:
-        offsets.append(k * cfg.fan_step_rad)
-        offsets.append(-k * cfg.fan_step_rad)
-        k += 1
-
-    direct_r: Optional[Tier2Result] = None
-    best = None            # (bearing, offset, result, dist_to_target)
-    best_score = float("inf")
-    for off in offsets:
-        b = bearing_rad + off
-        r = furthest_free_point(grid, meta, b, cfg, max_dist_m=max_dist_m)
-        if off == 0.0:
-            direct_r = r
-        if not r.ok:
-            continue
-        px, py = r.body_xy
-        d_target = math.hypot(px - tx, py - ty)
-        if d_target >= max_dist_m - cfg.progress_min_m:
-            continue       # this hop doesn't get us meaningfully closer
-        score = d_target + cfg.swing_penalty_m_per_rad * abs(off)
-        if score < best_score - 1e-9:
-            best, best_score = (b, off, r, d_target), score
-
-    if best is None:
-        # Nothing clear made progress. Report the direct ray's reason if it was
-        # the limiter, else that no bearing was open.
-        reason = direct_r.reason if (direct_r is not None and not direct_r.ok) else "no_clear_bearing"
-        fd = direct_r.free_dist_m if direct_r is not None else 0.0
+    # Snap off any not-clear cell (Tier-3 A* does the real footprint snap; this
+    # just avoids handing Tier-3 an obviously-blocked goal). When the goal cell
+    # is already clear, return the exact clamped point (no cell quantization).
+    if grid[i, j] == 1:
         return Tier2Decision(
-            bearing_rad=bearing_rad, max_dist_m=max_dist_m, ok=False, body_xy=None,
-            free_dist_m=fd, reason=reason, capped_at_target=False,
+            bearing_rad=bearing_rad, max_dist_m=max_dist_m, ok=True, body_xy=(bx, by),
+            free_dist_m=math.hypot(bx, by), reason="ok", capped_at_target=not capped,
             backoff_applied=False, bearing_offset_rad=0.0)
-
-    b, off, r, _ = best
-    reached_cap = r.free_dist_m >= max_dist_m - cfg.step_m
-    capped = abs(off) < 1e-9 and reached_cap     # straight shot all the way to the target
+    found = nearest_non_lethal(grid != 1, i, j, radius=10)
+    if found is None:
+        return Tier2Decision(bearing_rad, d, False, None, d, "no_free_cell", capped, False)
+    gx = ox + (found[0] + 0.5) * res
+    gy = oy + (found[1] + 0.5) * res
     return Tier2Decision(
-        bearing_rad=b, max_dist_m=max_dist_m, ok=True, body_xy=r.body_xy,
-        free_dist_m=r.free_dist_m, reason="ok", capped_at_target=capped,
-        backoff_applied=not reached_cap, bearing_offset_rad=off)
+        bearing_rad=bearing_rad, max_dist_m=max_dist_m, ok=True, body_xy=(gx, gy),
+        free_dist_m=math.hypot(gx, gy), reason="ok", capped_at_target=not capped,
+        backoff_applied=True, bearing_offset_rad=0.0)

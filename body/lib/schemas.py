@@ -67,13 +67,16 @@ def drive_status(
     omega_radps: float = 0.0,
     blocked_reason: str | None = None,
     mode: str | None = None,
+    path_body_xy: list | None = None,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
     ``state`` is one of IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT.
     ``goal_body_xy`` is the active goal transformed into the *live* body
     frame, for the operator UI to draw. ``blocked_reason`` is set only when
-    state==BLOCKED/FAULT: swept_block | no_progress | odom_stale | out_of_local_map.
+    state==BLOCKED/FAULT: no_path | swept_block | no_progress | odom_stale |
+    goal_out_of_map | start_blocked | goal_unreachable. ``path_body_xy`` is the
+    local A* path (body frame, downsampled) when driving, for the operator UI.
     """
     msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
@@ -89,6 +92,8 @@ def drive_status(
         msg["blocked_reason"] = blocked_reason
     if mode is not None:
         msg["mode"] = mode
+    if path_body_xy:
+        msg["path_body_xy"] = [[float(p[0]), float(p[1])] for p in path_body_xy]
     return msg
 
 

@@ -21,12 +21,13 @@ import time
 from typing import Any, Dict, Optional
 
 from body.lib import schemas, zenoh_helpers
-from body.lib.drive_safety import FootprintConfig
+from body.lib.drive_safety import FootprintConfig, swept_path_blocked
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
+from body.lib.local_costmap import LocalCostmapConfig
+from body.lib.local_planner import LocalPlanConfig, lookahead_on_path, plan_local
 from body.lib.local_drive_core import (
     STATE_ARRIVED, STATE_BLOCKED, STATE_DRIVING, STATE_FAULT, STATE_IDLE,
-    DriveParams, LocalPlanConfig, odom_to_body, plan_drive, rotate_to_heading,
-    wrap_pi,
+    DriveParams, odom_to_body, rotate_to_heading, steer_to_body_point, wrap_pi,
 )
 
 
@@ -105,25 +106,23 @@ def main() -> None:
         ),
         clear_buffer_cells=float(scan_cfg.get("clear_buffer_cells", 2.0)),
     )
-    lp = cfg.get("local_plan", {})
-    lpcfg = LocalPlanConfig(
-        center_range_m=float(lp.get("center_range_m", 0.8)),
-        center_back_margin_m=float(lp.get("center_back_margin_m", 0.2)),
-        center_target_clear_m=float(lp.get("center_target_clear_m", 0.3)),
-        k_center=float(lp.get("k_center", 1.5)),
-        gov_full_clear_m=float(lp.get("gov_full_clear_m", 0.7)),
-        gov_min_clear_m=float(lp.get("gov_min_clear_m", 0.3)),
-        gov_cone_rad=math.radians(float(lp.get("gov_cone_deg", 20.0))),
-        fan_max_rad=math.radians(float(lp.get("fan_max_deg", 50.0))),
-        fan_step_rad=math.radians(float(lp.get("fan_step_deg", 12.0))),
-        nudge_v_floor=float(lp.get("nudge_v_floor", 0.4)),
-        gap_scan_range_m=float(lp.get("gap_scan_range_m", 1.2)),
-        gap_min_m=float(lp.get("gap_min_m", 0.6)),
-        gap_step_rad=math.radians(float(lp.get("gap_step_deg", 12.0))),
-        gap_max_rad=math.radians(float(lp.get("gap_max_deg", 110.0))),
+    # Local A* planner config (the single local-routing authority). The
+    # costmap footprint is THE footprint model; keep the swept-veto FootprintConfig
+    # ≤ this so they agree (see drive_safety).
+    lp = cfg.get("local_planner", {})
+    local_plan_cfg = LocalPlanConfig(
+        costmap=LocalCostmapConfig(
+            footprint_radius_m=float(lp.get("footprint_radius_m", 0.11)),
+            safety_margin_m=float(lp.get("safety_margin_m", 0.08)),
+            inflation_decay_m=float(lp.get("inflation_decay_m", 0.20)),
+            unknown_cost=float(lp.get("unknown_cost", 25.0)),
+            unknown_is_lethal=bool(lp.get("unknown_is_lethal", False)),
+        ),
+        min_clearance_cells=int(lp.get("min_clearance_cells", 0)),
+        cost_per_unit=float(lp.get("cost_per_unit", 0.10)),
+        max_expansions=int(lp.get("max_expansions", 50000)),
     )
-    seek_facing_tol = math.radians(float(lp.get("seek_facing_tol_deg", 10.0)))
-    seek_timeout_s = float(lp.get("seek_timeout_s", 6.0))
+    lookahead_m = float(lp.get("lookahead_m", 0.4))
     control_hz = float(cfg.get("control_hz", 10.0))
     period = 1.0 / max(1.0, control_hz)
     cmd_timeout_ms = max(500, int(3.0 * period * 1000.0))
@@ -183,13 +182,14 @@ def main() -> None:
         )
 
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
-                       dist=0.0, v=0.0, omega=0.0, reason=None, mode=None) -> None:
+                       dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
+                       path_body=None) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
                 cmd_id=cmd_id, state=state, goal_body_xy=goal_body,
                 dist_remaining_m=dist, v_mps=v, omega_radps=omega,
-                blocked_reason=reason, mode=mode,
+                blocked_reason=reason, mode=mode, path_body_xy=path_body,
             ),
         )
 
@@ -198,11 +198,6 @@ def main() -> None:
     best_dist: Optional[float] = None
     best_dist_at = 0.0
     final_aligned = False
-    # Gap-seek commitment: when latched onto an out-of-fan corridor, the
-    # robot rotates to face this odom heading (ignoring goal pull) until
-    # aligned, so it doesn't flip-flop back toward the goal mid-turn.
-    seek_odom: Optional[float] = None
-    seek_t0 = 0.0
 
     print(f"local_drive: up; control_hz={control_hz} v_max={params.v_max}", flush=True)
     next_tick = time.monotonic()
@@ -226,7 +221,6 @@ def main() -> None:
             best_dist = None
             best_dist_at = now_mono
             final_aligned = False
-            seek_odom = None
 
         gx, gy = float(g["x_m"]), float(g["y_m"])
         tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
@@ -282,37 +276,36 @@ def main() -> None:
             float(scan.get("angle_increment", 0.0)), raster,
         )
 
-        # Seek commitment: while latched onto an out-of-fan corridor, rotate
-        # to face it (ignoring goal pull) until aligned or timed out, so the
-        # robot doesn't flip-flop back toward the goal mid-turn.
-        if seek_odom is not None:
-            if now_mono - seek_t0 > seek_timeout_s:
-                seek_odom = None
-                publish_cmd(0.0, 0.0)
-                publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                               dist=dist, reason="swept_block", mode="seek")
-                next_tick = _sleep_to(next_tick, period)
-                continue
-            err = wrap_pi(seek_odom - pose[2])
-            if abs(err) > seek_facing_tol:
-                om = max(-gp.omega_max, min(gp.omega_max, gp.k_omega * err))
-                publish_cmd(0.0, om)
-                publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                               dist=dist, omega=om, mode="seek")
-                best_dist = dist            # rotating to face the gap, not stuck
-                best_dist_at = now_mono
-                next_tick = _sleep_to(next_tick, period)
-                continue
-            seek_odom = None                # aligned → drive up the corridor
+        # Local A* over the footprint-inflated scan grid: the single authority
+        # for local feasibility/routing. Returns a body-frame path the body can
+        # follow the whole way, or an honest "no path".
+        plan = plan_local(grid, meta, (bx, by), local_plan_cfg)
+        if not plan.ok:
+            publish_cmd(0.0, 0.0)
+            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
+                           dist=dist, reason=plan.reason, mode="plan")
+            best_dist = dist            # stopped → reset the no-progress window
+            best_dist_at = now_mono
+            next_tick = _sleep_to(next_tick, period)
+            continue
 
-        # Proactive local steering: directional swept gate (#3), corridor
-        # centering, reactive nudge, and gap-seeking.
-        v, omega, mode, seek_target = plan_drive(grid, meta, (bx, by), gp, foot, lpcfg)
+        # Pure-pursuit follow: steer toward a lookahead point on the path.
+        look = lookahead_on_path(plan.path_body, lookahead_m) or (bx, by)
+        v, omega, _ld, _lb = steer_to_body_point(look, gp)
 
-        # No-progress watchdog — only while actually translating. Rotating
-        # in place (large bearing) or a blocked stop legitimately holds
-        # distance, so reset the timer whenever we're not translating; a
-        # fresh window starts once the robot begins to drive.
+        # Last-resort safety veto — A* won't route through lethal, but a
+        # dynamic/new obstacle can appear in the followed arc between replans.
+        # Strictly subordinate: it only stops, never steers.
+        if swept_path_blocked(grid, meta, v_mps=v, omega_radps=omega, config=foot):
+            publish_cmd(0.0, 0.0)
+            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
+                           dist=dist, reason="swept_block", mode="follow")
+            best_dist = dist
+            best_dist_at = now_mono
+            next_tick = _sleep_to(next_tick, period)
+            continue
+
+        # No-progress watchdog — only while actually translating.
         if v < 1e-3:
             best_dist = dist
             best_dist_at = now_mono
@@ -326,27 +319,10 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
-        if mode == "seek":
-            # Latch the out-of-fan corridor as an odom heading and commit.
-            seek_odom = wrap_pi(pose[2] + seek_target)
-            seek_t0 = now_mono
-            om = max(-gp.omega_max, min(gp.omega_max, gp.k_omega * seek_target))
-            publish_cmd(0.0, om)
-            publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, omega=om, mode="seek")
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        if mode == "blocked":
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="swept_block", mode="blocked")
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
         publish_cmd(v, omega)
         publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                       dist=dist, v=v, omega=omega, mode=mode)
+                       dist=dist, v=v, omega=omega, mode="follow",
+                       path_body=plan.path_body)
         next_tick = _sleep_to(next_tick, period)
 
     publish_cmd(0.0, 0.0)

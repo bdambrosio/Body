@@ -47,6 +47,7 @@ class BodyLocalMapView(QWidget):
         self._subgoal_body: Optional[Tuple[float, float]] = None
         self._bearing_rad: Optional[float] = None
         self._free_dist_m: float = 0.0
+        self._path_body: Optional[list] = None     # Tier-3 A* path, body frame
 
     def set_click_callback(self, cb: Callable[[float, float], None]) -> None:
         self._on_click = cb
@@ -63,6 +64,11 @@ class BodyLocalMapView(QWidget):
         self._subgoal_body = subgoal_body
         self._bearing_rad = bearing_rad
         self._free_dist_m = free_dist_m
+        self.update()
+
+    def set_planned_path(self, path_body: Optional[list]) -> None:
+        """Tier-3's local A* path (body-frame [[x,y],...]) to draw, or None."""
+        self._path_body = path_body
         self.update()
 
     def update_data(
@@ -168,6 +174,14 @@ class BodyLocalMapView(QWidget):
 
     def _draw_tier2_overlay(self, p: QPainter) -> None:
         rx, ry = self._body_to_px(0.0, 0.0)
+        # Tier-3's planned A* path (cyan polyline) — the route the robot follows.
+        if self._path_body and len(self._path_body) >= 2:
+            p.setPen(QPen(QColor(80, 220, 230), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            pts = [QPointF(*self._body_to_px(float(pt[0]), float(pt[1])))
+                   for pt in self._path_body]
+            for a, b in zip(pts, pts[1:]):
+                p.drawLine(a, b)
         # Bearing ray from the robot toward the target.
         if self._bearing_rad is not None and self._target_body is not None:
             d = max(0.3, math.hypot(*self._target_body))

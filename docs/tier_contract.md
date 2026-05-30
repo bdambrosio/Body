@@ -6,18 +6,23 @@ loop; every point the robot actually drives toward is observed live in the
 lidar scan.**
 
 ```
-Tier 1 (topological)      Tier 2 (visibility)            Tier 3 (reactive, on Pi)
-ordered waypoints   ──►   bearing → furthest live    ──►  pure-pursuit + local
-(world frame)             free point (body frame)         plan + swept-footprint
-   ▲                          │  body/drive/goto             veto, owns cmd_vel
-   └── advance on  ◄──────────┴───────────────────────◄──  body/drive/status
+Tier 1 (topological)      Tier 2 (projection)            Tier 3 (local A*, on Pi)
+ordered waypoints   ──►   clamp waypoint onto      ──►   inflate → A* → follow
+(world frame)             the local map (body)           path + swept-veto, owns cmd_vel
+   ▲                          │  body/drive/goto             body/drive/status (+ path)
+   └── advance on  ◄──────────┴───────────────────────◄──  (state, path_body_xy)
        PF-pose arrival
 ```
 
-Production wiring lives in `desktop/nav/hierarchical_drive.py`
-(`HierarchicalDrive`). The Tier-2 step itself is the pure
-`plan_tier2()` in `body/lib/tier2_subgoal.py`, shared with the Tier-2 debug
-console (`desktop/pi_drive --tier2`).
+**The local A\* (`body/lib/local_planner.py`) is the single authority for local
+feasibility/routing** — it inflates the body-frame scan grid by the robot
+footprint and finds a path the body can actually follow, or reports no path.
+Tier-2 no longer does geometry; it just projects the waypoint onto the local
+map. This makes "Tier-2 sets a waypoint Tier-3 can reach" hold by construction
+(one footprint model, one planner). Production wiring lives in
+`desktop/nav/hierarchical_drive.py`; the Tier-2 projection is `plan_tier2()` in
+`body/lib/tier2_subgoal.py`, shared with the debug console
+(`desktop/pi_drive --tier2`).
 
 ## Frames
 
@@ -49,16 +54,13 @@ taking a *body-frame* target directly, so Tier-2 can be debugged without PF.)
 
 ## Tier 2 → Tier 3  (`body/drive/goto`, `schemas.drive_goto`)
 
-Tier 2 ray-marches the live body-frame scan grid along `bearing`, **capped at
-`dist`** (never aim past the waypoint), and picks the furthest free point
-(`furthest_free_point` / `plan_tier2` → `Tier2Decision`):
-
-- clear all the way to the target → the sub-goal **is** the target (no backoff),
-- blocked/unknown/horizon first → back off `Tier2Config.backoff_m` from it.
-
-The sub-goal stays **body-frame** until `DriveClient.send_goto_from_body` rotates
-it to **odom** using the live odom pose — so the world↔odom yaw difference
-cancels and Tier 2 never re-touches world/odom math.
+Tier 2 **projects** the waypoint onto the local map (`plan_tier2`): clamp `dist`
+to the scan horizon along `bearing` (never aim past the waypoint), then nudge
+off any not-clear cell onto the nearest clear one (Tier-3's A* does the real
+footprint snap). The result stays **body-frame** until
+`DriveClient.send_goto_from_body` rotates it to **odom** via the live odom pose
+— so world↔odom cancels and Tier 2 never re-touches odom math. Tier-2 does *no*
+routing; the Pi A* routes.
 
 Goto fields: `cmd_id` (**monotonic; higher supersedes; the Pi rejects a lower
 id as stale** — `DriveClient` seeds `cmd_id` from wall-clock so it survives
@@ -68,22 +70,26 @@ the desktop keeps `live_command` OFF (Tier 3 owns `body/cmd_vel`).
 
 ## Tier 3 → Tier 2  (`body/drive/status`, `schemas.drive_status`)
 
-Tier 3 (`body/local_drive.py`) runs pure-pursuit + a local planner (centering,
-governor, fan, gap-seek) and a **swept-footprint safety veto** over its *own*
-rasterized scan. It reports every tick:
+Tier 3 (`body/local_drive.py`) builds a footprint-inflated, clearance-graded
+costmap (`body/lib/local_costmap.py`) from the live scan, runs **A\***
+(`body/lib/astar.py` via `local_planner.plan_local`) robot→goal, follows the
+path with pure-pursuit (`steer_to_body_point` toward a lookahead), and keeps the
+**swept-footprint veto only as a last-resort stop** (`drive_safety`, sized ≤ the
+A* footprint). Re-plans every tick. It reports:
 
 - `state` — IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT. (ARRIVED is
-  published for a *single* tick, then it drops the goal → IDLE; consumers must
-  treat IDLE-for-our-cmd_id as "sub-goal done".)
-- `mode` — pursue | center | nudge | seek | rotate | blocked.
-- `blocked_reason` — swept_block | no_progress | odom_stale | no_scan.
-- `goal_body_xy`, `dist_remaining_m`, `v_mps`, `omega_radps`, and the
-  **serviced `cmd_id`** (compare against the last sent id to detect a stale-id
-  collision).
+  published for a *single* tick, then it drops the goal → IDLE; consumers treat
+  IDLE-for-our-cmd_id as "done".)
+- `blocked_reason` — `no_path` | `goal_unreachable` | `start_blocked` |
+  `goal_out_of_map` | `swept_block` | `no_progress` | `odom_stale` | `no_scan`.
+- `mode` — `follow` | `plan`.
+- `path_body_xy` — the local A* path (body frame, downsampled) for the operator
+  UI to render.
+- `goal_body_xy`, `dist_remaining_m`, `v_mps`, `omega_radps`, serviced `cmd_id`.
 
 Tier 2 re-picks toward the same waypoint on ARRIVED/IDLE; on BLOCKED it retries
-a few times then pauses (consecutive-block counter). See
-`docs/drive_tier3_spec.md` for the full Tier-3 spec and arbitration rules.
+a few times then pauses. See `docs/drive_tier3_spec.md` for the full Tier-3
+spec and arbitration rules.
 
 ## Shared inputs
 

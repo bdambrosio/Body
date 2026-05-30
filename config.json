@@ -155,23 +155,16 @@
     "block_on_unknown": true,
     "unknown_block_range_m": 0.25,
     "min_observed_cells": 3,
-    "local_plan": {
-      "center_range_m": 0.8,
-      "center_back_margin_m": 0.2,
-      "center_target_clear_m": 0.3,
-      "k_center": 1.5,
-      "gov_full_clear_m": 1.1,
-      "gov_min_clear_m": 0.5,
-      "gov_cone_deg": 20.0,
-      "fan_max_deg": 50.0,
-      "fan_step_deg": 12.0,
-      "nudge_v_floor": 0.4,
-      "gap_scan_range_m": 1.2,
-      "gap_min_m": 0.6,
-      "gap_step_deg": 12.0,
-      "gap_max_deg": 110.0,
-      "seek_facing_tol_deg": 10.0,
-      "seek_timeout_s": 6.0
+    "local_planner": {
+      "footprint_radius_m": 0.11,
+      "min_clearance_cells": 0,
+      "safety_margin_m": 0.08,
+      "inflation_decay_m": 0.20,
+      "unknown_cost": 25.0,
+      "unknown_is_lethal": false,
+      "cost_per_unit": 0.10,
+      "max_expansions": 50000,
+      "lookahead_m": 0.4
     },
     "scan": {
       "resolution_m": 0.08,
