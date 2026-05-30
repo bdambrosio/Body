@@ -23,6 +23,8 @@ COLOR_BG = QColor(40, 40, 40)        # unknown / background
 COLOR_ROBOT = QColor(255, 255, 255)
 COLOR_GOAL = QColor(80, 160, 255)
 MARGIN_PX = 8
+# Drawn footprint radius (m); match config.json:local_drive.footprint_radius_m.
+FOOTPRINT_M = 0.14
 
 
 class BodyLocalMapView(QWidget):
@@ -140,11 +142,16 @@ class BodyLocalMapView(QWidget):
             p.drawText(10, 18, self._state_text)
 
     def _draw_robot(self, p: QPainter, ppm: float) -> None:
-        r = max(0.10, 0.22) * ppm  # footprint-ish marker
+        # Footprint circle = the Tier-3 swept-check radius. Keep in sync with
+        # config.json:local_drive.footprint_radius_m (the actual block radius
+        # is this + half a cell, so a pixel just outside the ring can still
+        # block until the half-cell / directional refinements land).
+        fp = FOOTPRINT_M
+        r = fp * ppm
         cx, cy = self._body_to_px(0.0, 0.0)
-        nose_x, nose_y = self._body_to_px(0.22, 0.0)
-        left_x, left_y = self._body_to_px(-0.05, 0.12)
-        right_x, right_y = self._body_to_px(-0.05, -0.12)
+        nose_x, nose_y = self._body_to_px(fp, 0.0)
+        left_x, left_y = self._body_to_px(-0.4 * fp, 0.55 * fp)
+        right_x, right_y = self._body_to_px(-0.4 * fp, -0.55 * fp)
         tri = QPolygonF([
             QPointF(nose_x, nose_y), QPointF(left_x, left_y), QPointF(right_x, right_y),
         ])

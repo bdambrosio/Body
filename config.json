@@ -146,7 +146,7 @@
     "no_progress_timeout_s": 4.0,
     "no_progress_eps_m": 0.03,
     "odom_stale_s": 0.5,
-    "footprint_radius_m": 0.22,
+    "footprint_radius_m": 0.14,
     "preview_distance_m": 0.35,
     "preview_min_distance_m": 0.15,
     "preview_time_s": 1.5,

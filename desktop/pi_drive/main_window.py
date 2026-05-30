@@ -9,6 +9,8 @@ Tier-3 owns cmd_vel while a goal is active (see docs/drive_tier3_spec.md).
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import Optional, Tuple
 
 from PyQt6.QtCore import Qt, QTimer
@@ -42,6 +44,13 @@ class PiDriveWindow(QMainWindow):
         self._conn_lbl = QLabel("conn: —")
         self._state_lbl = QLabel("drive: —")
         self._goal_lbl = QLabel("goal: —")
+        # Bring-up telemetry: is the robot actually responding to cmd_vel?
+        self._estop_lbl = QLabel("estop: —")
+        self._odom_lbl = QLabel("odom: —")
+        self._motor_lbl = QLabel("motor: —")
+        # For the odom "moving?" indicator (position delta between redraws).
+        self._last_odom_xy: Optional[Tuple[float, float]] = None
+        self._last_odom_t: Optional[float] = None
 
         self._tol_spin = QDoubleSpinBox()
         self._tol_spin.setRange(0.03, 1.0)
@@ -72,6 +81,10 @@ class PiDriveWindow(QMainWindow):
         pl.addWidget(connect_btn)
         pl.addWidget(stop_btn)
         pl.addWidget(QLabel("click the map to set a goal"))
+        pl.addSpacing(8)
+        pl.addWidget(self._estop_lbl)
+        pl.addWidget(self._odom_lbl)
+        pl.addWidget(self._motor_lbl)
         pl.addStretch(1)
 
         central = QWidget()
@@ -144,6 +157,62 @@ class PiDriveWindow(QMainWindow):
             )
             self._state_lbl.setText(f"drive: {state_text}")
         self._view.update_data(drive, meta, goal_body, state_text)
+        self._update_telemetry()
+
+    def _update_telemetry(self) -> None:
+        """e-stop / odom / motor readout — answers 'is the robot actually
+        responding to cmd_vel?' during bring-up."""
+        st = self.controller.state
+        with st.lock:
+            status = st.status
+            motor = st.motor_state
+            odom = st.odom
+
+        estop = None
+        if isinstance(motor, dict) and "e_stop_active" in motor:
+            estop = bool(motor["e_stop_active"])
+        elif isinstance(status, dict) and "e_stop_active" in status:
+            estop = bool(status["e_stop_active"])
+        timeout = bool(motor.get("cmd_timeout_active")) if isinstance(motor, dict) else False
+        stall = bool(motor.get("stall_detected")) if isinstance(motor, dict) else False
+        flags = []
+        if estop:
+            flags.append("E-STOP")
+        if timeout:
+            flags.append("cmd_timeout")
+        if stall:
+            flags.append("stall")
+        self._estop_lbl.setText(
+            "estop: " + (" ".join(flags) if flags else ("clear" if estop is not None else "—"))
+        )
+
+        if isinstance(odom, dict):
+            try:
+                x, y, th = float(odom["x"]), float(odom["y"]), float(odom["theta"])
+            except (KeyError, TypeError, ValueError):
+                x = y = th = float("nan")
+            now = time.monotonic()
+            moving = "—"
+            if self._last_odom_xy is not None and self._last_odom_t is not None:
+                d = math.hypot(x - self._last_odom_xy[0], y - self._last_odom_xy[1])
+                dt = max(1e-3, now - self._last_odom_t)
+                moving = f"MOVING {d / dt:.2f} m/s" if d > 0.005 else "still"
+            self._last_odom_xy = (x, y)
+            self._last_odom_t = now
+            src = str(odom.get("source", "?"))
+            self._odom_lbl.setText(
+                f"odom: x={x:+.2f} y={y:+.2f} θ={math.degrees(th):+.0f}°  [{moving}]  ({src})"
+            )
+        else:
+            self._odom_lbl.setText("odom: — (no body/odom)")
+
+        if isinstance(motor, dict):
+            self._motor_lbl.setText(
+                f"motor: L={motor.get('left_pwm', 0):+.2f}/{motor.get('left_dir', '?')} "
+                f"R={motor.get('right_pwm', 0):+.2f}/{motor.get('right_dir', '?')}"
+            )
+        else:
+            self._motor_lbl.setText("motor: — (no body/motor_state)")
 
     def closeEvent(self, event) -> None:
         try:
