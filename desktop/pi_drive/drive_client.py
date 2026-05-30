@@ -30,7 +30,12 @@ class DriveClient:
         self._status: Optional[Dict[str, Any]] = None
         self._odom: Optional[Dict[str, Any]] = None
         self._scan: Optional[Dict[str, Any]] = None
-        self._cmd_id = 0
+        # Seed from wall-clock so cmd_ids strictly exceed any previous
+        # session's: the Pi's Tier-3 keeps its last cmd_id across our restarts
+        # and rejects any goto with a lower id as superseded. A per-launch
+        # counter from 0 would be silently dropped until it climbed back past
+        # the Pi's remembered value. Monotonic wall time avoids that.
+        self._cmd_id = int(time.time())
         # Optional post-hoc trace: one JSON object per received status,
         # stamped with the desktop wall-clock arrival time. Mirrors the
         # nav JSONL tracing pattern so a leg can be reviewed offline.
