@@ -127,6 +127,15 @@ class LocalPlanConfig:
     fan_max_rad: float = 0.87           # ~50°
     fan_step_rad: float = 0.21          # ~12°
     nudge_v_floor: float = 0.4          # min speed scale on a sharp nudge
+    # Gap seeking: when the fan is fully blocked, look for an open corridor
+    # *beyond* the fan's reach (a side arm) and rotate to face it. A
+    # direction is "open" if its ray-clearance ≥ gap_min_m. If the only
+    # opening is within the fan (already tried, swept-infeasible), it's a
+    # narrow/wedged spot → blocked instead (caller escalates).
+    gap_scan_range_m: float = 1.2
+    gap_min_m: float = 0.6
+    gap_step_rad: float = 0.21          # ~12° scan resolution
+    gap_max_rad: float = 1.92           # ~110° each side of the goal bearing
 
 
 def _fan_offsets(max_rad: float, step_rad: float):
@@ -144,6 +153,41 @@ def _nearest_blocked(bxs, bys, px: float, py: float) -> float:
     return float(np.min(np.hypot(bxs - px, bys - py)))
 
 
+def _ray_clearance(grid, res, ox, oy, nx, ny, th, max_range):
+    """Distance from the body origin to the first blocked cell along bearing
+    `th` (body frame), capped at `max_range`. Unknown cells pass through."""
+    steps = max(1, int(max_range / res))
+    cth, sth = math.cos(th), math.sin(th)
+    for s in range(1, steps + 1):
+        d = s * res
+        i = int((d * cth - ox) / res)
+        j = int((d * sth - oy) / res)
+        if not (0 <= i < nx and 0 <= j < ny):
+            return d
+        if grid[i, j] == 0:
+            return d
+    return max_range
+
+
+def _find_open_heading(grid, res, ox, oy, nx, ny, bearing, cfg):
+    """Body-frame bearing of the open corridor nearest the goal bearing
+    (ray-clearance ≥ gap_min_m), and its offset from the goal bearing.
+    Scans outward from the goal bearing so the first hit is the nearest.
+    Returns (None, None) if nothing is open."""
+    offs = [0.0]
+    k = 1
+    while k * cfg.gap_step_rad <= cfg.gap_max_rad + 1e-9:
+        offs.append(k * cfg.gap_step_rad)
+        offs.append(-k * cfg.gap_step_rad)
+        k += 1
+    for off in offs:
+        th = bearing + off
+        clr = _ray_clearance(grid, res, ox, oy, nx, ny, th, cfg.gap_scan_range_m)
+        if clr >= cfg.gap_min_m:
+            return th, off
+    return None, None
+
+
 def plan_drive(
     grid: np.ndarray,
     meta: dict,
@@ -151,27 +195,34 @@ def plan_drive(
     params: DriveParams,
     foot: FootprintConfig,
     cfg: LocalPlanConfig,
-) -> Tuple[float, float, str]:
+) -> Tuple[float, float, str, float]:
     """Proactive clearance-aware local steering toward `goal_body`.
 
-    Returns (v_mps, omega_radps, mode) where mode is one of
-    'rotate' | 'pursue' | 'center' | 'nudge' | 'blocked':
+    Returns (v_mps, omega_radps, mode, seek_target) where mode is one of
+    'rotate' | 'pursue' | 'center' | 'nudge' | 'seek' | 'blocked':
       * rotate  — bearing too large; turn in place to face the goal.
       * pursue  — straight pursuit, path clear.
       * center  — pursuit + a clearance bias steering off a nearby wall.
       * nudge   — pursuit blocked; a turning arc around the obstacle.
-      * blocked — no feasible forward arc (dead-end); caller stops/escalates.
+      * seek    — fan blocked, but an open corridor exists *beyond* the fan;
+                  `seek_target` is its body-frame bearing — the caller should
+                  rotate to face it (with commitment, to avoid flip-flopping
+                  back toward the goal) then resume driving.
+      * blocked — no feasible forward arc and no out-of-fan opening (dead-end
+                  or too narrow); caller stops/escalates.
 
     The swept-footprint check (#3, directional) is the hard feasibility gate;
-    centering and the fan only ever choose among collision-free motions.
+    centering, the fan, and gap-seeking only choose collision-free motions.
+    `seek_target` is meaningful only when mode == 'seek'.
     """
     v_des, omega_des, dist, bearing = steer_to_body_point(goal_body, params)
     if v_des < 1e-3:
-        return v_des, omega_des, "rotate"
+        return v_des, omega_des, "rotate", 0.0
 
     res = float(meta["resolution_m"])
     ox = float(meta["origin_x_m"])
     oy = float(meta["origin_y_m"])
+    nx, ny = grid.shape
     bi, bj = np.where(grid == 0)
     has_blocked = bi.size > 0
     bxs = ox + (bi + 0.5) * res if has_blocked else None
@@ -193,7 +244,7 @@ def plan_drive(
     # Try pursuit (with centering) first.
     omega = _clip(omega_des + omega_center, -params.omega_max, params.omega_max)
     if not swept_path_blocked(grid, meta, v_mps=v_des, omega_radps=omega, config=foot):
-        return v_des, omega, ("center" if abs(omega_center) > 1e-3 else "pursue")
+        return v_des, omega, ("center" if abs(omega_center) > 1e-3 else "pursue"), 0.0
 
     # Blocked → reactive fan: pure pursuit (0) first, then growing offsets.
     for d in [0.0] + _fan_offsets(cfg.fan_max_rad, cfg.fan_step_rad):
@@ -201,6 +252,13 @@ def plan_drive(
         om = _clip(params.k_omega * th, -params.omega_max, params.omega_max)
         v = max(params.v_min_mps, v_des * max(cfg.nudge_v_floor, math.cos(d)))
         if not swept_path_blocked(grid, meta, v_mps=v, omega_radps=om, config=foot):
-            return v, om, ("pursue" if abs(d) < 1e-9 else "nudge")
+            return v, om, ("pursue" if abs(d) < 1e-9 else "nudge"), 0.0
 
-    return 0.0, 0.0, "blocked"
+    # Fan exhausted → gap-seek: is there an open corridor beyond the fan?
+    th, off = _find_open_heading(grid, res, ox, oy, nx, ny, bearing, cfg)
+    if th is None or abs(off) <= cfg.fan_max_rad:
+        # Nothing open, or the only opening is within the fan we just tried
+        # (so it's narrow/wedged, not a missed side arm) → escalate.
+        return 0.0, 0.0, "blocked", 0.0
+    omega = _clip(params.k_omega * th, -params.omega_max, params.omega_max)
+    return 0.0, omega, "seek", th

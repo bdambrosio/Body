@@ -149,10 +149,12 @@ class PiDriveWindow(QMainWindow):
                 goal_body = (float(gb[0]), float(gb[1]))
             state = status.get("state", "—")
             reason = status.get("blocked_reason")
+            mode = status.get("mode")
             state_text = (
                 f"{state}  d={float(status.get('dist_remaining_m', 0.0)):.2f}m "
                 f"v={float(status.get('v_mps', 0.0)):+.2f} "
                 f"ω={float(status.get('omega_radps', 0.0)):+.2f}"
+                + (f"  ‹{mode}›" if mode else "")
                 + (f"  [{reason}]" if reason else "")
             )
             self._state_lbl.setText(f"drive: {state_text}")

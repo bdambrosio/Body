@@ -26,6 +26,7 @@ from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.local_drive_core import (
     STATE_ARRIVED, STATE_BLOCKED, STATE_DRIVING, STATE_FAULT, STATE_IDLE,
     DriveParams, LocalPlanConfig, odom_to_body, plan_drive, rotate_to_heading,
+    wrap_pi,
 )
 
 
@@ -111,7 +112,13 @@ def main() -> None:
         fan_max_rad=math.radians(float(lp.get("fan_max_deg", 50.0))),
         fan_step_rad=math.radians(float(lp.get("fan_step_deg", 12.0))),
         nudge_v_floor=float(lp.get("nudge_v_floor", 0.4)),
+        gap_scan_range_m=float(lp.get("gap_scan_range_m", 1.2)),
+        gap_min_m=float(lp.get("gap_min_m", 0.6)),
+        gap_step_rad=math.radians(float(lp.get("gap_step_deg", 12.0))),
+        gap_max_rad=math.radians(float(lp.get("gap_max_deg", 110.0))),
     )
+    seek_facing_tol = math.radians(float(lp.get("seek_facing_tol_deg", 10.0)))
+    seek_timeout_s = float(lp.get("seek_timeout_s", 6.0))
     control_hz = float(cfg.get("control_hz", 10.0))
     period = 1.0 / max(1.0, control_hz)
     cmd_timeout_ms = max(500, int(3.0 * period * 1000.0))
@@ -171,13 +178,13 @@ def main() -> None:
         )
 
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
-                       dist=0.0, v=0.0, omega=0.0, reason=None) -> None:
+                       dist=0.0, v=0.0, omega=0.0, reason=None, mode=None) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
                 cmd_id=cmd_id, state=state, goal_body_xy=goal_body,
                 dist_remaining_m=dist, v_mps=v, omega_radps=omega,
-                blocked_reason=reason,
+                blocked_reason=reason, mode=mode,
             ),
         )
 
@@ -186,6 +193,11 @@ def main() -> None:
     best_dist: Optional[float] = None
     best_dist_at = 0.0
     final_aligned = False
+    # Gap-seek commitment: when latched onto an out-of-fan corridor, the
+    # robot rotates to face this odom heading (ignoring goal pull) until
+    # aligned, so it doesn't flip-flop back toward the goal mid-turn.
+    seek_odom: Optional[float] = None
+    seek_t0 = 0.0
 
     print(f"local_drive: up; control_hz={control_hz} v_max={params.v_max}", flush=True)
     next_tick = time.monotonic()
@@ -209,6 +221,7 @@ def main() -> None:
             best_dist = None
             best_dist_at = now_mono
             final_aligned = False
+            seek_odom = None
 
         gx, gy = float(g["x_m"]), float(g["y_m"])
         tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
@@ -227,6 +240,7 @@ def main() -> None:
 
         # Arrival (+ optional final-heading rotate).
         if dist <= tol:
+            seek_odom = None
             fh = g.get("final_heading_rad")
             if fh is not None and not final_aligned:
                 omega, aligned = rotate_to_heading(pose[2], float(fh), gp)
@@ -263,9 +277,32 @@ def main() -> None:
             float(scan.get("angle_increment", 0.0)), raster,
         )
 
+        # Seek commitment: while latched onto an out-of-fan corridor, rotate
+        # to face it (ignoring goal pull) until aligned or timed out, so the
+        # robot doesn't flip-flop back toward the goal mid-turn.
+        if seek_odom is not None:
+            if now_mono - seek_t0 > seek_timeout_s:
+                seek_odom = None
+                publish_cmd(0.0, 0.0)
+                publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
+                               dist=dist, reason="swept_block", mode="seek")
+                next_tick = _sleep_to(next_tick, period)
+                continue
+            err = wrap_pi(seek_odom - pose[2])
+            if abs(err) > seek_facing_tol:
+                om = max(-gp.omega_max, min(gp.omega_max, gp.k_omega * err))
+                publish_cmd(0.0, om)
+                publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
+                               dist=dist, omega=om, mode="seek")
+                best_dist = dist            # rotating to face the gap, not stuck
+                best_dist_at = now_mono
+                next_tick = _sleep_to(next_tick, period)
+                continue
+            seek_odom = None                # aligned → drive up the corridor
+
         # Proactive local steering: directional swept gate (#3), corridor
-        # centering, and a reactive nudge around obstacles.
-        v, omega, mode = plan_drive(grid, meta, (bx, by), gp, foot, lpcfg)
+        # centering, reactive nudge, and gap-seeking.
+        v, omega, mode, seek_target = plan_drive(grid, meta, (bx, by), gp, foot, lpcfg)
 
         # No-progress watchdog — only while actually translating. Rotating
         # in place (large bearing) or a blocked stop legitimately holds
@@ -284,16 +321,27 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
+        if mode == "seek":
+            # Latch the out-of-fan corridor as an odom heading and commit.
+            seek_odom = wrap_pi(pose[2] + seek_target)
+            seek_t0 = now_mono
+            om = max(-gp.omega_max, min(gp.omega_max, gp.k_omega * seek_target))
+            publish_cmd(0.0, om)
+            publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
+                           dist=dist, omega=om, mode="seek")
+            next_tick = _sleep_to(next_tick, period)
+            continue
+
         if mode == "blocked":
             publish_cmd(0.0, 0.0)
             publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="swept_block")
+                           dist=dist, reason="swept_block", mode="blocked")
             next_tick = _sleep_to(next_tick, period)
             continue
 
         publish_cmd(v, omega)
         publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                       dist=dist, v=v, omega=omega)
+                       dist=dist, v=v, omega=omega, mode=mode)
         next_tick = _sleep_to(next_tick, period)
 
     publish_cmd(0.0, 0.0)

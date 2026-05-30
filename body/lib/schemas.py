@@ -66,6 +66,7 @@ def drive_status(
     v_mps: float = 0.0,
     omega_radps: float = 0.0,
     blocked_reason: str | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
@@ -86,6 +87,8 @@ def drive_status(
         msg["goal_body_xy"] = [float(goal_body_xy[0]), float(goal_body_xy[1])]
     if blocked_reason is not None:
         msg["blocked_reason"] = blocked_reason
+    if mode is not None:
+        msg["mode"] = mode
     return msg
 
 

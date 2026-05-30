@@ -160,7 +160,13 @@
       "k_center": 1.0,
       "fan_max_deg": 50.0,
       "fan_step_deg": 12.0,
-      "nudge_v_floor": 0.4
+      "nudge_v_floor": 0.4,
+      "gap_scan_range_m": 1.2,
+      "gap_min_m": 0.6,
+      "gap_step_deg": 12.0,
+      "gap_max_deg": 110.0,
+      "seek_facing_tol_deg": 10.0,
+      "seek_timeout_s": 6.0
     },
     "scan": {
       "resolution_m": 0.08,
