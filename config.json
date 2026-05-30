@@ -146,7 +146,6 @@
     "no_progress_timeout_s": 4.0,
     "no_progress_eps_m": 0.03,
     "odom_stale_s": 0.5,
-    "footprint_radius_m": 0.11,
     "preview_distance_m": 0.35,
     "preview_min_distance_m": 0.15,
     "preview_time_s": 1.5,
@@ -158,6 +157,7 @@
     "local_planner": {
       "footprint_radius_m": 0.11,
       "min_clearance_cells": 0,
+      "goal_clearance_cells": 1,
       "safety_margin_m": 0.08,
       "inflation_decay_m": 0.20,
       "unknown_cost": 25.0,

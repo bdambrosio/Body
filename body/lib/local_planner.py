@@ -32,6 +32,7 @@ class LocalPlanConfig:
     heuristic_weight: float = 1.0
     max_expansions: int = 50_000
     min_clearance_cells: int = 0       # hard extra margin beyond footprint (0 = halo only)
+    goal_clearance_cells: int = 1      # snap the goal to a cell with this much extra clearance
     downsample_step_cells: int = 3     # path point spacing (cells)
 
 
@@ -86,10 +87,19 @@ def plan_local(
         if relaxed is None:
             return _fail("start_blocked")
         si, sj = relaxed
-    if lethal[gi, gj]:
-        relaxed = nearest_non_lethal(lethal, gi, gj, radius=max(8, 6 + 2 * cfg.min_clearance_cells))
+    # Snap the goal to a cell with extra clearance (don't aim right at a wall —
+    # e.g. a world-frame goal that mis-registers onto a wall in the live scan).
+    # Prefer a clearance-dilated mask; fall back to the nearest merely-legal
+    # cell so we never fail just for lack of the extra margin.
+    goal_radius = max(8, 6 + 2 * cfg.min_clearance_cells)
+    goal_lethal = (dilate_bool(lethal, iters=cfg.goal_clearance_cells)
+                   if cfg.goal_clearance_cells > 0 else lethal)
+    if goal_lethal[gi, gj]:
+        relaxed = nearest_non_lethal(goal_lethal, gi, gj, radius=goal_radius)
         if relaxed is None:
-            return _fail("goal_unreachable")
+            relaxed = nearest_non_lethal(lethal, gi, gj, radius=goal_radius)
+            if relaxed is None:
+                return _fail("goal_unreachable")
         gi, gj = relaxed
 
     cells, n_exp, msg = astar_8c(

@@ -77,17 +77,6 @@ def main() -> None:
         k_omega=float(cfg.get("k_omega", 1.5)),
         slowdown_distance_m=float(cfg.get("slowdown_distance_m", 0.4)),
     )
-    foot = FootprintConfig(
-        footprint_radius_m=float(cfg.get("footprint_radius_m", 0.22)),
-        preview_distance_m=float(cfg.get("preview_distance_m", 0.35)),
-        preview_min_distance_m=float(cfg.get("preview_min_distance_m", 0.15)),
-        preview_time_s=float(cfg.get("preview_time_s", 1.5)),
-        forward_cone_rad=math.radians(float(cfg.get("forward_cone_deg", 60.0))),
-        hard_radius_m=float(cfg.get("hard_radius_m", 0.07)),
-        block_on_unknown=bool(cfg.get("block_on_unknown", True)),
-        unknown_block_range_m=float(cfg.get("unknown_block_range_m", 0.25)),
-        min_observed_cells=int(cfg.get("min_observed_cells", 3)),
-    )
     # Tier-3 obstacle field = the live lidar scan rasterized each tick (see
     # body/lib/scan_raster.py). Lidar mount/range come from the existing
     # lidar / local_map config so there's one source of truth.
@@ -124,6 +113,27 @@ def main() -> None:
         max_expansions=int(lp.get("max_expansions", 50000)),
     )
     lookahead_m = float(lp.get("lookahead_m", 0.4))
+
+    # Last-resort swept veto (drive_safety). It must NOT be stricter than the
+    # A* costmap or it rejects A*'s own feasible paths (the doorway/near-wall
+    # false swept_block). Derive its footprint from the A* footprint so they
+    # can't drift: the swept check adds ½ cell internally, so subtract that to
+    # keep its effective radius ≤ the A* lethal radius. The veto then only fires
+    # on a genuine corner-cut off the path or a new obstacle, never on an
+    # A*-blessed path.
+    half_cell = 0.5 * float(scan_cfg.get("resolution_m", 0.08))
+    veto_foot = max(0.02, local_plan_cfg.costmap.footprint_radius_m - half_cell)
+    foot = FootprintConfig(
+        footprint_radius_m=veto_foot,
+        preview_distance_m=float(cfg.get("preview_distance_m", 0.35)),
+        preview_min_distance_m=float(cfg.get("preview_min_distance_m", 0.15)),
+        preview_time_s=float(cfg.get("preview_time_s", 1.5)),
+        forward_cone_rad=math.radians(float(cfg.get("forward_cone_deg", 60.0))),
+        hard_radius_m=min(float(cfg.get("hard_radius_m", 0.05)), veto_foot),
+        block_on_unknown=bool(cfg.get("block_on_unknown", True)),
+        unknown_block_range_m=float(cfg.get("unknown_block_range_m", 0.25)),
+        min_observed_cells=int(cfg.get("min_observed_cells", 3)),
+    )
     control_hz = float(cfg.get("control_hz", 10.0))
     period = 1.0 / max(1.0, control_hz)
     cmd_timeout_ms = max(500, int(3.0 * period * 1000.0))

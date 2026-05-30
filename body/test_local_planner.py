@@ -64,6 +64,18 @@ class TestPlanLocal(unittest.TestCase):
         self.assertTrue(p.ok)                     # snapped to a nearby free cell
         self.assertIsNotNone(p.goal_body_snapped)
 
+    def test_goal_clearance_pulls_off_wall(self):
+        # A goal jammed next to a wall (e.g. world→local mis-registration) is
+        # snapped to a cell with extra clearance, not the nearest barely-legal one.
+        grid = _clear()
+        for y in np.arange(-1.0, 1.01, RES / 2):
+            _block(grid, 0.5, float(y))             # wall column at x=0.5
+        cfg = LocalPlanConfig(
+            costmap=LocalCostmapConfig(footprint_radius_m=0.11), goal_clearance_cells=2)
+        p = plan_local(grid, META, (0.45, 0.0), cfg)  # goal right by the wall
+        self.assertTrue(p.ok)
+        self.assertLess(p.goal_body_snapped[0], 0.45)   # pulled back off the wall
+
     def test_goal_out_of_map(self):
         p = plan_local(_clear(), META, (10.0, 0.0), _cfg())
         self.assertFalse(p.ok)
