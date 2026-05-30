@@ -31,20 +31,23 @@ class FootprintConfig:
 
 def _arc_samples(
     v_mps: float, omega_radps: float, reach_m: float, n: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Body-frame footprint centers along the constant-(v, ω) arc from the
-    origin out to arc length ``reach_m``. (n+1,) arrays. Handles the
-    straight (ω≈0) and reverse (v<0) cases by sign."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Body-frame footprint centers + heading along the constant-(v, ω) arc
+    from the origin out to arc length ``reach_m``. (n+1,) arrays (cx, cy,
+    theta) where theta is the body heading at each sample (0 for straight).
+    Handles the straight (ω≈0) and reverse (v<0) cases by sign."""
     speed = abs(v_mps)
     ks = np.arange(n + 1, dtype=np.float64)
     if speed < 1e-6:
-        return np.zeros(n + 1), np.zeros(n + 1)
+        z = np.zeros(n + 1)
+        return z, z.copy(), z.copy()
     t = (reach_m / speed) * ks / n
+    theta = omega_radps * t
     if abs(omega_radps) < 1e-6:
-        return v_mps * t, np.zeros(n + 1)
+        return v_mps * t, np.zeros(n + 1), theta
     radius = v_mps / omega_radps
     phi = omega_radps * t
-    return radius * np.sin(phi), radius * (1.0 - np.cos(phi))
+    return radius * np.sin(phi), radius * (1.0 - np.cos(phi)), theta
 
 
 def swept_path_blocked(
@@ -77,7 +80,8 @@ def swept_path_blocked(
         max(cfg.preview_min_distance_m, speed * cfg.preview_time_s),
     )
     n = int(max(3, min(25, math.ceil(reach_m / max(res, 1e-3)))))
-    cx, cy = _arc_samples(v_mps, omega_radps, reach_m, n)
+    cx, cy, theta = _arc_samples(v_mps, omega_radps, reach_m, n)
+    sgn = 1.0 if v_mps >= 0 else -1.0
 
     r_foot = cfg.footprint_radius_m + 0.5 * res
     pad = r_foot + res
@@ -94,10 +98,22 @@ def swept_path_blocked(
     cell_x = ox + (ii + 0.5) * res
     cell_y = oy + (jj + 0.5) * res
 
+    # Directional swept region: a cell counts only if it is within r_foot of
+    # a sample AND in the *forward* half-plane of the body's velocity at that
+    # sample. This drops the trailing/lateral hemisphere of the (stationary)
+    # origin footprint, so an obstacle beside or behind the robot no longer
+    # vetoes motion that drives past or away from it — only obstacles the
+    # motion actually carries the body toward block.
     r2 = r_foot * r_foot
     in_swept = np.zeros(sub.shape, dtype=bool)
-    for sx, sy in zip(cx, cy):
-        in_swept |= (cell_x - sx) ** 2 + (cell_y - sy) ** 2 <= r2
+    for sx, sy, th in zip(cx, cy, theta):
+        dx = cell_x - sx                     # (H, 1)
+        dy = cell_y - sy                     # (1, W)
+        near = dx * dx + dy * dy <= r2       # (H, W)
+        dirx = sgn * math.cos(th)
+        diry = sgn * math.sin(th)
+        ahead = dx * dirx + dy * diry >= 0.0  # (H, W)
+        in_swept |= near & ahead
     if not np.any(in_swept):
         return True
 

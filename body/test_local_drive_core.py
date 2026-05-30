@@ -148,6 +148,25 @@ class TestSweptSafety(unittest.TestCase):
         self.assertTrue(swept_path_blocked(
             g, m, v_mps=-0.10, omega_radps=0.0, config=self.cfg))
 
+    def test_directional_side_behind_obstacle_does_not_block_forward(self):
+        # #3: an obstacle beside-and-behind the robot, within the footprint
+        # radius, must NOT veto forward motion (we're driving away from it).
+        g, m = _grid(), _meta()
+        _set(g, m, -0.10, 0.05, 0)   # behind-left, within r_foot
+        self.assertFalse(swept_path_blocked(
+            g, m, v_mps=0.18, omega_radps=0.0, config=self.cfg))
+        # But it DOES block reverse motion (we'd back into it).
+        self.assertTrue(swept_path_blocked(
+            g, m, v_mps=-0.10, omega_radps=0.0, config=self.cfg))
+
+    def test_directional_obstacle_ahead_still_blocks(self):
+        # The forward hemisphere is still checked: an obstacle dead ahead
+        # within the footprint blocks (regression guard for the #3 change).
+        g, m = _grid(), _meta()
+        _set(g, m, 0.12, 0.0, 0)
+        self.assertTrue(swept_path_blocked(
+            g, m, v_mps=0.18, omega_radps=0.0, config=self.cfg))
+
 
 class TestDriveableFromRows(unittest.TestCase):
     def test_conversion(self):
