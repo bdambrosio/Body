@@ -2090,20 +2090,30 @@ class NavMainWindow(QMainWindow):
             self._hier_drive.stop()
             self._hier_drive = None
         self._shared_view.set_lookahead(None)
+        self._cameras.set_lidar_overlay(None, None)
 
     def _on_all_stop(self) -> None:
         """ALL-STOP hook: cancel any in-flight hierarchical-drive goto."""
         self._stop_hier_drive()
 
     def _refresh_hier_overlay(self, pose) -> None:
-        """Render the live Tier-2 sub-goal on the map (display only — the
-        body-frame point is converted to world using the current pose; it
-        never feeds the drive command)."""
-        sub = self._hier_drive.current_subgoal_body() if self._hier_drive else None
-        if sub is not None and pose is not None:
-            self._shared_view.set_lookahead(body_to_odom(sub, pose))
-        else:
-            self._shared_view.set_lookahead(None)
+        """Render the live Tier-2 sub-goal + next waypoint (display only).
+
+        World maps get the sub-goal as a lookahead marker; the lidar plot
+        gets both the sub-goal and the next waypoint in BODY frame, so the
+        world->body translation is visible against the live scan."""
+        hd = self._hier_drive
+        sub = hd.current_subgoal_body() if hd else None
+        wp_world = hd.current_waypoint_world() if hd else None
+        self._shared_view.set_lookahead(
+            body_to_odom(sub, pose) if (sub is not None and pose is not None) else None
+        )
+        wp_body = None
+        if wp_world is not None and pose is not None:
+            dx, dy = wp_world[0] - pose[0], wp_world[1] - pose[1]
+            c, s = math.cos(-pose[2]), math.sin(-pose[2])
+            wp_body = (dx * c - dy * s, dx * s + dy * c)
+        self._cameras.set_lidar_overlay(wp_body, sub)
 
     # ── Toolbar handlers ─────────────────────────────────────────────
 

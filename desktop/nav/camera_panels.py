@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
@@ -50,6 +50,10 @@ class LidarFeedView(QWidget):
         super().__init__(parent)
         self._scan: Optional[Dict[str, Any]] = None
         self._scan_ts: float = 0.0
+        # Body-frame overlay markers (hierarchical drive): the next waypoint
+        # and the live Tier-2 sub-goal, each (x_fwd, y_left) or None.
+        self._wp_body: Optional[Tuple[float, float]] = None
+        self._sub_body: Optional[Tuple[float, float]] = None
         self.setMinimumSize(160, 80)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
@@ -59,6 +63,16 @@ class LidarFeedView(QWidget):
     def update_scan(self, scan: Optional[Dict[str, Any]], ts: float) -> None:
         self._scan = scan
         self._scan_ts = ts
+        self.update()
+
+    def set_overlay(
+        self,
+        wp_body: Optional[Tuple[float, float]],
+        sub_body: Optional[Tuple[float, float]],
+    ) -> None:
+        """Body-frame next-waypoint + sub-goal markers (or None to clear)."""
+        self._wp_body = wp_body
+        self._sub_body = sub_body
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: D401
@@ -126,6 +140,34 @@ class LidarFeedView(QWidget):
                 QPointF(cx + 5, cy + 5),
             ])
             p.drawPolygon(tri)
+
+            # Hierarchical-drive overlay (body frame: +x fwd up, +y left).
+            # Same screen mapping as the returns: sx = cx - y*scale,
+            # sy = cy - x*scale. Points beyond the plot are clamped onto
+            # the outer ring along their bearing so direction stays visible.
+            def _to_screen(x_b: float, y_b: float):
+                r = math.hypot(x_b, y_b)
+                if r > self.PLOT_RANGE_M and r > 1e-6:
+                    f = self.PLOT_RANGE_M / r
+                    x_b, y_b = x_b * f, y_b * f
+                return cx - y_b * scale, cy - x_b * scale
+
+            wp = self._wp_body
+            sub = self._sub_body
+            if wp is not None:
+                wsx, wsy = _to_screen(wp[0], wp[1])
+                # Line robot→waypoint so the commanded direction is obvious.
+                p.setPen(QPen(QColor(120, 230, 120), 1, Qt.PenStyle.DashLine))
+                p.drawLine(QPointF(cx, cy), QPointF(wsx, wsy))
+                p.setPen(QPen(QColor(120, 230, 120), 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(wsx, wsy), 6, 6)
+                p.drawText(QRectF(wsx + 7, wsy - 8, 28, 14), 0, "wp")
+            if sub is not None:
+                ssx, ssy = _to_screen(sub[0], sub[1])
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255, 170, 60))   # sub-goal: orange dot
+                p.drawEllipse(QPointF(ssx, ssy), 4, 4)
 
             # Age + count text in top-left.
             p.setPen(QColor(140, 140, 140))
@@ -283,6 +325,9 @@ class CameraFeedsDock(QDockWidget):
         self.lidar_meta.setText(
             f"{len(ranges)} rays  age={age_s:4.2f}s"
         )
+
+    def set_lidar_overlay(self, wp_body, sub_body) -> None:
+        self.lidar_view.set_overlay(wp_body, sub_body)
 
     def render_depth(self, snap: dict) -> None:
         img = snap["depth_image"]
@@ -490,6 +535,10 @@ class CameraPanels:
         )
         self._feeds_dock.render_depth(snap)
         self._feeds_dock.render_lidar(snap)
+
+    def set_lidar_overlay(self, wp_body, sub_body) -> None:
+        """Body-frame next-waypoint + sub-goal markers on the lidar plot."""
+        self._feeds_dock.set_lidar_overlay(wp_body, sub_body)
 
     def _on_request_rgb(self) -> None:
         req = self.chassis.request_rgb()
