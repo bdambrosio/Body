@@ -37,6 +37,9 @@ from .follower import (
     STATUS_ARRIVED, STATUS_FOLLOWING, STATUS_NO_PATH, STATUS_ROTATING,
 )
 from .health import LivenessWatcher
+from .hierarchical_drive import (
+    HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
+)
 from .mission import Mission, MissionConfig, MissionState
 from . import patrol as patrol_mod
 from .patrol import Patrol, PatrolRunner
@@ -62,6 +65,9 @@ from .tracing import (
 from .camera_panels import CameraPanels, build_camera_snapshot
 from .safety_toolbar import SafetyToolbar
 from .teleop_panels import TeleopPanels, build_chassis_snapshot
+
+from body.lib.local_drive_core import body_to_odom
+from desktop.pi_drive.drive_client import DriveClient
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +120,15 @@ class NavMainWindow(QMainWindow):
         self.chassis = chassis
         self.chassis_config = chassis_config
 
+        # Stage-B hierarchical drive (Tier-1/Tier-2). Lazily wired: the
+        # DriveClient (own zenoh session, body/drive/goto + status + scan)
+        # is only opened when the operator enables the mode. Until then
+        # nav behaves exactly as before. Initialized before _build_toolbars
+        # so the ALL-STOP callback can reference them safely.
+        self._stage_b_mode: bool = False
+        self._hier_drive: Optional[HierarchicalDrive] = None
+        self._drive_client: Optional[DriveClient] = None
+
         self._build_toolbars()
         self._build_ui()
         self._build_docks()
@@ -124,6 +139,8 @@ class NavMainWindow(QMainWindow):
 
     def _build_toolbars(self) -> None:
         self._safety_toolbar = SafetyToolbar(self.chassis, self.fuser, parent=self)
+        # ALL-STOP must cancel an in-flight hierarchical-drive goto too.
+        self._safety_toolbar.set_stop_callback(self._on_all_stop)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._safety_toolbar)
 
         # Map toolbar: world_map-scoped actions. Starts with Reset-world;
@@ -203,6 +220,18 @@ class NavMainWindow(QMainWindow):
         )
         self._cancel_act.triggered.connect(self._on_cancel)
         self._map_toolbar.addAction(self._cancel_act)
+
+        self._hier_act = QAction("Hierarchical drive", self)
+        self._hier_act.setCheckable(True)
+        self._hier_act.setChecked(False)
+        self._hier_act.setToolTip(
+            "Stage-B hierarchical drive: place patrol waypoints, then Go to "
+            "drive each leg toward a live-observed sub-goal via the Pi's "
+            "Tier-3 loop (body/drive/goto). Leave Live cmd OFF — Tier-3 owns "
+            "cmd_vel; nav only keeps the heartbeat alive."
+        )
+        self._hier_act.toggled.connect(self._on_stage_b_toggled)
+        self._map_toolbar.addAction(self._hier_act)
 
         self._patrol_edit_act = QAction("Patrol edit", self)
         self._patrol_edit_act.setCheckable(True)
@@ -685,6 +714,12 @@ class NavMainWindow(QMainWindow):
             self._safety_blocked = False
             self._update_safety_block_trace(False)
             self._active_recovery = None
+        # Stage-B hierarchical drive runs its own loop (Tier-3 owns cmd_vel
+        # via body/drive/goto). It is mutually exclusive with the old mission
+        # path — Stage B never starts self._mission — so no cmd_vel contention.
+        if self._stage_b_mode and self._hier_drive is not None:
+            self._hier_drive.tick(time.time())
+            self._refresh_hier_overlay(pose)
         # Trace lifecycle: close the per-mission file on the
         # active→terminal edge so each mission yields one self-
         # contained JSONL artifact.
@@ -876,6 +911,24 @@ class NavMainWindow(QMainWindow):
         # Go/Stop button enable mirrors mission state.
         self._go_act.setEnabled(self._mission.can_start())
         self._cancel_act.setEnabled(self._mission.can_cancel())
+
+        # Stage-B overrides the follow label + Go/Stop enable with the
+        # hierarchical-drive state (the old mission is dormant here).
+        if self._stage_b_mode:
+            hd = self._hier_drive
+            running = hd is not None and hd.state() not in (
+                HierState.IDLE, HierState.ARRIVED, HierState.FAILED,
+            )
+            self._go_act.setEnabled(not running)
+            self._cancel_act.setEnabled(running)
+            if hd is not None:
+                br = hd.block_reason()
+                txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
+                self._follow_lbl.setText(txt)
+                self._follow_lbl.setStyleSheet(
+                    "color: #e8a;" if hd.state() in (HierState.BLOCKED, HierState.FAILED)
+                    else "color: #8cf;"
+                )
 
         # Session id is fixed-8; pose-source label can be "odom" or
         # "imu+scan_match" — clamp so the label width is bounded.
@@ -1887,6 +1940,8 @@ class NavMainWindow(QMainWindow):
         single goal pin as before. The toolbar Plan label / Stop /
         Cancel paths are common between both modes.
         """
+        if self._stage_b_mode:
+            return self._on_go_stage_b()
         if not self._mission.can_start():
             return  # already FOLLOWING — nothing to do
         # If a patrol is loaded with waypoints, override the goal pin
@@ -1963,10 +2018,92 @@ class NavMainWindow(QMainWindow):
         """Operator-initiated stop. Zero cmd_vel and transition to
         CANCELED. Live cmd is left ON so the operator can drive
         manually without a second click."""
+        if self._stage_b_mode:
+            self._stop_hier_drive()
+            return
         if self._mission.is_active():
             self.chassis.set_cmd_vel(0.0, 0.0)
         self._cancel_recovery()
         self._mission.cancel()
+
+    # ── Stage-B hierarchical drive ───────────────────────────────────
+
+    def _on_stage_b_toggled(self, checked: bool) -> None:
+        """Enter/leave hierarchical-drive mode. On enter, lazily open the
+        DriveClient session (own zenoh session for body/drive/goto + status
+        + scan). On leave, stop any active drive and close the session."""
+        self._stage_b_mode = bool(checked)
+        if checked:
+            if self._drive_client is None:
+                self._drive_client = DriveClient(self.chassis_config.router)
+            ok, err = self._drive_client.connect()
+            if not ok:
+                QMessageBox.warning(
+                    self, "Hierarchical drive",
+                    f"Drive client connect failed:\n{err}",
+                )
+                self._stage_b_mode = False
+                self._hier_act.setChecked(False)
+                return
+        else:
+            self._stop_hier_drive()
+            if self._drive_client is not None:
+                self._drive_client.shutdown()
+                self._drive_client = None
+
+    def _on_go_stage_b(self) -> None:
+        """Start hierarchical drive over the loaded patrol. Live cmd stays
+        OFF — Tier-3 owns cmd_vel; nav only keeps the heartbeat alive."""
+        patrol = self._shared_view.patrol()
+        if patrol is None or len(patrol.waypoints) == 0:
+            QMessageBox.information(
+                self, "Hierarchical drive",
+                "Place patrol waypoints first (Patrol edit), then review the "
+                "route on the map before Go.",
+            )
+            return
+        if self._drive_client is None:
+            return
+        with self.chassis.state.lock:
+            connected = self.chassis.state.connected
+        if not connected:
+            QMessageBox.warning(
+                self, "Hierarchical drive", "Chassis disconnected — connect first.",
+            )
+            return
+        if self._drive_client.odom_pose() is None or self._drive_client.latest_scan() is None:
+            QMessageBox.warning(
+                self, "Hierarchical drive",
+                "No odom/scan from the Pi yet — wait for telemetry.",
+            )
+            return
+        runner = PatrolRunner(patrol)
+        provider = PFPoseProvider(self.fuser)
+        self._hier_drive = HierarchicalDrive(
+            runner, provider, self._drive_client, HierConfig(),
+        )
+        self._shared_view.set_patrol_active_wp_index(0)
+        self._hier_drive.start()
+
+    def _stop_hier_drive(self) -> None:
+        if self._hier_drive is not None:
+            self._hier_drive.stop()
+            self._hier_drive = None
+        self._shared_view.set_lookahead(None)
+
+    def _on_all_stop(self) -> None:
+        """ALL-STOP hook: cancel any in-flight hierarchical-drive goto."""
+        self._stop_hier_drive()
+
+    def _refresh_hier_overlay(self, pose) -> None:
+        """Render the live Tier-2 sub-goal on the map (display only — the
+        body-frame point is converted to world using the current pose; it
+        never feeds the drive command)."""
+        sub = self._hier_drive.current_subgoal_body() if self._hier_drive else None
+        if sub is not None and pose is not None:
+            self._shared_view.set_lookahead(body_to_odom(sub, pose))
+        else:
+            self._shared_view.set_lookahead(None)
 
     # ── Toolbar handlers ─────────────────────────────────────────────
 

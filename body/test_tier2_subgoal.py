@@ -1,0 +1,159 @@
+"""Tests for Tier-2 visibility sub-goal selection (pure)."""
+import math
+import unittest
+
+import numpy as np
+
+from body.lib.drive_safety import FootprintConfig, swept_path_blocked
+from body.lib.tier2_subgoal import (
+    Tier2Config,
+    bearing_to_waypoint,
+    furthest_free_point,
+)
+
+RES = 0.08
+HALF = 2.5
+N = 2 * int(math.ceil(HALF / RES))   # 64, matches ScanRasterConfig defaults
+META = {
+    "resolution_m": RES,
+    "origin_x_m": -HALF,
+    "origin_y_m": -HALF,
+    "nx": N,
+    "ny": N,
+    "frame": "body",
+}
+
+
+def _clear_grid():
+    return np.ones((N, N), dtype=np.int8)
+
+
+def _unknown_grid():
+    return np.full((N, N), -1, dtype=np.int8)
+
+
+def _cell(x, y):
+    i = int(math.floor((x - META["origin_x_m"]) / RES))
+    j = int(math.floor((y - META["origin_y_m"]) / RES))
+    return i, j
+
+
+def _block(grid, x, y):
+    i, j = _cell(x, y)
+    grid[i, j] = 0
+
+
+class TestFurthestFreePoint(unittest.TestCase):
+    def setUp(self):
+        self.cfg = Tier2Config()   # horizon 2.0, backoff 0.30, min 0.20
+
+    def test_clear_lane_ahead(self):
+        r = furthest_free_point(_clear_grid(), META, 0.0, self.cfg)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.reason, "ok")
+        # Capped at horizon − backoff, on the bearing (straight ahead).
+        self.assertAlmostEqual(r.free_dist_m, self.cfg.horizon_m - self.cfg.backoff_m, places=6)
+        self.assertAlmostEqual(r.body_xy[0], 1.7, places=6)
+        self.assertAlmostEqual(r.body_xy[1], 0.0, places=6)
+
+    def test_horizon_cap_not_exceeded(self):
+        # Clear well past horizon must not push the sub-goal beyond it.
+        r = furthest_free_point(_clear_grid(), META, 0.0, self.cfg)
+        self.assertLessEqual(r.free_dist_m, self.cfg.horizon_m - self.cfg.backoff_m + 1e-9)
+
+    def test_blocked_ahead_backs_off(self):
+        grid = _clear_grid()
+        _block(grid, 1.0, 0.0)
+        r = furthest_free_point(grid, META, 0.0, self.cfg)
+        self.assertTrue(r.ok)
+        self.assertEqual(r.reason, "ok")
+        # Sub-goal sits ~1.0 − backoff ahead of the block (within one cell).
+        self.assertAlmostEqual(r.body_xy[0], 1.0 - self.cfg.backoff_m, delta=2 * RES)
+        self.assertLess(r.body_xy[0], 1.0 - self.cfg.backoff_m + 1e-9)
+
+    def test_blocked_at_origin(self):
+        grid = _clear_grid()
+        _block(grid, 0.0, 0.0)   # robot cell itself blocked
+        r = furthest_free_point(grid, META, 0.0, self.cfg)
+        self.assertFalse(r.ok)
+        self.assertIsNone(r.body_xy)
+        self.assertEqual(r.reason, "blocked_at_origin")
+
+    def test_blocked_too_close_is_too_short(self):
+        grid = _clear_grid()
+        _block(grid, 0.35, 0.0)   # cleared a little, but < backoff+min
+        r = furthest_free_point(grid, META, 0.0, self.cfg)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.reason, "too_short")
+
+    def test_gap_to_one_side(self):
+        # Wall straight ahead at x≈0.5 covering the center/right, open up-left.
+        grid = _clear_grid()
+        for y in np.arange(-1.0, 0.21, RES / 2):
+            _block(grid, 0.5, float(y))
+        straight = furthest_free_point(grid, META, 0.0, self.cfg)
+        # A bearing through the gap (toward +y/left) sees much further.
+        side = furthest_free_point(grid, META, 0.7, self.cfg)
+        self.assertGreater(side.free_dist_m, straight.free_dist_m)
+        self.assertTrue(side.ok)
+
+    def test_all_unknown_grid(self):
+        r = furthest_free_point(_unknown_grid(), META, 0.0, self.cfg)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.reason, "all_unknown")
+
+    def test_unknown_allowed_when_not_require_clear(self):
+        cfg = Tier2Config(require_clear=False)
+        r = furthest_free_point(_unknown_grid(), META, 0.0, cfg)
+        self.assertTrue(r.ok)   # unknown treated as traversable → reaches horizon
+
+    def test_off_grid_bearing_treated_as_horizon(self):
+        # Horizon beyond the grid extent: ray exits the window, capped, no crash.
+        cfg = Tier2Config(horizon_m=3.0)   # grid only reaches 2.5
+        r = furthest_free_point(_clear_grid(), META, 0.0, cfg)
+        self.assertTrue(r.ok)
+        self.assertLess(r.free_dist_m, HALF)   # capped near the grid edge
+
+    def test_backoff_clears_swept_footprint(self):
+        # The backed-off sub-goal leaves room for Tier-3's swept-footprint check.
+        foot = FootprintConfig(footprint_radius_m=0.22)
+        far = _clear_grid()
+        _block(far, 1.0, 0.0)
+        r = furthest_free_point(far, META, 0.0, self.cfg)
+        self.assertTrue(r.ok)
+        # A straight push over this grid is not vetoed (block is well beyond preview).
+        self.assertFalse(swept_path_blocked(far, META, v_mps=0.18, omega_radps=0.0, config=foot))
+        # Whereas a block right in front is vetoed.
+        near = _clear_grid()
+        for y in np.arange(-0.3, 0.31, RES / 2):
+            _block(near, 0.3, float(y))
+        self.assertTrue(swept_path_blocked(near, META, v_mps=0.18, omega_radps=0.0, config=foot))
+
+
+class TestBearingToWaypoint(unittest.TestCase):
+    def test_straight_ahead(self):
+        self.assertAlmostEqual(bearing_to_waypoint(0, 0, 0.0, 1.0, 0.0), 0.0, places=6)
+
+    def test_left_is_positive(self):
+        self.assertAlmostEqual(bearing_to_waypoint(0, 0, 0.0, 0.0, 1.0), math.pi / 2, places=6)
+
+    def test_right_is_negative(self):
+        self.assertAlmostEqual(bearing_to_waypoint(0, 0, 0.0, 0.0, -1.0), -math.pi / 2, places=6)
+
+    def test_behind(self):
+        self.assertAlmostEqual(abs(bearing_to_waypoint(0, 0, 0.0, -1.0, 0.0)), math.pi, places=6)
+
+    def test_robot_yaw_subtracted(self):
+        # Waypoint dead ahead in world, but robot faces +90° → waypoint is to its right.
+        self.assertAlmostEqual(
+            bearing_to_waypoint(0, 0, math.pi / 2, 1.0, 0.0), -math.pi / 2, places=6)
+
+    def test_result_wrapped(self):
+        # Waypoint behind with robot yaw near π must stay in (−π, π].
+        b = bearing_to_waypoint(0, 0, math.pi - 0.01, -1.0, 0.05)
+        self.assertGreaterEqual(b, -math.pi)
+        self.assertLessEqual(b, math.pi)
+
+
+if __name__ == "__main__":
+    unittest.main()

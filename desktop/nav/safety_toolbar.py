@@ -78,6 +78,10 @@ class SafetyToolbar(QToolBar):
         self.fuser = fuser
         self._last_hb_seq: int = -1
         self._last_hb_change_wall: float = 0.0
+        # Optional hook invoked after ALL-STOP zeroes the chassis, so an
+        # owner (e.g. nav's hierarchical drive) can cancel its own in-flight
+        # command — ALL-STOP must halt every drive path, not just cmd_vel.
+        self._on_stop_cb = None
 
         self.setMovable(False)
         self.setFloatable(False)
@@ -191,6 +195,15 @@ class SafetyToolbar(QToolBar):
         blk = self._live_box.blockSignals(True)
         self._live_box.setChecked(False)
         self._live_box.blockSignals(blk)
+        if self._on_stop_cb is not None:
+            try:
+                self._on_stop_cb()
+            except Exception:
+                logger.exception("ALL-STOP stop callback raised")
+
+    def set_stop_callback(self, cb) -> None:
+        """Register a callable run after ALL-STOP zeroes the chassis."""
+        self._on_stop_cb = cb
 
     # ── Helpers ──────────────────────────────────────────────────────
 
