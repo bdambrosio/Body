@@ -127,8 +127,12 @@ class MapEditorWindow(QMainWindow):
         self._act_locate = None
         if self._router:
             tb.addSeparator()
-            self._act_connect = tb.addAction("Connect", self._on_connect)
+            # NB: drive Connect from `toggled` (passes the checked bool),
+            # not addAction's `triggered` (which calls the slot with no
+            # args → _on_connect would lose its `want`).
+            self._act_connect = tb.addAction("Connect")
             self._act_connect.setCheckable(True)
+            self._act_connect.toggled.connect(self._on_connect)
             self._act_relocate = tb.addAction("Relocate", self._on_relocate)
             self._act_relocate.setEnabled(False)
             self._act_locate = tb.addAction("Set location")
