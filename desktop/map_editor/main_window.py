@@ -14,6 +14,7 @@ map; the brush remains the only writer.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import List, Optional, Tuple
@@ -75,6 +76,10 @@ class MapEditorWindow(QMainWindow):
 
         self._build_toolbar()
         self._status = self.statusBar()
+        # Persistent numeric pose readout (right side of the status bar).
+        self._pose_lbl = QLabel("")
+        self._pose_lbl.setStyleSheet("color:#9cf; font-family:monospace;")
+        self._status.addPermanentWidget(self._pose_lbl)
 
         # Live redraw timer (5 Hz). Inert until connected.
         self._live_timer = QTimer(self)
@@ -322,6 +327,7 @@ class MapEditorWindow(QMainWindow):
         self._overlay_pose = None
         self._odom_anchor = None
         self._view.set_scan_points(None)
+        self._pose_lbl.setText("")
         if self._act_connect is not None:
             self._act_connect.setText("Connect")
             self._act_connect.setChecked(False)
@@ -380,9 +386,10 @@ class MapEditorWindow(QMainWindow):
             self._overlay_pose = (float(base[0]), float(base[1]), float(base[2]))
             self._odom_anchor = self._link.odom_pose()
             self._view.set_align_mode(True)
+            self._view.setFocus()  # so arrow-key nudge reaches the view
             self._status.showMessage(
-                "Align: drag to move the scan onto a trusted wall; "
-                "⟲/⟳ (keys , .) to rotate. Dead-reckoned by odom.")
+                "Align: drag or arrow-keys (Shift=coarse) to move the scan "
+                "onto a trusted wall; ⟲/⟳ (, .) to rotate. Odom dead-reckoned.")
         else:
             self._overlay_pose = None
             self._odom_anchor = None
@@ -399,7 +406,6 @@ class MapEditorWindow(QMainWindow):
             self._status.showMessage(
                 "Turn on Align scan first to rotate the overlay.", 3000)
             return
-        import math
         x, y, th = self._overlay_pose
         self._overlay_pose = (x, y, th + sign * math.radians(1.0))
 
@@ -431,11 +437,15 @@ class MapEditorWindow(QMainWindow):
                 pose=pose, bounds_ij=self._emap.bounds_ij(),
             )
         age = self._link.scan_age_s(time.time())
-        pose_s = ("no pose" if pose is None
-                  else f"pose ({pose[0]:.2f}, {pose[1]:.2f}, {pose[2]:.2f})")
         age_s = "scan —" if age is None else f"scan {age:.1f}s"
         n = 0 if world is None else len(world)
-        self._status.showMessage(f"Live[{mode}]: {pose_s} · {age_s} · {n} pts")
+        self._status.showMessage(f"Live[{mode}] · {age_s} · {n} pts")
+        if pose is None:
+            self._pose_lbl.setText("pose: —")
+        else:
+            self._pose_lbl.setText(
+                f"[{mode}] x={pose[0]:+.2f} y={pose[1]:+.2f} "
+                f"θ={math.degrees(pose[2]):+6.1f}°")
 
     def _update_title(self) -> None:
         name = os.path.basename(self._path) if self._path else "(no map)"

@@ -39,6 +39,8 @@ class EditableMapView(WorldDriveableView):
         self._align_mode: bool = False
         self._align_last: Optional[tuple] = None  # last drag world pt
         self._scan_world_xy: Optional[np.ndarray] = None
+        # Accept key focus so arrow-key nudge works in align mode.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     # ── External API ────────────────────────────────────────────────
 
@@ -124,6 +126,25 @@ class EditableMapView(WorldDriveableView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        # Arrow keys nudge the aligned scan in screen-aligned directions
+        # (Shift = coarse). The view isn't rotated, so screen↔world is
+        # fixed: +world_x is up, +world_y is left (see _world_to_widget).
+        if self._align_mode and self._paint_geom is not None:
+            coarse = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            step = 0.10 if coarse else 0.02
+            d = {
+                Qt.Key.Key_Up: (step, 0.0),
+                Qt.Key.Key_Down: (-step, 0.0),
+                Qt.Key.Key_Left: (0.0, step),
+                Qt.Key.Key_Right: (0.0, -step),
+            }.get(event.key())
+            if d is not None:
+                self.alignDragWorld.emit(d[0], d[1])
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     # ── Overlay rendering ───────────────────────────────────────────
 
