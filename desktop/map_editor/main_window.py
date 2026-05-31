@@ -30,6 +30,7 @@ from desktop.world_map.map_views import SharedMapView
 
 from . import editor_map as em
 from .editable_map_view import EditableMapView
+from .live_overlay import body_xy_to_world, pose_compose, pose_relative
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +59,18 @@ class MapEditorWindow(QMainWindow):
         self._pf_particles = pf_particles
         self._link = None  # LiveLink, created on Connect
         self._live_pose: Optional[Tuple[float, float, float]] = None
+        # Manual-align overlay pose (world). When set, the overlay is
+        # drawn at this operator-aligned pose, dead-reckoned by odom
+        # only (no scan-match creep). None → use the MCL pose.
+        self._overlay_pose: Optional[Tuple[float, float, float]] = None
+        self._odom_anchor: Optional[Tuple[float, float, float]] = None
 
         self._shared = SharedMapView()
         self._view = EditableMapView(shared=self._shared)
         self.setCentralWidget(self._view)
         self._view.paintAtWorld.connect(self._on_paint_at)
         self._view.strokeStarted.connect(self._on_stroke_started)
+        self._view.alignDragWorld.connect(self._on_align_drag)
         self._shared.set_locate_callback(self._on_locate)
 
         self._build_toolbar()
@@ -139,6 +146,23 @@ class MapEditorWindow(QMainWindow):
             self._act_locate.setCheckable(True)
             self._act_locate.setEnabled(False)
             self._act_locate.toggled.connect(self._on_locate_armed)
+            tb.addSeparator()
+            # Manual align: drag the scan onto trusted walls, rotate with
+            # the buttons. Dead-reckoned by odom (no scan-match creep).
+            self._act_align = tb.addAction("Align scan")
+            self._act_align.setCheckable(True)
+            self._act_align.setEnabled(False)
+            self._act_align.toggled.connect(self._on_align_toggled)
+            self._act_rot_ccw = tb.addAction("⟲")
+            self._act_rot_ccw.setToolTip("Rotate scan +1° (key: ,)")
+            self._act_rot_ccw.setShortcut(",")
+            self._act_rot_ccw.triggered.connect(lambda: self._on_rotate(+1))
+            self._act_rot_cw = tb.addAction("⟳")
+            self._act_rot_cw.setToolTip("Rotate scan −1° (key: .)")
+            self._act_rot_cw.setShortcut(".")
+            self._act_rot_cw.triggered.connect(lambda: self._on_rotate(-1))
+            for a in (self._act_rot_ccw, self._act_rot_cw):
+                a.setEnabled(False)
 
     def _set_kind(self, kind: str) -> None:
         self._brush_kind = kind
@@ -281,6 +305,9 @@ class MapEditorWindow(QMainWindow):
             self._act_connect.setText("Disconnect")
             self._act_relocate.setEnabled(True)
             self._act_locate.setEnabled(True)
+            self._act_align.setEnabled(True)
+            self._act_rot_ccw.setEnabled(True)
+            self._act_rot_cw.setEnabled(True)
             self._live_timer.start()
             self._status.showMessage("Connected — Relocate to seat the pose.")
         else:
@@ -292,6 +319,8 @@ class MapEditorWindow(QMainWindow):
             self._link.disconnect()
             self._link = None
         self._live_pose = None
+        self._overlay_pose = None
+        self._odom_anchor = None
         self._view.set_scan_points(None)
         if self._act_connect is not None:
             self._act_connect.setText("Connect")
@@ -299,6 +328,11 @@ class MapEditorWindow(QMainWindow):
             self._act_relocate.setEnabled(False)
             self._act_locate.setChecked(False)
             self._act_locate.setEnabled(False)
+            self._act_align.setChecked(False)
+            self._act_align.setEnabled(False)
+            self._act_rot_ccw.setEnabled(False)
+            self._act_rot_cw.setEnabled(False)
+            self._view.set_align_mode(False)
         self._rerender(fit=False)
 
     def _on_relocate(self) -> None:
@@ -329,24 +363,79 @@ class MapEditorWindow(QMainWindow):
             self._act_locate.setChecked(False)  # one-shot
         return True
 
+    # ── Manual align ────────────────────────────────────────────────
+
+    def _on_align_toggled(self, on: bool) -> None:
+        if self._link is None:
+            return
+        if on:
+            if self._act_edit.isChecked():
+                self._act_edit.setChecked(False)
+            base = self._live_pose or self._link.latest_pose()
+            if base is None:
+                self._status.showMessage(
+                    "No pose yet — wait for the overlay before aligning.", 4000)
+                self._act_align.setChecked(False)
+                return
+            self._overlay_pose = (float(base[0]), float(base[1]), float(base[2]))
+            self._odom_anchor = self._link.odom_pose()
+            self._view.set_align_mode(True)
+            self._status.showMessage(
+                "Align: drag to move the scan onto a trusted wall; "
+                "⟲/⟳ (keys , .) to rotate. Dead-reckoned by odom.")
+        else:
+            self._overlay_pose = None
+            self._odom_anchor = None
+            self._view.set_align_mode(False)
+
+    def _on_align_drag(self, dx_w: float, dy_w: float) -> None:
+        if self._overlay_pose is None:
+            return
+        x, y, th = self._overlay_pose
+        self._overlay_pose = (x + dx_w, y + dy_w, th)
+
+    def _on_rotate(self, sign: int) -> None:
+        if self._overlay_pose is None:
+            self._status.showMessage(
+                "Turn on Align scan first to rotate the overlay.", 3000)
+            return
+        import math
+        x, y, th = self._overlay_pose
+        self._overlay_pose = (x, y, th + sign * math.radians(1.0))
+
     def _live_tick(self) -> None:
         if self._link is None or self._emap is None:
             return
-        self._live_pose = self._link.latest_pose()
-        world = self._link.latest_scan_world(max_range_m=_SCAN_MAX_RANGE_M)
+        od = self._link.odom_pose()
+        if self._overlay_pose is not None:
+            # Manual-aligned pose, dead-reckoned by odom only (no
+            # scan-match creep): advance by the odom delta since the
+            # last tick, then re-anchor.
+            if self._odom_anchor is not None and od is not None:
+                self._overlay_pose = pose_compose(
+                    self._overlay_pose, pose_relative(self._odom_anchor, od))
+                self._odom_anchor = od
+            pose = self._overlay_pose
+            body = self._link.scan_body_xy(max_range_m=_SCAN_MAX_RANGE_M)
+            world = body_xy_to_world(body, pose) if body is not None else None
+            mode = "align"
+        else:
+            pose = self._link.latest_pose()
+            world = self._link.latest_scan_world(max_range_m=_SCAN_MAX_RANGE_M)
+            mode = "mcl"
+        self._live_pose = pose
         self._view.set_scan_points(world)
         if self._drive_cache is not None:
             self._view.update_map(
                 self._drive_cache, self._emap.meta, ts=time.time(),
-                pose=self._live_pose, bounds_ij=self._emap.bounds_ij(),
+                pose=pose, bounds_ij=self._emap.bounds_ij(),
             )
         age = self._link.scan_age_s(time.time())
-        pose_s = ("no pose" if self._live_pose is None
-                  else f"pose ({self._live_pose[0]:.2f}, {self._live_pose[1]:.2f}, "
-                       f"{self._live_pose[2]:.2f})")
+        pose_s = ("no pose" if pose is None
+                  else f"pose ({pose[0]:.2f}, {pose[1]:.2f}, {pose[2]:.2f})")
         age_s = "scan —" if age is None else f"scan {age:.1f}s"
         n = 0 if world is None else len(world)
-        self._status.showMessage(f"Live: {pose_s} · {age_s} · {n} pts")
+        self._status.showMessage(f"Live[{mode}]: {pose_s} · {age_s} · {n} pts")
 
     def _update_title(self) -> None:
         name = os.path.basename(self._path) if self._path else "(no map)"

@@ -38,6 +38,33 @@ def resolve_device(choice: str) -> str:
         return "cpu"
 
 
+def pose_relative(a, b):
+    """Express pose `b` in pose `a`'s frame → (dx, dy, dθ).
+
+    a, b are world poses (x, y, θ). Used to read an odom increment:
+    relative(anchor, now) is the motion since the anchor in the
+    anchor's local frame.
+    """
+    ax, ay, ath = a
+    bx, by, bth = b
+    c, s = math.cos(ath), math.sin(ath)
+    dxw, dyw = bx - ax, by - ay
+    return (c * dxw + s * dyw, -s * dxw + c * dyw, _wrap(bth - ath))
+
+
+def pose_compose(p, d):
+    """Apply a local delta `d=(dx,dy,dθ)` to world pose `p` → new world
+    pose. Inverse of pose_relative: compose(a, relative(a, b)) == b."""
+    px, py, pth = p
+    dx, dy, dth = d
+    c, s = math.cos(pth), math.sin(pth)
+    return (px + c * dx - s * dy, py + s * dx + c * dy, _wrap(pth + dth))
+
+
+def _wrap(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
 def scan_to_world(
     ranges,
     angle_min: float,
@@ -69,6 +96,18 @@ def scan_to_world(
     wx = px + c * bx - s * by
     wy = py + s * bx + c * by
     return np.column_stack([wx, wy])
+
+
+def body_xy_to_world(body_xy: np.ndarray,
+                     pose: Tuple[float, float, float]) -> np.ndarray:
+    """Rotate+translate body-frame points (N,2) by world pose (x,y,θ)."""
+    if body_xy is None or len(body_xy) == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    px, py, th = float(pose[0]), float(pose[1]), float(pose[2])
+    c, s = math.cos(th), math.sin(th)
+    bx = body_xy[:, 0]
+    by = body_xy[:, 1]
+    return np.column_stack([px + c * bx - s * by, py + s * bx + c * by])
 
 
 class LiveLink:
@@ -139,6 +178,30 @@ class LiveLink:
             return None
         pose = lp[0]  # (Pose, ts) → Pose is indexable (x, y, theta)
         return (float(pose[0]), float(pose[1]), float(pose[2]))
+
+    def odom_pose(self) -> Optional[Tuple[float, float, float]]:
+        """Raw wheel-odom pose (x, y, θ) — used to dead-reckon the
+        manually-aligned overlay pose (clean at rest; no scan-match
+        creep)."""
+        if self._drive is None:
+            return None
+        return self._drive.odom_pose()
+
+    def scan_body_xy(self, *, max_range_m: float = 12.0
+                     ) -> Optional[np.ndarray]:
+        """Latest scan as body-frame (N,2) endpoints, for drawing at an
+        arbitrary (manually-aligned) pose."""
+        if self._drive is None:
+            return None
+        scan = self._drive.latest_scan()
+        if not scan or not scan.get("ranges"):
+            return None
+        r = np.asarray(scan["ranges"], dtype=np.float64).ravel()
+        ang = (float(scan.get("angle_min", 0.0))
+               + np.arange(r.size) * float(scan.get("angle_increment", 0.0)))
+        valid = np.isfinite(r) & (r > 0.05) & (r < max_range_m)
+        r, ang = r[valid], ang[valid]
+        return np.column_stack([r * np.cos(ang), r * np.sin(ang)])
 
     def latest_scan_world(self, *, max_range_m: float = 12.0
                           ) -> Optional[np.ndarray]:

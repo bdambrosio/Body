@@ -9,7 +9,9 @@ import unittest
 
 import numpy as np
 
-from desktop.map_editor.live_overlay import scan_to_world
+from desktop.map_editor.live_overlay import (
+    body_xy_to_world, pose_compose, pose_relative, scan_to_world,
+)
 
 
 class TestScanToWorld(unittest.TestCase):
@@ -46,6 +48,44 @@ class TestScanToWorld(unittest.TestCase):
     def test_empty(self):
         w = scan_to_world([], 0.0, 0.1, (0.0, 0.0, 0.0))
         self.assertEqual(w.shape, (0, 2))
+
+
+class TestPoseMath(unittest.TestCase):
+    def test_compose_relative_roundtrip(self):
+        # compose(a, relative(a, b)) == b, for arbitrary poses.
+        a = (1.0, 2.0, 0.3)
+        b = (3.5, -1.0, -0.8)
+        d = pose_relative(a, b)
+        got = pose_compose(a, d)
+        for g, e in zip(got, b):
+            self.assertAlmostEqual(g, e, places=9)
+
+    def test_relative_zero_when_same(self):
+        a = (2.0, -1.0, 1.1)
+        dx, dy, dth = pose_relative(a, a)
+        self.assertAlmostEqual(dx, 0.0, places=12)
+        self.assertAlmostEqual(dy, 0.0, places=12)
+        self.assertAlmostEqual(dth, 0.0, places=12)
+
+    def test_deadreckon_pure_forward(self):
+        # Robot facing +y (θ=π/2). Odom moves +1 in its local x (forward).
+        # In world that's +y. Overlay pose should advance +y by 1.
+        anchor = (0.0, 0.0, 0.0)        # odom frame anchor
+        now = (1.0, 0.0, 0.0)           # odom moved +1 forward
+        overlay = (5.0, 5.0, math.pi / 2)
+        d = pose_relative(anchor, now)  # (1, 0, 0) local
+        moved = pose_compose(overlay, d)
+        np.testing.assert_allclose(moved[:2], [5.0, 6.0], atol=1e-9)
+
+    def test_body_xy_to_world(self):
+        body = np.array([[1.0, 0.0], [0.0, 1.0]])
+        w = body_xy_to_world(body, (1.0, 2.0, math.pi / 2))
+        np.testing.assert_allclose(w[0], [1.0, 3.0], atol=1e-9)  # fwd→+y
+        np.testing.assert_allclose(w[1], [0.0, 2.0], atol=1e-9)  # left→-x
+
+    def test_body_xy_to_world_empty(self):
+        self.assertEqual(
+            body_xy_to_world(np.empty((0, 2)), (0, 0, 0)).shape, (0, 2))
 
 
 if __name__ == "__main__":

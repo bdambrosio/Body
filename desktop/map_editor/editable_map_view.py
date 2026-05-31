@@ -26,6 +26,9 @@ class EditableMapView(WorldDriveableView):
     # Emitted when a paint stroke ends (mouse release). For undo grouping.
     strokeStarted = pyqtSignal()
     strokeEnded = pyqtSignal()
+    # Emitted with a world-frame translation delta (dx, dy) while in
+    # align mode (left-drag moves the scan overlay to seat it on walls).
+    alignDragWorld = pyqtSignal(float, float)
 
     def __init__(self, parent=None, *, shared=None) -> None:
         # The editor's map is static — it must never dim with the
@@ -33,6 +36,8 @@ class EditableMapView(WorldDriveableView):
         super().__init__(parent, stale_s=1e12, shared=shared)
         self._paint_mode: bool = False
         self._painting: bool = False
+        self._align_mode: bool = False
+        self._align_last: Optional[tuple] = None  # last drag world pt
         self._scan_world_xy: Optional[np.ndarray] = None
 
     # ── External API ────────────────────────────────────────────────
@@ -43,6 +48,16 @@ class EditableMapView(WorldDriveableView):
             self._painting = False
         self.setCursor(
             Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor
+        )
+
+    def set_align_mode(self, on: bool) -> None:
+        self._align_mode = bool(on)
+        self._align_last = None
+        if on:
+            self._paint_mode = False
+            self._painting = False
+        self.setCursor(
+            Qt.CursorShape.SizeAllCursor if on else Qt.CursorShape.ArrowCursor
         )
 
     def set_scan_points(self, world_xy: Optional[np.ndarray]) -> None:
@@ -74,11 +89,26 @@ class EditableMapView(WorldDriveableView):
             self._emit_paint_at(event)
             event.accept()
             return
+        if (self._align_mode
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._paint_geom is not None):
+            self._align_last = self._widget_to_world(
+                float(event.position().x()), float(event.position().y()))
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         if self._painting:
             self._emit_paint_at(event)
+            event.accept()
+            return
+        if self._align_mode and self._align_last is not None:
+            x_w, y_w = self._widget_to_world(
+                float(event.position().x()), float(event.position().y()))
+            self.alignDragWorld.emit(x_w - self._align_last[0],
+                                     y_w - self._align_last[1])
+            self._align_last = (x_w, y_w)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -87,6 +117,10 @@ class EditableMapView(WorldDriveableView):
         if self._painting and event.button() == Qt.MouseButton.LeftButton:
             self._painting = False
             self.strokeEnded.emit()
+            event.accept()
+            return
+        if self._align_mode and event.button() == Qt.MouseButton.LeftButton:
+            self._align_last = None
             event.accept()
             return
         super().mouseReleaseEvent(event)
