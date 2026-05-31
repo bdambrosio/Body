@@ -36,7 +36,11 @@ class DriveParams:
     v_min_mps: float = 0.08
     arrival_tol_m: float = 0.12
     # Bearing beyond which we rotate in place rather than arc toward the goal.
-    rotate_in_place_thresh_rad: float = 0.61   # ~35°
+    rotate_in_place_thresh_rad: float = 0.61   # ~35° — ENTER rotate-in-place
+    # Hysteresis: once rotating, keep rotating until the bearing falls below
+    # this (lower) threshold before resuming drive. Prevents rotate↔drive
+    # chatter when the bearing hovers at the enter threshold.
+    rotate_exit_thresh_rad: float = 0.26        # ~15° — EXIT rotate-in-place
     k_omega: float = 1.5                        # proportional heading gain
     slowdown_distance_m: float = 0.4
     # Heading tolerance for the optional final-heading rotate on arrival.
@@ -71,26 +75,32 @@ def _clip(x: float, lo: float, hi: float) -> float:
 
 
 def steer_to_body_point(
-    goal_body: Point2, params: DriveParams,
-) -> Tuple[float, float, float, float]:
+    goal_body: Point2, params: DriveParams, rotating: bool = False,
+) -> Tuple[float, float, float, float, bool]:
     """Pure-pursuit-style command toward a body-frame point.
 
-    Returns (v_mps, omega_radps, dist_m, bearing_rad). Rotates in place when
-    the bearing exceeds the threshold (so it faces the goal before driving),
-    otherwise arcs toward it with a goal-distance slowdown. Caller decides
-    arrival/safety; this only shapes the velocity toward the point.
+    Returns (v_mps, omega_radps, dist_m, bearing_rad, rotating_next).
+    Rotates in place when the bearing exceeds the threshold (so it faces the
+    goal before driving), otherwise arcs toward it with a goal-distance
+    slowdown. ``rotating`` is the caller-held rotate-in-place state from the
+    previous tick; the returned ``rotating_next`` must be fed back next tick.
+    Hysteresis (enter at ``rotate_in_place_thresh_rad``, exit only below
+    ``rotate_exit_thresh_rad``) prevents rotate↔drive chatter at the boundary.
+    Caller decides arrival/safety; this only shapes the velocity.
     """
     bx, by = goal_body
     dist = math.hypot(bx, by)
     bearing = math.atan2(by, bx)
     omega = _clip(params.k_omega * bearing, -params.omega_max, params.omega_max)
-    if abs(bearing) > params.rotate_in_place_thresh_rad:
-        return 0.0, omega, dist, bearing
+    thresh = (params.rotate_exit_thresh_rad if rotating
+              else params.rotate_in_place_thresh_rad)
+    if abs(bearing) > thresh:
+        return 0.0, omega, dist, bearing, True
     v_factor = _clip(dist / max(params.slowdown_distance_m, 1e-6), 0.0, 1.0)
     v = params.v_max * v_factor
     if 0.0 < v < params.v_min_mps:
         v = params.v_min_mps
-    return v, omega, dist, bearing
+    return v, omega, dist, bearing, False
 
 
 def rotate_to_heading(

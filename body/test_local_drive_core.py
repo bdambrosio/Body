@@ -49,17 +49,30 @@ class TestSteer(unittest.TestCase):
         self.p = DriveParams()
 
     def test_straight_ahead_drives_forward(self):
-        v, omega, dist, bearing = steer_to_body_point((1.0, 0.0), self.p)
+        v, omega, dist, bearing, rot = steer_to_body_point((1.0, 0.0), self.p)
         self.assertGreater(v, 0.0)
         self.assertAlmostEqual(omega, 0.0)
         self.assertAlmostEqual(dist, 1.0)
+        self.assertFalse(rot)
 
     def test_large_bearing_rotates_in_place(self):
         # Goal 90° to the left → rotate, no translation.
-        v, omega, _, bearing = steer_to_body_point((0.0, 1.0), self.p)
+        v, omega, _, bearing, rot = steer_to_body_point((0.0, 1.0), self.p)
         self.assertEqual(v, 0.0)
         self.assertGreater(omega, 0.0)
         self.assertAlmostEqual(bearing, math.pi / 2)
+        self.assertTrue(rot)
+
+    def test_rotate_hysteresis_band_is_sticky(self):
+        # Bearing 0.45 rad sits in the band (exit 0.26 < 0.45 < enter 0.61):
+        # the mode should be sticky to the incoming `rotating` state.
+        band = (math.cos(0.45), math.sin(0.45))  # dist 1, bearing 0.45
+        v_d, _, _, _, rot_d = steer_to_body_point(band, self.p, rotating=False)
+        self.assertGreater(v_d, 0.0)      # was driving → keep driving
+        self.assertFalse(rot_d)
+        v_r, _, _, _, rot_r = steer_to_body_point(band, self.p, rotating=True)
+        self.assertEqual(v_r, 0.0)        # was rotating → keep rotating
+        self.assertTrue(rot_r)
 
     def test_slowdown_near_goal(self):
         far = steer_to_body_point((1.0, 0.0), self.p)[0]
@@ -68,12 +81,12 @@ class TestSteer(unittest.TestCase):
 
     def test_v_min_snap(self):
         # Just outside arrival, within slowdown → should not stall below v_min.
-        v, _, _, _ = steer_to_body_point((0.05, 0.0), self.p)
+        v, _, _, _, _ = steer_to_body_point((0.05, 0.0), self.p)
         self.assertGreaterEqual(v, self.p.v_min_mps - 1e-9)
 
     def test_omega_capped(self):
         steep = DriveParams(k_omega=100.0, omega_max=0.6)
-        _, omega, _, _ = steer_to_body_point((0.0, 0.3), steep)
+        _, omega, _, _, _ = steer_to_body_point((0.0, 0.3), steep)
         self.assertLessEqual(abs(omega), 0.6 + 1e-9)
 
     def test_rotate_to_heading_aligned(self):

@@ -47,6 +47,7 @@ def _with_vmax(params: DriveParams, v_max: float) -> DriveParams:
         v_max=v_max, omega_max=params.omega_max, v_min_mps=params.v_min_mps,
         arrival_tol_m=params.arrival_tol_m,
         rotate_in_place_thresh_rad=params.rotate_in_place_thresh_rad,
+        rotate_exit_thresh_rad=params.rotate_exit_thresh_rad,
         k_omega=params.k_omega, slowdown_distance_m=params.slowdown_distance_m,
         heading_tol_rad=params.heading_tol_rad,
     )
@@ -74,6 +75,7 @@ def main() -> None:
         v_min_mps=float(cfg.get("v_min_mps", 0.08)),
         arrival_tol_m=float(cfg.get("arrival_tol_m", 0.12)),
         rotate_in_place_thresh_rad=float(cfg.get("rotate_in_place_thresh_rad", 0.61)),
+        rotate_exit_thresh_rad=float(cfg.get("rotate_exit_thresh_rad", 0.26)),
         k_omega=float(cfg.get("k_omega", 1.5)),
         slowdown_distance_m=float(cfg.get("slowdown_distance_m", 0.4)),
     )
@@ -209,6 +211,7 @@ def main() -> None:
 
     # Per-goal bookkeeping (main loop only).
     tracked_cmd_id = -1
+    rotating = False  # rotate-in-place hysteresis state (per goal)
     best_dist: Optional[float] = None
     best_dist_at = 0.0
     final_aligned = False
@@ -235,6 +238,7 @@ def main() -> None:
             best_dist = None
             best_dist_at = now_mono
             final_aligned = False
+            rotating = False
 
         gx, gy = float(g["x_m"]), float(g["y_m"])
         tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
@@ -305,7 +309,7 @@ def main() -> None:
 
         # Pure-pursuit follow: steer toward a lookahead point on the path.
         look = lookahead_on_path(plan.path_body, lookahead_m) or (bx, by)
-        v, omega, _ld, _lb = steer_to_body_point(look, gp)
+        v, omega, _ld, _lb, rotating = steer_to_body_point(look, gp, rotating)
 
         # Last-resort safety veto — A* won't route through lethal, but a
         # dynamic/new obstacle can appear in the followed arc between replans.
