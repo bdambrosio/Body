@@ -197,4 +197,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Hard-exit once the Qt loop returns. zenoh/torch spawn native threads the
+    # interpreter would otherwise block on at shutdown — that's why closing the
+    # window used to hang until ^C. Resource teardown already ran in main()'s
+    # finally (and the window closeEvent) before we reach here.
+    os._exit(main())
