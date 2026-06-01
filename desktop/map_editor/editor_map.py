@@ -39,7 +39,13 @@ from desktop.reference_map.reference_map import (
 WALL = "wall"
 FREE = "free"
 UNKNOWN = "unknown"
-PAINT_KINDS = (WALL, FREE, UNKNOWN)
+PAINT_KINDS = (WALL, FREE, UNKNOWN)        # write the occupancy layer
+
+# Keep-out (policy) layer kinds — write the bool `nogo` mask, never
+# occupancy, so localization is unaffected.
+NOGO = "nogo"
+ERASE_NOGO = "erase_nogo"
+NOGO_KINDS = (NOGO, ERASE_NOGO)
 
 _PAINT_LOG_ODDS = {
     WALL: float(LOG_ODDS_MAX),    # +4.0  → occupied
@@ -60,6 +66,16 @@ class EditorMap:
     session_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     trajectory: Optional[np.ndarray] = None
+    # Keep-out mask (bool, same shape as log_odds). Operator policy layer;
+    # carried through to save_npz, never touches occupancy. Filled to an
+    # all-False array on construction when None.
+    nogo: Optional[np.ndarray] = None
+
+    def __post_init__(self) -> None:
+        if self.nogo is None:
+            self.nogo = np.zeros(self.log_odds.shape, dtype=bool)
+        else:
+            self.nogo = np.asarray(self.nogo, dtype=bool)
 
     # ── Geometry (mirrors ReferenceMap) ─────────────────────────────
 
@@ -133,20 +149,28 @@ class EditorMap:
         return (ii.ravel(), jj.ravel())
 
     def paint(self, ii: np.ndarray, jj: np.ndarray, kind: str) -> None:
-        """Set `log_odds` at cells (ii, jj) to the confident value for
-        `kind` (wall=+max, free=-max, unknown=0)."""
-        if kind not in PAINT_KINDS:
-            raise ValueError(f"unknown paint kind: {kind!r}")
+        """Paint cells (ii, jj). Occupancy kinds (wall/free/unknown) set
+        `log_odds`; keep-out kinds (nogo/erase_nogo) set the `nogo` mask."""
         if len(ii) == 0:
             return
-        self.log_odds[ii, jj] = _PAINT_LOG_ODDS[kind]
+        if kind in PAINT_KINDS:
+            self.log_odds[ii, jj] = _PAINT_LOG_ODDS[kind]
+        elif kind == NOGO:
+            self.nogo[ii, jj] = True
+        elif kind == ERASE_NOGO:
+            self.nogo[ii, jj] = False
+        else:
+            raise ValueError(f"unknown paint kind: {kind!r}")
 
-    def snapshot_occ(self) -> np.ndarray:
-        """Copy of log_odds for the undo stack."""
-        return self.log_odds.copy()
+    def snapshot_state(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Copy of (log_odds, nogo) for the undo stack — a stroke may
+        touch either layer."""
+        return self.log_odds.copy(), self.nogo.copy()
 
-    def restore_occ(self, log_odds: np.ndarray) -> None:
+    def restore_state(self, state: Tuple[np.ndarray, np.ndarray]) -> None:
+        log_odds, nogo = state
         np.copyto(self.log_odds, log_odds)
+        np.copyto(self.nogo, nogo)
 
 
 # ── npz I/O ─────────────────────────────────────────────────────────
@@ -164,6 +188,8 @@ def load_npz(path: str) -> EditorMap:
         metadata=dict(rm.metadata),
         trajectory=(None if rm.trajectory is None
                     else np.array(rm.trajectory, dtype=np.float64)),
+        nogo=(None if rm.nogo_mask is None
+              else np.array(rm.nogo_mask, dtype=bool)),
     )
 
 
@@ -182,6 +208,7 @@ def save_npz(emap: EditorMap, path: str, *, backup: bool = True) -> str:
         session_id=emap.session_id or None,
         metadata=emap.metadata,
         trajectory=emap.trajectory,
+        nogo_mask=emap.nogo,
     )
     save_reference_map(path, rm)
     return path

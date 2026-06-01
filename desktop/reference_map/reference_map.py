@@ -50,6 +50,11 @@ class ReferenceMap:
     session_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     trajectory: Optional[np.ndarray] = None  # (N, 4) ts, x, y, theta
+    # Operator keep-out mask (bool, nx×ny). POLICY layer for planning only:
+    # folded into the costmap's lethal set, NEVER into the localization
+    # likelihood/distance fields (those are built from occupancy alone).
+    # None == no keep-out cells.
+    nogo_mask: Optional[np.ndarray] = None
 
     @property
     def nx(self) -> int:
@@ -69,6 +74,12 @@ class ReferenceMap:
     def driveable_int8(self) -> np.ndarray:
         return driveable_from_occupancy(self.occupancy_log_odds)
 
+    def nogo_or_empty(self) -> np.ndarray:
+        """bool (nx, ny) keep-out mask; all-False when unset."""
+        if self.nogo_mask is None:
+            return np.zeros((self.nx, self.ny), dtype=bool)
+        return self.nogo_mask.astype(bool)
+
     def snapshot_for_ui(self) -> Dict[str, Any]:
         """Shape compatible with ``build_costmap`` / map views."""
         drive = self.driveable_int8()
@@ -77,6 +88,7 @@ class ReferenceMap:
         return {
             "grid": grid,
             "driveable": drive,
+            "nogo": self.nogo_or_empty(),
             "meta": {
                 "resolution_m": self.resolution_m,
                 "origin_x_m": self.origin_x_m,
@@ -294,6 +306,7 @@ def build_reference_map_from_log_odds(
     session_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     trajectory: Optional[np.ndarray] = None,
+    nogo_mask: Optional[np.ndarray] = None,
     denoise_min_neighbors: int = 2,
     occupied_low_log_odds: float = OCCUPIED_LOG_ODDS_LOW_THRESHOLD,
 ) -> ReferenceMap:
@@ -323,6 +336,7 @@ def build_reference_map_from_log_odds(
         session_id=session_id or uuid.uuid4().hex[:12],
         metadata=meta,
         trajectory=trajectory,
+        nogo_mask=(None if nogo_mask is None else nogo_mask.astype(bool)),
     )
 
 
@@ -341,6 +355,10 @@ def save_reference_map(path: str, ref_map: ReferenceMap) -> None:
     }
     if ref_map.trajectory is not None and ref_map.trajectory.size > 0:
         kwargs["trajectory"] = ref_map.trajectory.astype(np.float64)
+    # Operator keep-out mask — stored only when non-empty (uint8 keeps
+    # allow_pickle=False loads working). Absent key == no keep-out cells.
+    if ref_map.nogo_mask is not None and bool(np.any(ref_map.nogo_mask)):
+        kwargs["nogo_mask"] = ref_map.nogo_mask.astype(np.uint8)
     np.savez_compressed(path, **kwargs)
 
 
@@ -361,6 +379,7 @@ def load_reference_map(path: str) -> ReferenceMap:
         occupied = log_odds > OCCUPIED_LOG_ODDS_THRESHOLD
         lik = build_likelihood_field(occupied, resolution_m=resolution_m)
         dist = build_distance_field(occupied, resolution_m=resolution_m)
+    nogo = data["nogo_mask"].astype(bool) if "nogo_mask" in data else None
     return ReferenceMap(
         occupancy_log_odds=log_odds,
         resolution_m=resolution_m,
@@ -371,4 +390,5 @@ def load_reference_map(path: str) -> ReferenceMap:
         session_id=str(data.get("session_id") or meta.get("session_id") or ""),
         metadata=meta,
         trajectory=trajectory,
+        nogo_mask=nogo,
     )

@@ -94,12 +94,78 @@ class TestPaint(unittest.TestCase):
 
     def test_undo_restore(self):
         m = _make_map()
-        snap = m.snapshot_occ()
+        snap = m.snapshot_state()
         ii, jj = m.brush_cells(10, 10, radius_cells=2)
         m.paint(ii, jj, em.WALL)
-        self.assertFalse(np.array_equal(m.log_odds, snap))
-        m.restore_occ(snap)
-        self.assertTrue(np.array_equal(m.log_odds, snap))
+        self.assertFalse(np.array_equal(m.log_odds, snap[0]))
+        m.restore_state(snap)
+        self.assertTrue(np.array_equal(m.log_odds, snap[0]))
+
+
+class TestNoGo(unittest.TestCase):
+    def test_nogo_paint_sets_mask_not_occupancy(self):
+        m = _make_map()
+        ii, jj = m.brush_cells(10, 10, radius_cells=1)
+        m.paint(ii, jj, em.NOGO)
+        self.assertTrue(m.nogo[ii, jj].all())
+        # Occupancy (and thus localization) untouched.
+        self.assertTrue((m.log_odds[ii, jj] == 0).all())
+        self.assertTrue((m.driveable_grid()[ii, jj] == -1).all())
+
+    def test_erase_nogo(self):
+        m = _make_map()
+        ii, jj = m.brush_cells(10, 10, radius_cells=1)
+        m.paint(ii, jj, em.NOGO)
+        m.paint(ii, jj, em.ERASE_NOGO)
+        self.assertFalse(m.nogo[ii, jj].any())
+
+    def test_undo_restores_both_layers(self):
+        m = _make_map()
+        snap = m.snapshot_state()
+        ii, jj = m.brush_cells(8, 8, radius_cells=1)
+        m.paint(ii, jj, em.NOGO)
+        self.assertTrue(m.nogo[ii, jj].all())
+        m.restore_state(snap)
+        self.assertFalse(m.nogo.any())
+
+    def test_nogo_round_trips(self):
+        m = _make_map(nx=40, ny=40)
+        ii, jj = m.brush_cells(20, 20, radius_cells=2)
+        m.paint(ii, jj, em.NOGO)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "reference_map.npz")
+            em.save_npz(m, path, backup=False)
+            rm = load_reference_map(path)
+        self.assertIsNotNone(rm.nogo_mask)
+        self.assertTrue(rm.nogo_mask[ii, jj].all())
+
+    def test_nogo_does_not_affect_likelihood_field(self):
+        # Localization isolation: an identical map with vs without a
+        # no-go region must produce byte-identical likelihood/distance.
+        def _saved(with_nogo):
+            m = _make_map(nx=40, ny=40)
+            wi, wj = m.brush_cells(10, 10, radius_cells=2)
+            m.paint(wi, wj, em.WALL)  # a real wall in both
+            if with_nogo:
+                ni, nj = m.brush_cells(28, 28, radius_cells=3)
+                m.paint(ni, nj, em.NOGO)
+            d = tempfile.mkdtemp()
+            path = os.path.join(d, "reference_map.npz")
+            em.save_npz(m, path, backup=False)
+            return load_reference_map(path)
+
+        a, b = _saved(False), _saved(True)
+        self.assertTrue(np.array_equal(a.likelihood_field, b.likelihood_field))
+        self.assertTrue(np.array_equal(a.distance_field_m, b.distance_field_m))
+
+    def test_empty_nogo_not_persisted(self):
+        # An all-False mask is not written (absent key), and loads as None.
+        m = _make_map(nx=12, ny=12)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "reference_map.npz")
+            em.save_npz(m, path, backup=False)
+            rm = load_reference_map(path)
+        self.assertIsNone(rm.nogo_mask)
 
 
 class TestRoundTrip(unittest.TestCase):

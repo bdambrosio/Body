@@ -178,6 +178,15 @@ def build_costmap(
     if cfg.unknown_is_lethal:
         lethal = lethal | unknown
 
+    # Operator keep-out (policy layer, e.g. from the map editor): lethal
+    # exactly at the painted cells — NO footprint dilation, and it bypasses
+    # the perception speckle-denoise above so thin sealing lines survive.
+    # Localization never sees this (it scores the reference likelihood
+    # field, built from occupancy alone).
+    nogo = snap.get("nogo")
+    if nogo is not None and np.any(nogo):
+        lethal = lethal | np.asarray(nogo, dtype=bool)
+
     # Cost field. Inside the safety band (lethal_radius..lethal_radius
     # + safety_margin) the halo is at full halo_max — strongly avoided
     # but not lethal. Beyond, exponential decay.

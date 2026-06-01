@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
 _UNDO_DEPTH = 25
 _SCAN_MAX_RANGE_M = 12.0
 
+# Which edit layer each brush kind writes.
+_KIND_LAYER = {
+    em.WALL: "occ", em.FREE: "occ", em.UNKNOWN: "occ",
+    em.NOGO: "nogo", em.ERASE_NOGO: "nogo",
+}
+
 
 class MapEditorWindow(QMainWindow):
     def __init__(self, map_path: Optional[str] = None, *,
@@ -51,7 +57,8 @@ class MapEditorWindow(QMainWindow):
         self._path: Optional[str] = None
         self._dirty: bool = False
         self._brush_kind: str = em.WALL
-        self._undo: List[np.ndarray] = []
+        self._active_layer: str = "occ"  # "occ" | "nogo"
+        self._undo: List = []  # stack of (log_odds, nogo) snapshots
         self._drive_cache: Optional[np.ndarray] = None
 
         # Live (Phase 2) state — only wired when a router is given.
@@ -108,15 +115,37 @@ class MapEditorWindow(QMainWindow):
         self._act_edit.toggled.connect(self._view.set_paint_mode)
         tb.addSeparator()
 
-        # Brush palette as an exclusive, checkable action group.
+        # Edit-layer selector: Occupancy (perception → localization +
+        # planning) vs No-go (policy → planning only).
+        layer_grp = QActionGroup(self)
+        layer_grp.setExclusive(True)
+        self._act_layer_occ = tb.addAction("Occupancy")
+        self._act_layer_occ.setCheckable(True)
+        self._act_layer_occ.setChecked(True)
+        self._act_layer_occ.triggered.connect(
+            lambda _c=False: self._set_layer("occ"))
+        layer_grp.addAction(self._act_layer_occ)
+        self._act_layer_nogo = tb.addAction("No-go")
+        self._act_layer_nogo.setCheckable(True)
+        self._act_layer_nogo.triggered.connect(
+            lambda _c=False: self._set_layer("nogo"))
+        layer_grp.addAction(self._act_layer_nogo)
+        tb.addSeparator()
+
+        # Brush palette — one exclusive group spanning both layers; only
+        # the active layer's kinds are visible (see _set_layer).
         grp = QActionGroup(self)
         grp.setExclusive(True)
+        self._brush_actions = {}
         for kind, label in ((em.WALL, "Wall"), (em.FREE, "Free"),
-                            (em.UNKNOWN, "Unknown")):
+                            (em.UNKNOWN, "Unknown"),
+                            (em.NOGO, "Paint"), (em.ERASE_NOGO, "Erase")):
             a = tb.addAction(label)
             a.setCheckable(True)
             a.triggered.connect(lambda _c=False, k=kind: self._set_kind(k))
+            a.setVisible(_KIND_LAYER[kind] == "occ")  # start on occupancy
             grp.addAction(a)
+            self._brush_actions[kind] = a
             if kind == em.WALL:
                 a.setChecked(True)
         tb.addSeparator()
@@ -171,6 +200,23 @@ class MapEditorWindow(QMainWindow):
 
     def _set_kind(self, kind: str) -> None:
         self._brush_kind = kind
+
+    def _set_layer(self, layer: str) -> None:
+        """Switch the active edit layer; show that layer's brushes and
+        select its default kind (Wall / no-go Paint)."""
+        self._active_layer = layer
+        default = em.WALL if layer == "occ" else em.NOGO
+        for kind, a in self._brush_actions.items():
+            a.setVisible(_KIND_LAYER[kind] == layer)
+        self._brush_actions[default].setChecked(True)
+        self._set_kind(default)
+        if layer == "nogo":
+            self._status.showMessage(
+                "No-go layer (orange): paint keep-out zones. Planning only "
+                "— does not affect localization.", 5000)
+        else:
+            self._status.showMessage(
+                "Occupancy layer: Wall / Free / Unknown.", 3000)
 
     # ── Load / Save ─────────────────────────────────────────────────
 
@@ -238,7 +284,7 @@ class MapEditorWindow(QMainWindow):
     def _on_stroke_started(self) -> None:
         if self._emap is None:
             return
-        self._undo.append(self._emap.snapshot_occ())
+        self._undo.append(self._emap.snapshot_state())
         if len(self._undo) > _UNDO_DEPTH:
             self._undo.pop(0)
         self._act_undo.setEnabled(True)
@@ -258,7 +304,7 @@ class MapEditorWindow(QMainWindow):
     def _on_undo(self) -> None:
         if self._emap is None or not self._undo:
             return
-        self._emap.restore_occ(self._undo.pop())
+        self._emap.restore_state(self._undo.pop())
         self._dirty = True
         self._rerender(fit=False)
         self._update_title()
@@ -278,6 +324,22 @@ class MapEditorWindow(QMainWindow):
             self._drive_cache, self._emap.meta, ts=time.time(),
             pose=self._live_pose, bounds_ij=self._emap.bounds_ij(),
         )
+        self._push_nogo_overlay()
+
+    def _push_nogo_overlay(self) -> None:
+        """Hand the keep-out cell centers (world frame) to the view for the
+        orange overlay, or clear it when the mask is empty."""
+        if self._emap is None:
+            return
+        mask = self._emap.nogo
+        res = self._emap.resolution_m
+        if mask is None or not mask.any():
+            self._view.set_nogo_cells(None, res)
+            return
+        ii, jj = np.where(mask)
+        cx = self._emap.origin_x_m + (ii + 0.5) * res
+        cy = self._emap.origin_y_m + (jj + 0.5) * res
+        self._view.set_nogo_cells(np.column_stack([cx, cy]), res)
 
     def _refresh_actions(self) -> None:
         have = self._emap is not None

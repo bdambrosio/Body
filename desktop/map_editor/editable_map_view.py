@@ -39,6 +39,9 @@ class EditableMapView(WorldDriveableView):
         self._align_mode: bool = False
         self._align_last: Optional[tuple] = None  # last drag world pt
         self._scan_world_xy: Optional[np.ndarray] = None
+        # Keep-out overlay: world-frame cell centers (N,2) + cell size (m).
+        self._nogo_centers: Optional[np.ndarray] = None
+        self._nogo_res_m: float = 0.0
         # Accept key focus so arrow-key nudge works in align mode.
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
@@ -69,6 +72,19 @@ class EditableMapView(WorldDriveableView):
             np.asarray(world_xy, dtype=np.float64)
             if world_xy is not None and len(world_xy) else None
         )
+        self.update()
+
+    def set_nogo_cells(
+        self, centers_xy: Optional[np.ndarray], res_m: float,
+    ) -> None:
+        """Install keep-out cell centers (N,2) in world frame for the
+        translucent orange overlay, or None to clear. `res_m` is the cell
+        size so the squares stay glued to cells at any zoom."""
+        self._nogo_centers = (
+            np.asarray(centers_xy, dtype=np.float64)
+            if centers_xy is not None and len(centers_xy) else None
+        )
+        self._nogo_res_m = float(res_m)
         self.update()
 
     # ── Mouse: paint when armed, else delegate to base ──────────────
@@ -150,8 +166,30 @@ class EditableMapView(WorldDriveableView):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if self._scan_world_xy is None or self._paint_geom is None:
+        if self._paint_geom is None:
             return
+        # Keep-out under the live scan so scan dots stay visible on top.
+        if self._nogo_centers is not None:
+            self._draw_nogo()
+        if self._scan_world_xy is not None:
+            self._draw_scan()
+
+    def _draw_nogo(self) -> None:
+        ppm = self._paint_geom[3]  # px per metre (cwx, cwy, side_px, ppm, …)
+        side = max(1, int(round(self._nogo_res_m * ppm)))
+        half = side / 2.0
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 140, 0, 110))  # translucent orange
+            for x_w, y_w in self._nogo_centers:
+                rx, ry = self._world_to_widget(float(x_w), float(y_w))
+                p.drawRect(int(rx - half), int(ry - half), side, side)
+        finally:
+            p.end()
+
+    def _draw_scan(self) -> None:
         p = QPainter(self)
         try:
             p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
