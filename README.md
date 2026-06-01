@@ -3,7 +3,7 @@
 Differential-drive robot software in two halves that share one repo:
 
 - **`body/`** — Pi-side runtime. Independent Python processes on a Raspberry Pi (target) communicate over [Zenoh](https://zenoh.io/) using JSON messages.
-- **`desktop/`** — Operator-side stack (laptop / workstation). `chassis` is a low-level monitoring + manual command UI; `mapping` builds a reference map, `localization` + `nav` drive against it (hierarchical Tier-1/2/3), and `map_editor` cleans the map (occupancy + no-go layers). (`world_map` is now a shared costmap/grid/PF library — the standalone fuser app was retired.) All connect to the Pi over the same Zenoh router.
+- **`desktop/`** — Operator-side stack (laptop / workstation). Four apps: **`mapping`** builds a reference map, **`nav`** drives against it (manual teleop **plus** autonomous hierarchical Tier-1/2/3 — the main operator UI, and the `heartbeat`/`cmd_vel` source for standalone runs), **`map_editor`** cleans the map (occupancy + no-go layers, no drive controls), and **`pi_drive`** is a Tier-2/3 debug console. (`localization`, `reference_map`, `world_map`, `chassis` are supporting libraries, not apps.) All connect to the Pi over the same Zenoh router.
 
 The contract between the two halves — and with any external agent (Jill / Cognitive Workbench) — is defined in [docs/body_project_spec.md](docs/body_project_spec.md).
 
@@ -12,7 +12,7 @@ The contract between the two halves — and with any external agent (Jill / Cogn
 - Python 3.11+
 - `eclipse-zenoh` and, for `oakd_driver`, `depthai` (see [requirements.txt](requirements.txt)); Linux udev rules for Movidius (`03e7`) are required to open the OAK from a non-root user.
 - **OAK-D-Lite IMU:** retail units usually include a BNO IMU; DepthAI may require `oakd.imu_enable_firmware_update: true` (default in [config.json](config.json)) on first use. Some **Kickstarter OAK-D-Lite** boards have **no IMU** ([Luxonis docs](https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes/imu/)) — set **`imu_hardware_present`: false** to run `oakd_driver` with synthetic `body/oakd/imu` so the launcher does not crash.
-- A Zenoh **router** (`zenohd`) reachable by every Body process and every client (`desktop.chassis`, `desktop.world_map`, or Jill). On the robot, run the router on the Pi and listen on TCP **7447** (see [Configuration](#configuration)).
+- A Zenoh **router** (`zenohd`) reachable by every Body process and every client (`desktop.nav`, `desktop.map_editor`, or Jill). On the robot, run the router on the Pi and listen on TCP **7447** (see [Configuration](#configuration)).
 - Desktop side (`desktop/`) needs `PyQt6` + `requests`; see [desktop/requirements.txt](desktop/requirements.txt). Install only on machines that will run the operator UI — no need on the Pi.
 
 ## Install (once per machine)
@@ -69,7 +69,7 @@ Router on the Pi (matches the spec): listen on `0.0.0.0:7447` so peers on the LA
 }
 ```
 
-Processes on the Pi should connect to **`tcp/127.0.0.1:7447`** (default in `config.json`). A laptop running `desktop.chassis` or `desktop.world_map` uses **`tcp/<pi-ip>:7447`** via `ZENOH_CONNECT` or edited `connect_endpoints`.
+Processes on the Pi should connect to **`tcp/127.0.0.1:7447`** (default in `config.json`). A laptop running a desktop app (`desktop.nav`, `desktop.mapping`, `desktop.map_editor`, `desktop.pi_drive`) uses **`tcp/<pi-ip>:7447`** via `ZENOH_CONNECT`, the `--router` flag, or edited `connect_endpoints`.
 
 ### Starting `zenohd` (router)
 
@@ -116,20 +116,19 @@ flowchart LR
     L[body.launcher]
     R --- L
   end
-  subgraph clients [Desktop clients optional]
-    C[desktop.chassis]
-    W[desktop.world_map]
+  subgraph clients [Desktop apps optional]
+    N[desktop.nav]
+    M[desktop.map_editor]
     J[Jill bridge]
   end
-  C --> R
-  W --> R
+  N --> R
+  M --> R
   J --> R
 ```
 
 1. Start **`zenohd`** on the Pi (or your dev box for all-local tests).
 2. Start **`body.launcher`** on the Pi (motor, lidar, oakd, watchdog processes).
-3. Optionally start **`desktop.chassis`** (or a Jill-side bridge) on a laptop so **`body/heartbeat`** and **`body/cmd_vel`** are published. Without heartbeats, the watchdog will treat the robot as not under command and can trigger **`body/emergency_stop`**.
-4. Optionally start **`desktop.world_map`** on the same or another laptop to fuse `body/map/local_2p5d` + `body/odom` into a continuous world map (see [docs/world_map_spec.md](docs/world_map_spec.md)). Consumer-only; safe to run alongside `chassis`.
+3. Optionally start **`desktop.nav`** (or `desktop.mapping` for the first map, or a Jill-side bridge) on a laptop so **`body/heartbeat`** and **`body/cmd_vel`** are published. Without heartbeats, the watchdog will treat the robot as not under command and can trigger **`body/emergency_stop`**.
 
 ## Running the stack (`body.launcher`)
 
@@ -149,7 +148,7 @@ Startup order: `watchdog` → `motor_controller` → `lidar_driver` → `oakd_dr
 
 **Deploy tip:** If errors reference old line numbers or missing symbols (e.g. `XLinkOut` on DepthAI v3), the Pi’s `~/Body` tree is behind your main repo—`git pull` or rsync the updated `body/` tree, then restart the launcher.
 
-**Watchdog:** Until something publishes **`body/heartbeat`** (e.g. `desktop.chassis` with Live cmd enabled), the watchdog may emit **`body/emergency_stop`** (`heartbeat_timeout`). That is expected; start a desktop client when you want the stack to see a live operator.
+**Watchdog:** Until something publishes **`body/heartbeat`** (e.g. `desktop.nav` with Live cmd enabled), the watchdog may emit **`body/emergency_stop`** (`heartbeat_timeout`). That is expected; start a desktop client when you want the stack to see a live operator.
 
 ### Running under systemd
 
@@ -172,7 +171,7 @@ The units assume Body lives at `/home/bruce/Body`, the launcher venv is `/home/b
 
 ## Standalone mode (no Jill)
 
-**Standalone** means: Body processes on the Pi, and **you** provide heartbeat and velocity commands using `desktop.chassis` — no Cognitive Workbench / agent needs to run.
+**Standalone** means: Body processes on the Pi, and **you** drive from a desktop app — no Cognitive Workbench / agent needs to run. The operator app is **`desktop.nav`** (manual teleop **plus** autonomous patrols; it publishes `body/heartbeat` + `body/cmd_vel`). `nav` needs a reference map — to build the first one, teleop-drive with **`desktop.mapping`**, which saves a `reference_map.npz`.
 
 ### On the Pi
 
@@ -184,23 +183,16 @@ The units assume Body lives at `/home/bruce/Body`, the launcher venv is `/home/b
 ```bash
 cd /path/to/Body
 export PYTHONPATH="$(pwd)"
-export ZENOH_CONNECT=tcp/192.168.1.50:7447
-desktop/.venv/bin/python -m desktop.chassis
+# First map only: teleop-drive and save a reference_map.npz
+desktop/.venv/bin/python -m desktop.mapping --router tcp/192.168.1.50:7447
+# Thereafter: drive against the map (manual teleop + autonomous patrols)
+desktop/.venv/bin/python -m desktop.nav --router tcp/192.168.1.50:7447 \
+  --map ~/Body/maps/<session>/map_*/reference_map.npz
 ```
 
-(Replace the address with your Pi’s IP or hostname; flags `--router`, `--heartbeat-hz`, `--map-stale-s`, `-v` are available — see `python -m desktop.chassis --help`.)
+(Replace the address with your Pi’s IP or hostname.) Both apps open a PyQt6 window with camera / lidar / local-map / teleop docks. Heartbeat + `cmd_vel` are published while the **Live cmd** control is on; toggle off to release motion authority without quitting. `nav` adds goal-click + patrol autonomy on top of the manual controls. (`map_editor` has **no** drive controls — it only edits the map.)
 
-`chassis` opens a PyQt6 window with docks for camera, lidar, local map, motor test, vision, and a sweep-360 calibration mission. Heartbeat + `cmd_vel` are published while the **Live cmd** checkbox is on; toggle off to release motion authority without quitting.
-
-### Optional: world_map fuser
-
-```bash
-desktop/.venv/bin/python -m desktop.world_map
-```
-
-Consumer-only — does not publish heartbeat or cmd_vel. Safe to run alongside `chassis`. See [docs/world_map_spec.md](docs/world_map_spec.md).
-
-**Motion authority:** Do **not** run `chassis` (with Live cmd on) and another publisher (e.g. Jill) both commanding `body/cmd_vel` at the same time; the motor side effectively sees interleaved commands.
+**Motion authority:** Do **not** run two publishers (e.g. `nav` with Live cmd on and Jill) both commanding `body/cmd_vel` at the same time; the motor side effectively sees interleaved commands.
 
 ## Integration expectations (Jill / other agents)
 
@@ -214,7 +206,7 @@ After a heartbeat fault, recovery follows **§5.10** in [docs/body_project_spec.
 
 ## Smoke check (optional)
 
-With the stack running, subscribe to `body/**` with Zenoh tooling (e.g. `zenoh-python` examples) and confirm traffic: `body/odom`, `body/lidar/scan`, `body/oakd/imu`, `body/status`, and—when `chassis` or Jill is active—`body/heartbeat` and `body/cmd_vel`.
+With the stack running, subscribe to `body/**` with Zenoh tooling (e.g. `zenoh-python` examples) and confirm traffic: `body/odom`, `body/lidar/scan`, `body/oakd/imu`, `body/status`, and—when `nav` (Live cmd) or Jill is active—`body/heartbeat` and `body/cmd_vel`.
 
 ## Navigation UI (`desktop.nav`)
 
@@ -232,9 +224,7 @@ desktop/.venv/bin/python -m desktop.nav --router tcp/PI_IP:7447 \
   --relocate-on-load
 ```
 
-Run tests: `desktop/.venv/bin/python -m unittest discover -s desktop/reference_map -p 'test_*.py'` (same pattern for `desktop/localization`, `desktop/mapping`).
-
-Legacy online fusion (`desktop.world_map` fuser, `--pf`, `--slam`) remains in tree for comparison but is no longer used by `desktop.nav`. See [docs/slam_map_architecture.md](docs/slam_map_architecture.md).
+`nav` is the main operator UI: manual teleop (Live cmd) + goal-click + autonomous patrols, all against the loaded map. Run tests: `desktop/.venv/bin/python -m unittest discover -s desktop/reference_map -p 'test_*.py'` (same pattern for `desktop/localization`, `desktop/mapping`, `desktop/nav`, `desktop/map_editor`).
 
 ### Hierarchical drive (Tier 1 / 2 / 3)
 
@@ -278,7 +268,7 @@ The Pi runs Body services as `body-launcher.service`. The Pi's WiFi should be on
 ## Layout
 
 - [body/](body/) — Pi-side package: `launcher`, drivers (`motor_controller`, `lidar_driver`, `oakd_driver`, `watchdog`, `imu_driver`), `local_map`, `local_drive` (Tier-3 reactive drive), `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`, `host_metrics`, and the pure drive cores `astar`, `local_costmap`, `local_planner`, `scan_raster`, `drive_safety`, `tier2_subgoal`).
-- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis), [`mapping`](desktop/mapping) (reference map builder), [`reference_map`](desktop/reference_map) (frozen-map I/O + likelihood/distance fields), [`localization`](desktop/localization) (MCL), [`nav`](desktop/nav) (hierarchical drive UI), [`pi_drive`](desktop/pi_drive) (Tier-2/3 debug consoles), [`map_editor`](desktop/map_editor) (reference-map editor: occupancy + no-go layers), [`world_map`](desktop/world_map) (shared costmap / grid / particle-filter library — the standalone fuser app was retired), `vision_service.py`, `utils/`.
+- [desktop/](desktop/) — operator-side packages. **Apps:** [`mapping`](desktop/mapping) (reference-map builder + teleop), [`nav`](desktop/nav) (operator UI: teleop + hierarchical drive), [`map_editor`](desktop/map_editor) (reference-map editor: occupancy + no-go layers), [`pi_drive`](desktop/pi_drive) (Tier-2/3 debug console). **Libraries:** [`reference_map`](desktop/reference_map) (frozen-map I/O + likelihood/distance fields), [`localization`](desktop/localization) (MCL), [`world_map`](desktop/world_map) (shared costmap / grid / particle-filter — fuser app retired), [`chassis`](desktop/chassis) (teleop/vision widgets reused by nav), `vision_service.py`, `utils/`.
 - [docs/](docs/) — specs and design docs, including [tier_contract.md](docs/tier_contract.md) + [drive_tier3_spec.md](docs/drive_tier3_spec.md) (hierarchical drive), [bayesian_localization_redesign.md](docs/bayesian_localization_redesign.md) (Phase 0–8 plan and status log), and [noise_models.md](docs/noise_models.md) (Phase 0 motion-model calibration).
 - [scripts/](scripts/) — calibration + analysis tools (`phase0_*.py`, `phase1_likelihood_field_demo.py`, `record_body_topics.py`).
 - [deploy/](deploy/) — ops files (`zenohd-router.json`, `body-launcher.service`, `99-pwm.rules`, `NETWORK.md`).
