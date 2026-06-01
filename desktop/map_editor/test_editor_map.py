@@ -168,6 +168,43 @@ class TestNoGo(unittest.TestCase):
         self.assertIsNone(rm.nogo_mask)
 
 
+class TestStampScan(unittest.TestCase):
+    def test_in_range_hit_becomes_wall(self):
+        m = _make_map(nx=40, ny=40, res=0.05, ox=-1.0, oy=-1.0)
+        world = np.array([[0.5, 0.0]])             # 0.5 m ahead of (0,0)
+        ii, jj = m.stamp_cells_from_scan(world, (0.0, 0.0, 0.0), max_range_m=4.0)
+        self.assertEqual(len(ii), 1)               # no thickening
+        m.paint(ii, jj, em.WALL)
+        self.assertTrue((m.driveable_grid()[ii, jj] == 0).all())
+
+    def test_range_gate_excludes_far(self):
+        m = _make_map(nx=400, ny=400, res=0.05, ox=-1.0, oy=-1.0)
+        world = np.array([[3.0, 0.0], [5.0, 0.0]])  # keep 3 m, drop 5 m
+        ii, _ = m.stamp_cells_from_scan(world, (0.0, 0.0, 0.0), max_range_m=4.0)
+        self.assertEqual(len(ii), 1)
+
+    def test_skips_existing_wall(self):
+        m = _make_map(nx=40, ny=40, res=0.05, ox=-1.0, oy=-1.0)
+        world = np.array([[0.5, 0.0]])
+        ii, jj = m.stamp_cells_from_scan(world, (0.0, 0.0, 0.0), max_range_m=4.0)
+        m.paint(ii, jj, em.WALL)
+        ii2, _ = m.stamp_cells_from_scan(world, (0.0, 0.0, 0.0), max_range_m=4.0)
+        self.assertEqual(len(ii2), 0)              # already wall → nothing
+
+    def test_dedup_same_cell(self):
+        m = _make_map(nx=40, ny=40, res=0.05, ox=-1.0, oy=-1.0)
+        world = np.array([[0.500, 0.0], [0.505, 0.0]])  # same cell
+        ii, _ = m.stamp_cells_from_scan(world, (0.0, 0.0, 0.0), max_range_m=4.0)
+        self.assertEqual(len(ii), 1)
+
+    def test_empty_scan(self):
+        m = _make_map()
+        self.assertEqual(len(m.stamp_cells_from_scan(
+            None, (0.0, 0.0, 0.0), max_range_m=4.0)[0]), 0)
+        self.assertEqual(len(m.stamp_cells_from_scan(
+            np.empty((0, 2)), (0.0, 0.0, 0.0), max_range_m=4.0)[0]), 0)
+
+
 class TestRoundTrip(unittest.TestCase):
     def test_save_regenerates_fields_and_persists_edits(self):
         m = _make_map(nx=40, ny=40)

@@ -162,6 +162,42 @@ class EditorMap:
         else:
             raise ValueError(f"unknown paint kind: {kind!r}")
 
+    def stamp_cells_from_scan(
+        self, world_xy: Optional[np.ndarray],
+        pose: Tuple[float, float, float], *, max_range_m: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Cells (ii, jj) to promote to Wall from live-scan world points.
+
+        Keeps hits within ``max_range_m`` of the robot (``pose`` x, y) that
+        land on a currently free-or-unknown cell (never an existing wall).
+        One cell per hit — NO thickening — deduplicated. Pure: returns the
+        cells; the caller paints + handles undo."""
+        empty = (np.empty(0, np.intp), np.empty(0, np.intp))
+        if world_xy is None or len(world_xy) == 0:
+            return empty
+        pts = np.asarray(world_xy, dtype=np.float64)
+        rng = np.hypot(pts[:, 0] - pose[0], pts[:, 1] - pose[1])
+        pts = pts[rng <= max_range_m]
+        if len(pts) == 0:
+            return empty
+        res = self.resolution_m
+        ii = np.floor((pts[:, 0] - self.origin_x_m) / res + 1e-9).astype(np.intp)
+        jj = np.floor((pts[:, 1] - self.origin_y_m) / res + 1e-9).astype(np.intp)
+        nx, ny = self.shape
+        inb = (ii >= 0) & (ii < nx) & (jj >= 0) & (jj < ny)
+        ii, jj = ii[inb], jj[inb]
+        if len(ii) == 0:
+            return empty
+        # free+unknown only (driveable: 0=wall, 1=free, -1=unknown).
+        drive = driveable_from_occupancy(self.log_odds)
+        fu = drive[ii, jj] != 0
+        ii, jj = ii[fu], jj[fu]
+        if len(ii) == 0:
+            return empty
+        # Dedup repeated hits in the same cell so counts are honest.
+        _, uniq = np.unique(ii.astype(np.int64) * ny + jj, return_index=True)
+        return ii[uniq], jj[uniq]
+
     def snapshot_state(self) -> Tuple[np.ndarray, np.ndarray]:
         """Copy of (log_odds, nogo) for the undo stack — a stroke may
         touch either layer."""

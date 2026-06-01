@@ -35,11 +35,26 @@ The first tracer only modeled `Body/` on the path, not `Body/desktop/`, so it
 missed bare-name imports. Lesson for future reachability passes: model **both**
 `Body/` and `Body/desktop/` as import roots.
 
+## `world_map/` is now a LIBRARY, not an app
+
+The `world_map` fuser is **gone** — there is no longer a `desktop.world_map`
+entry point (`__main__.py` removed), and `python -m desktop.world_map` no longer
+runs. Production localization is `desktop/localization/` (PF/MCL). What survives
+under `world_map/` is purely a shared library the nav stack imports:
+`costmap.py`, `map_views.py`, `particle_filter_pose.py`, `pose_source.py`,
+`transport.py`, `world_grid.py` (+ `test_costmap.py`,
+`test_particle_filter_pose.py`). Don't reintroduce a fuser app or treat this
+package as one.
+
 ## Still-present non-nav-app entry points (intentional)
 
 - `desktop.mapping` — the **map builder** GUI (produces `reference_map.npz` the
   editor edits). Not retired. `mapping/__main__.py` + `mapping/ui_qt.py` are
   only reachable via mapping itself, but the package is a required pipeline tool.
+
+The only app entry points now are: `desktop.nav`, `desktop.map_editor`,
+`desktop.pi_drive`, and `desktop.mapping` (builder). `chassis` and `world_map`
+are libraries, not apps.
 
 ## Verification
 

@@ -3,7 +3,7 @@
 Differential-drive robot software in two halves that share one repo:
 
 - **`body/`** — Pi-side runtime. Independent Python processes on a Raspberry Pi (target) communicate over [Zenoh](https://zenoh.io/) using JSON messages.
-- **`desktop/`** — Operator-side stack (laptop / workstation). `chassis` is a low-level monitoring + manual command UI; `mapping` builds a reference map, `localization` + `nav` drive against it (hierarchical Tier-1/2/3), and `map_editor` cleans the map. (`world_map` is the legacy online fuser, kept for comparison.) All connect to the Pi over the same Zenoh router.
+- **`desktop/`** — Operator-side stack (laptop / workstation). `chassis` is a low-level monitoring + manual command UI; `mapping` builds a reference map, `localization` + `nav` drive against it (hierarchical Tier-1/2/3), and `map_editor` cleans the map (occupancy + no-go layers). (`world_map` is now a shared costmap/grid/PF library — the standalone fuser app was retired.) All connect to the Pi over the same Zenoh router.
 
 The contract between the two halves — and with any external agent (Jill / Cognitive Workbench) — is defined in [docs/body_project_spec.md](docs/body_project_spec.md).
 
@@ -257,14 +257,19 @@ desktop/.venv/bin/python -m desktop.pi_drive --tier2 \
 
 ## Map editing (`desktop.map_editor`)
 
-Clean a mapping-run `reference_map.npz` so MCL localizes better. Loads an existing map, lets you paint **Wall / Free / Unknown** occupancy with a disk brush — toggle **Edit** on first (left-drag paints, middle/right-drag pans) — with Undo and Save / Save As. Save regenerates the MCL `likelihood_field` + `distance_field` from the edited occupancy and backs up the original to `.bak`. The editor never fuses — the brush is the only writer.
+Clean a mapping-run `reference_map.npz` so MCL localizes better, and mark areas the robot must avoid. **Two editable layers**, chosen by the **Occupancy | No-go** toolbar selector; toggle **Edit** on to paint (left-drag paints, middle/right-drag pans), Undo (Ctrl+Z) covers both layers:
+
+- **Occupancy** — paint **Wall / Free / Unknown** with a disk brush. This is the *perception* layer: it feeds **both** MCL localization (`likelihood_field`) and planning. Note nav treats **Unknown as blocked** (lethal) and the map is static (never written back at runtime), so **paint Free along any corridor you want patrols to drive** — nav never converts unknown→free on its own.
+- **No-go** (orange) — paint **keep-out** zones (chair clutter, areas to avoid). This is a *policy* layer: folded into the planner's lethal set but **never** into the localization fields, so it can't confuse the tracker. Lethal exactly where you brush — no inflation.
+
+Save regenerates the MCL `likelihood_field` + `distance_field` from the edited occupancy, writes the no-go mask, and backs up the original to `.bak`. The editor never fuses — the brush is the only writer. (Maps saved before the no-go layer load fine — the layer starts empty.)
 
 ```bash
 QT_QPA_PLATFORM=xcb desktop/.venv/bin/python -m desktop.map_editor \
   --map ~/Body/maps/<session>/map_*/reference_map.npz
 ```
 
-Optional **live overlay**: add `--router tcp/PI_IP:7447`, then **Connect** to a running bot for a read-only lidar overlay (MCL pose + live scan drawn over the map; never fuses). **Relocate** / **Set location** seat the pose, so you can drive to a spot, see the live scan against the map, and paint the correction. The bot can be powered on *after* the editor starts.
+Optional **live overlay**: add `--router tcp/PI_IP:7447` and a second toolbar row of live controls appears. **Connect** to a running bot for a read-only lidar overlay (MCL pose + live scan drawn over the map; never fuses). **Relocate** / **Set location** seat the pose; **Align scan** lets you drag and rotate (`,` / `.`) the scan onto trusted walls (odom dead-reckoned). **Stamp scan→wall** writes the live scan's hits (≤4 m, onto free/unknown cells, no thickening) into the occupancy Wall layer — fix walls the map missed without re-mapping. The bot can be powered on *after* the editor starts.
 
 ## Network (Pi side)
 
@@ -273,7 +278,7 @@ The Pi runs Body services as `body-launcher.service`. The Pi's WiFi should be on
 ## Layout
 
 - [body/](body/) — Pi-side package: `launcher`, drivers (`motor_controller`, `lidar_driver`, `oakd_driver`, `watchdog`, `imu_driver`), `local_map`, `local_drive` (Tier-3 reactive drive), `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`, `host_metrics`, and the pure drive cores `astar`, `local_costmap`, `local_planner`, `scan_raster`, `drive_safety`, `tier2_subgoal`).
-- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis), [`mapping`](desktop/mapping) (reference map builder), [`reference_map`](desktop/reference_map) (frozen-map I/O + likelihood/distance fields), [`localization`](desktop/localization) (MCL), [`nav`](desktop/nav) (hierarchical drive UI), [`pi_drive`](desktop/pi_drive) (Tier-2/3 debug consoles), [`map_editor`](desktop/map_editor) (reference-map editor), [`world_map`](desktop/world_map) (legacy online fuser), `vision_service.py`, `utils/`.
+- [desktop/](desktop/) — operator-side packages: [`chassis`](desktop/chassis), [`mapping`](desktop/mapping) (reference map builder), [`reference_map`](desktop/reference_map) (frozen-map I/O + likelihood/distance fields), [`localization`](desktop/localization) (MCL), [`nav`](desktop/nav) (hierarchical drive UI), [`pi_drive`](desktop/pi_drive) (Tier-2/3 debug consoles), [`map_editor`](desktop/map_editor) (reference-map editor: occupancy + no-go layers), [`world_map`](desktop/world_map) (shared costmap / grid / particle-filter library — the standalone fuser app was retired), `vision_service.py`, `utils/`.
 - [docs/](docs/) — specs and design docs, including [tier_contract.md](docs/tier_contract.md) + [drive_tier3_spec.md](docs/drive_tier3_spec.md) (hierarchical drive), [bayesian_localization_redesign.md](docs/bayesian_localization_redesign.md) (Phase 0–8 plan and status log), and [noise_models.md](docs/noise_models.md) (Phase 0 motion-model calibration).
 - [scripts/](scripts/) — calibration + analysis tools (`phase0_*.py`, `phase1_likelihood_field_demo.py`, `record_body_topics.py`).
 - [deploy/](deploy/) — ops files (`zenohd-router.json`, `body-launcher.service`, `99-pwm.rules`, `NETWORK.md`).

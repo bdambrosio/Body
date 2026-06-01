@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 _UNDO_DEPTH = 25
 _SCAN_MAX_RANGE_M = 12.0
+_STAMP_MAX_RANGE_M = 4.0  # only stamp live-scan hits within this range
 
 # Which edit layer each brush kind writes.
 _KIND_LAYER = {
@@ -72,6 +73,9 @@ class MapEditorWindow(QMainWindow):
         # only (no scan-match creep). None → use the MCL pose.
         self._overlay_pose: Optional[Tuple[float, float, float]] = None
         self._odom_anchor: Optional[Tuple[float, float, float]] = None
+        # Latest world-frame live-scan endpoints (what the cyan dots show),
+        # retained so "Stamp scan→wall" writes exactly what you see.
+        self._live_scan_world: Optional[np.ndarray] = None
 
         self._shared = SharedMapView()
         self._view = EditableMapView(shared=self._shared)
@@ -166,37 +170,54 @@ class MapEditorWindow(QMainWindow):
         self._act_connect = None
         self._act_relocate = None
         self._act_locate = None
+        self._act_stamp = None
         if self._router:
-            tb.addSeparator()
+            # Live controls live on a SECOND toolbar row so the top row
+            # doesn't overflow the window width and bury buttons in the
+            # ">>" overflow menu.
+            self.addToolBarBreak()
+            tb2 = QToolBar("live")
+            tb2.setMovable(False)
+            self.addToolBar(tb2)
             # NB: drive Connect from `toggled` (passes the checked bool),
             # not addAction's `triggered` (which calls the slot with no
             # args → _on_connect would lose its `want`).
-            self._act_connect = tb.addAction("Connect")
+            self._act_connect = tb2.addAction("Connect")
             self._act_connect.setCheckable(True)
             self._act_connect.toggled.connect(self._on_connect)
-            self._act_relocate = tb.addAction("Relocate", self._on_relocate)
+            self._act_relocate = tb2.addAction("Relocate", self._on_relocate)
             self._act_relocate.setEnabled(False)
-            self._act_locate = tb.addAction("Set location")
+            self._act_locate = tb2.addAction("Set location")
             self._act_locate.setCheckable(True)
             self._act_locate.setEnabled(False)
             self._act_locate.toggled.connect(self._on_locate_armed)
-            tb.addSeparator()
+            tb2.addSeparator()
             # Manual align: drag the scan onto trusted walls, rotate with
             # the buttons. Dead-reckoned by odom (no scan-match creep).
-            self._act_align = tb.addAction("Align scan")
+            self._act_align = tb2.addAction("Align scan")
             self._act_align.setCheckable(True)
             self._act_align.setEnabled(False)
             self._act_align.toggled.connect(self._on_align_toggled)
-            self._act_rot_ccw = tb.addAction("⟲")
+            self._act_rot_ccw = tb2.addAction("⟲")
             self._act_rot_ccw.setToolTip("Rotate scan +1° (key: ,)")
             self._act_rot_ccw.setShortcut(",")
             self._act_rot_ccw.triggered.connect(lambda: self._on_rotate(+1))
-            self._act_rot_cw = tb.addAction("⟳")
+            self._act_rot_cw = tb2.addAction("⟳")
             self._act_rot_cw.setToolTip("Rotate scan −1° (key: .)")
             self._act_rot_cw.setShortcut(".")
             self._act_rot_cw.triggered.connect(lambda: self._on_rotate(-1))
             for a in (self._act_rot_ccw, self._act_rot_cw):
                 a.setEnabled(False)
+            tb2.addSeparator()
+            # Stamp the live scan into the occupancy Wall layer (WYSIWYG:
+            # exactly the cyan dots, within range, onto free/unknown cells).
+            self._act_stamp = tb2.addAction("Stamp scan→wall")
+            self._act_stamp.setToolTip(
+                f"Write live-scan hits (≤{_STAMP_MAX_RANGE_M:.0f} m) into the "
+                "occupancy Wall layer. Edits the localization map — stamp only "
+                "stable structure.")
+            self._act_stamp.setEnabled(False)
+            self._act_stamp.triggered.connect(self._on_stamp_scan)
 
     def _set_kind(self, kind: str) -> None:
         self._brush_kind = kind
@@ -375,6 +396,7 @@ class MapEditorWindow(QMainWindow):
             self._act_align.setEnabled(True)
             self._act_rot_ccw.setEnabled(True)
             self._act_rot_cw.setEnabled(True)
+            self._act_stamp.setEnabled(True)
             self._live_timer.start()
             self._status.showMessage("Connected — Relocate to seat the pose.")
         else:
@@ -388,6 +410,7 @@ class MapEditorWindow(QMainWindow):
         self._live_pose = None
         self._overlay_pose = None
         self._odom_anchor = None
+        self._live_scan_world = None
         self._view.set_scan_points(None)
         self._pose_lbl.setText("")
         if self._act_connect is not None:
@@ -400,6 +423,7 @@ class MapEditorWindow(QMainWindow):
             self._act_align.setEnabled(False)
             self._act_rot_ccw.setEnabled(False)
             self._act_rot_cw.setEnabled(False)
+            self._act_stamp.setEnabled(False)
             self._view.set_align_mode(False)
         self._rerender(fit=False)
 
@@ -471,6 +495,41 @@ class MapEditorWindow(QMainWindow):
         x, y, th = self._overlay_pose
         self._overlay_pose = (x, y, th + sign * math.radians(1.0))
 
+    def _on_stamp_scan(self) -> None:
+        """One-shot: write the live scan's in-range hits into the Wall
+        layer (free/unknown cells only). Edits the localization map, so it
+        confirms first."""
+        if self._emap is None or self._link is None:
+            return
+        pose = self._live_pose
+        if self._live_scan_world is None or pose is None:
+            self._status.showMessage("No live scan to stamp.", 3000)
+            return
+        ii, jj = self._emap.stamp_cells_from_scan(
+            self._live_scan_world, pose, max_range_m=_STAMP_MAX_RANGE_M)
+        n = int(len(ii))
+        if n == 0:
+            self._status.showMessage(
+                f"Nothing to stamp (no free/unknown hits within "
+                f"{_STAMP_MAX_RANGE_M:.0f} m).", 4000)
+            return
+        r = QMessageBox.question(
+            self, "Stamp scan to wall?",
+            f"Write {n} live-scan cell(s) into the occupancy (Wall) layer?\n\n"
+            "This edits the LOCALIZATION map — stamp only stable structure, "
+            "not people or moved furniture.")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._undo.append(self._emap.snapshot_state())
+        if len(self._undo) > _UNDO_DEPTH:
+            self._undo.pop(0)
+        self._act_undo.setEnabled(True)
+        self._emap.paint(ii, jj, em.WALL)
+        self._dirty = True
+        self._rerender(fit=False)
+        self._update_title()
+        self._status.showMessage(f"Stamped {n} cell(s) to wall.", 4000)
+
     def _live_tick(self) -> None:
         if self._link is None or self._emap is None:
             return
@@ -492,6 +551,7 @@ class MapEditorWindow(QMainWindow):
             world = self._link.latest_scan_world(max_range_m=_SCAN_MAX_RANGE_M)
             mode = "mcl"
         self._live_pose = pose
+        self._live_scan_world = world
         self._view.set_scan_points(world)
         if self._drive_cache is not None:
             self._view.update_map(
