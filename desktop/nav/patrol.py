@@ -280,6 +280,26 @@ class PatrolRunner:
         nxt = self.patrol.waypoints[(wp_index + 1) % n]
         return (nxt.x_m, nxt.y_m)
 
+    def is_terminal_leg(self) -> bool:
+        """Non-mutating peek: would arriving at the *current* target end the
+        patrol? Mirrors `on_arrived`'s terminal branches. Used by the
+        hierarchical driver to decide between a tight, stop-at-the-end arrival
+        and a loose pass-through advance at intermediate waypoints.
+        """
+        n = self.n
+        if n == 0:
+            return True
+        p = self.patrol
+        if not p.loop:
+            return self.wp_index >= n - 1
+        # loop: terminal only on a lap-closing arrival back at wp[0] once the
+        # configured lap count is reached. _legs_completed >= 1 mirrors the
+        # post-increment `_legs_completed > 1` test in on_arrived.
+        return (
+            self._legs_completed >= 1 and self.wp_index == 0
+            and p.laps is not None and (self.lap_index + 1) >= p.laps
+        )
+
     def on_arrived(self) -> Tuple[Optional[int], bool]:
         """Record arrival at the current target. Return the new
         `(next_wp_index, lap_completed)`. `next_wp_index` is None when

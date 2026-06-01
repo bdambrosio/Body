@@ -84,6 +84,12 @@ class HierState(enum.Enum):
 @dataclass(frozen=True)
 class HierConfig:
     waypoint_tol_m: float = 0.30          # PF-pose distance to count a waypoint reached
+    # Intermediate (non-terminal) waypoints advance at this looser radius and
+    # WITHOUT canceling Tier-3 — the next goto supersedes seamlessly, so the
+    # bot doesn't decelerate-stop at every sub-waypoint. Must exceed Tier-3's
+    # slowdown_distance_m (~0.4) so the advance fires before it slows. The
+    # terminal waypoint still uses the tight waypoint_tol_m + a real stop.
+    passthrough_tol_m: float = 0.60
     subgoal_arrival_tol_m: float = 0.15   # tol passed to Tier-3 for each sub-goal
     repick_hysteresis_rad: float = 0.35   # re-pick mid-leg if the bearing drifts past this
     max_blocked_repicks: int = 3          # retries before BLOCKED becomes a pause
@@ -153,6 +159,12 @@ class HierarchicalDrive:
                            reason, self._cfg.max_blocked_repicks)
         self._to(HierState.BLOCKED)
 
+    def _arrival_tol(self) -> float:
+        """Tight stop tolerance on the terminal leg, loose pass-through radius
+        for intermediates (so we advance + retarget before Tier-3 decelerates)."""
+        return (self._cfg.waypoint_tol_m if self._runner.is_terminal_leg()
+                else self._cfg.passthrough_tol_m)
+
     # ── Introspection (for the UI overlay / status label) ────────────
 
     def state(self) -> HierState:
@@ -199,7 +211,7 @@ class HierarchicalDrive:
             self._to(HierState.FAILED)
             return
         self._waypoint = (wp.x_m, wp.y_m)
-        if _dist(pose, self._waypoint) <= self._cfg.waypoint_tol_m:
+        if _dist(pose, self._waypoint) <= self._arrival_tol():
             self._to(HierState.ADVANCE_WAYPOINT)
             return
 
@@ -249,8 +261,12 @@ class HierarchicalDrive:
         pose = self._pose.world_pose()
         # Waypoint reached (PF-judged) supersedes any sub-goal progress.
         if pose is not None and self._waypoint is not None:
-            if _dist(pose, self._waypoint) <= self._cfg.waypoint_tol_m:
-                self._io.cancel()
+            if _dist(pose, self._waypoint) <= self._arrival_tol():
+                # Only stop at the terminal waypoint. For intermediates, leave
+                # Tier-3 driving and let the next SELECT_SUBGOAL goto supersede
+                # it (seamless via cmd_id) — no decelerate-stop at each hop.
+                if self._runner.is_terminal_leg():
+                    self._io.cancel()
                 self._to(HierState.ADVANCE_WAYPOINT)
                 return
 

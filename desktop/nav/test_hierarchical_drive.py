@@ -110,11 +110,33 @@ class TestHierarchicalDrive(unittest.TestCase):
     def test_waypoint_reached_advances(self):
         hd, io, po = self._build(points=((1.0, 0.0), (3.0, 0.0)))
         self._drive_to_sending(hd)
-        po.pose = (1.0, 0.0, 0.0)        # now sitting on wp0
+        po.pose = (1.0, 0.0, 0.0)        # now sitting on wp0 (intermediate)
         self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
-        self.assertGreaterEqual(io.cancels, 1)
+        # Intermediate advance is seamless — Tier-3 is NOT canceled; the next
+        # SELECT_SUBGOAL goto supersedes it.
+        self.assertEqual(io.cancels, 0)
         self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)   # toward wp1
         self.assertEqual(hd._runner.wp_index, 1)
+
+    def test_passthrough_advances_intermediate_without_stop(self):
+        # wp0 is non-terminal: a pose inside passthrough_tol (0.6) but outside
+        # the tight waypoint_tol (0.3) should advance (and not cancel).
+        hd, io, po = self._build(points=((1.0, 0.0), (3.0, 0.0)))
+        self._drive_to_sending(hd)
+        po.pose = (0.55, 0.0, 0.0)       # 0.45 m from wp0
+        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
+        self.assertEqual(io.cancels, 0)
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(hd._runner.wp_index, 1)
+
+    def test_terminal_does_not_passthrough(self):
+        # Single (terminal) waypoint: at 0.45 m — inside passthrough but outside
+        # the tight tol — it must NOT advance yet (terminal uses the tight tol).
+        hd, io, po = self._build(points=((1.0, 0.0),))
+        self._drive_to_sending(hd)
+        po.pose = (0.55, 0.0, 0.0)       # 0.45 m from the only (terminal) wp
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(io.cancels, 0)
 
     def test_last_waypoint_terminal_arrived(self):
         hd, io, po = self._build(points=((1.0, 0.0),))

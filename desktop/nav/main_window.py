@@ -43,6 +43,7 @@ from .hierarchical_drive import (
 from .mission import Mission, MissionConfig, MissionState
 from . import patrol as patrol_mod
 from .patrol import Patrol, PatrolRunner
+from .patrol_expand import ExpandConfig, expand_patrol
 from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
 from .primitives import RotateToHeading
@@ -2077,7 +2078,32 @@ class NavMainWindow(QMainWindow):
                 "No odom/scan from the Pi yet — wait for telemetry.",
             )
             return
-        runner = PatrolRunner(patrol)
+        # Tier-1 global expansion: route each high-level segment with A* on the
+        # reference-map costmap and densify into Tier-3-executable sub-waypoints,
+        # so the drive follows corridors around dead-ends instead of beelining.
+        if self._last_costmap is None:
+            QMessageBox.warning(
+                self, "Hierarchical drive",
+                "No costmap yet — wait for the map to render before Go.",
+            )
+            return
+        exp = expand_patrol(patrol, self._last_costmap, ExpandConfig())
+        if not exp.ok:
+            seg = exp.failed_segment
+            QMessageBox.warning(
+                self, "Hierarchical drive",
+                f"Could not route the patrol (segment {seg}): {exp.reason}\n"
+                "Adjust that waypoint or add an intermediate one and retry.",
+            )
+            return
+        exec_patrol = exp.patrol
+        # Preview the dense routed path on the maps (cyan polyline).
+        self._shared_view.set_planned_path(
+            [(w.x_m, w.y_m) for w in exec_patrol.waypoints]
+        )
+        logger.info("hier: expanded %d waypoints -> %d sub-waypoints",
+                    len(patrol.waypoints), len(exec_patrol.waypoints))
+        runner = PatrolRunner(exec_patrol)
         provider = PFPoseProvider(self.fuser)
         self._hier_drive = HierarchicalDrive(
             runner, provider, self._drive_client, HierConfig(),
@@ -2090,6 +2116,7 @@ class NavMainWindow(QMainWindow):
             self._hier_drive.stop()
             self._hier_drive = None
         self._shared_view.set_lookahead(None)
+        self._shared_view.set_planned_path([])   # clear the routed-path preview
         self._cameras.set_lidar_overlay(None, None)
 
     def _on_all_stop(self) -> None:
