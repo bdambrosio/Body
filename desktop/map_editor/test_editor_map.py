@@ -253,6 +253,26 @@ class TestRoundTrip(unittest.TestCase):
             np.array_equal(m.log_odds, rm2.occupancy_log_odds))
 
 
+class TestCheckpointPersistence(unittest.TestCase):
+    def test_checkpoint_survives_save_load(self):
+        from desktop.localization.checkpoints import (
+            checkpoints_from_metadata, upsert_checkpoint,
+            write_checkpoints_to_metadata,
+        )
+        m = _make_map()
+        cps, _ = upsert_checkpoint([], (0.3, -0.2, 0.5), 2.0, created_ts=42.0)
+        write_checkpoints_to_metadata(m.metadata, cps)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "reference_map.npz")
+            em.save_npz(m, path, backup=False)
+            rm = load_reference_map(path)
+        back = checkpoints_from_metadata(rm.metadata)
+        self.assertEqual(len(back), 1)
+        self.assertEqual(back[0].id, "cp_000")
+        self.assertAlmostEqual(back[0].x_m, 0.3)
+        self.assertAlmostEqual(back[0].radius_m, 2.0)
+
+
 class TestRestampFromScans(unittest.TestCase):
     """Recognize's local clear-and-restamp (ray-trace, replace observed)."""
 

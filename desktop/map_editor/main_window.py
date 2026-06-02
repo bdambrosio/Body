@@ -28,6 +28,11 @@ from PyQt6.QtWidgets import (
     QToolBar, QWidget,
 )
 
+from desktop.localization.checkpoints import (
+    checkpoints_from_metadata,
+    upsert_checkpoint,
+    write_checkpoints_to_metadata,
+)
 from desktop.world_map.map_views import SharedMapView
 
 from . import editor_map as em
@@ -612,11 +617,16 @@ class MapEditorWindow(QMainWindow):
             center_xy=(pose[0], pose[1]),
             radius_m=_RECOGNIZE_RADIUS_M,
         )
+        # Persist this spot as an LPR checkpoint (add, or correct a nearby one).
+        cps = checkpoints_from_metadata(self._emap.metadata)
+        cps, cp = upsert_checkpoint(
+            cps, pose, _RECOGNIZE_RADIUS_M, created_ts=time.time())
+        write_checkpoints_to_metadata(self._emap.metadata, cps)
         self._dirty = True
         self._rerender(fit=False)
         self._update_title()
         self._status.showMessage(
-            f"Recognized: re-stamped {n} cell(s) within "
+            f"Recognized {cp.id}: re-stamped {n} cell(s) within "
             f"{_RECOGNIZE_RADIUS_M:.1f} m from {len(scans)} scan(s).", 5000)
 
     def _live_tick(self) -> None:
