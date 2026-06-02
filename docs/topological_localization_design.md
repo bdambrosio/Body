@@ -242,6 +242,15 @@ radius isn't just faster, it's *more correct*.
 In a tiled house you are almost always near a checkpoint, so the particle
 filter rarely runs.
 
+The match itself is **occlusion-aware** — a first-hit ray-cast, *not* the
+likelihood field. The likelihood field scores each endpoint by distance to the
+nearest occupied cell, which "sees through walls" and is **degenerate on an
+over-occupied / smeared map** (more occupied → higher score everywhere — the
+very failure you're hitting). A first-hit ray-cast makes everything behind the
+first return physically invisible, so behind-wall smear can't corrupt the
+score, and an all-occupied map scores *low* (every beam blocked early). See §8
+Phase 3 for the scorer spec.
+
 **The one honest limit:** a **mid-corridor** checkpoint's within-radius patch
 is **along-track-blind** (slide forward/back, the patch looks the same), so it
 pins cross-track + yaw but not forward position — along-track still rides odom
@@ -297,17 +306,45 @@ stored.
   `_overlay_pose`; save persists it.
 
 **Phase 3 — Runtime checkpoint localizer (fast pose).** New module, behind a
-flag.
-- `CheckpointMatcher` (desktop/localization): reference_map + checkpoints +
-  prior pose + live scan → pick nearby checkpoint(s), slice the patch from
-  occupancy, `ScanMatcher.search()` with a small xy window + yaw sweep, return
-  best pose + score; gate on score.
-- `CheckpointPoseProvider` implementing the `PoseProvider.world_pose()` seam:
-  odom dead-reckon in the map frame + re-anchor on a confident checkpoint
-  match; drop-in for `PFPoseProvider` (reuse the PF as the local filter, or
-  plain odom+IMU).
-- Wire into `HierarchicalDrive` via the seam, selectable by flag; validate
-  against the live scan overlay before making it default.
+flag. **The scorer is the novel piece and is occlusion-aware — NOT the
+likelihood-field `ScanMatcher`.**
+
+*Scorer (`raycast_match`)* — radius-limited **first-hit ray-cast** beam model:
+- March each beam from the sensor cell to the first occupied cell → predicted
+  range; compare to the measured range. The first-hit march encodes both halves
+  at once — occupied *at* the hit AND clear *up to* it (it would have stopped
+  earlier otherwise). That is why an all-occupied map scores *low* (every beam
+  blocked immediately → predicted ≪ measured), not high.
+- **Soft** range residual (tolerance ≈ a few cells) so beam sparsity at range
+  and small map error aren't over-penalized; only the sampled beams are scored,
+  never the angular gaps between them.
+- **Asymmetric** (the beam-model p_short/p_hit/p_max split, tuned for a
+  mid-healing map): predicted **shorter** than measured (map blocks a beam
+  reality says is clear — phantom / smear / all-red) → **penalize hard**;
+  predicted **longer / max** (map *missing* a wall reality has — an
+  un-Recognized spot or a dynamic obstacle) → **neutral**. Tolerates an
+  incomplete map; rejects a contradicted one.
+- Aggregate as the **mean of bounded per-beam values** — Gaussian-on-residual
+  for a hit (gradient → sharp search peak, not a flat within-tolerance
+  plateau), hard negative for a contradiction, ≈0 for a missing wall — robust
+  because no single beam's contribution is unbounded; **gate on inlier
+  fraction**.
+- (Extension: scoring *no-return* beams as a free-space constraint catches
+  open-bearing phantoms; deferred — v1 scores valid-return beams only.)
+- Consequence: keep Phase-1 Recognize *conservative* (preserve behind-wall
+  geometry) — the matcher ignores behind-first-hit cells and tolerates missing
+  walls, so the map needn't be scrubbed aggressively.
+
+*`CheckpointMatcher`* — reference_map + checkpoints + prior pose + live scan →
+pick nearby checkpoint(s), slice the patch from occupancy, search a small xy
+window + yaw sweep with the ray-cast scorer, return best pose + score; gate on
+inlier fraction.
+
+*`CheckpointPoseProvider`* implementing the `PoseProvider.world_pose()` seam:
+odom dead-reckon in the map frame + re-anchor on a confident checkpoint match;
+drop-in for `PFPoseProvider` (reuse the PF as the local filter, or plain
+odom+IMU). Wire into `HierarchicalDrive` via the seam, selectable by flag;
+validate against the live scan overlay before making it default.
 
 **Phase 4 — Recast `.nav` Re-localize + cold start.**
 - Re-localize button → checkpoint recognition (nearest / test-all); demote
