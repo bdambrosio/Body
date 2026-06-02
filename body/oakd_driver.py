@@ -284,12 +284,27 @@ def _wait_rgb_frame(rgb_queue: Any, timeout_s: float = 3.0) -> Any | None:
     return _rgb_drain_latest(rgb_queue)
 
 
-def _jpeg_b64_from_imgframe(frame: Any, oakd_cfg: dict[str, Any]) -> tuple[str, int, int]:
+def _jpeg_b64_from_imgframe(
+    frame: Any,
+    oakd_cfg: dict[str, Any],
+    *,
+    max_width: int | None = None,
+    jpeg_quality: int = 85,
+) -> tuple[str, int, int]:
     bgr = _apply_oakd_image_rotate(frame.getCvFrame(), oakd_cfg)
-    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    h, w = bgr.shape[:2]
+    # Optional downscale for low-bandwidth streaming (operator preview over a
+    # weak link, where full-res RGB stalls while lidar keeps flowing).
+    # Downscale only — never upsample — and preserve aspect ratio.
+    if max_width is not None and 0 < int(max_width) < w:
+        new_w = int(max_width)
+        new_h = max(1, int(round(h * (new_w / float(w)))))
+        bgr = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        h, w = bgr.shape[:2]
+    q = int(max(1, min(100, jpeg_quality)))
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
     if not ok or buf is None:
         raise RuntimeError("cv2.imencode failed for RGB frame")
-    h, w = bgr.shape[:2]
     b64 = base64.standard_b64encode(buf.tobytes()).decode("ascii")
     return b64, w, h
 
@@ -327,8 +342,16 @@ def _process_oakd_config_queue(
                 schemas.oakd_rgb_capture_error(rid, "no_rgb_frame_timeout"),
             )
             continue
+        # Optional per-request downscale/quality — streaming sends low values
+        # for bandwidth; on-demand (VLM) capture omits them → full res, q=85.
+        mw = req.get("max_width")
+        max_width = int(mw) if isinstance(mw, (int, float)) else None
+        jq = req.get("jpeg_quality")
+        jpeg_quality = int(jq) if isinstance(jq, (int, float)) else 85
         try:
-            jpeg_b64, fw, fh = _jpeg_b64_from_imgframe(frame, oakd_cfg)
+            jpeg_b64, fw, fh = _jpeg_b64_from_imgframe(
+                frame, oakd_cfg, max_width=max_width, jpeg_quality=jpeg_quality,
+            )
             zenoh_helpers.publish_json(
                 session,
                 "body/oakd/rgb",

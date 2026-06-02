@@ -484,7 +484,10 @@ class StubController:
         return self._streaming_misses
 
     def request_rgb_streaming(
-        self, in_flight_timeout_s: float = 2.0,
+        self,
+        in_flight_timeout_s: float = 2.0,
+        max_width: int = 320,
+        jpeg_quality: int = 60,
     ) -> Optional[str]:
         """Publish body/oakd/config capture_rgb without setting the
         on-demand `pending_rgb_request_id` field, so:
@@ -517,8 +520,12 @@ class StubController:
                 f"sending fresh request"
             )
         req_id = str(uuid.uuid4())
+        # Streaming is the operator preview — request a downscaled, lower-
+        # quality frame so it keeps flowing on a weak link instead of
+        # stalling. On-demand (VLM) capture omits these → full res, q=85.
         payload = json.dumps({
             "action": "capture_rgb", "request_id": req_id,
+            "max_width": int(max_width), "jpeg_quality": int(jpeg_quality),
         }).encode("utf-8")
         try:
             self._session.put(self.config.topics.oakd_config, payload)
