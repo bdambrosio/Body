@@ -182,28 +182,143 @@ working** and the §3.1 arrival rework may be unnecessary. Directions A and C
 recognition is likely the lowest-effort route that actually works**, leaning
 entirely on existing infrastructure + the overlay.
 
-### 5.4 Open design decision (settle before building C)
+### 5.4 Resolved: local clear-and-restamp from odom-stitched scans
 
-Should **Recognize**:
+Neither (a) add-evidence (thickening — **rejected**, smears walls) nor (b) a
+local optimizer. **Recognize = replace the observed occupancy within a fixed
+radius from the asserted pose, rebuilt from 2-3 odom-stitched scans:**
 
-- **(a) Add evidence** — stamp the current scan, strengthening occupancy
-  toward the asserted pose. Simpler, additive, but can thicken/smear walls
-  over repeated passes; or
-- **(b) Re-solve locally** — shift existing local occupancy so its argmax
-  moves to the asserted pose. Cleaner result, needs a local optimization.
+- **Replace, observed-cells-only.** Within radius R (default ~2 m, the dense
+  reliable lidar zone), run the standard occupancy stamp in **set (not
+  accumulate)** mode: ray-trace free up to each endpoint, mark the endpoint
+  occupied, leave cells no beam touched alone. Keeps walls one cell thin *and*
+  never erases out-of-view geometry behind a wall (rays stop at the first hit).
+- **Stitch 2-3 scans with raw odom — never the PF pose.** Anchor scan #1 at
+  the operator-asserted pose; place #2/#3 by **raw odom delta** from #1 (over
+  ~5 cm odom is ~0.3 mm accurate). Union the ray-stamps. Payoff: fills
+  occlusion shadows and gives the likelihood a broader, smoother basin around
+  the true pose instead of a knife-edge.
+- **No undo needed.** Recognize is manual: the operator asserts the pose while
+  seeing the old map + the live scan overlay (verify-before-bake), and
+  replace-semantics make Recognize **self-correcting** — a subtly-wrong spot
+  is fixed by driving back and Recognizing again (last-write-wins, no
+  residue). "Re-Recognize" *is* the undo. (The editor's `snapshot_state()`
+  stack still covers accidental clicks.)
+
+### 5.5 The "small move"
+
+Straight **forward** (diff-drive can't strafe; forward keeps odom cleanest),
+**~5 cm** per step, 2-3 scans over ~10 cm total. At ~1°/beam the endpoints are
+~3.5 cm apart at 2 m, so ~5 cm interleaves new endpoints between the old ones
+and clears a few shadow cells past near occluders. Keep it small so the union
+stays self-consistent and tightly tied to the one pose the operator verified;
+returns diminish fast — a single +5 cm second scan captures most of it.
 
 ---
 
-## 6. Recommendation
+## 6. The radius-limited checkpoint — the unifying primitive
 
-1. Stop treating the metric MCL as the global localizer for the hierarchical
-   stack; it is the right tool only for **local/relative** tracking.
-2. Pursue **Direction C** first (supervised map-healing via Recognize) — it
-   reuses everything and is operator-supervised — keeping **Set-location** as
-   the manual anchor and **junction recognition** for global recovery.
-3. Keep **Direction A** (LPR-backed provider + arrival-by-node) as the
-   longer-term endpoint the `PFPoseProvider` seam already anticipates; adopt
-   it if/when C's local-healing proves insufficient for global recovery.
+Directions A, B and C collapse into **one operation: a radius-limited local
+patch match.** Each Recognize spot is stored as an **LPR checkpoint** = the
+baked local occupancy patch (cells within R) + its asserted pose. The same
+radius limit that makes the *edit* clean makes the *match* robust: at runtime
+you score only the beams inside the certified patch and **ignore the distorted
+far field** — exactly the part that poisons global MCL. So limiting to the
+radius isn't just faster, it's *more correct*.
+
+**Runtime loop (the "pre-MCL fast pose"):**
+
+1. **Propagate odom** continuously (locally true) in the map frame.
+2. **Fast checkpoint test:** use the dead-reckoned pose to pick the 1-3
+   checkpoints within ~R; run a small-window `ScanMatcher.search()` against
+   each checkpoint's patch. Above a confidence gate → **snap / re-anchor**.
+   Cheap, O(1), no particle cloud.
+3. **Full MCL demoted to fallback:** only when no checkpoint is in range and a
+   global fix is genuinely needed (cold start / lost). Testing *all*
+   checkpoints with no odom prior *is* the relocalization primitive — i.e.
+   `.nav` **Re-localize = "which checkpoint am I at"** (Direction B). One code
+   path serves tracking re-anchor, Re-localize, and cold start.
+
+In a tiled house you are almost always near a checkpoint, so the particle
+filter rarely runs.
+
+**The one honest limit:** a **mid-corridor** checkpoint's within-radius patch
+is **along-track-blind** (slide forward/back, the patch looks the same), so it
+pins cross-track + yaw but not forward position — along-track still rides odom
+through the corridor. Checkpoints buy the most at **distinctive geometry**
+(junctions, doorways, corners); put one at the end of each corridor to
+re-anchor the along-track drift accumulated across it.
+
+---
+
+## 7. Recommendation
+
+1. The metric MCL is the right tool only for **local/relative** matching; stop
+   using it as the global localizer for the hierarchical stack.
+2. Build the **radius-limited patch match** (§6) as the one shared primitive:
+   used by `map_editor` Recognize to bake checkpoints, and by a runtime
+   checkpoint provider for fast pose + re-anchor + Re-localize.
+3. Keep **Set-location** as the manual anchor and **full MCL** as the
+   cold-start / lost fallback.
+
+---
+
+## 8. Implementation plan
+
+Phased; each phase is independently testable and everything runtime lands
+behind the existing `PoseProvider` seam, so the production drive is unaffected
+until an explicit cut-over.
+
+**Phase 1 — `map_editor` Recognize (the bake).** Reuses `EditorMap`,
+`LiveLink`, `_overlay_pose` (the operator-asserted pose from the existing
+align / Set-location / rotate tools).
+- Add a ray-trace occupancy stamp to `EditorMap` (DDA/Bresenham): free along
+  each ray, occupied at endpoint, **set-mode**, bounded to radius R; operates
+  on the existing `log_odds` grid. Push `snapshot_state()` first.
+- Keep a short ring of recent `(scan_body, odom_pose)` in the live tick
+  (already cached at 5 Hz) so Recognize can stitch the last 2-3 scans by raw
+  odom delta, anchored at `_overlay_pose`.
+- Add a **Recognize** toolbar button (row 2, by Stamp scan→wall) →
+  `_on_recognize()`: snapshot, restamp within R from the stitched scans at
+  `_overlay_pose`, mark dirty, re-render. Keep additive Stamp as a manual
+  touch-up.
+- Save path unchanged: `save_npz` → `build_reference_map_from_log_odds`
+  already regenerates the **global** likelihood/distance fields from the
+  edited occupancy. (No local field regen — sidesteps the whole-map-only
+  field constraint entirely.)
+
+**Phase 2 — Checkpoint persistence.** Lightweight; the patch is *derived*, not
+stored.
+- A checkpoint = `{id, pose:[x,y,θ], radius_m, created_ts}`. Its patch is the
+  occupancy disk around `pose` sliced at load time — no blob to store, and it
+  always reflects the current (healed) map.
+- Store as `ReferenceMap.metadata["checkpoints"]` (→ `meta_json`,
+  backward-compatible). Recognize adds/updates the checkpoint at
+  `_overlay_pose`; save persists it.
+
+**Phase 3 — Runtime checkpoint localizer (fast pose).** New module, behind a
+flag.
+- `CheckpointMatcher` (desktop/localization): reference_map + checkpoints +
+  prior pose + live scan → pick nearby checkpoint(s), slice the patch from
+  occupancy, `ScanMatcher.search()` with a small xy window + yaw sweep, return
+  best pose + score; gate on score.
+- `CheckpointPoseProvider` implementing the `PoseProvider.world_pose()` seam:
+  odom dead-reckon in the map frame + re-anchor on a confident checkpoint
+  match; drop-in for `PFPoseProvider` (reuse the PF as the local filter, or
+  plain odom+IMU).
+- Wire into `HierarchicalDrive` via the seam, selectable by flag; validate
+  against the live scan overlay before making it default.
+
+**Phase 4 — Recast `.nav` Re-localize + cold start.**
+- Re-localize button → checkpoint recognition (nearest / test-all); demote
+  global `relocate()` to an explicit fallback. Keep `relocate_at`
+  ("Set location") as the manual anchor.
+
+**Phase 5 (optional) — arrival-by-node.** Only if local healing proves
+insufficient: judge arrival at distinctive waypoints by checkpoint
+recognition; keep dead-reckon distance for mid-corridor pass-throughs. Likely
+unnecessary if §5.3 holds (healed map → metric distance trustworthy near
+waypoints).
 
 See also: `bayesian_localization_redesign.md` (PF production stack),
 `tier_contract.md` / `drive_tier3_spec.md` (the hierarchical tiers).
