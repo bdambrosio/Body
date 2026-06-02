@@ -16,6 +16,8 @@ import time
 from dataclasses import asdict
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
+
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel,
@@ -68,6 +70,7 @@ from .safety_toolbar import SafetyToolbar
 from .teleop_panels import TeleopPanels, build_chassis_snapshot
 
 from body.lib.local_drive_core import body_to_odom
+from desktop.nav.slam.scan_matcher import lidar_scan_to_xy
 from desktop.pi_drive.drive_client import DriveClient
 
 logger = logging.getLogger(__name__)
@@ -571,6 +574,22 @@ class NavMainWindow(QMainWindow):
         )
         view_menu.addAction(self._rings_action)
 
+        self._scan_overlay_action = QAction("Lidar scan overlay", self)
+        self._scan_overlay_action.setCheckable(True)
+        self._scan_overlay_action.setChecked(
+            self._shared_view.show_scan_overlay()
+        )
+        self._scan_overlay_action.setShortcut("Ctrl+L")
+        self._scan_overlay_action.setToolTip(
+            "Overlay the live lidar scan, transformed into the believed "
+            "pose, on the maps. If the pose match is right the scan lands "
+            "on the walls; if not, the mismatch is visible."
+        )
+        self._scan_overlay_action.toggled.connect(
+            self._shared_view.set_show_scan_overlay
+        )
+        view_menu.addAction(self._scan_overlay_action)
+
     def _build_timer(self) -> None:
         period_ms = int(1000.0 / max(1.0, self.fuser_config.ui_redraw_hz))
         self._redraw_timer = QTimer(self)
@@ -631,11 +650,50 @@ class NavMainWindow(QMainWindow):
         else:
             self._shared_view.set_scan_match_overlay(None)
 
+    def _update_scan_overlay(self, pose) -> None:
+        """Transform the latest lidar scan into the believed pose (world
+        frame) and hand it to the shared map view, so the operator can see
+        whether the scan lands on the mapped walls — i.e. whether the pose
+        match is correct. Cleared when no scan/pose is available."""
+        if pose is None:
+            self._shared_view.set_scan_overlay(None)
+            return
+        with self.chassis.state.lock:
+            scan = self.chassis.state.lidar_scan
+        ranges = scan.get("ranges") if isinstance(scan, dict) else None
+        if not isinstance(ranges, list) or not ranges:
+            self._shared_view.set_scan_overlay(None)
+            return
+        angle_min = float(scan.get("angle_min", 0.0))
+        angle_inc = float(scan.get("angle_increment", 0.0))
+        if angle_inc == 0.0:
+            self._shared_view.set_scan_overlay(None)
+            return
+        n = len(ranges)
+        angles = angle_min + np.arange(n, dtype=np.float64) * angle_inc
+        r = np.asarray(
+            [v if isinstance(v, (int, float)) else np.nan for v in ranges],
+            dtype=np.float64,
+        )
+        pts_body = lidar_scan_to_xy(r, angles)   # (M, 2); invalid dropped
+        if pts_body.shape[0] == 0:
+            self._shared_view.set_scan_overlay(None)
+            return
+        # Body → world by the believed pose (same transform the matcher uses).
+        px, py, pth = float(pose[0]), float(pose[1]), float(pose[2])
+        c, s = math.cos(pth), math.sin(pth)
+        bx, by = pts_body[:, 0], pts_body[:, 1]
+        wx = px + bx * c - by * s
+        wy = py + bx * s + by * c
+        self._shared_view.set_scan_overlay(np.stack([wx, wy], axis=-1))
+
     def _refresh_fuser_panel(self) -> None:
         snap = self.fuser.snapshot_for_ui()
         latest = self.fuser.pose_source.latest_pose()
         pose = latest[0] if latest is not None else None
         trail = self.fuser.pose_trail()
+        # Live lidar scan, transformed into the believed pose, over the map.
+        self._update_scan_overlay(pose)
         # Pull status_summary up here so pose_age is available for the
         # mission tick. ages["odom"] is local-arrival-time age — what
         # we actually want for freshness (Pi clock skew doesn't matter).

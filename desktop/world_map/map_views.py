@@ -66,6 +66,12 @@ class SharedMapView:
         self._view_rect: Optional[Tuple[float, float, float, float]] = None
         self._show_grid: bool = True
         self._show_range_rings: bool = True
+        # Live lidar scan transformed into the believed pose, in world
+        # frame (N×2). Drawn as dots so the operator can see whether the
+        # scan lands on the mapped walls — i.e. whether the pose match is
+        # right. None when no scan/pose available; toggle via _show_scan.
+        self._scan_overlay_world: Optional[Any] = None
+        self._show_scan_overlay: bool = True
         self._views: List["_WorldViewBase"] = []
         # Mission state shared across panels: a single goal pin in
         # world frame, and the most recently planned path. Both are
@@ -211,6 +217,24 @@ class SharedMapView:
         self._scan_match_overlay = (
             dict(overlay) if overlay is not None else None
         )
+        self._notify()
+
+    # ── Live scan overlay (believed-pose lidar over the map) ────────
+
+    def scan_overlay(self) -> Optional[Any]:
+        return self._scan_overlay_world
+
+    def set_scan_overlay(self, pts_world: Optional[Any]) -> None:
+        """Install the live scan in world frame (N×2 array/sequence), or
+        None to clear. Cheap-set: stores the reference as-is."""
+        self._scan_overlay_world = pts_world
+        self._notify()
+
+    def show_scan_overlay(self) -> bool:
+        return self._show_scan_overlay
+
+    def set_show_scan_overlay(self, on: bool) -> None:
+        self._show_scan_overlay = bool(on)
         self._notify()
 
     # ── Patrol overlay ──────────────────────────────────────────────
@@ -529,6 +553,10 @@ class _WorldViewBase(QWidget):
             # Planned path (above the trail, below pose/anchor markers).
             self._draw_planned_path(p, ox, oy, side_px)
 
+            # Live lidar scan at the believed pose (above the map, below
+            # the pose/anchor markers so the markers stay legible).
+            self._draw_scan_overlay(p, ox, oy, side_px)
+
             # World origin (anchor) marker.
             self._draw_world_marker(
                 p, 0.0, 0.0, 0.0, ox, oy, side_px,
@@ -732,6 +760,34 @@ class _WorldViewBase(QWidget):
         p.setPen(QPen(QColor(80, 200, 255, 220), 2.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+        p.restore()
+
+    def _draw_scan_overlay(
+        self, p: QPainter, ox: int, oy: int, side_px: int,
+    ) -> None:
+        """Draw the live lidar scan (already transformed into the believed
+        pose, world frame) as small cyan dots. If the pose match is right,
+        the dots fall on the mapped walls; if wrong, the mismatch is
+        immediately visible."""
+        if not self._shared.show_scan_overlay():
+            return
+        pts = self._shared.scan_overlay()
+        if pts is None or len(pts) == 0:
+            return
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        pen = QPen(QColor(80, 220, 255, 230), 1.0)
+        p.setPen(pen)
+        p.setBrush(QColor(80, 220, 255, 230))
+        x0, y0 = float(ox), float(oy)
+        x1, y1 = x0 + side_px, y0 + side_px
+        r = 1.4
+        for pt in pts:
+            rx, ry = self._world_to_widget(float(pt[0]), float(pt[1]))
+            # Cheap manual cull — drawEllipse outside the clip still costs.
+            if rx < x0 or rx > x1 or ry < y0 or ry > y1:
+                continue
+            p.drawEllipse(QPointF(rx, ry), r, r)
         p.restore()
 
     def _draw_scan_match_overlay(
