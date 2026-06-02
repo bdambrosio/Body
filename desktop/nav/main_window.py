@@ -121,12 +121,15 @@ class NavMainWindow(QMainWindow):
         self.chassis = chassis
         self.chassis_config = chassis_config
 
-        # Stage-B hierarchical drive (Tier-1/Tier-2). Lazily wired: the
-        # DriveClient (own zenoh session, body/drive/goto + status + scan)
-        # is only opened when the operator enables the mode. Until then
-        # nav behaves exactly as before. Initialized before _build_toolbars
-        # so the ALL-STOP callback can reference them safely.
-        self._stage_b_mode: bool = False
+        # Hierarchical drive (Tier-1/Tier-2/Tier-3) is the production drive
+        # path — Go/Stop always route through it. The DriveClient (own zenoh
+        # session, body/drive/goto + status + scan) is opened lazily on the
+        # first Go. The old reactive-follower mission path is retired and no
+        # longer reachable (its modules remain on disk pending cleanup).
+        # `_stage_b_mode` is kept as an always-on constant so the existing
+        # dispatch branches need no rewrite. Initialized before
+        # _build_toolbars so the ALL-STOP callback can reference them safely.
+        self._stage_b_mode: bool = True
         self._hier_drive: Optional[HierarchicalDrive] = None
         self._drive_client: Optional[DriveClient] = None
 
@@ -208,16 +211,17 @@ class NavMainWindow(QMainWindow):
 
         self._go_act = QAction("Go", self)
         self._go_act.setToolTip(
-            "Begin autonomous follow of the planned path. "
-            "Requires Live cmd ON and a successful plan."
+            "Drive the loaded patrol with hierarchical drive: each leg routes "
+            "toward a live-observed sub-goal via the Pi's Tier-3 loop "
+            "(body/drive/goto). Place waypoints (Patrol edit) first. Tier-3 "
+            "owns cmd_vel — leave Live cmd OFF; nav keeps the heartbeat alive."
         )
         self._go_act.triggered.connect(self._on_go)
         self._map_toolbar.addAction(self._go_act)
 
         self._cancel_act = QAction("Stop", self)
         self._cancel_act.setToolTip(
-            "Halt the autonomous follow and zero cmd_vel. "
-            "Live cmd remains on so manual driving stays available."
+            "Stop the hierarchical drive and cancel the in-flight Tier-3 goto."
         )
         self._cancel_act.triggered.connect(self._on_cancel)
         self._map_toolbar.addAction(self._cancel_act)
@@ -231,18 +235,6 @@ class NavMainWindow(QMainWindow):
         self._resume_act.setEnabled(False)
         self._resume_act.triggered.connect(self._on_resume_hier)
         self._map_toolbar.addAction(self._resume_act)
-
-        self._hier_act = QAction("Hierarchical drive", self)
-        self._hier_act.setCheckable(True)
-        self._hier_act.setChecked(False)
-        self._hier_act.setToolTip(
-            "Stage-B hierarchical drive: place patrol waypoints, then Go to "
-            "drive each leg toward a live-observed sub-goal via the Pi's "
-            "Tier-3 loop (body/drive/goto). Leave Live cmd OFF — Tier-3 owns "
-            "cmd_vel; nav only keeps the heartbeat alive."
-        )
-        self._hier_act.toggled.connect(self._on_stage_b_toggled)
-        self._map_toolbar.addAction(self._hier_act)
 
         self._patrol_edit_act = QAction("Patrol edit", self)
         self._patrol_edit_act.setCheckable(True)
@@ -2044,28 +2036,21 @@ class NavMainWindow(QMainWindow):
 
     # ── Stage-B hierarchical drive ───────────────────────────────────
 
-    def _on_stage_b_toggled(self, checked: bool) -> None:
-        """Enter/leave hierarchical-drive mode. On enter, lazily open the
-        DriveClient session (own zenoh session for body/drive/goto + status
-        + scan). On leave, stop any active drive and close the session."""
-        self._stage_b_mode = bool(checked)
-        if checked:
-            if self._drive_client is None:
-                self._drive_client = DriveClient(self.chassis_config.router)
-            ok, err = self._drive_client.connect()
-            if not ok:
-                QMessageBox.warning(
-                    self, "Hierarchical drive",
-                    f"Drive client connect failed:\n{err}",
-                )
-                self._stage_b_mode = False
-                self._hier_act.setChecked(False)
-                return
-        else:
-            self._stop_hier_drive()
-            if self._drive_client is not None:
-                self._drive_client.shutdown()
-                self._drive_client = None
+    def _ensure_drive_client(self) -> bool:
+        """Lazily open the DriveClient session (own zenoh session for
+        body/drive/goto + status + scan) on the first Go. Returns True once
+        a connected client is available; warns and returns False otherwise.
+        Closed in closeEvent."""
+        if self._drive_client is None:
+            self._drive_client = DriveClient(self.chassis_config.router)
+        ok, err = self._drive_client.connect()
+        if not ok:
+            QMessageBox.warning(
+                self, "Hierarchical drive",
+                f"Drive client connect failed:\n{err}",
+            )
+            return False
+        return True
 
     def _on_go_stage_b(self) -> None:
         """Start hierarchical drive over the loaded patrol. Live cmd stays
@@ -2078,7 +2063,7 @@ class NavMainWindow(QMainWindow):
                 "route on the map before Go.",
             )
             return
-        if self._drive_client is None:
+        if not self._ensure_drive_client():
             return
         with self.chassis.state.lock:
             connected = self.chassis.state.connected
@@ -2421,6 +2406,15 @@ class NavMainWindow(QMainWindow):
         # close releases the fd cleanly for any tail consumer).
         try:
             self._tracer.close()
+        except Exception:
+            pass
+        # Stop any in-flight hierarchical drive and close the DriveClient
+        # session (opened lazily on the first Go).
+        try:
+            self._stop_hier_drive()
+            if self._drive_client is not None:
+                self._drive_client.shutdown()
+                self._drive_client = None
         except Exception:
             pass
         super().closeEvent(event)
