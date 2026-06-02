@@ -253,5 +253,55 @@ class TestRoundTrip(unittest.TestCase):
             np.array_equal(m.log_odds, rm2.occupancy_log_odds))
 
 
+class TestRestampFromScans(unittest.TestCase):
+    """Recognize's local clear-and-restamp (ray-trace, replace observed)."""
+
+    WALL = em._PAINT_LOG_ODDS[em.WALL]    # +4
+    FREE = em._PAINT_LOG_ODDS[em.FREE]    # -4
+
+    def _grid(self):
+        # 60×60 @ 0.1 m, origin 0 → world (x) = 0.1*i; sensor at (3,3)=(30,30).
+        return em.EditorMap(
+            log_odds=np.zeros((60, 60), dtype=np.float32),
+            resolution_m=0.1, origin_x_m=0.0, origin_y_m=0.0,
+        )
+
+    def test_replace_clears_stale_wall_and_stamps_endpoint(self):
+        m = self._grid()
+        m.log_odds[35, 30] = self.WALL          # stale wall on the beam path
+        # One east-facing beam: sensor (3,3) → endpoint (4,3) = cell (40,30).
+        m.restamp_from_scans(
+            [(np.array([[4.0, 3.0]]), (3.0, 3.0))],
+            center_xy=(3.0, 3.0), radius_m=2.0,
+        )
+        self.assertEqual(m.log_odds[35, 30], self.FREE)   # stale wall cleared
+        self.assertEqual(m.log_odds[40, 30], self.WALL)   # endpoint occupied
+        self.assertEqual(m.log_odds[30, 30], self.FREE)   # sensor cell freed
+        self.assertEqual(m.log_odds[45, 30], 0.0)         # behind endpoint untouched
+        self.assertEqual(m.log_odds[30, 40], 0.0)         # off-beam untouched
+
+    def test_endpoint_beyond_radius_not_stamped_inner_freed(self):
+        m = self._grid()
+        # Endpoint (5.5,3)=cell (55,30) is 25 cells from center > 20-cell radius.
+        m.restamp_from_scans(
+            [(np.array([[5.5, 3.0]]), (3.0, 3.0))],
+            center_xy=(3.0, 3.0), radius_m=2.0,
+        )
+        self.assertEqual(m.log_odds[50, 30], self.FREE)   # within radius: freed
+        self.assertEqual(m.log_odds[55, 30], 0.0)         # endpoint past radius: untouched
+
+    def test_endpoint_wins_over_free_across_scans(self):
+        m = self._grid()
+        # Scan A puts a wall at (40,30); scan B's longer beam traverses it as free.
+        m.restamp_from_scans(
+            [
+                (np.array([[4.0, 3.0]]), (3.0, 3.0)),
+                (np.array([[4.4, 3.0]]), (3.0, 3.0)),
+            ],
+            center_xy=(3.0, 3.0), radius_m=2.0,
+        )
+        self.assertEqual(m.log_odds[40, 30], self.WALL)   # occupied wins the tie
+
+
 if __name__ == "__main__":
     unittest.main()

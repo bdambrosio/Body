@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -38,6 +39,10 @@ logger = logging.getLogger(__name__)
 _UNDO_DEPTH = 25
 _SCAN_MAX_RANGE_M = 12.0
 _STAMP_MAX_RANGE_M = 4.0  # only stamp live-scan hits within this range
+# Recognize re-stamps observed occupancy within this radius of the asserted
+# pose, rebuilt from the last few odom-stitched scans (Phase 1 of the
+# topological-localization plan; see docs/topological_localization_design.md).
+_RECOGNIZE_RADIUS_M = 2.0
 
 # Which edit layer each brush kind writes.
 _KIND_LAYER = {
@@ -76,6 +81,10 @@ class MapEditorWindow(QMainWindow):
         # Latest world-frame live-scan endpoints (what the cyan dots show),
         # retained so "Stamp scan→wall" writes exactly what you see.
         self._live_scan_world: Optional[np.ndarray] = None
+        # Recent (world_scan, pose) snapshots in the *asserted* (align) frame,
+        # for Recognize's odom-stitched multi-scan re-stamp. Filled only in
+        # align mode; cleared on any frame discontinuity (re-assert / rotate).
+        self._scan_ring: deque = deque(maxlen=16)
 
         self._shared = SharedMapView()
         self._view = EditableMapView(shared=self._shared)
@@ -171,6 +180,7 @@ class MapEditorWindow(QMainWindow):
         self._act_relocate = None
         self._act_locate = None
         self._act_stamp = None
+        self._act_recognize = None
         if self._router:
             # Live controls live on a SECOND toolbar row so the top row
             # doesn't overflow the window width and bury buttons in the
@@ -218,6 +228,17 @@ class MapEditorWindow(QMainWindow):
                 "stable structure.")
             self._act_stamp.setEnabled(False)
             self._act_stamp.triggered.connect(self._on_stamp_scan)
+            # Recognize: heal the map locally so the asserted pose scores best
+            # here (replace observed occupancy within a radius from a few
+            # odom-stitched scans). Requires an asserted pose (Align/Set loc).
+            self._act_recognize = tb2.addAction("Recognize")
+            self._act_recognize.setToolTip(
+                f"Heal the map here: replace occupancy within "
+                f"{_RECOGNIZE_RADIUS_M:.0f} m of the asserted pose (Align scan / "
+                "Set location) from the live scan, so this pose scores best "
+                "here. Edits the localization map.")
+            self._act_recognize.setEnabled(False)
+            self._act_recognize.triggered.connect(self._on_recognize)
 
     def _set_kind(self, kind: str) -> None:
         self._brush_kind = kind
@@ -397,6 +418,7 @@ class MapEditorWindow(QMainWindow):
             self._act_rot_ccw.setEnabled(True)
             self._act_rot_cw.setEnabled(True)
             self._act_stamp.setEnabled(True)
+            self._act_recognize.setEnabled(True)
             self._live_timer.start()
             self._status.showMessage("Connected — Relocate to seat the pose.")
         else:
@@ -411,6 +433,7 @@ class MapEditorWindow(QMainWindow):
         self._overlay_pose = None
         self._odom_anchor = None
         self._live_scan_world = None
+        self._scan_ring.clear()
         self._view.set_scan_points(None)
         self._pose_lbl.setText("")
         if self._act_connect is not None:
@@ -424,6 +447,7 @@ class MapEditorWindow(QMainWindow):
             self._act_rot_ccw.setEnabled(False)
             self._act_rot_cw.setEnabled(False)
             self._act_stamp.setEnabled(False)
+            self._act_recognize.setEnabled(False)
             self._view.set_align_mode(False)
         self._rerender(fit=False)
 
@@ -447,6 +471,7 @@ class MapEditorWindow(QMainWindow):
         if self._link is None:
             return False
         res = self._link.relocate_at(x_w, y_w)
+        self._scan_ring.clear()   # believed pose moved
         ok = bool(res.get("success"))
         self._status.showMessage(
             f"Set location ({x_w:.2f}, {y_w:.2f}) "
@@ -471,6 +496,7 @@ class MapEditorWindow(QMainWindow):
                 return
             self._overlay_pose = (float(base[0]), float(base[1]), float(base[2]))
             self._odom_anchor = self._link.odom_pose()
+            self._scan_ring.clear()   # new asserted frame
             self._view.set_align_mode(True)
             self._view.setFocus()  # so arrow-key nudge reaches the view
             self._status.showMessage(
@@ -479,6 +505,7 @@ class MapEditorWindow(QMainWindow):
         else:
             self._overlay_pose = None
             self._odom_anchor = None
+            self._scan_ring.clear()
             self._view.set_align_mode(False)
 
     def _on_align_drag(self, dx_w: float, dy_w: float) -> None:
@@ -486,6 +513,7 @@ class MapEditorWindow(QMainWindow):
             return
         x, y, th = self._overlay_pose
         self._overlay_pose = (x + dx_w, y + dy_w, th)
+        self._scan_ring.clear()   # pose jumped → old-frame scans are stale
 
     def _on_rotate(self, sign: int) -> None:
         if self._overlay_pose is None:
@@ -494,6 +522,7 @@ class MapEditorWindow(QMainWindow):
             return
         x, y, th = self._overlay_pose
         self._overlay_pose = (x, y, th + sign * math.radians(1.0))
+        self._scan_ring.clear()   # pose jumped → old-frame scans are stale
 
     def _on_stamp_scan(self) -> None:
         """One-shot: write the live scan's in-range hits into the Wall
@@ -530,6 +559,66 @@ class MapEditorWindow(QMainWindow):
         self._update_title()
         self._status.showMessage(f"Stamped {n} cell(s) to wall.", 4000)
 
+    def _recent_distinct_scans(
+        self, max_scans: int = 3, min_step_m: float = 0.03,
+    ) -> List[Tuple[np.ndarray, Tuple[float, float, float]]]:
+        """Up to `max_scans` recent (world_scan, pose) from the ring, newest
+        first, spaced ≥ min_step_m in xy so they give distinct viewpoints. A
+        stationary bot yields just the latest."""
+        out: List[Tuple[np.ndarray, Tuple[float, float, float]]] = []
+        last_xy: Optional[Tuple[float, float]] = None
+        for world, pose in reversed(self._scan_ring):
+            if last_xy is not None and math.hypot(
+                pose[0] - last_xy[0], pose[1] - last_xy[1]) < min_step_m:
+                continue
+            out.append((world, pose))
+            last_xy = (pose[0], pose[1])
+            if len(out) >= max_scans:
+                break
+        return out
+
+    def _on_recognize(self) -> None:
+        """Heal the map locally so the asserted pose scores best here:
+        replace observed occupancy within `_RECOGNIZE_RADIUS_M` of the
+        asserted pose, rebuilt from the last few odom-stitched scans.
+        Requires an asserted pose (Align scan / Set location). Edits the
+        localization map — confirms first."""
+        if self._emap is None or self._link is None:
+            return
+        if self._overlay_pose is None:
+            self._status.showMessage(
+                "Recognize needs an asserted pose — turn on Align scan and "
+                "line the scan up to the real walls first.", 5000)
+            return
+        scans = self._recent_distinct_scans()
+        if not scans:
+            self._status.showMessage("No live scan to recognize yet.", 3000)
+            return
+        pose = self._overlay_pose
+        r = QMessageBox.question(
+            self, "Recognize here?",
+            f"Replace occupancy within {_RECOGNIZE_RADIUS_M:.1f} m of the "
+            f"asserted pose, rebuilt from {len(scans)} scan(s), so this becomes "
+            "the best-scoring pose here?\n\nThis edits the LOCALIZATION map — "
+            "verify the scan matches the real room first.")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        self._undo.append(self._emap.snapshot_state())
+        if len(self._undo) > _UNDO_DEPTH:
+            self._undo.pop(0)
+        self._act_undo.setEnabled(True)
+        n = self._emap.restamp_from_scans(
+            [(w, (p[0], p[1])) for (w, p) in scans],
+            center_xy=(pose[0], pose[1]),
+            radius_m=_RECOGNIZE_RADIUS_M,
+        )
+        self._dirty = True
+        self._rerender(fit=False)
+        self._update_title()
+        self._status.showMessage(
+            f"Recognized: re-stamped {n} cell(s) within "
+            f"{_RECOGNIZE_RADIUS_M:.1f} m from {len(scans)} scan(s).", 5000)
+
     def _live_tick(self) -> None:
         if self._link is None or self._emap is None:
             return
@@ -552,6 +641,12 @@ class MapEditorWindow(QMainWindow):
             mode = "mcl"
         self._live_pose = pose
         self._live_scan_world = world
+        # In align mode the overlay is odom-dead-reckoned from the asserted
+        # anchor, so consecutive scans share one consistent world frame —
+        # exactly the odom-stitched set Recognize wants. (MCL-mode poses can
+        # jump, so don't collect those.)
+        if mode == "align" and world is not None and pose is not None:
+            self._scan_ring.append((world, pose))
         self._view.set_scan_points(world)
         if self._drive_cache is not None:
             self._view.update_map(

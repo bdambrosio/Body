@@ -54,6 +54,29 @@ _PAINT_LOG_ODDS = {
 }
 
 
+def _bresenham(x0: int, y0: int, x1: int, y1: int):
+    """Integer line from (x0,y0) to (x1,y1) inclusive. Yields
+    (i, j, is_endpoint) for each cell along the ray."""
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    x, y = x0, y0
+    while True:
+        is_end = (x == x1 and y == y1)
+        yield x, y, is_end
+        if is_end:
+            return
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
+
+
 @dataclass
 class EditorMap:
     """In-memory editable reference map. `log_odds` is the (nx, ny)
@@ -197,6 +220,62 @@ class EditorMap:
         # Dedup repeated hits in the same cell so counts are honest.
         _, uniq = np.unique(ii.astype(np.int64) * ny + jj, return_index=True)
         return ii[uniq], jj[uniq]
+
+    def restamp_from_scans(
+        self,
+        scans,                      # list[(world_xy (N,2), origin_xy (x,y))]
+        *,
+        center_xy: Tuple[float, float],
+        radius_m: float,
+        max_range_m: float = 6.0,
+    ) -> int:
+        """Replace the *observed* occupancy within ``radius_m`` of
+        ``center_xy``, rebuilt from one or more scans by ray-tracing:
+        FREE along each beam, WALL at the endpoint, in **set** mode.
+
+        Cells no beam crosses are left untouched, so geometry behind a wall
+        is preserved (rays stop at the first hit). Endpoint wins over free
+        where they collide. ``scans`` is a list of (world-frame endpoints
+        (N,2), sensor-origin (x,y)); pass several odom-stitched scans in the
+        same world frame to fill occlusion shadows. Returns cells changed.
+        Mutates ``log_odds``; the caller snapshots for undo."""
+        nx, ny = self.shape
+        ci, cj = self.world_to_cell(center_xy[0], center_xy[1])
+        r_cells = max(1, int(math.ceil(radius_m / self.resolution_m)))
+        r2 = r_cells * r_cells
+        free: set = set()
+        occ: set = set()
+        for world_xy, origin in scans:
+            if world_xy is None or len(world_xy) == 0:
+                continue
+            pts = np.asarray(world_xy, dtype=np.float64)
+            ox, oy = float(origin[0]), float(origin[1])
+            oi, oj = self.world_to_cell(ox, oy)
+            rng = np.hypot(pts[:, 0] - ox, pts[:, 1] - oy)
+            pts = pts[(rng > 1e-3) & (rng <= max_range_m)]
+            for k in range(pts.shape[0]):
+                ei, ej = self.world_to_cell(pts[k, 0], pts[k, 1])
+                end_in = (ei - ci) ** 2 + (ej - cj) ** 2 <= r2
+                for i, j, is_end in _bresenham(oi, oj, ei, ej):
+                    if (i - ci) ** 2 + (j - cj) ** 2 > r2:
+                        break  # straight ray that leaves the disk won't re-enter
+                    if not (0 <= i < nx and 0 <= j < ny):
+                        break
+                    if is_end:
+                        if end_in:
+                            occ.add((i, j))
+                    else:
+                        free.add((i, j))
+        free -= occ
+        changed = 0
+        for cells, kind in ((free, FREE), (occ, WALL)):
+            if not cells:
+                continue
+            ii = np.fromiter((c[0] for c in cells), np.intp, len(cells))
+            jj = np.fromiter((c[1] for c in cells), np.intp, len(cells))
+            self.log_odds[ii, jj] = _PAINT_LOG_ODDS[kind]
+            changed += len(cells)
+        return changed
 
     def snapshot_state(self) -> Tuple[np.ndarray, np.ndarray]:
         """Copy of (log_odds, nogo) for the undo stack — a stroke may
