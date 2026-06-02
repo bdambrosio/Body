@@ -24,7 +24,6 @@ from __future__ import annotations
 import enum
 import logging
 import math
-import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Tuple
 
@@ -61,9 +60,10 @@ class PFPoseProvider:
 
     A *stale* pose is reported as None (no pose). ``latest_pose()`` never
     expires its estimate, so on a connectivity drop the PF keeps returning a
-    frozen pose; without this the drive would keep steering on it. The age
-    is odom-ts vs wall-clock — fail-safe under the usual skew (a lagging Pi
-    clock inflates the age → suspends sooner); relies on Pi/desktop NTP sync.
+    frozen pose; without this the drive would keep steering on it. Staleness
+    is judged by the pose source's ``odom_age_s()`` — a desktop-side monotonic
+    receive age, skew-immune (no Pi timestamp in the comparison), so a clock
+    offset can't spuriously null a fresh pose.
     """
 
     def __init__(self, fuser: Any, max_pose_age_s: float = 0.75):
@@ -74,12 +74,10 @@ class PFPoseProvider:
         latest = self._fuser.pose_source.latest_pose()
         if latest is None:
             return None
-        if isinstance(latest, tuple) and len(latest) == 2:
-            pose, ts = latest
-            if (time.time() - float(ts)) > self._max_pose_age_s:
-                return None
-        else:
-            pose = latest
+        age = self._fuser.pose_source.odom_age_s()
+        if age is not None and age > self._max_pose_age_s:
+            return None
+        pose = latest[0] if isinstance(latest, tuple) and len(latest) == 2 else latest
         return (float(pose[0]), float(pose[1]), float(pose[2]))
 
 

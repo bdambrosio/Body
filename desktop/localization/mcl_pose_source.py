@@ -89,6 +89,10 @@ class MCLPoseSource(PoseSource):
         # the relocate staleness gate instead of the Pi-stamped wall-clock
         # ``ts`` so Pi/desktop clock skew can't make a fresh scan look stale.
         self._last_scan_recv_mono = 0.0
+        # Same idea for odom: desktop monotonic receive time of the last odom
+        # update, so pose-freshness consumers (the hierarchical drive) can
+        # gate on a skew-immune age rather than the Pi-stamped odom ts.
+        self._last_odom_recv_mono = 0.0
         self._last_ranges: Optional[np.ndarray] = None
         self._last_angles: Optional[np.ndarray] = None
 
@@ -122,6 +126,10 @@ class MCLPoseSource(PoseSource):
 
     def update(self, ts: float, x: float, y: float, theta: float) -> None:
         self._counters["odom_seen"] += 1
+        # Stamp desktop receive time (monotonic) on every odom, before any
+        # early return, so odom_age_s() reflects true receipt regardless of
+        # Pi clock or seeding/teleport branches below.
+        self._last_odom_recv_mono = time.monotonic()
         self._ekf.update_odom(ts, x, y, theta)
         with self._lock:
             if not self._seeded:
@@ -191,6 +199,15 @@ class MCLPoseSource(PoseSource):
             if not self._seeded or self._last_odom is None:
                 return None
             return self._mcl.posterior_mean(), self._last_odom[0]
+
+    def odom_age_s(self) -> Optional[float]:
+        """Seconds since the last odom was received, by the desktop's own
+        monotonic clock — skew-immune (no Pi timestamp in the comparison).
+        None if no odom has arrived yet."""
+        recv = self._last_odom_recv_mono
+        if recv <= 0.0:
+            return None
+        return time.monotonic() - recv
 
     def pose_at(self, ts: float) -> Optional[Pose]:
         buf_pose = self._pose_buffer.pose_at(ts)

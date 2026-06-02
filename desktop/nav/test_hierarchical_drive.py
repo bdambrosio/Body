@@ -2,8 +2,47 @@
 import math
 import unittest
 
-from desktop.nav.hierarchical_drive import HierarchicalDrive, HierConfig, HierState
+from desktop.nav.hierarchical_drive import (
+    HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
+)
 from desktop.nav.patrol import Patrol, PatrolRunner, Waypoint
+
+
+class _FakePoseSource:
+    """Minimal pose_source: a fixed pose + a settable skew-immune odom age."""
+    def __init__(self, pose=(1.0, 2.0, 0.5), age_s=0.0):
+        self._pose = pose
+        self._age = age_s
+
+    def latest_pose(self):
+        return (self._pose, 12345.0)   # ts deliberately bogus — must be ignored
+
+    def odom_age_s(self):
+        return self._age
+
+
+class _FakeFuser:
+    def __init__(self, src):
+        self.pose_source = src
+
+
+class TestPFPoseProvider(unittest.TestCase):
+    def test_fresh_age_returns_pose(self):
+        src = _FakePoseSource(age_s=0.1)
+        p = PFPoseProvider(_FakeFuser(src), max_pose_age_s=0.75)
+        self.assertEqual(p.world_pose(), (1.0, 2.0, 0.5))
+
+    def test_stale_age_returns_none(self):
+        src = _FakePoseSource(age_s=1.5)
+        p = PFPoseProvider(_FakeFuser(src), max_pose_age_s=0.75)
+        self.assertIsNone(p.world_pose())
+
+    def test_ignores_pi_timestamp(self):
+        # Bogus Pi ts (12345.0, decades stale) must NOT make a fresh pose look
+        # stale — staleness is judged by odom_age_s only (the skew-immune fix).
+        src = _FakePoseSource(age_s=0.0)
+        p = PFPoseProvider(_FakeFuser(src), max_pose_age_s=0.75)
+        self.assertEqual(p.world_pose(), (1.0, 2.0, 0.5))
 
 N = 360
 ANGLE_MIN = -math.pi
