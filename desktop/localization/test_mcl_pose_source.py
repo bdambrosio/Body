@@ -71,6 +71,7 @@ class TestRelocateAt(unittest.TestCase):
         src._last_ranges = ranges
         src._last_angles = angles
         src._last_scan_ts = ts
+        src._last_scan_recv_mono = time.monotonic()
         return src
 
     def test_not_seeded_guard(self) -> None:

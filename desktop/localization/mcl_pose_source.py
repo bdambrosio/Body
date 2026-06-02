@@ -85,6 +85,10 @@ class MCLPoseSource(PoseSource):
         self._last_scan_mono = 0.0
         self._last_imu_obs_mono = 0.0
         self._last_scan_ts = 0.0
+        # Desktop receive time (monotonic) of the last cached scan. Used for
+        # the relocate staleness gate instead of the Pi-stamped wall-clock
+        # ``ts`` so Pi/desktop clock skew can't make a fresh scan look stale.
+        self._last_scan_recv_mono = 0.0
         self._last_ranges: Optional[np.ndarray] = None
         self._last_angles: Optional[np.ndarray] = None
 
@@ -400,10 +404,11 @@ class MCLPoseSource(PoseSource):
             ranges = self._last_ranges
             angles = self._last_angles
             scan_ts = self._last_scan_ts
+            scan_recv_mono = self._last_scan_recv_mono
             prior_tuple = self._mcl.posterior_mean()
         if ranges is None or angles is None or scan_ts <= 0:
             return {"success": False, "reason": "no_scan_cached"}
-        if time.time() - scan_ts > self._config.relocate_max_scan_age_s:
+        if time.monotonic() - scan_recv_mono > self._config.relocate_max_scan_age_s:
             return {"success": False, "reason": "scan_too_stale"}
 
         points = self._scan_points(ranges, angles)
@@ -507,10 +512,11 @@ class MCLPoseSource(PoseSource):
             ranges = self._last_ranges
             angles = self._last_angles
             scan_ts = self._last_scan_ts
+            scan_recv_mono = self._last_scan_recv_mono
             prior_tuple = self._mcl.posterior_mean()
         if ranges is None or angles is None or scan_ts <= 0:
             return {"success": False, "reason": "no_scan_cached"}
-        if time.time() - scan_ts > self._config.relocate_max_scan_age_s:
+        if time.monotonic() - scan_recv_mono > self._config.relocate_max_scan_age_s:
             return {"success": False, "reason": "scan_too_stale"}
 
         points = self._scan_points(ranges, angles)
@@ -655,6 +661,7 @@ class MCLPoseSource(PoseSource):
             if not self._seeded:
                 return
             self._last_scan_ts = scan_ts
+            self._last_scan_recv_mono = time.monotonic()
             self._last_ranges = ranges_arr
             self._last_angles = angles
 
