@@ -203,6 +203,50 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.state(), HierState.IDLE)
         self.assertGreaterEqual(io.cancels, 1)
 
+    def test_pose_loss_while_driving_suspends_and_cancels(self):
+        # Lose the pose mid-drive → SUSPENDED, Tier-3 canceled (so the Pi stops
+        # chasing the old goal), and it does NOT auto-resume when pose returns.
+        hd, io, po = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        cancels_before = io.cancels
+        po.pose = None                       # connectivity drop
+        self.assertEqual(hd.tick(0.0), HierState.SUSPENDED)
+        self.assertEqual(io.cancels, cancels_before + 1)
+        self.assertEqual(hd.block_reason(), "pose_lost")
+        # Pose comes back — must STAY suspended (no auto-lurch).
+        po.pose = (0.5, 0.0, 0.0)
+        sent_before = len(io.sent)
+        self.assertEqual(hd.tick(0.0), HierState.SUSPENDED)
+        self.assertEqual(len(io.sent), sent_before)
+
+    def test_resume_from_suspended_drives_again(self):
+        hd, io, po = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        po.pose = None
+        hd.tick(0.0)                         # → SUSPENDED
+        po.pose = (0.5, 0.0, 0.0)            # link restored
+        self.assertTrue(hd.request_resume())
+        self.assertEqual(hd.state(), HierState.ALIGNING)
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # drives again
+
+    def test_resume_noop_when_not_suspended(self):
+        hd, io, _ = self._build()
+        self._drive_to_sending(hd)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        self.assertFalse(hd.request_resume())
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+
+    def test_select_pose_loss_suspends(self):
+        # Pose lost at the SELECT step (between sub-goals) also suspends.
+        hd, io, po = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="ARRIVED")
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        po.pose = None
+        self.assertEqual(hd.tick(0.0), HierState.SUSPENDED)
+
 
 if __name__ == "__main__":
     unittest.main()

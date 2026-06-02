@@ -24,6 +24,7 @@ from __future__ import annotations
 import enum
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Tuple
 
@@ -57,16 +58,28 @@ class PFPoseProvider:
 
     Replace with an LPR-backed provider (or one that re-anchors the PF to an
     LPR fix) when LPR lands — the orchestrator only knows ``world_pose()``.
+
+    A *stale* pose is reported as None (no pose). ``latest_pose()`` never
+    expires its estimate, so on a connectivity drop the PF keeps returning a
+    frozen pose; without this the drive would keep steering on it. The age
+    is odom-ts vs wall-clock — fail-safe under the usual skew (a lagging Pi
+    clock inflates the age → suspends sooner); relies on Pi/desktop NTP sync.
     """
 
-    def __init__(self, fuser: Any):
+    def __init__(self, fuser: Any, max_pose_age_s: float = 0.75):
         self._fuser = fuser
+        self._max_pose_age_s = max_pose_age_s
 
     def world_pose(self) -> Optional[Pose]:
         latest = self._fuser.pose_source.latest_pose()
         if latest is None:
             return None
-        pose = latest[0] if isinstance(latest, tuple) and len(latest) == 2 else latest
+        if isinstance(latest, tuple) and len(latest) == 2:
+            pose, ts = latest
+            if (time.time() - float(ts)) > self._max_pose_age_s:
+                return None
+        else:
+            pose = latest
         return (float(pose[0]), float(pose[1]), float(pose[2]))
 
 
@@ -78,6 +91,11 @@ class HierState(enum.Enum):
     ADVANCE_WAYPOINT = "ADVANCE_WAYPOINT"
     ARRIVED = "ARRIVED"
     BLOCKED = "BLOCKED"
+    # Pose/telemetry went stale mid-drive (typically a connectivity drop).
+    # Tier-3 is canceled and the drive HOLDS here — it does NOT auto-resume
+    # when the pose returns. The operator must call request_resume() so the
+    # bot can't silently lurch back into motion on an intermittent reconnect.
+    SUSPENDED = "SUSPENDED"
     FAILED = "FAILED"
 
 
@@ -147,6 +165,34 @@ class HierarchicalDrive:
         self._subgoal_body = None
         self._to(HierState.IDLE)
 
+    def _enter_suspended(self, reason: str) -> None:
+        # Pose/telemetry lost while driving. Revoke the in-flight goto so the
+        # Pi isn't still chasing the old goal when the link returns, then hold
+        # in SUSPENDED until the operator explicitly resumes.
+        logger.warning("hier: suspended (%s) — holding for operator resume", reason)
+        self._io.cancel()
+        self._subgoal_body = None
+        self._block_reason = reason
+        self._to(HierState.SUSPENDED)
+
+    def request_resume(self) -> bool:
+        """Operator-initiated resume after a SUSPENDED (connectivity) hold.
+
+        Returns True if a resume was armed. Re-acquires via ALIGNING, which
+        only advances to driving once a fresh pose is available again — so a
+        resume clicked while still offline simply waits rather than lurching.
+        """
+        if self._state is not HierState.SUSPENDED:
+            return False
+        logger.info("hier: operator resume from SUSPENDED")
+        self._blocked_repicks = 0
+        self._block_reason = None
+        self._to(HierState.ALIGNING)
+        return True
+
+    def is_suspended(self) -> bool:
+        return self._state is HierState.SUSPENDED
+
     def _enter_blocked(self, reason: str) -> None:
         # Count *consecutive* blocks (only reset by real progress — a sub-goal
         # done or a waypoint advance), NOT by a successful re-send. Otherwise a
@@ -193,7 +239,8 @@ class HierarchicalDrive:
             self._tick_advance()
         elif s == HierState.BLOCKED:
             self._tick_blocked()
-        # IDLE / ARRIVED / FAILED are terminal/inert.
+        # IDLE / ARRIVED / FAILED are terminal/inert. SUSPENDED is inert too —
+        # it only leaves via request_resume() (operator) or stop().
         return self._state
 
     def _tick_aligning(self) -> None:
@@ -204,7 +251,8 @@ class HierarchicalDrive:
     def _tick_select(self) -> None:
         pose = self._pose.world_pose()
         if pose is None:
-            self._to(HierState.ALIGNING)
+            # Lost the pose after we were already driving — gate the resume.
+            self._enter_suspended("pose_lost")
             return
         wp = self._runner.current_target()
         if wp is None:
@@ -259,6 +307,11 @@ class HierarchicalDrive:
 
     def _tick_driving(self) -> None:
         pose = self._pose.world_pose()
+        if pose is None:
+            # Pose went stale while driving (typically a connectivity drop) —
+            # cancel Tier-3 and hold for an explicit operator resume.
+            self._enter_suspended("pose_lost")
+            return
         # Waypoint reached (PF-judged) supersedes any sub-goal progress.
         if pose is not None and self._waypoint is not None:
             if _dist(pose, self._waypoint) <= self._arrival_tol():

@@ -222,6 +222,16 @@ class NavMainWindow(QMainWindow):
         self._cancel_act.triggered.connect(self._on_cancel)
         self._map_toolbar.addAction(self._cancel_act)
 
+        self._resume_act = QAction("Resume", self)
+        self._resume_act.setToolTip(
+            "Resume a hierarchical drive that SUSPENDED itself on a "
+            "connectivity drop (stale pose). The bot does NOT restart on its "
+            "own after a reconnect — click this to re-acquire and continue."
+        )
+        self._resume_act.setEnabled(False)
+        self._resume_act.triggered.connect(self._on_resume_hier)
+        self._map_toolbar.addAction(self._resume_act)
+
         self._hier_act = QAction("Hierarchical drive", self)
         self._hier_act.setCheckable(True)
         self._hier_act.setChecked(False)
@@ -922,14 +932,19 @@ class NavMainWindow(QMainWindow):
             )
             self._go_act.setEnabled(not running)
             self._cancel_act.setEnabled(running)
+            suspended = hd is not None and hd.is_suspended()
+            self._resume_act.setEnabled(suspended)
             if hd is not None:
                 br = hd.block_reason()
                 txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
                 self._follow_lbl.setText(txt)
                 self._follow_lbl.setStyleSheet(
+                    "color: #fb4;" if suspended else
                     "color: #e8a;" if hd.state() in (HierState.BLOCKED, HierState.FAILED)
                     else "color: #8cf;"
                 )
+        else:
+            self._resume_act.setEnabled(False)
 
         # Session id is fixed-8; pose-source label can be "odom" or
         # "imu+scan_match" — clamp so the label width is bounded.
@@ -2110,6 +2125,12 @@ class NavMainWindow(QMainWindow):
         )
         self._shared_view.set_patrol_active_wp_index(0)
         self._hier_drive.start()
+
+    def _on_resume_hier(self) -> None:
+        """Operator resume of a SUSPENDED (connectivity-paused) hier drive."""
+        hd = self._hier_drive
+        if hd is not None and hd.is_suspended():
+            hd.request_resume()
 
     def _stop_hier_drive(self) -> None:
         if self._hier_drive is not None:
