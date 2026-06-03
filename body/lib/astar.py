@@ -102,6 +102,76 @@ def astar_8c(
     return None, expansions, "no path"
 
 
+def astar_toward(
+    *,
+    cost: np.ndarray,
+    lethal: np.ndarray,
+    start: Cell,
+    goal: Cell,
+    cost_per_unit: float = 0.10,
+    h_weight: float = 1.0,
+    max_expansions: int = 50_000,
+) -> Tuple[Optional[List[Cell]], int, str]:
+    """Like ``astar_8c``, but goal-unreachable is not failure: return the path
+    to the **reachable** cell closest (octile) to ``goal``. This is what makes
+    the Tier-3 sub-goal reachable by construction — the robot always heads as
+    far toward the requested point as the live free space allows (rounding
+    corners), and only reports "boxed in" when no reachable cell is any closer
+    than the start.
+
+    Returns (cells_path, n_expansions, msg) with msg:
+      * "ok"       — reached the goal exactly,
+      * "frontier" — best-effort path to the closest reachable cell,
+      * "no path"  — nothing reachable makes progress (path is just [start])."""
+    nx, ny = cost.shape
+    if start == goal:
+        return [start], 0, "ok"
+    g: Dict[Cell, float] = {start: 0.0}
+    parents: Dict[Cell, Cell] = {}
+    open_heap: List[Tuple[float, int, Cell]] = []
+    counter = 0
+    heapq.heappush(open_heap, (_octile(start, goal) * h_weight, counter, start))
+    closed: Dict[Cell, bool] = {}
+    expansions = 0
+    best_cell: Cell = start
+    best_h: float = _octile(start, goal)
+    while open_heap:
+        _f, _cnt, cur = heapq.heappop(open_heap)
+        if cur in closed:
+            continue
+        closed[cur] = True
+        h_cur = _octile(cur, goal)
+        if h_cur < best_h:
+            best_h, best_cell = h_cur, cur
+        if cur == goal:
+            return _reconstruct(parents, cur), expansions, "ok"
+        expansions += 1
+        if expansions > max_expansions:
+            break
+        ci, cj = cur
+        cur_g = g[cur]
+        for di, dj, base in _NEIGHBORS_8:
+            ni, nj = ci + di, cj + dj
+            if not (0 <= ni < nx and 0 <= nj < ny):
+                continue
+            if lethal[ni, nj] or (ni, nj) in closed:
+                continue
+            step = base + cost_per_unit * float(cost[ni, nj])
+            tentative = cur_g + step
+            prev = g.get((ni, nj))
+            if prev is not None and tentative >= prev:
+                continue
+            g[(ni, nj)] = tentative
+            parents[(ni, nj)] = cur
+            counter += 1
+            heapq.heappush(
+                open_heap,
+                (tentative + h_weight * _octile((ni, nj), goal), counter, (ni, nj)))
+    if best_cell == start:
+        return [start], expansions, "no path"
+    return _reconstruct(parents, best_cell), expansions, "frontier"
+
+
 def nearest_non_lethal(
     lethal: np.ndarray, i: int, j: int, *, radius: int,
 ) -> Optional[Cell]:

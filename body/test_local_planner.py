@@ -46,14 +46,28 @@ class TestPlanLocal(unittest.TestCase):
         # the path must bow off the x-axis to get around the wall
         self.assertGreater(max(abs(y) for _x, y in p.path_body), 0.3)
 
-    def test_sealed_corridor_no_path(self):
+    def test_sealed_corridor_heads_to_wall_not_through(self):
+        # Fully sealed: A* can't reach the goal, so plan_local returns a
+        # best-effort FRONTIER path to the near side (reachable by construction,
+        # Invariant I3). It must NOT cross the wall; the runtime no-progress
+        # watchdog turns a non-advancing frontier into BLOCKED.
         grid = _clear()
         for x in np.arange(0.5, 0.71, RES / 2):  # thick band, spans whole grid
             for y in np.arange(-HALF, HALF + RES, RES / 2):
                 _block(grid, float(x), float(y))
         p = plan_local(grid, META, (1.2, 0.0), _cfg())
+        self.assertTrue(p.ok)
+        self.assertEqual(p.reason, "frontier")
+        self.assertLess(max(x for x, _y in p.path_body), 0.5)  # stays near-side
+
+    def test_boxed_in_fails(self):
+        # Robot walled in on all sides → no reachable cell beats the start.
+        grid = _clear()
+        for ang in np.arange(0.0, 2 * np.pi, 0.1):
+            _block(grid, 0.16 * np.cos(ang), 0.16 * np.sin(ang))
+        p = plan_local(grid, META, (1.2, 0.0), _cfg())
         self.assertFalse(p.ok)
-        self.assertIn(p.reason, ("no_path", "goal_unreachable"))
+        self.assertEqual(p.reason, "boxed_in")
 
     def test_goal_in_obstacle_snapped(self):
         grid = _clear()

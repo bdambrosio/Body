@@ -27,8 +27,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Tuple
 
-from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
-from body.lib.tier2_subgoal import Tier2Config, bearing_to_waypoint, plan_tier2
+from body.lib.tier2_subgoal import Tier2Config, bearing_to_waypoint
 from desktop.nav.patrol import PatrolRunner
 
 logger = logging.getLogger(__name__)
@@ -110,7 +109,8 @@ class HierConfig:
     repick_hysteresis_rad: float = 0.35   # re-pick mid-leg if the bearing drifts past this
     max_blocked_repicks: int = 3          # retries before BLOCKED becomes a pause
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
-    raster_cfg: ScanRasterConfig = field(default_factory=ScanRasterConfig)
+    # Only horizon_m is used now (the cap on the projected sub-goal distance);
+    # Tier-2 no longer rasterizes or does clearance — Tier-3 owns that.
     tier2_cfg: Tier2Config = field(default_factory=Tier2Config)
 
 
@@ -257,28 +257,21 @@ class HierarchicalDrive:
             self._to(HierState.FAILED)
             return
         self._waypoint = (wp.x_m, wp.y_m)
-        if _dist(pose, self._waypoint) <= self._arrival_tol():
+        wp_dist = _dist(pose, self._waypoint)
+        if wp_dist <= self._arrival_tol():
             self._to(HierState.ADVANCE_WAYPOINT)
             return
 
-        grid_meta = self._raster()
-        if grid_meta is None:
-            self._enter_blocked("no_scan")
-            return
-        grid, meta = grid_meta
-        wp_dist = _dist(pose, self._waypoint)
+        # Tier-2 = direction only (contract I3): project the waypoint to a
+        # body-frame point clamped to the local horizon. NO clearance/geometry
+        # here — Tier-3's footprint A* selects the reachable point toward it and
+        # routes (rounding corners), so the goal is reachable by construction.
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
-        # Tier-2 step (shared with the debug console): furthest free point
-        # along the bearing, capped at the waypoint — never aim past it.
-        r = plan_tier2(grid, meta, bearing, wp_dist, self._cfg.tier2_cfg)
-        if not r.ok:
-            logger.info("hier: tier2 no point (%s) bearing=%.2f wp_dist=%.2f",
-                        r.reason, bearing, wp_dist)
-            self._enter_blocked(r.reason)
-            return
+        dist = min(wp_dist, self._cfg.tier2_cfg.horizon_m)
+        bx, by = dist * math.cos(bearing), dist * math.sin(bearing)
 
         cid = self._io.send_goto_from_body(
-            r.body_xy[0], r.body_xy[1],
+            bx, by,
             arrival_tol_m=self._cfg.subgoal_arrival_tol_m,
             v_max=self._cfg.sub_v_max,
         )
@@ -287,20 +280,13 @@ class HierarchicalDrive:
             return
         self._cmd_id = cid
         self._sent_bearing = bearing
-        self._subgoal_body = r.body_xy
+        self._subgoal_body = (bx, by)
         self._block_reason = None
-        # Where the robot *thinks* the waypoint is relative to its own nose
-        # (+x fwd, +y left). Compare against where the obstacle/clear space
-        # actually is to tell a bad world->body bearing from a real obstacle.
-        dx, dy = wp.x_m - pose[0], wp.y_m - pose[1]
-        cw, sw = math.cos(-pose[2]), math.sin(-pose[2])
-        wp_bx, wp_by = dx * cw - dy * sw, dx * sw + dy * cw
         logger.info(
             "hier: goto cmd=%d pose=(%.2f,%.2f,%.0f°) wp=(%.2f,%.2f) "
-            "wp_body=(%.2f,%.2f) bearing=%.0f° free=%.2f sub=(%.2f,%.2f)",
+            "bearing=%.0f° dist=%.2f sub=(%.2f,%.2f)",
             cid, pose[0], pose[1], math.degrees(pose[2]), wp.x_m, wp.y_m,
-            wp_bx, wp_by, math.degrees(bearing), r.free_dist_m,
-            r.body_xy[0], r.body_xy[1])
+            math.degrees(bearing), dist, bx, by)
         self._to(HierState.DRIVING_SUBGOAL)
 
     def _tick_driving(self) -> None:
@@ -364,15 +350,3 @@ class HierarchicalDrive:
         if self._blocked_repicks <= self._cfg.max_blocked_repicks:
             self._to(HierState.SELECT_SUBGOAL)
 
-    # ── Helpers ──────────────────────────────────────────────────────
-
-    def _raster(self):
-        scan = self._io.latest_scan()
-        if not scan:
-            return None
-        return rasterize_scan(
-            scan.get("ranges"),
-            float(scan.get("angle_min", 0.0)),
-            float(scan.get("angle_increment", 0.0)),
-            self._cfg.raster_cfg,
-        )

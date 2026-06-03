@@ -3,7 +3,12 @@ import unittest
 
 import numpy as np
 
-from body.lib.astar import astar_8c, nearest_non_lethal
+from body.lib.astar import astar_8c, astar_toward, nearest_non_lethal
+
+
+def _octile_d(a, b):
+    di, dj = abs(a[0] - b[0]), abs(a[1] - b[1])
+    return (di + dj) + (2 ** 0.5 - 2) * min(di, dj)
 
 
 def _grids(n=20):
@@ -27,6 +32,33 @@ class TestAStar(unittest.TestCase):
         self.assertIsNotNone(cells)
         # Path must pass through the gap rows (i >= 15) at column 6.
         self.assertTrue(any(c[1] == 6 and c[0] >= 15 for c in cells))
+
+
+class TestAStarToward(unittest.TestCase):
+    def test_reachable_goal_reaches_it(self):
+        cost, lethal = _grids()
+        cells, _n, msg = astar_toward(cost=cost, lethal=lethal, start=(2, 2), goal=(2, 10))
+        self.assertEqual(msg, "ok")
+        self.assertEqual(cells[-1], (2, 10))
+
+    def test_unreachable_goal_heads_to_closest_reachable(self):
+        cost, lethal = _grids()
+        lethal[:, 6] = True            # full wall — goal at col 12 is sealed off
+        goal = (2, 12)
+        cells, _n, msg = astar_toward(cost=cost, lethal=lethal, start=(2, 2), goal=goal)
+        self.assertEqual(msg, "frontier")
+        self.assertEqual(cells[0], (2, 2))
+        # Endpoint is reachable (col < 6) and closer to the goal than the start.
+        self.assertLess(cells[-1][1], 6)
+        self.assertLess(_octile_d(cells[-1], goal), _octile_d((2, 2), goal))
+
+    def test_boxed_in_returns_start_only(self):
+        cost, lethal = _grids()
+        lethal[1:4, 1:4] = True
+        lethal[2, 2] = False           # robot's cell free, walled on all sides
+        cells, _n, msg = astar_toward(cost=cost, lethal=lethal, start=(2, 2), goal=(2, 10))
+        self.assertEqual(msg, "no path")
+        self.assertEqual(cells, [(2, 2)])
 
     def test_no_path_when_sealed(self):
         cost, lethal = _grids()

@@ -216,17 +216,21 @@ class TestHierarchicalDrive(unittest.TestCase):
         io.set_status(cmd_id=99, state="ARRIVED")   # not our cmd_id
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
 
-    def test_no_scan_blocks_then_pauses(self):
-        # No scan ever → SELECT blocks; rotate_repick retries to the cap, then holds.
+    def test_select_is_projection_only_no_scan_dependency(self):
+        # Tier-2 is direction-only now: SELECT projects the waypoint and sends a
+        # goto without consulting the scan (no_scan is Tier-3's BLOCKED to
+        # report, handled in DRIVING). With no scan it still sends + drives.
         io = FakeDriveIO(scan=None)
-        hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0, 0, 0)),
-                               io, HierConfig(max_blocked_repicks=2))
+        hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io)
         hd.start()
-        hd.tick(0.0)                  # ALIGNING → SELECT
-        states = [hd.tick(0.0) for _ in range(8)]
-        self.assertEqual(states[-1], HierState.BLOCKED)
-        self.assertEqual(io.sent, [])
-        self.assertEqual(hd.block_reason(), "no_scan")
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 1)
+        # Sub-goal is the waypoint direction clamped to the horizon (2 m), not
+        # the 5 m waypoint.
+        bx, by, _tol, _v = io.sent[0]
+        self.assertAlmostEqual(bx, 2.0, places=6)
+        self.assertAlmostEqual(by, 0.0, places=6)
 
     def test_bearing_hysteresis_repicks(self):
         hd, io, po = self._build(points=((5.0, 0.0),), repick_hysteresis_rad=0.2)

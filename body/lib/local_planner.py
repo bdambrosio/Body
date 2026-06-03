@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from body.lib.astar import astar_8c, nearest_non_lethal
+from body.lib.astar import astar_toward, nearest_non_lethal
 from body.lib.local_costmap import (
     LocalCostmap, LocalCostmapConfig, build_local_costmap, dilate_bool,
 )
@@ -102,23 +102,26 @@ def plan_local(
                 return _fail("goal_unreachable")
         gi, gj = relaxed
 
-    cells, n_exp, msg = astar_8c(
+    # Reachable-by-construction (Invariant I3): if the requested goal isn't
+    # reachable, head to the reachable cell closest to it (round the corner)
+    # rather than reporting no-path. Only a genuine box-in ("no path") fails.
+    cells, n_exp, msg = astar_toward(
         cost=cm.cost, lethal=lethal, start=(si, sj), goal=(gi, gj),
         cost_per_unit=cfg.cost_per_unit, h_weight=cfg.heuristic_weight,
         max_expansions=cfg.max_expansions)
     elapsed = (time.monotonic() - t0) * 1000.0
-    if cells is None:
-        return LocalPlan(False, [], None,
-                         "max_expansions" if "max" in msg else "no_path",
+    if cells is None or len(cells) <= 1:
+        return LocalPlan(False, [], None, "boxed_in",
                          n_expansions=n_exp, elapsed_ms=elapsed)
 
+    end = cells[-1]
     path = _downsample(cells, cfg.downsample_step_cells)
     path_body = [_cell_to_world(c, res, ox, oy) for c in path]
     # Anchor the path at the robot so the follower's lookahead starts there.
     if path_body and math.hypot(path_body[0][0], path_body[0][1]) > res:
         path_body = [(0.0, 0.0)] + path_body
-    return LocalPlan(True, path_body, _cell_to_world((gi, gj), res, ox, oy),
-                     "ok", n_expansions=n_exp, elapsed_ms=elapsed)
+    return LocalPlan(True, path_body, _cell_to_world(end, res, ox, oy),
+                     msg, n_expansions=n_exp, elapsed_ms=elapsed)
 
 
 def _downsample(cells: List[Cell], step: int) -> List[Cell]:
