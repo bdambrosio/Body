@@ -94,6 +94,8 @@ class WorldMapView(QWidget):
         self._extent = None              # (x0, y0, x1, y1) world metres
         self._pose = None
         self._wp = None
+        self._route = None               # full Tier-1 route [[x,y],...]
+        self._wp_index = 0
 
     def set_map(self, drive, meta) -> None:
         g = np.asarray(drive)
@@ -119,9 +121,11 @@ class WorldMapView(QWidget):
                         ox + (imax + 1) * res, oy + (jmax + 1) * res)
         self.update()
 
-    def update_overlay(self, pose, wp) -> None:
+    def update_overlay(self, pose, wp, route=None, wp_index=0) -> None:
         self._pose = pose
         self._wp = wp
+        self._route = route
+        self._wp_index = int(wp_index)
         self.update()
 
     def _fit(self):
@@ -156,6 +160,21 @@ class WorldMapView(QWidget):
         ppm, ox_px, oy_px = fit
         x0, y0, x1, y1 = self._extent
         p.drawImage(QRectF(ox_px, oy_px, (x1 - x0) * ppm, (y1 - y0) * ppm), self._img)
+        # Full Tier-1 route: visited segments dim, upcoming bright; a dot per
+        # sub-waypoint. (Tier-1 builds this whole route; Tier-2 only gets the
+        # current waypoint, drawn as the yellow crosshair below.)
+        if self._route and len(self._route) >= 2:
+            pts = [QPointF(*self._w2p(fit, w[0], w[1])) for w in self._route]
+            for i, (a, b) in enumerate(zip(pts, pts[1:])):
+                upcoming = i + 1 >= self._wp_index
+                p.setPen(QPen(QColor(90, 200, 120) if upcoming
+                              else QColor(90, 90, 90), 1.4))
+                p.drawLine(a, b)
+            for i, pt in enumerate(pts):
+                p.setBrush(QColor(120, 210, 140) if i >= self._wp_index
+                           else QColor(110, 110, 110))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(pt, 2.2, 2.2)
         if self._pose is None:
             return
         rx, ry = self._w2p(fit, self._pose[0], self._pose[1])
@@ -230,8 +249,10 @@ class HandoffPanel(QWidget):
         if self._world:                       # Tier-1 world map (global layer)
             pose = rec.get("pose")
             wp = rec.get("wp")
-            self._view.update_overlay(tuple(pose) if pose else None,
-                                      tuple(wp) if wp else None)
+            self._view.update_overlay(
+                tuple(pose) if pose else None,
+                tuple(wp) if wp else None,
+                route=rec.get("route"), wp_index=rec.get("wp_index", 0))
             self._readout.setText(format_record(rec))
             return
         grid, meta = grid_and_meta(rec)

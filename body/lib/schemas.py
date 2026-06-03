@@ -459,10 +459,13 @@ def _grid_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
 def handoff_t1(
     *, ts: float | None = None, pose, wp, wp_index: int, wp_total: int,
     lap_index: int = 0, terminal: bool, arrival_tol_m: float,
-    bearing_rad: float, wp_dist_m: float,
+    bearing_rad: float, wp_dist_m: float, route=None,
 ) -> dict[str, Any]:
-    """HO-1 Tier-1 → Tier-2: the chosen world-frame waypoint + bearing."""
-    return {
+    """HO-1 Tier-1 → Tier-2: the chosen world-frame waypoint + bearing, plus the
+    full dense Tier-1 route (all expanded sub-waypoints) for the global display
+    — Tier-1 builds the whole route but only hands ``wp`` (index ``wp_index``)
+    down each leg."""
+    msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
         "tier": 1,
         "pose": [float(pose[0]), float(pose[1]), float(pose[2])],
@@ -472,6 +475,9 @@ def handoff_t1(
         "arrival_tol_m": float(arrival_tol_m),
         "bearing_rad": float(bearing_rad), "wp_dist_m": float(wp_dist_m),
     }
+    if route is not None:
+        msg["route"] = [[float(x), float(y)] for x, y in route]
+    return msg
 
 
 def handoff_t2(

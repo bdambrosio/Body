@@ -311,14 +311,17 @@ class HierarchicalDrive:
 
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
 
-        # HO-1 Tier-1 → Tier-2: the chosen world-frame waypoint + bearing.
+        # HO-1 Tier-1 → Tier-2: the chosen world-frame waypoint + bearing, plus
+        # the FULL dense Tier-1 route (Tier-1 builds the whole route; only this
+        # one waypoint is handed to Tier-2 each leg).
         self._sink.record(1, schemas.handoff_t1(
             pose=pose, wp=(wp.x_m, wp.y_m),
             wp_index=self._runner.wp_index, wp_total=self._runner.n,
             lap_index=getattr(self._runner, "lap_index", 0),
             terminal=self._runner.is_terminal_leg(),
             arrival_tol_m=self._arrival_tol(),
-            bearing_rad=bearing, wp_dist_m=wp_dist))
+            bearing_rad=bearing, wp_dist_m=wp_dist,
+            route=[(w.x_m, w.y_m) for w in self._runner.patrol.waypoints]))
         if self._hold(1):
             return
 
