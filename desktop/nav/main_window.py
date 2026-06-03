@@ -70,8 +70,25 @@ from .safety_toolbar import SafetyToolbar
 from .teleop_panels import TeleopPanels, build_chassis_snapshot
 
 from body.lib.local_drive_core import body_to_odom
+from desktop.localization.checkpoint_localizer import (
+    CheckpointLocalizer,
+    CheckpointPoseProvider,
+)
+from desktop.localization.checkpoint_matcher import (
+    CheckpointMatchConfig,
+    CheckpointMatcher,
+)
+from desktop.localization.checkpoints import checkpoints_from_metadata
 from desktop.nav.slam.scan_matcher import lidar_scan_to_xy
 from desktop.pi_drive.drive_client import DriveClient
+
+# Tight, odom-primed search window for the runtime checkpoint re-anchor (the
+# drift between throttled re-anchors is small, so the window can be small →
+# fast enough to run inline). Tunable.
+_RUNTIME_CP_CFG = CheckpointMatchConfig(
+    xy_half_m=0.15, xy_step_m=0.06,
+    theta_half_rad=math.radians(9.0), theta_step_rad=math.radians(3.0),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +133,8 @@ class NavMainWindow(QMainWindow):
         fuser_config: LocalizationConfig,
         chassis: StubController,
         chassis_config: StubConfig,
+        *,
+        use_checkpoint_pose: bool = False,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Body Nav")
@@ -123,6 +142,11 @@ class NavMainWindow(QMainWindow):
         self.fuser_config = fuser_config
         self.chassis = chassis
         self.chassis_config = chassis_config
+        # EXPERIMENTAL: hierarchical drive localizes via odom dead-reckon +
+        # checkpoint re-anchor instead of the PF posterior. Off by default;
+        # read at each Go. The active localizer is kept for a status readout.
+        self._use_checkpoint_pose: bool = bool(use_checkpoint_pose)
+        self._cp_localizer: Optional[CheckpointLocalizer] = None
 
         # Hierarchical drive (Tier-1/Tier-2/Tier-3) is the production drive
         # path — Go/Stop always route through it. The DriveClient (own zenoh
@@ -590,6 +614,17 @@ class NavMainWindow(QMainWindow):
         )
         view_menu.addAction(self._scan_overlay_action)
 
+        self._cp_pose_action = QAction("Checkpoint pose (experimental)", self)
+        self._cp_pose_action.setCheckable(True)
+        self._cp_pose_action.setChecked(self._use_checkpoint_pose)
+        self._cp_pose_action.setToolTip(
+            "Hierarchical drive localizes via odom dead-reckon + checkpoint "
+            "re-anchor instead of the PF posterior. Applied at the next Go; "
+            "needs checkpoints (Recognize) in the map."
+        )
+        self._cp_pose_action.toggled.connect(self._on_toggle_checkpoint_pose)
+        view_menu.addAction(self._cp_pose_action)
+
     def _build_timer(self) -> None:
         period_ms = int(1000.0 / max(1.0, self.fuser_config.ui_redraw_hz))
         self._redraw_timer = QTimer(self)
@@ -987,6 +1022,12 @@ class NavMainWindow(QMainWindow):
             if hd is not None:
                 br = hd.block_reason()
                 txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
+                # Checkpoint-pose: show the last re-anchor (cp id + inlier) so
+                # the operator can see it locking onto checkpoints while driving.
+                if self._cp_localizer is not None:
+                    lm = self._cp_localizer.last_match
+                    txt += (f"  ⚓{lm.checkpoint_id} {lm.inlier_frac:.2f}"
+                            if lm is not None else "  ⚓cp?")
                 self._follow_lbl.setText(txt)
                 self._follow_lbl.setStyleSheet(
                     "color: #fb4;" if suspended else
@@ -2162,12 +2203,75 @@ class NavMainWindow(QMainWindow):
         logger.info("hier: expanded %d waypoints -> %d sub-waypoints",
                     len(patrol.waypoints), len(exec_patrol.waypoints))
         runner = PatrolRunner(exec_patrol)
-        provider = PFPoseProvider(self.fuser)
+        provider = self._make_pose_provider()
         self._hier_drive = HierarchicalDrive(
             runner, provider, self._drive_client, HierConfig(),
         )
         self._shared_view.set_patrol_active_wp_index(0)
         self._hier_drive.start()
+
+    # ── Pose provider (PF posterior, or checkpoint re-anchor) ────────
+
+    def _make_pose_provider(self):
+        """The PoseProvider the hierarchical drive runs on. Default: the PF
+        posterior (`PFPoseProvider`). With checkpoint-pose enabled (and the
+        map has checkpoints): odom dead-reckon + checkpoint re-anchor."""
+        self._cp_localizer = None
+        if not self._use_checkpoint_pose:
+            return PFPoseProvider(self.fuser)
+        rm = self.fuser.reference_map
+        cps = checkpoints_from_metadata(rm.metadata)
+        if not cps:
+            QMessageBox.warning(
+                self, "Checkpoint pose",
+                "No checkpoints in this map — using the PF pose instead.\n"
+                "Recognize some spots in the map editor first.")
+            return PFPoseProvider(self.fuser)
+        occ = rm.occupancy_log_odds > 0.0
+        matcher = CheckpointMatcher(
+            occ, rm.origin_x_m, rm.origin_y_m, rm.resolution_m, cps,
+            _RUNTIME_CP_CFG)
+        self._cp_localizer = CheckpointLocalizer(matcher, reanchor_min_interval_s=0.5)
+        logger.info("hier: checkpoint-pose enabled (%d checkpoints)", len(cps))
+        return CheckpointPoseProvider(
+            self._cp_localizer,
+            odom_fn=self._cp_odom,
+            scan_fn=self._cp_scan,
+            seed_fn=self._cp_seed,
+            age_fn=self.fuser.pose_source.odom_age_s,
+        )
+
+    def _cp_odom(self):
+        return self._drive_client.odom_pose() if self._drive_client else None
+
+    def _cp_seed(self):
+        latest = self.fuser.pose_source.latest_pose()
+        return latest[0] if latest is not None else None
+
+    def _cp_scan(self):
+        if self._drive_client is None:
+            return None
+        scan = self._drive_client.latest_scan()
+        if not scan:
+            return None
+        ranges = scan.get("ranges")
+        if not isinstance(ranges, list) or not ranges:
+            return None
+        amin = float(scan.get("angle_min", 0.0))
+        ainc = float(scan.get("angle_increment", 0.0))
+        if ainc == 0.0:
+            return None
+        n = len(ranges)
+        angles = amin + np.arange(n, dtype=np.float64) * ainc
+        r = np.asarray(
+            [v if isinstance(v, (int, float)) else np.nan for v in ranges],
+            dtype=np.float64)
+        return angles, r
+
+    def _on_toggle_checkpoint_pose(self, on: bool) -> None:
+        """Flip the pose source for the *next* Go (a running drive keeps its
+        provider until restarted)."""
+        self._use_checkpoint_pose = bool(on)
 
     def _on_resume_hier(self) -> None:
         """Operator resume of a SUSPENDED (connectivity-paused) hier drive."""
@@ -2179,6 +2283,7 @@ class NavMainWindow(QMainWindow):
         if self._hier_drive is not None:
             self._hier_drive.stop()
             self._hier_drive = None
+        self._cp_localizer = None
         self._shared_view.set_lookahead(None)
         self._shared_view.set_planned_path([])   # clear the routed-path preview
         self._cameras.set_lidar_overlay(None, None)
@@ -2483,8 +2588,11 @@ def run_app(
     fuser_config: LocalizationConfig,
     chassis: StubController,
     chassis_config: StubConfig,
+    *,
+    use_checkpoint_pose: bool = False,
 ) -> int:
     app = QApplication.instance() or QApplication([])
-    win = NavMainWindow(fuser, fuser_config, chassis, chassis_config)
+    win = NavMainWindow(fuser, fuser_config, chassis, chassis_config,
+                        use_checkpoint_pose=use_checkpoint_pose)
     win.show()
     return app.exec()

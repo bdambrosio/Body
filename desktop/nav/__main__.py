@@ -98,6 +98,13 @@ def _parse_args(argv):
         "--no-autoconnect", action="store_true",
         help="Wait for Connect in the UI.",
     )
+    p.add_argument(
+        "--checkpoint-pose", action="store_true",
+        help="EXPERIMENTAL: hierarchical drive localizes via odom dead-reckon "
+             "+ checkpoint re-anchor (CheckpointPoseProvider) instead of the PF "
+             "posterior. Needs checkpoints in the map (Recognize). Toggleable "
+             "live in View ▸ Checkpoint pose.",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -184,7 +191,8 @@ def main(argv=None) -> int:
         ).start()
 
     try:
-        return run_app(localizer, loc_config, chassis, chassis_config)
+        return run_app(localizer, loc_config, chassis, chassis_config,
+                       use_checkpoint_pose=args.checkpoint_pose)
     finally:
         try:
             chassis.shutdown()
