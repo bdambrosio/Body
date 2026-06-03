@@ -251,6 +251,12 @@ class HierarchicalDrive:
     def is_suspended(self) -> bool:
         return self._state is HierState.SUSPENDED
 
+    def held_tier(self) -> Optional[int]:
+        """The handoff tier we're paused at for an armed inspector breakpoint
+        (HO-1/HO-2), or None. (HO-3 holds on the Pi; detect that via the drive
+        status mode == 'held'.)"""
+        return self._held_tier
+
     def _enter_blocked(self, reason: str) -> None:
         # Count *consecutive* blocks (only reset by real progress — a sub-goal
         # done or a waypoint advance), NOT by a successful re-send. Otherwise a

@@ -1036,20 +1036,34 @@ class NavMainWindow(QMainWindow):
             suspended = hd is not None and hd.is_suspended()
             self._resume_act.setEnabled(suspended)
             if hd is not None:
-                br = hd.block_reason()
-                txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
-                # Checkpoint-pose: show the last re-anchor (cp id + inlier) so
-                # the operator can see it locking onto checkpoints while driving.
-                if self._cp_localizer is not None:
-                    lm = self._cp_localizer.last_match
-                    txt += (f"  ⚓{lm.checkpoint_id} {lm.inlier_frac:.2f}"
-                            if lm is not None else "  ⚓cp?")
-                self._follow_lbl.setText(txt)
-                self._follow_lbl.setStyleSheet(
-                    "color: #fb4;" if suspended else
-                    "color: #e8a;" if hd.state() in (HierState.BLOCKED, HierState.FAILED)
-                    else "color: #8cf;"
-                )
+                # Held at an inspector breakpoint reads as "running" (the mission
+                # IS active, just paused) — make that obvious so a paused drive
+                # isn't mistaken for a stopped/finished one. HO-1/HO-2 hold on
+                # the desktop (held_tier); HO-3 holds on the Pi (status mode).
+                held = hd.held_tier()
+                if held is None and self._drive_client is not None:
+                    st = self._drive_client.latest_status()
+                    if st is not None and st.get("mode") == "held":
+                        held = 3
+                if held is not None:
+                    self._follow_lbl.setText(
+                        f"⏸ PAUSED @ HO-{held} — breakpoint (Run free in inspector)")
+                    self._follow_lbl.setStyleSheet("color: #fd0; font-weight: bold;")
+                else:
+                    br = hd.block_reason()
+                    txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
+                    # Checkpoint-pose: show the last re-anchor (cp id + inlier) so
+                    # the operator sees it locking onto checkpoints while driving.
+                    if self._cp_localizer is not None:
+                        lm = self._cp_localizer.last_match
+                        txt += (f"  ⚓{lm.checkpoint_id} {lm.inlier_frac:.2f}"
+                                if lm is not None else "  ⚓cp?")
+                    self._follow_lbl.setText(txt)
+                    self._follow_lbl.setStyleSheet(
+                        "color: #fb4;" if suspended else
+                        "color: #e8a;" if hd.state() in (HierState.BLOCKED, HierState.FAILED)
+                        else "color: #8cf;"
+                    )
         else:
             self._resume_act.setEnabled(False)
 

@@ -3,7 +3,7 @@
 Differential-drive robot software in two halves that share one repo:
 
 - **`body/`** — Pi-side runtime. Independent Python processes on a Raspberry Pi (target) communicate over [Zenoh](https://zenoh.io/) using JSON messages.
-- **`desktop/`** — Operator-side stack (laptop / workstation). Four apps: **`mapping`** builds a reference map, **`nav`** drives against it (manual teleop **plus** autonomous hierarchical Tier-1/2/3 — the main operator UI, and the `heartbeat`/`cmd_vel` source for standalone runs), **`map_editor`** cleans the map (occupancy + no-go layers, no drive controls), and **`pi_drive`** is a Tier-2/3 debug console. (`localization`, `reference_map`, `world_map`, `chassis` are supporting libraries, not apps.) All connect to the Pi over the same Zenoh router.
+- **`desktop/`** — Operator-side stack (laptop / workstation). Apps: **`mapping`** builds a reference map, **`nav`** drives against it (manual teleop **plus** autonomous hierarchical Tier-1/2/3 — the main operator UI, and the `heartbeat`/`cmd_vel` source for standalone runs), **`map_editor`** cleans the map (occupancy + no-go layers, no drive controls); debug tools are **`pi_drive`** (Tier-2/3 console) and **`handoff_inspector`** (breakpoint + visualize each Tier-1→2→3 handoff). (`localization`, `reference_map`, `world_map`, `chassis` are supporting libraries, not apps.) All connect to the Pi over the same Zenoh router.
 
 The contract between the two halves — and with any external agent (Jill / Cognitive Workbench) — is defined in [docs/body_project_spec.md](docs/body_project_spec.md).
 
@@ -230,9 +230,9 @@ desktop/.venv/bin/python -m desktop.nav --router tcp/PI_IP:7447 \
 
 Autonomous local driving uses a three-tier hierarchy so only a coarse *direction* crosses from the (noisy, topological) world map into the metric loop — every point the robot actually drives toward is observed live in the lidar scan:
 
-- **Tier 1** (desktop) — ordered world-frame waypoints (patrols).
-- **Tier 2** (desktop) — projects the next waypoint onto the live local map (a body bearing + a reachable sub-goal).
-- **Tier 3** (Pi, `body.local_drive`) — the single local-routing authority: inflates the live scan into a costmap, runs local A\*, and follows the path with pure-pursuit; owns `body/cmd_vel`.
+- **Tier 1** (desktop) — ordered world-frame waypoints (patrols), expanded to a dense route by global A\* on the reference costmap (which folds in the **no-go** mask, so the route avoids keep-out zones; Tier-2/3 are scan-based and do *not* see no-go). The lead-in from the robot's start pose to the first marker is routed too.
+- **Tier 2** (desktop) — **tracks** that route rather than beelining: advances a carrot one sub-waypoint at a time via a *passed-vertex* test (never skipping closely-spaced corner points), and hands Tier-3 the furthest live-clear point along that bearing, marched on **Tier-3's own footprint-inflated costmap** so the sub-goal is one Tier-3 accepts without snapping.
+- **Tier 3** (Pi, `body.local_drive`) — the single local-routing authority: inflates the live scan into a costmap, runs local A\*, follows with pure-pursuit, and a swept-footprint veto guards each arc; owns `body/cmd_vel`. On a swept-block it **re-aims in place** (a pure rotation is collision-free for the circular footprint) to straighten the approach instead of stopping dead.
 
 See [docs/tier_contract.md](docs/tier_contract.md) and [docs/drive_tier3_spec.md](docs/drive_tier3_spec.md); production wiring is `desktop/nav/hierarchical_drive.py`. Debug the Pi-side drive in isolation with the **pi_drive** console:
 
@@ -243,6 +243,15 @@ desktop/.venv/bin/python -m desktop.pi_drive --router tcp/PI_IP:7447
 desktop/.venv/bin/python -m desktop.pi_drive --tier2 \
   --load-map ~/Body/maps/<session>/map_*/reference_map.npz \
   --router tcp/PI_IP:7447
+```
+
+#### Handoff inspector
+
+A standalone window that **breakpoints and visualizes each tier boundary** of a live `nav` run — decoupled, it only subscribes to the per-tier handoff records and publishes arm/continue over Zenoh. Three panels: **HO-1** Tier-1→Tier-2 (the global map + full route + current carrot), **HO-2** Tier-2→Tier-3 (the body-frame scan + chosen sub-goal), **HO-3** Tier-3→motors (the local costmap + A\* path + the `(v, ω)` it's about to command). Each panel has **Arm** + **Continue**; **Arm all** / **Run free** act on all three. Arm a tier to freeze the robot there and single-step; while a breakpoint holds, `nav`'s status reads `⏸ PAUSED @ HO-n`.
+
+```bash
+desktop/.venv/bin/python -m desktop.handoff_inspector --router tcp/PI_IP:7447 \
+  --map ~/Body/maps/<session>/map_*/reference_map.npz   # --map: HO-1 global layer
 ```
 
 ## Map editing (`desktop.map_editor`)
@@ -268,7 +277,7 @@ The Pi runs Body services as `body-launcher.service`. The Pi's WiFi should be on
 ## Layout
 
 - [body/](body/) — Pi-side package: `launcher`, drivers (`motor_controller`, `lidar_driver`, `oakd_driver`, `watchdog`, `imu_driver`), `local_map`, `local_drive` (Tier-3 reactive drive), `lib/` (`zenoh_helpers`, `schemas`, `diff_drive`, `host_metrics`, and the pure drive cores `astar`, `local_costmap`, `local_planner`, `scan_raster`, `drive_safety`, `tier2_subgoal`).
-- [desktop/](desktop/) — operator-side packages. **Apps:** [`mapping`](desktop/mapping) (reference-map builder + teleop), [`nav`](desktop/nav) (operator UI: teleop + hierarchical drive), [`map_editor`](desktop/map_editor) (reference-map editor: occupancy + no-go layers), [`pi_drive`](desktop/pi_drive) (Tier-2/3 debug console). **Libraries:** [`reference_map`](desktop/reference_map) (frozen-map I/O + likelihood/distance fields), [`localization`](desktop/localization) (MCL), [`world_map`](desktop/world_map) (shared costmap / grid / particle-filter — fuser app retired), [`chassis`](desktop/chassis) (teleop/vision widgets reused by nav), `vision_service.py`, `utils/`.
+- [desktop/](desktop/) — operator-side packages. **Apps:** [`mapping`](desktop/mapping) (reference-map builder + teleop), [`nav`](desktop/nav) (operator UI: teleop + hierarchical drive), [`map_editor`](desktop/map_editor) (reference-map editor: occupancy + no-go layers), [`pi_drive`](desktop/pi_drive) (Tier-2/3 debug console), [`handoff_inspector`](desktop/handoff_inspector) (breakpoint/visualize the Tier-1→2→3 handoffs). **Libraries:** [`reference_map`](desktop/reference_map) (frozen-map I/O + likelihood/distance fields), [`localization`](desktop/localization) (MCL), [`world_map`](desktop/world_map) (shared costmap / grid / particle-filter — fuser app retired), [`chassis`](desktop/chassis) (teleop/vision widgets reused by nav), `vision_service.py`, `utils/`.
 - [docs/](docs/) — specs and design docs, including [tier_contract.md](docs/tier_contract.md) + [drive_tier3_spec.md](docs/drive_tier3_spec.md) (hierarchical drive), [bayesian_localization_redesign.md](docs/bayesian_localization_redesign.md) (Phase 0–8 plan and status log), and [noise_models.md](docs/noise_models.md) (Phase 0 motion-model calibration).
 - [scripts/](scripts/) — calibration + analysis tools (`phase0_*.py`, `phase1_likelihood_field_demo.py`, `record_body_topics.py`).
 - [deploy/](deploy/) — ops files (`zenohd-router.json`, `body-launcher.service`, `99-pwm.rules`, `NETWORK.md`).
