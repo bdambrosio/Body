@@ -29,7 +29,8 @@ from body.lib.local_costmap import LocalCostmapConfig
 from body.lib.local_planner import LocalPlanConfig, lookahead_on_path, plan_local
 from body.lib.local_drive_core import (
     STATE_ARRIVED, STATE_BLOCKED, STATE_DRIVING, STATE_FAULT, STATE_IDLE,
-    DriveParams, odom_to_body, rotate_to_heading, steer_to_body_point, wrap_pi,
+    DriveParams, odom_to_body, rotate_to_heading, steer_to_body_point,
+    swept_block_response, wrap_pi,
 )
 
 
@@ -144,6 +145,11 @@ def main() -> None:
     scan_stale_s = float(scan_cfg.get("scan_stale_s", 0.5))
     no_progress_timeout_s = float(cfg.get("no_progress_timeout_s", 4.0))
     no_progress_eps_m = float(cfg.get("no_progress_eps_m", 0.03))
+    # On a swept-block, re-aim in place (swept-free) toward the path's lookahead
+    # rather than stopping, until the lookahead is within this bearing or we've
+    # been re-aiming longer than the timeout (then it's a genuine dead-end).
+    swept_realign_thresh_rad = float(cfg.get("swept_realign_thresh_rad", 0.10))
+    swept_realign_timeout_s = float(cfg.get("swept_realign_timeout_s", 2.0))
 
     # Shared with zenoh callback threads. Callbacks only ever assign these;
     # all per-goal bookkeeping lives in the main loop, keyed by cmd_id.
@@ -220,6 +226,7 @@ def main() -> None:
     best_dist: Optional[float] = None
     best_dist_at = 0.0
     final_aligned = False
+    realign_since: Optional[float] = None   # start of the current swept-block re-aim
 
     print(f"local_drive: up; control_hz={control_hz} v_max={params.v_max}", flush=True)
     next_tick = time.monotonic()
@@ -244,6 +251,7 @@ def main() -> None:
             best_dist_at = now_mono
             final_aligned = False
             rotating = False
+            realign_since = None
 
         gx, gy = float(g["x_m"]), float(g["y_m"])
         tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
@@ -331,6 +339,25 @@ def main() -> None:
             meta=meta))
 
         if blocked:
+            # The forward arc clips a wall. A pure rotation is swept-free (the
+            # footprint is a circle), so re-aim in place toward the lookahead to
+            # straighten the approach instead of giving up. Only when already
+            # aligned (or re-aiming too long) is it a genuine dead-end.
+            if realign_since is None:
+                realign_since = now_mono
+            look_bearing = math.atan2(look[1], look[0])
+            resp, omega_r = swept_block_response(
+                look_bearing, now_mono - realign_since,
+                thresh_rad=swept_realign_thresh_rad,
+                timeout_s=swept_realign_timeout_s,
+                k_omega=gp.k_omega, omega_max=gp.omega_max)
+            if resp == "realign":
+                publish_cmd(0.0, omega_r)
+                publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
+                               dist=dist, v=0.0, omega=omega_r, mode="realign")
+                rotating = True
+                next_tick = _sleep_to(next_tick, period)
+                continue
             publish_cmd(0.0, 0.0)
             publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
                            dist=dist, reason="swept_block", mode="follow")
@@ -367,6 +394,7 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
+        realign_since = None        # real forward motion → reset the re-aim window
         publish_cmd(v, omega)
         publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
                        dist=dist, v=v, omega=omega, mode="follow",

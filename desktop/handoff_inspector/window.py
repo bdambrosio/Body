@@ -23,7 +23,8 @@ from PyQt6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 
 from body.lib import zenoh_helpers
 from body.lib.handoff_gate import CTRL_KEY, RECORD_PREFIX
@@ -81,10 +82,111 @@ def format_record(rec: Dict[str, Any]) -> str:
 
 # ── widgets ──────────────────────────────────────────────────────────
 
+class WorldMapView(QWidget):
+    """World-frame reference map (the Tier-1 global layer): the static map as a
+    QImage cropped to its occupied bbox, plus the live robot pose + current
+    waypoint + bearing from each HO-1 record."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(320, 320)
+        self._img = None                 # QImage of the cropped occupied region
+        self._extent = None              # (x0, y0, x1, y1) world metres
+        self._pose = None
+        self._wp = None
+
+    def set_map(self, drive, meta) -> None:
+        g = np.asarray(drive)
+        occ = g != -1
+        if not occ.any():
+            self._img = None
+            self.update()
+            return
+        ii, jj = np.where(occ)
+        imin, imax, jmin, jmax = int(ii.min()), int(ii.max()), int(jj.min()), int(jj.max())
+        res = float(meta["resolution_m"])
+        ox, oy = float(meta["origin_x_m"]), float(meta["origin_y_m"])
+        crop = g[imin:imax + 1, jmin:jmax + 1]            # [i=x, j=y]
+        gt = np.flipud(crop.T)                            # rows = y (top high), cols = x
+        h, w = gt.shape
+        rgb = np.empty((h, w, 3), dtype=np.uint8)
+        rgb[...] = (18, 18, 18)                           # unknown / bg
+        rgb[gt == 1] = (46, 92, 56)                       # clear
+        rgb[gt == 0] = (200, 80, 80)                      # blocked (walls)
+        self._img = QImage(rgb.tobytes(), w, h, 3 * w,
+                           QImage.Format.Format_RGB888).copy()
+        self._extent = (ox + imin * res, oy + jmin * res,
+                        ox + (imax + 1) * res, oy + (jmax + 1) * res)
+        self.update()
+
+    def update_overlay(self, pose, wp) -> None:
+        self._pose = pose
+        self._wp = wp
+        self.update()
+
+    def _fit(self):
+        if self._extent is None:
+            return None
+        x0, y0, x1, y1 = self._extent
+        wm, hm = x1 - x0, y1 - y0
+        if wm <= 0 or hm <= 0:
+            return None
+        m = 8
+        ww, wh = self.width() - 2 * m, self.height() - 2 * m
+        ppm = min(ww / wm, wh / hm)
+        ox_px = m + (ww - wm * ppm) / 2
+        oy_px = m + (wh - hm * ppm) / 2
+        return ppm, ox_px, oy_px
+
+    def _w2p(self, fit, wx, wy):
+        ppm, ox_px, oy_px = fit
+        x0, _y0, _x1, y1 = self._extent
+        return ox_px + (wx - x0) * ppm, oy_px + (y1 - wy) * ppm   # flip y
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.fillRect(0, 0, self.width(), self.height(), QColor(12, 12, 12))
+        if self._img is None:
+            p.setPen(QColor(160, 160, 160))
+            p.drawText(10, 18, "no map (pass --map)")
+            return
+        fit = self._fit()
+        if fit is None:
+            return
+        ppm, ox_px, oy_px = fit
+        x0, y0, x1, y1 = self._extent
+        p.drawImage(QRectF(ox_px, oy_px, (x1 - x0) * ppm, (y1 - y0) * ppm), self._img)
+        if self._pose is None:
+            return
+        rx, ry = self._w2p(fit, self._pose[0], self._pose[1])
+        if self._wp is not None:
+            wx, wy = self._w2p(fit, self._wp[0], self._wp[1])
+            p.setPen(QPen(QColor(120, 200, 255, 160), 1, Qt.PenStyle.DashLine))
+            p.drawLine(int(rx), int(ry), int(wx), int(wy))
+            p.setPen(QPen(QColor(255, 220, 80), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(wx, wy), 6, 6)
+            p.drawLine(int(wx - 8), int(wy), int(wx + 8), int(wy))
+            p.drawLine(int(wx), int(wy - 8), int(wx), int(wy + 8))
+        self._draw_robot(p, rx, ry, float(self._pose[2]))
+
+    def _draw_robot(self, p, rx, ry, th) -> None:
+        c, s = math.cos(th), math.sin(th)
+
+        def pt(fwd, left):                 # body (fwd, left) → screen (y flipped)
+            wx, wy = fwd * c - left * s, fwd * s + left * c
+            return QPointF(rx + wx, ry - wy)
+
+        tri = QPolygonF([pt(11, 0), pt(-6, 6), pt(-6, -6)])
+        p.setPen(QPen(QColor(255, 255, 255), 1))
+        p.setBrush(QColor(255, 255, 255))
+        p.drawPolygon(tri)
+
+
 class HandoffPanel(QWidget):
     """One tier column: Arm + Continue, a body-frame view, and a readout."""
 
-    def __init__(self, tier: int, on_arm, on_continue, parent=None):
+    def __init__(self, tier: int, on_arm, on_continue, world_map=None, parent=None):
         super().__init__(parent)
         self._tier = tier
         v = QVBoxLayout(self)
@@ -100,7 +202,14 @@ class HandoffPanel(QWidget):
         v.addLayout(head)
         self._status = QLabel("waiting…")
         v.addWidget(self._status)
-        self._view = BodyLocalMapView()
+        # Tier-1 is a world-frame handoff → show the global reference map (when
+        # one was loaded). Tier-2/Tier-3 are body-frame local maps.
+        self._world = tier == 1 and world_map is not None
+        if self._world:
+            self._view = WorldMapView()
+            self._view.set_map(world_map[0], world_map[1])
+        else:
+            self._view = BodyLocalMapView()
         v.addWidget(self._view, 1)
         self._readout = QLabel("—")
         self._readout.setStyleSheet("font-family: monospace;")
@@ -118,6 +227,13 @@ class HandoffPanel(QWidget):
         self._status.setText(
             f"seq={rec.get('seq', '—')}  age={age_s:.1f}s"
             + ("   ⏸ ARMED (holding)" if armed else ""))
+        if self._world:                       # Tier-1 world map (global layer)
+            pose = rec.get("pose")
+            wp = rec.get("wp")
+            self._view.update_overlay(tuple(pose) if pose else None,
+                                      tuple(wp) if wp else None)
+            self._readout.setText(format_record(rec))
+            return
         grid, meta = grid_and_meta(rec)
         t = self._tier
         if t == 1:
@@ -146,8 +262,8 @@ class HandoffPanel(QWidget):
 
 
 class HandoffInspectorWindow(QMainWindow):
-    def __init__(self, session, *, record_prefix: str = RECORD_PREFIX,
-                 ctrl_key: str = CTRL_KEY):
+    def __init__(self, session, *, reference_map=None,
+                 record_prefix: str = RECORD_PREFIX, ctrl_key: str = CTRL_KEY):
         super().__init__()
         self.setWindowTitle("Tier Handoff Inspector")
         self._session = session
@@ -177,7 +293,9 @@ class HandoffInspectorWindow(QMainWindow):
         outer.addLayout(row, 1)
         self._panels: Dict[int, HandoffPanel] = {}
         for t in (1, 2, 3):
-            self._panels[t] = HandoffPanel(t, self._send_arm, self._send_continue)
+            self._panels[t] = HandoffPanel(
+                t, self._send_arm, self._send_continue,
+                world_map=reference_map if t == 1 else None)
             row.addWidget(self._panels[t], 1)
 
         self._timer = QTimer(self)

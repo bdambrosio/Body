@@ -9,7 +9,7 @@ from body.lib.drive_safety import (
 )
 from body.lib.local_drive_core import (
     DriveParams, body_to_odom, odom_to_body,
-    rotate_to_heading, steer_to_body_point, wrap_pi,
+    rotate_to_heading, steer_to_body_point, swept_block_response, wrap_pi,
 )
 
 
@@ -190,6 +190,35 @@ class TestDriveableFromRows(unittest.TestCase):
 
     def test_bad_shape_returns_none(self):
         self.assertIsNone(driveable_from_rows([[True]], 2, 3))
+
+
+class TestSweptBlockResponse(unittest.TestCase):
+    KW = dict(thresh_rad=0.10, timeout_s=2.0, k_omega=1.5, omega_max=0.6)
+
+    def test_offaxis_realigns_toward_lookahead(self):
+        # Lookahead 30° to the left → rotate left (positive omega) in place.
+        resp, omega = swept_block_response(math.radians(30), 0.0, **self.KW)
+        self.assertEqual(resp, "realign")
+        self.assertGreater(omega, 0.0)
+        # …and to the right → rotate right.
+        resp, omega = swept_block_response(math.radians(-30), 0.0, **self.KW)
+        self.assertEqual(resp, "realign")
+        self.assertLess(omega, 0.0)
+
+    def test_omega_clamped(self):
+        _resp, omega = swept_block_response(math.radians(170), 0.0, **self.KW)
+        self.assertAlmostEqual(omega, 0.6, places=6)        # clamped to omega_max
+
+    def test_aligned_is_a_genuine_block(self):
+        # Within the bearing threshold and still blocked → real dead-end.
+        resp, omega = swept_block_response(math.radians(3), 0.0, **self.KW)
+        self.assertEqual(resp, "block")
+        self.assertEqual(omega, 0.0)
+
+    def test_realign_times_out(self):
+        # Off-axis but re-aiming too long → give up (bounded episode).
+        resp, _omega = swept_block_response(math.radians(30), 2.5, **self.KW)
+        self.assertEqual(resp, "block")
 
 
 if __name__ == "__main__":

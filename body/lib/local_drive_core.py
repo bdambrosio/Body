@@ -113,3 +113,21 @@ def rotate_to_heading(
         return 0.0, True
     sign = 1.0 if err >= 0.0 else -1.0
     return sign * min(params.omega_max, params.k_omega * abs(err)), False
+
+
+def swept_block_response(
+    look_bearing: float, realign_elapsed_s: float, *,
+    thresh_rad: float, timeout_s: float, k_omega: float, omega_max: float,
+) -> Tuple[str, float]:
+    """How Tier-3 reacts when the followed arc is swept-blocked.
+
+    A circular footprint rotating in place sweeps nothing new, so instead of
+    stopping dead, re-aim toward the path's lookahead — straightening the
+    approach until the forward arc clears. Returns ``("realign", omega)`` while
+    the lookahead is still off-axis and we haven't been re-aiming longer than
+    ``timeout_s``; otherwise ``("block", 0.0)`` — a genuine dead-end (already
+    aligned and still blocked, or re-aimed too long). The timeout is reset by
+    real forward progress, so a realign episode is bounded."""
+    if abs(look_bearing) > thresh_rad and realign_elapsed_s <= timeout_s:
+        return "realign", _clip(k_omega * look_bearing, -omega_max, omega_max)
+    return "block", 0.0
