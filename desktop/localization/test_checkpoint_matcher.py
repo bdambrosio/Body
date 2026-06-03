@@ -80,6 +80,25 @@ class TestCheckpointMatcher(unittest.TestCase):
         far = (5.0, 5.0, 0.0)                     # > select_radius from cp
         self.assertIsNone(self.matcher.match(far, angles, ranges))
 
+    def test_relocalize_recovers_with_no_odom_prior(self):
+        # Cold start: the search is centred on the checkpoint's own pose, not
+        # an odom prior. A wrong-by-meters prior would defeat match(), but
+        # relocalize finds it (yaw IMU-hinted).
+        true = (0.2, -0.1, math.radians(30))
+        angles, ranges = _synth(self.occ, true)
+        m = self.matcher.relocalize(
+            angles, ranges, yaw_hint=math.radians(25),
+            xy_half_m=0.5, theta_half_rad=math.radians(45))
+        self.assertIsNotNone(m)
+        self.assertEqual(m.checkpoint_id, "cp_000")
+        self.assertLess(math.hypot(m.pose[0] - 0.2, m.pose[1] + 0.1), 0.12)
+        self.assertLess(abs(m.pose[2] - math.radians(30)), math.radians(5))
+
+    def test_relocalize_rejects_contradicted_scan(self):
+        angles = np.linspace(-math.pi, math.pi, 360, endpoint=False)
+        ranges = np.full(360, 1.9)
+        self.assertIsNone(self.matcher.relocalize(ranges=ranges, angles=angles))
+
     def test_gate_rejects_contradicted_scan(self):
         # Measured ranges (1.9 m) are well beyond the 1.5 m walls → every beam
         # is blocked early (predicted < measured = contradiction) → rejected.

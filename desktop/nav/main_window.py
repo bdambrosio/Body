@@ -1912,13 +1912,49 @@ class NavMainWindow(QMainWindow):
                 ),
             )
 
+    def _try_checkpoint_relocate(self) -> bool:
+        """Recognize which checkpoint we're at and seat the pose there —
+        robust on a metrically-loose map (where the global scan-match snaps to
+        the wrong self-similar basin). Returns True if a checkpoint matched."""
+        matcher = self._checkpoint_matcher(CheckpointMatchConfig())
+        if matcher is None:
+            return False
+        ar = self.fuser.pose_source.latest_scan_polar()
+        if ar is None:
+            return False
+        latest = self.fuser.pose_source.latest_pose()
+        yaw = float(latest[0][2]) if latest is not None else None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            m = matcher.relocalize(
+                ar[0], ar[1], yaw_hint=yaw,
+                xy_half_m=0.6, theta_half_rad=math.radians(60.0))
+        finally:
+            QApplication.restoreOverrideCursor()
+        if m is None:
+            return False
+        # Seat the PF pose at the recognized spot (relocate_at recovers yaw on
+        # the locally-healed patch); re-seed an active checkpoint localizer.
+        self.fuser.request_relocate_at(m.pose[0], m.pose[1], reason="ui_relocate_cp")
+        if self._cp_localizer is not None:
+            odom = self._cp_odom()
+            if odom is not None:
+                self._cp_localizer.seed(m.pose, odom)
+        QMessageBox.information(
+            self, "Re-localize",
+            f"Recognized checkpoint {m.checkpoint_id} "
+            f"(inlier {m.inlier_frac:.2f}) — pose seated there.")
+        return True
+
     def _on_relocate(self) -> None:
-        # Wide global scan-match snap. Zero cmd_vel first — relocate
-        # rewrites the world offset, and the follower's last cmd_vel
-        # was computed against the pre-relocate pose.
+        # Prefer checkpoint recognition (robust on a metrically-loose map);
+        # fall back to the global scan-match only when no checkpoint matches.
+        # Zero cmd_vel first — a relocate rewrites the world offset.
         if self._mission.is_active():
             self.chassis.set_cmd_vel(0.0, 0.0)
             self._mission.cancel()
+        if self._try_checkpoint_relocate():
+            return
         result = self._run_relocate(reason="ui_relocate")
         if result.get("success"):
             shift = int(result.get("shift_count", 0))
@@ -2219,20 +2255,15 @@ class NavMainWindow(QMainWindow):
         self._cp_localizer = None
         if not self._use_checkpoint_pose:
             return PFPoseProvider(self.fuser)
-        rm = self.fuser.reference_map
-        cps = checkpoints_from_metadata(rm.metadata)
-        if not cps:
+        matcher = self._checkpoint_matcher(_RUNTIME_CP_CFG)
+        if matcher is None:
             QMessageBox.warning(
                 self, "Checkpoint pose",
                 "No checkpoints in this map — using the PF pose instead.\n"
                 "Recognize some spots in the map editor first.")
             return PFPoseProvider(self.fuser)
-        occ = rm.occupancy_log_odds > 0.0
-        matcher = CheckpointMatcher(
-            occ, rm.origin_x_m, rm.origin_y_m, rm.resolution_m, cps,
-            _RUNTIME_CP_CFG)
         self._cp_localizer = CheckpointLocalizer(matcher, reanchor_min_interval_s=0.5)
-        logger.info("hier: checkpoint-pose enabled (%d checkpoints)", len(cps))
+        logger.info("hier: checkpoint-pose enabled")
         return CheckpointPoseProvider(
             self._cp_localizer,
             odom_fn=self._cp_odom,
@@ -2240,6 +2271,17 @@ class NavMainWindow(QMainWindow):
             seed_fn=self._cp_seed,
             age_fn=self.fuser.pose_source.odom_age_s,
         )
+
+    def _checkpoint_matcher(self, cfg: CheckpointMatchConfig):
+        """A CheckpointMatcher over the loaded map + its checkpoints, or None
+        when the map has none."""
+        rm = self.fuser.reference_map
+        cps = checkpoints_from_metadata(rm.metadata)
+        if not cps:
+            return None
+        occ = rm.occupancy_log_odds > 0.0
+        return CheckpointMatcher(
+            occ, rm.origin_x_m, rm.origin_y_m, rm.resolution_m, cps, cfg)
 
     def _cp_odom(self):
         return self._drive_client.odom_pose() if self._drive_client else None

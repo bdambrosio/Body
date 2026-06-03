@@ -137,3 +137,43 @@ class CheckpointMatcher:
                 if best is None or m.score > best.score:
                     best = m
         return best
+
+    def relocalize(
+        self,
+        angles: Sequence[float],
+        ranges: Sequence[float],
+        *,
+        yaw_hint: Optional[float] = None,
+        xy_half_m: float = 0.6,
+        xy_step_m: float = 0.10,
+        theta_half_rad: float = math.pi,
+        theta_step_rad: float = math.radians(5.0),
+    ) -> Optional[CheckpointMatch]:
+        """Cold-start / recovery: test **all** checkpoints, searching a window
+        around *each checkpoint's own pose* (not an odom prior). Heading is
+        swept around ``yaw_hint`` (IMU-primed) over ±``theta_half_rad``, or the
+        full circle when ``yaw_hint`` is None. Returns the best accepted match.
+        Slower than ``match`` — a deliberate operator action, not per-tick."""
+        best: Optional[CheckpointMatch] = None
+        for c in self._checkpoints:
+            sub, sox, soy = crop_disk(
+                self._occ, self._ox, self._oy, self._res,
+                (c.x_m, c.y_m), c.radius_m)
+            if sub.size == 0 or not sub.any():
+                continue
+            rc = replace(
+                self._cfg.raycast,
+                max_range_m=min(self._cfg.raycast.max_range_m, c.radius_m))
+            center_theta = c.theta_rad if yaw_hint is None else float(yaw_hint)
+            pose, s = best_pose_in_window(
+                sub, sox, soy, self._res,
+                (c.x_m, c.y_m, center_theta), angles, ranges,
+                xy_half_m=xy_half_m, xy_step_m=xy_step_m,
+                theta_half_rad=theta_half_rad, theta_step_rad=theta_step_rad,
+                cfg=rc)
+            if (s.inlier_frac >= self._cfg.min_inlier_frac
+                    and s.short_frac <= self._cfg.max_short_frac):
+                m = CheckpointMatch(c.id, pose, s.inlier_frac, s.short_frac, s.score)
+                if best is None or m.score > best.score:
+                    best = m
+        return best

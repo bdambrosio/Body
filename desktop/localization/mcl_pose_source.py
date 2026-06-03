@@ -209,6 +209,14 @@ class MCLPoseSource(PoseSource):
             return None
         return time.monotonic() - recv
 
+    def latest_scan_polar(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Latest cached lidar scan as (angles_rad, ranges_m), body frame, or
+        None. Used by checkpoint relocalization (no DriveClient required)."""
+        with self._lock:
+            if self._last_ranges is None or self._last_angles is None:
+                return None
+            return self._last_angles.copy(), self._last_ranges.copy()
+
     def pose_at(self, ts: float) -> Optional[Pose]:
         buf_pose = self._pose_buffer.pose_at(ts)
         if buf_pose is not None:
