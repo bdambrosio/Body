@@ -94,6 +94,29 @@ class TestCheckpointLocalizer(unittest.TestCase):
         self.assertLess(math.hypot(p[0] - 0.1, p[1] + 0.05), 0.1)
         self.assertLess(abs(p[2] - math.radians(5)), math.radians(4))
 
+    def test_reanchor_snap_measures_drift(self):
+        m, occ = _matcher()
+        loc = CheckpointLocalizer(m, reanchor_min_interval_s=0.0)
+        # Dead-reckon forward 0.2 m (within the matcher's 0.30 m search window),
+        # but the scan is from the TRUE pose at the origin — so the re-anchor
+        # corrects ~0.2 m and the snap should report that.
+        angles, ranges = _synth(occ, (0.0, 0.0, 0.0))
+        loc.seed((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        loc.on_odom((0.1, 0.0, 0.0))
+        loc.on_odom((0.2, 0.0, 0.0))          # dead-reckoned to (0.2, 0, 0)
+        self.assertAlmostEqual(loc._dist_since_anchor, 0.2, places=5)
+        match = loc.try_reanchor(1.0, angles, ranges)
+        self.assertIsNotNone(match)
+        snap = loc.last_reanchor_snap
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.checkpoint_id, "cp_000")
+        self.assertAlmostEqual(snap.dist_since_anchor_m, 0.2, places=5)
+        self.assertGreater(snap.trans_m, 0.1)     # corrected the ~0.2 m drift
+        self.assertLess(snap.trans_m, 0.3)
+        # dist-since-anchor resets after a successful re-anchor.
+        loc.on_odom((0.25, 0.0, 0.0))
+        self.assertAlmostEqual(loc._dist_since_anchor, 0.05, places=5)
+
     def test_reanchor_throttled(self):
         m, occ = _matcher()
         loc = CheckpointLocalizer(m, reanchor_min_interval_s=0.5)

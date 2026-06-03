@@ -327,8 +327,8 @@ def main() -> None:
             cmd_id=cmd_id, goal_body=(bx, by), plan_reason=plan.reason,
             path_body=plan.path_body, lookahead=look, v_mps=v, omega_radps=omega,
             swept_blocked=blocked,
-            grid_rows=(grid.tolist() if gate.is_armed(3) else None),
-            meta=(meta if gate.is_armed(3) else None)))
+            grid_rows=grid.tolist(),
+            meta=meta))
 
         if blocked:
             publish_cmd(0.0, 0.0)

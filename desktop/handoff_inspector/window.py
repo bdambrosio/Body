@@ -131,7 +131,9 @@ class HandoffPanel(QWidget):
             sg = tuple(rec.get("subgoal_body", (0.0, 0.0)))
             tb = rec.get("target_body")
             brg = rec.get("bearing_rad", 0.0)
-            self._view.update_data(grid, meta, sg)
+            # goal_body=None: the sub-goal is drawn once, as the orange overlay
+            # dot (not also as a blue goal-circle).
+            self._view.update_data(grid, meta, None)
             self._view.set_planned_path(None)
             self._view.set_overlay(tuple(tb) if tb else None, sg, brg,
                                    rec.get("free_dist_m", 0.0))

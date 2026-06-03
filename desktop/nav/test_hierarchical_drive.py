@@ -284,10 +284,11 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 1)
         bx, by, _tol, _v = io.sent[0]
-        # clear-run reached the 1.5 m horizon then backed off 0.15 m → ~1.35 m,
-        # strictly short of the blind 1.5 m. Proves the scan path is wired.
+        # All-clear scan → no inflation; clear-run reaches the 1.5 m horizon then
+        # backs off a ½ cell (0.04 m) → ~1.46 m, short of the blind 1.5 m. Proves
+        # the scan path is wired (and the new ½-cell backoff is in effect).
         self.assertLess(bx, 1.5)
-        self.assertAlmostEqual(bx, 1.35, places=2)
+        self.assertAlmostEqual(bx, 1.46, places=2)
         self.assertAlmostEqual(by, 0.0, places=2)
 
     # ── handoff breakpoints (HO-1 / HO-2) ────────────────────────────
@@ -339,21 +340,18 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertIn(2, sink.recorded_tiers())
         self.assertEqual(len(io.sent), 1)
 
-    def test_t2_record_attaches_grid_only_when_armed(self):
-        # Not armed → lean record (no grid). Armed → grid+meta attached.
-        sink = FakeSink()
-        hd, io = self._build_sink(sink)
-        hd.tick(0.0)
-        t2 = [p for t, p in sink.records if t == 2][0]
-        self.assertNotIn("grid", t2)
-
-        sink2 = FakeSink()
-        sink2.arm(2)
-        hd2, _ = self._build_sink(sink2)
-        hd2.tick(0.0)
-        t2b = [p for t, p in sink2.records if t == 2][0]
-        self.assertIn("grid", t2b)
-        self.assertIn("meta", t2b)
+    def test_t2_record_always_attaches_grid_when_scan_present(self):
+        # The local map is attached every select (so the inspector's map isn't
+        # intermittent), independent of whether BP2 is armed.
+        for armed in (False, True):
+            sink = FakeSink()
+            if armed:
+                sink.arm(2)
+            hd, _ = self._build_sink(sink)
+            hd.tick(0.0)
+            t2 = [p for t, p in sink.records if t == 2][0]
+            self.assertIn("grid", t2)
+            self.assertIn("meta", t2)
 
     def test_bearing_hysteresis_repicks(self):
         hd, io, po = self._build(points=((5.0, 0.0),), repick_hysteresis_rad=0.2)

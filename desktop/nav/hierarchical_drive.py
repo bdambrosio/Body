@@ -24,10 +24,14 @@ from __future__ import annotations
 import enum
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Protocol, Tuple
 
 from body.lib import schemas
+from body.lib.local_costmap import (
+    LocalCostmapConfig, build_local_costmap, dilate_bool,
+)
+from body.lib.local_planner import LocalPlanConfig
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.tier2_subgoal import (
     Tier2Config, bearing_to_waypoint, furthest_free_point,
@@ -165,6 +169,11 @@ class HierarchicalDrive:
         # Body-frame scan raster for the Tier-2 clear-run (must match Tier-3's
         # grid so what we hand down lands on the same local map it routes on).
         self._raster = ScanRasterConfig()
+        # Tier-3's own footprint/clearance model — the clear-run marches on this
+        # inflated mask so the sub-goal is a goal Tier-3 accepts without snapping
+        # (incl. walls lateral to the ray). Same config as the Pi → same lethal.
+        self._costmap_cfg = LocalCostmapConfig()
+        self._goal_clearance_cells = LocalPlanConfig().goal_clearance_cells
         # Handoff inspector sink (HO-1/HO-2 record + breakpoint). No-op default.
         self._sink: HandoffSink = sink or NullHandoffSink()
         self._held_tier: Optional[int] = None    # which handoff we're paused at
@@ -327,8 +336,8 @@ class HierarchicalDrive:
             subgoal_body=(bx, by),
             target_body=(horizon_d * math.cos(bearing), horizon_d * math.sin(bearing)),
             arrival_tol_m=self._cfg.subgoal_arrival_tol_m, v_max=self._cfg.sub_v_max,
-            grid_rows=(grid.tolist() if (grid is not None and self._sink.is_armed(2)) else None),
-            meta=(meta if self._sink.is_armed(2) else None)))
+            grid_rows=(grid.tolist() if grid is not None else None),
+            meta=meta))
         if self._hold(2):
             return
 
@@ -388,7 +397,19 @@ class HierarchicalDrive:
             grid, meta = rasterize_scan(
                 scan.get("ranges"), float(scan.get("angle_min", 0.0)),
                 float(scan.get("angle_increment", 0.0)), self._raster)
-            res = furthest_free_point(grid, meta, bearing, t2, max_dist_m=wp_dist)
+            # March on Tier-3's footprint-inflated + goal-clearance lethal mask
+            # (its exact costmap model), not the raw scan: a "clear" point here
+            # is a goal Tier-3 accepts without snapping, and the 2-D inflation
+            # catches walls lateral to the ray a single ray-march would miss.
+            cm = build_local_costmap(grid, meta, self._costmap_cfg)
+            blocked = dilate_bool(cm.lethal, iters=self._goal_clearance_cells)
+            march_grid = grid.copy()
+            march_grid[blocked] = 0
+            # Inflation already provides the clearance — only a half-cell backoff
+            # to land cleanly inside the free region (not 0.15 m on top of it).
+            march_cfg = replace(t2, backoff_m=0.5 * float(meta["resolution_m"]))
+            res = furthest_free_point(march_grid, meta, bearing, march_cfg,
+                                      max_dist_m=wp_dist)
             if res.ok and res.body_xy is not None:
                 return res.body_xy, "clear", res.free_dist_m, grid, meta
         dist = min(wp_dist, t2.horizon_m)

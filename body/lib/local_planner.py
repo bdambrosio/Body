@@ -32,7 +32,10 @@ class LocalPlanConfig:
     heuristic_weight: float = 1.0
     max_expansions: int = 50_000
     min_clearance_cells: int = 0       # hard extra margin beyond footprint (0 = halo only)
-    goal_clearance_cells: int = 1      # snap the goal to a cell with this much extra clearance
+    goal_clearance_cells: int = 0      # extra goal clearance beyond the footprint.
+    #   0 = accept a goal at the footprint edge (the swept veto still guards
+    #   actual motion). Tier-2 reads this same value to stay ½-cell more
+    #   conservative than Tier-3 by construction (no goal snapping).
     downsample_step_cells: int = 3     # path point spacing (cells)
 
 

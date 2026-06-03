@@ -14,8 +14,10 @@ alternative to `PFPoseProvider`.
 """
 from __future__ import annotations
 
+import logging
 import math
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Tuple
 
 from desktop.localization.checkpoint_matcher import (
@@ -23,7 +25,22 @@ from desktop.localization.checkpoint_matcher import (
     CheckpointMatcher,
 )
 
+logger = logging.getLogger(__name__)
+
 Pose = Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class ReanchorSnap:
+    """How far a checkpoint re-anchor moved the pose = the accumulated odom
+    dead-reckon drift since the last successful anchor. ``trans_m`` / ``rot_rad``
+    are the correction magnitude; ``dist_since_anchor_m`` is the path length the
+    drift built up over (so ``trans_m / dist_since_anchor_m`` ≈ drift rate)."""
+    checkpoint_id: str
+    trans_m: float
+    rot_rad: float
+    dist_since_anchor_m: float
+    score: float
 
 
 def _wrap(a: float) -> float:
@@ -63,6 +80,8 @@ class CheckpointLocalizer:
         self._last_odom: Optional[Pose] = None
         self._last_reanchor_t: float = -1e18
         self._last_match: Optional[CheckpointMatch] = None
+        self._last_reanchor_snap: Optional[ReanchorSnap] = None
+        self._dist_since_anchor: float = 0.0
         self._seeded = False
 
     @property
@@ -72,6 +91,11 @@ class CheckpointLocalizer:
     @property
     def last_match(self) -> Optional[CheckpointMatch]:
         return self._last_match
+
+    @property
+    def last_reanchor_snap(self) -> Optional[ReanchorSnap]:
+        """The most recent re-anchor's drift correction (None until one fires)."""
+        return self._last_reanchor_snap
 
     def seed(self, map_pose: Pose, odom_pose: Pose) -> None:
         """Set the initial map-frame pose and the odom reference it rides on."""
@@ -86,6 +110,7 @@ class CheckpointLocalizer:
         if self._last_odom is not None and self._map_pose is not None:
             d = pose_relative(self._last_odom, odom_pose)
             self._map_pose = pose_compose(self._map_pose, d)
+            self._dist_since_anchor += math.hypot(d[0], d[1])
         self._last_odom = (float(odom_pose[0]), float(odom_pose[1]), float(odom_pose[2]))
 
     def try_reanchor(
@@ -102,6 +127,17 @@ class CheckpointLocalizer:
         self._last_reanchor_t = now
         m = self._matcher.match(self._map_pose, angles, ranges)
         if m is not None:
+            # The correction (dead-reckoned pose → matched pose) IS the odom
+            # drift that accumulated over dist_since_anchor since the last fix.
+            rel = pose_relative(self._map_pose, m.pose)
+            self._last_reanchor_snap = ReanchorSnap(
+                checkpoint_id=m.checkpoint_id,
+                trans_m=math.hypot(rel[0], rel[1]),
+                rot_rad=rel[2],
+                dist_since_anchor_m=self._dist_since_anchor,
+                score=m.score,
+            )
+            self._dist_since_anchor = 0.0
             self._map_pose = m.pose
             self._last_match = m
         return m
@@ -159,5 +195,16 @@ class CheckpointPoseProvider:
             self._loc.on_odom(odom)
         scan = self._scan_fn()
         if scan is not None:
-            self._loc.try_reanchor(self._clock(), scan[0], scan[1])
+            m = self._loc.try_reanchor(self._clock(), scan[0], scan[1])
+            if m is not None:
+                s = self._loc.last_reanchor_snap
+                if s is not None:
+                    # The drift instrumentation: snap magnitude = accumulated
+                    # dead-reckon error since the last fix. Greppable on the nav
+                    # console as "checkpoint: re-anchor".
+                    logger.info(
+                        "checkpoint: re-anchor cp=%s snap=%.3fm/%+.1f° "
+                        "drift-over=%.2fm score=%.2f",
+                        s.checkpoint_id, s.trans_m, math.degrees(s.rot_rad),
+                        s.dist_since_anchor_m, s.score)
         return self._loc.pose()
