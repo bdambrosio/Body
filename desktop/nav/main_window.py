@@ -165,6 +165,16 @@ class NavMainWindow(QMainWindow):
         self._build_docks()
         self._build_menu()
         self._build_timer()
+        self._show_map_checkpoints()
+
+    def _show_map_checkpoints(self) -> None:
+        """Draw the loaded map's LPR checkpoints (purple rings) on the maps."""
+        try:
+            cps = checkpoints_from_metadata(self.fuser.reference_map.metadata)
+            self._shared_view.set_checkpoints(
+                [(c.x_m, c.y_m, c.radius_m, c.id) for c in cps])
+        except Exception:
+            logger.exception("failed to load map checkpoints for overlay")
 
     # ── Layout ───────────────────────────────────────────────────────
 
