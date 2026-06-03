@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 from body.lib import schemas, zenoh_helpers
 from body.lib.buildinfo import git_sha
 from body.lib.drive_safety import FootprintConfig, swept_path_blocked
+from body.lib.handoff_gate import HandoffGate
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.local_costmap import LocalCostmapConfig
 from body.lib.local_planner import LocalPlanConfig, lookahead_on_path, plan_local
@@ -185,6 +186,10 @@ def main() -> None:
     zenoh_helpers.declare_subscriber_json(session, "body/lidar/scan", on_scan)
     zenoh_helpers.declare_subscriber_json(session, "body/drive/goto", on_goto)
 
+    # HO-3 handoff gate (Tier-3 → motors): records each command + obeys the
+    # standalone Handoff Inspector's arm/continue. tier 3 only on this side.
+    gate = HandoffGate(session, tiers=(3,))
+
     signal.signal(signal.SIGTERM, lambda _s, _f: stop.set())
     signal.signal(signal.SIGINT, lambda _s, _f: stop.set())
 
@@ -314,7 +319,18 @@ def main() -> None:
         # Last-resort safety veto — A* won't route through lethal, but a
         # dynamic/new obstacle can appear in the followed arc between replans.
         # Strictly subordinate: it only stops, never steers.
-        if swept_path_blocked(grid, meta, v_mps=v, omega_radps=omega, config=foot):
+        blocked = swept_path_blocked(grid, meta, v_mps=v, omega_radps=omega, config=foot)
+
+        # HO-3 Tier-3 → motors: record what we're about to command. Attach the
+        # costmap only when BP3 is armed (it's heavy at the control rate).
+        gate.record(3, schemas.handoff_t3(
+            cmd_id=cmd_id, goal_body=(bx, by), plan_reason=plan.reason,
+            path_body=plan.path_body, lookahead=look, v_mps=v, omega_radps=omega,
+            swept_blocked=blocked,
+            grid_rows=(grid.tolist() if gate.is_armed(3) else None),
+            meta=(meta if gate.is_armed(3) else None)))
+
+        if blocked:
             publish_cmd(0.0, 0.0)
             publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
                            dist=dist, reason="swept_block", mode="follow")
@@ -322,6 +338,20 @@ def main() -> None:
             best_dist_at = now_mono
             next_tick = _sleep_to(next_tick, period)
             continue
+
+        # HO-3 breakpoint: hold here with motors at 0 (heartbeat + cmd_vel keep
+        # flowing so the watchdog stays happy and the link alive) until the
+        # inspector single-steps. Reset the no-progress window so holding here
+        # never trips it.
+        if gate.should_hold(3):
+            publish_cmd(0.0, 0.0)
+            publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
+                           dist=dist, v=0.0, omega=0.0, mode="held")
+            best_dist = dist
+            best_dist_at = now_mono
+            next_tick = _sleep_to(next_tick, period)
+            continue
+        gate.consume_continue(3)
 
         # No-progress watchdog — only while actually translating.
         if v < 1e-3:

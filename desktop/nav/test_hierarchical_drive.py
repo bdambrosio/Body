@@ -94,6 +94,39 @@ class FakePose:
         return self.pose
 
 
+class FakeSink:
+    """In-memory HandoffSink for breakpoint tests."""
+    def __init__(self):
+        self.records = []           # list of (tier, payload)
+        self._armed = set()
+        self._continue = set()
+
+    def record(self, tier, payload):
+        self.records.append((tier, payload))
+
+    def is_armed(self, tier):
+        return tier in self._armed
+
+    def should_hold(self, tier):
+        return tier in self._armed and tier not in self._continue
+
+    def consume_continue(self, tier):
+        if tier in self._continue:
+            self._continue.discard(tier)
+            return True
+        return False
+
+    # test controls
+    def arm(self, tier):
+        self._armed.add(tier)
+
+    def cont(self, tier):
+        self._continue.add(tier)
+
+    def recorded_tiers(self):
+        return [t for t, _ in self.records]
+
+
 class TestHierarchicalDrive(unittest.TestCase):
     def _build(self, points=((2.0, 0.0),), pose=(0.0, 0.0, 0.0), scan=None, **cfg):
         io = FakeDriveIO(scan=scan if scan is not None else _clear_scan())
@@ -216,21 +249,111 @@ class TestHierarchicalDrive(unittest.TestCase):
         io.set_status(cmd_id=99, state="ARRIVED")   # not our cmd_id
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
 
-    def test_select_is_projection_only_no_scan_dependency(self):
-        # Tier-2 is direction-only now: SELECT projects the waypoint and sends a
-        # goto without consulting the scan (no_scan is Tier-3's BLOCKED to
-        # report, handled in DRIVING). With no scan it still sends + drives.
+    def test_select_no_scan_falls_back_to_blind_projection(self):
+        # Tier-2 prefers the clear-run over the live scan, but with NO
+        # rasterizable scan it falls back to a blind horizon projection so it
+        # still sends + drives (no_scan is then Tier-3's BLOCKED to report).
         io = FakeDriveIO(scan=None)
         hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io)
         hd.start()
         self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 1)
-        # Sub-goal is the waypoint direction clamped to the horizon (2 m), not
-        # the 5 m waypoint.
+        # Fallback sub-goal is the waypoint direction clamped to the horizon
+        # (1.5 m), not the 5 m waypoint — and NOT backed off (no scan).
         bx, by, _tol, _v = io.sent[0]
-        self.assertAlmostEqual(bx, 2.0, places=6)
+        self.assertAlmostEqual(bx, 1.5, places=6)
         self.assertAlmostEqual(by, 0.0, places=6)
+
+    def test_select_uses_clear_run_when_scan_present(self):
+        # With a live scan, Tier-2 marches the bearing and hands Tier-3 the
+        # furthest CLEAR point backed off the horizon — NOT the blind 1.5 m
+        # projection. An all-no-return scan is clear everywhere, so the sub-goal
+        # is horizon - backoff along +x.
+        n = 360
+        scan = {
+            "ranges": [10.0] * n,          # all beyond range_max → no-return → clear
+            "angle_min": -math.pi,
+            "angle_increment": 2.0 * math.pi / n,
+            "ts": 1.0,
+        }
+        io = FakeDriveIO(scan=scan)
+        hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io)
+        hd.start()
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 1)
+        bx, by, _tol, _v = io.sent[0]
+        # clear-run reached the 1.5 m horizon then backed off 0.15 m → ~1.35 m,
+        # strictly short of the blind 1.5 m. Proves the scan path is wired.
+        self.assertLess(bx, 1.5)
+        self.assertAlmostEqual(bx, 1.35, places=2)
+        self.assertAlmostEqual(by, 0.0, places=2)
+
+    # ── handoff breakpoints (HO-1 / HO-2) ────────────────────────────
+    def _build_sink(self, sink, points=((2.0, 0.0),)):
+        io = FakeDriveIO(scan=_clear_scan())
+        hd = HierarchicalDrive(_runner(points), FakePose((0.0, 0.0, 0.0)), io,
+                               HierConfig(), sink=sink)
+        hd.start()
+        hd.tick(0.0)   # ALIGNING → SELECT
+        return hd, io
+
+    def test_records_emitted_without_arming(self):
+        # With nothing armed, both handoffs record and the drive proceeds.
+        sink = FakeSink()
+        hd, io = self._build_sink(sink)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(sink.recorded_tiers(), [1, 2])
+        self.assertEqual(len(io.sent), 1)
+
+    def test_breakpoint_t2_holds_then_single_steps(self):
+        sink = FakeSink()
+        sink.arm(2)
+        hd, io = self._build_sink(sink)
+        # Armed at HO-2: holds in SELECT, cancels the bot, sends nothing.
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(io.sent, [])
+        self.assertGreaterEqual(io.cancels, 1)
+        self.assertIn(2, sink.recorded_tiers())
+        # Re-holding does NOT re-cancel each tick.
+        cancels_after_first = io.cancels
+        hd.tick(0.0)
+        self.assertEqual(io.cancels, cancels_after_first)
+        self.assertEqual(io.sent, [])
+        # Continue → single-step past HO-2, goto goes out.
+        sink.cont(2)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 1)
+
+    def test_breakpoint_t1_holds_before_subgoal_selection(self):
+        sink = FakeSink()
+        sink.arm(1)
+        hd, io = self._build_sink(sink)
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(io.sent, [])
+        # Held at HO-1 → HO-2 not reached, so no tier-2 record yet.
+        self.assertEqual(sink.recorded_tiers(), [1])
+        sink.cont(1)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertIn(2, sink.recorded_tiers())
+        self.assertEqual(len(io.sent), 1)
+
+    def test_t2_record_attaches_grid_only_when_armed(self):
+        # Not armed → lean record (no grid). Armed → grid+meta attached.
+        sink = FakeSink()
+        hd, io = self._build_sink(sink)
+        hd.tick(0.0)
+        t2 = [p for t, p in sink.records if t == 2][0]
+        self.assertNotIn("grid", t2)
+
+        sink2 = FakeSink()
+        sink2.arm(2)
+        hd2, _ = self._build_sink(sink2)
+        hd2.tick(0.0)
+        t2b = [p for t, p in sink2.records if t == 2][0]
+        self.assertIn("grid", t2b)
+        self.assertIn("meta", t2b)
 
     def test_bearing_hysteresis_repicks(self):
         hd, io, po = self._build(points=((5.0, 0.0),), repick_hysteresis_rad=0.2)

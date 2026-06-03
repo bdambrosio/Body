@@ -81,6 +81,8 @@ from desktop.localization.checkpoint_matcher import (
 from desktop.localization.checkpoints import checkpoints_from_metadata
 from desktop.nav.slam.scan_matcher import lidar_scan_to_xy
 from desktop.pi_drive.drive_client import DriveClient
+from desktop.chassis.transport import open_session
+from body.lib.handoff_gate import HandoffGate
 
 # Tight, odom-primed search window for the runtime checkpoint re-anchor (the
 # drift between throttled re-anchors is small, so the window can be small →
@@ -159,6 +161,10 @@ class NavMainWindow(QMainWindow):
         self._stage_b_mode: bool = True
         self._hier_drive: Optional[HierarchicalDrive] = None
         self._drive_client: Optional[DriveClient] = None
+        # Handoff inspector seam: a dedicated zenoh session carrying the HO-1/
+        # HO-2 records + arm/continue, opened lazily on the first Go.
+        self._handoff_session: Optional[Any] = None
+        self._handoff_gate: Optional[HandoffGate] = None
 
         self._build_toolbars()
         self._build_ui()
@@ -2211,6 +2217,21 @@ class NavMainWindow(QMainWindow):
             return False
         return True
 
+    def _ensure_handoff_gate(self) -> Optional[HandoffGate]:
+        """Lazily open the handoff-inspector session + gate (HO-1/HO-2 records
+        + arm/continue over zenoh). Tolerant: on failure the drive simply runs
+        with no sink (NullHandoffSink), i.e. exactly as before."""
+        if self._handoff_gate is not None:
+            return self._handoff_gate
+        try:
+            self._handoff_session = open_session(self.chassis_config.router)
+            self._handoff_gate = HandoffGate(self._handoff_session, tiers=(1, 2))
+        except Exception:
+            logger.exception("handoff gate session failed; running without inspector")
+            self._handoff_session = None
+            self._handoff_gate = None
+        return self._handoff_gate
+
     def _on_go_stage_b(self) -> None:
         """Start hierarchical drive over the loaded patrol. Live cmd stays
         OFF — Tier-3 owns cmd_vel; nav only keeps the heartbeat alive."""
@@ -2266,6 +2287,7 @@ class NavMainWindow(QMainWindow):
         provider = self._make_pose_provider()
         self._hier_drive = HierarchicalDrive(
             runner, provider, self._drive_client, HierConfig(),
+            sink=self._ensure_handoff_gate(),
         )
         self._shared_view.set_patrol_active_wp_index(0)
         self._hier_drive.start()
@@ -2644,6 +2666,10 @@ class NavMainWindow(QMainWindow):
             if self._drive_client is not None:
                 self._drive_client.shutdown()
                 self._drive_client = None
+            if self._handoff_session is not None:
+                self._handoff_session.close()
+                self._handoff_session = None
+                self._handoff_gate = None
         except Exception:
             pass
         super().closeEvent(event)

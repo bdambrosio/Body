@@ -27,7 +27,11 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Tuple
 
-from body.lib.tier2_subgoal import Tier2Config, bearing_to_waypoint
+from body.lib import schemas
+from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
+from body.lib.tier2_subgoal import (
+    Tier2Config, bearing_to_waypoint, furthest_free_point,
+)
 from desktop.nav.patrol import PatrolRunner
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,31 @@ class DriveIO(Protocol):
         arrival_tol_m: Optional[float] = None, v_max: Optional[float] = None,
     ) -> Optional[int]: ...
     def cancel(self) -> None: ...
+
+
+class HandoffSink(Protocol):
+    """Breakpoint/record sink for the Tier-1→2 and Tier-2→3 handoffs (a
+    ``body.lib.handoff_gate.HandoffGate`` satisfies it). The default
+    ``NullHandoffSink`` makes the drive behave exactly as before."""
+    def record(self, tier: int, payload: Dict[str, Any]) -> None: ...
+    def should_hold(self, tier: int) -> bool: ...
+    def consume_continue(self, tier: int) -> bool: ...
+    def is_armed(self, tier: int) -> bool: ...
+
+
+class NullHandoffSink:
+    """No-op sink: never holds, never records (production default / tests)."""
+    def record(self, tier: int, payload: Dict[str, Any]) -> None:
+        pass
+
+    def should_hold(self, tier: int) -> bool:
+        return False
+
+    def consume_continue(self, tier: int) -> bool:
+        return False
+
+    def is_armed(self, tier: int) -> bool:
+        return False
 
 
 class PFPoseProvider:
@@ -127,11 +156,18 @@ class HierarchicalDrive:
         pose: PoseProvider,
         io: DriveIO,
         cfg: Optional[HierConfig] = None,
+        sink: Optional[HandoffSink] = None,
     ):
         self._runner = runner
         self._pose = pose
         self._io = io
         self._cfg = cfg or HierConfig()
+        # Body-frame scan raster for the Tier-2 clear-run (must match Tier-3's
+        # grid so what we hand down lands on the same local map it routes on).
+        self._raster = ScanRasterConfig()
+        # Handoff inspector sink (HO-1/HO-2 record + breakpoint). No-op default.
+        self._sink: HandoffSink = sink or NullHandoffSink()
+        self._held_tier: Optional[int] = None    # which handoff we're paused at
         self._state = HierState.IDLE
         self._cmd_id: Optional[int] = None
         self._sent_bearing: Optional[float] = None
@@ -152,6 +188,7 @@ class HierarchicalDrive:
         self._block_reason = None
         self._cmd_id = None
         self._subgoal_body = None
+        self._held_tier = None
         logger.info("hier: start (%d waypoints)", self._runner.n)
         self._to(
             HierState.ALIGNING if self._runner.current_target() is not None
@@ -161,6 +198,7 @@ class HierarchicalDrive:
     def stop(self) -> None:
         self._io.cancel()
         self._subgoal_body = None
+        self._held_tier = None
         self._to(HierState.IDLE)
 
     def _enter_suspended(self, reason: str) -> None:
@@ -262,13 +300,42 @@ class HierarchicalDrive:
             self._to(HierState.ADVANCE_WAYPOINT)
             return
 
-        # Tier-2 = direction only (contract I3): project the waypoint to a
-        # body-frame point clamped to the local horizon. NO clearance/geometry
-        # here — Tier-3's footprint A* selects the reachable point toward it and
-        # routes (rounding corners), so the goal is reachable by construction.
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
-        dist = min(wp_dist, self._cfg.tier2_cfg.horizon_m)
-        bx, by = dist * math.cos(bearing), dist * math.sin(bearing)
+
+        # HO-1 Tier-1 → Tier-2: the chosen world-frame waypoint + bearing.
+        self._sink.record(1, schemas.handoff_t1(
+            pose=pose, wp=(wp.x_m, wp.y_m),
+            wp_index=self._runner.wp_index, wp_total=self._runner.n,
+            lap_index=getattr(self._runner, "lap_index", 0),
+            terminal=self._runner.is_terminal_leg(),
+            arrival_tol_m=self._arrival_tol(),
+            bearing_rad=bearing, wp_dist_m=wp_dist))
+        if self._hold(1):
+            return
+
+        # Tier-2 (contract I3): the sub-goal is the furthest live-visible CLEAR
+        # point along the bearing in the body-frame scan grid (ray-march, back
+        # off the first block), so what we hand Tier-3 is reachable ON ITS OWN
+        # local map — not a blind projection that can land past a wall.
+        (bx, by), src, free_dist, grid, meta = self._select_subgoal_body(bearing, wp_dist)
+
+        # HO-2 Tier-2 → Tier-3: the body-frame sub-goal + the scan it sits on.
+        # The scan grid is heavy, so only attach it when BP2 is armed.
+        horizon_d = min(wp_dist, self._cfg.tier2_cfg.horizon_m)
+        self._sink.record(2, schemas.handoff_t2(
+            pose=pose, bearing_rad=bearing, src=src, free_dist_m=free_dist,
+            subgoal_body=(bx, by),
+            target_body=(horizon_d * math.cos(bearing), horizon_d * math.sin(bearing)),
+            arrival_tol_m=self._cfg.subgoal_arrival_tol_m, v_max=self._cfg.sub_v_max,
+            grid_rows=(grid.tolist() if (grid is not None and self._sink.is_armed(2)) else None),
+            meta=(meta if self._sink.is_armed(2) else None)))
+        if self._hold(2):
+            return
+
+        # Proceeding past both handoffs — clear the one-shot continue tokens.
+        self._sink.consume_continue(1)
+        self._sink.consume_continue(2)
+        self._held_tier = None
 
         cid = self._io.send_goto_from_body(
             bx, by,
@@ -284,10 +351,49 @@ class HierarchicalDrive:
         self._block_reason = None
         logger.info(
             "hier: goto cmd=%d pose=(%.2f,%.2f,%.0f°) wp=(%.2f,%.2f) "
-            "bearing=%.0f° dist=%.2f sub=(%.2f,%.2f)",
+            "bearing=%.0f° wp_dist=%.2f sub=(%.2f,%.2f) src=%s free=%.2f",
             cid, pose[0], pose[1], math.degrees(pose[2]), wp.x_m, wp.y_m,
-            math.degrees(bearing), dist, bx, by)
+            math.degrees(bearing), wp_dist, bx, by, src, free_dist)
         self._to(HierState.DRIVING_SUBGOAL)
+
+    def _hold(self, tier: int) -> bool:
+        """If ``tier``'s breakpoint is armed and unstepped, hold here. On the
+        first hold of a pause, cancel the active goto so the robot stops instead
+        of driving the prior sub-goal while we inspect. Returns True when the
+        caller should return (paused); the state stays SELECT_SUBGOAL so the
+        next tick re-records the (live) handoff and re-checks for a continue."""
+        if not self._sink.should_hold(tier):
+            return False
+        if self._held_tier is None:
+            self._io.cancel()
+        self._held_tier = tier
+        return True
+
+    def _select_subgoal_body(
+        self, bearing: float, wp_dist: float,
+    ) -> Tuple[Tuple[float, float], str, float, Optional[Any], Optional[Dict[str, Any]]]:
+        """Tier-2 sub-goal toward ``bearing``, capped at ``wp_dist``.
+
+        Restores the clear-run guarantee (I3): march the live scan along the
+        bearing and return the furthest confirmed-clear point (backed off the
+        first block/unknown), so the sub-goal is reachable on Tier-3's local
+        map. Only when there's no rasterizable scan do we fall back to the old
+        blind horizon projection. Returns ``((bx, by), source, free_dist_m,
+        grid, meta)`` — source ``clear`` (ray-march) or ``blind`` (fallback);
+        ``grid``/``meta`` are the rasterized scan (None when no scan)."""
+        t2 = self._cfg.tier2_cfg
+        grid = meta = None
+        scan = self._io.latest_scan()
+        if scan is not None and scan.get("ranges"):
+            grid, meta = rasterize_scan(
+                scan.get("ranges"), float(scan.get("angle_min", 0.0)),
+                float(scan.get("angle_increment", 0.0)), self._raster)
+            res = furthest_free_point(grid, meta, bearing, t2, max_dist_m=wp_dist)
+            if res.ok and res.body_xy is not None:
+                return res.body_xy, "clear", res.free_dist_m, grid, meta
+        dist = min(wp_dist, t2.horizon_m)
+        return ((dist * math.cos(bearing), dist * math.sin(bearing)),
+                "blind", dist, grid, meta)
 
     def _tick_driving(self) -> None:
         pose = self._pose.world_pose()

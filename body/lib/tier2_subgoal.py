@@ -26,7 +26,10 @@ from body.lib.local_drive_core import wrap_pi
 
 @dataclass(frozen=True)
 class Tier2Config:
-    horizon_m: float = 2.0          # cap sub-goal distance (≤ scan half_extent)
+    horizon_m: float = 1.5          # cap sub-goal distance; < scan half_extent (2.5)
+    #   so Tier-3's local A* keeps room/context beyond the goal and the swept
+    #   preview doesn't clip the grid edge (2.0 m put the goal at the edge →
+    #   unreliable Tier-3 targets).
     step_m: float = 0.04            # ray-march step (~half a cell)
     # Pull the sub-goal back from the first block/unknown. Small on purpose:
     # Tier-3 owns the real footprint safety gate (its own swept-footprint

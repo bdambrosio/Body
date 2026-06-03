@@ -442,3 +442,92 @@ def local_map_2p5d(
     if anchor_pose is not None:
         msg["anchor_pose"] = anchor_pose
     return msg
+
+
+# ── Tier handoff records (debug: the Handoff Inspector) ──────────────
+# One record per tier boundary, published to drive/handoff/t{1,2,3}. Pure
+# JSON (grids passed as already-listified int8 rows so this module stays
+# numpy-free). The HandoffGate stamps `seq`; producers stamp the rest.
+
+def _grid_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    if meta is None:
+        return None
+    return {k: meta[k] for k in
+            ("resolution_m", "origin_x_m", "origin_y_m", "nx", "ny")}
+
+
+def handoff_t1(
+    *, ts: float | None = None, pose, wp, wp_index: int, wp_total: int,
+    lap_index: int = 0, terminal: bool, arrival_tol_m: float,
+    bearing_rad: float, wp_dist_m: float,
+) -> dict[str, Any]:
+    """HO-1 Tier-1 → Tier-2: the chosen world-frame waypoint + bearing."""
+    return {
+        "ts": now_ts() if ts is None else ts,
+        "tier": 1,
+        "pose": [float(pose[0]), float(pose[1]), float(pose[2])],
+        "wp": [float(wp[0]), float(wp[1])],
+        "wp_index": int(wp_index), "wp_total": int(wp_total),
+        "lap_index": int(lap_index), "terminal": bool(terminal),
+        "arrival_tol_m": float(arrival_tol_m),
+        "bearing_rad": float(bearing_rad), "wp_dist_m": float(wp_dist_m),
+    }
+
+
+def handoff_t2(
+    *, ts: float | None = None, pose=None, bearing_rad: float, src: str,
+    free_dist_m: float, subgoal_body, target_body=None, arrival_tol_m: float,
+    v_max: float | None = None, cmd_id: int | None = None,
+    grid_rows: list | None = None, meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """HO-2 Tier-2 → Tier-3: the body-frame sub-goal + the live scan it sits on."""
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "tier": 2,
+        "bearing_rad": float(bearing_rad), "src": src,
+        "free_dist_m": float(free_dist_m),
+        "subgoal_body": [float(subgoal_body[0]), float(subgoal_body[1])],
+        "arrival_tol_m": float(arrival_tol_m),
+    }
+    if pose is not None:
+        msg["pose"] = [float(pose[0]), float(pose[1]), float(pose[2])]
+    if target_body is not None:
+        msg["target_body"] = [float(target_body[0]), float(target_body[1])]
+    if v_max is not None:
+        msg["v_max"] = float(v_max)
+    if cmd_id is not None:
+        msg["cmd_id"] = int(cmd_id)
+    if grid_rows is not None:
+        msg["grid"] = grid_rows
+    gm = _grid_meta(meta)
+    if gm is not None:
+        msg["meta"] = gm
+    return msg
+
+
+def handoff_t3(
+    *, ts: float | None = None, cmd_id: int, goal_body, plan_reason,
+    path_body=None, lookahead=None, v_mps: float, omega_radps: float,
+    swept_blocked: bool, grid_rows: list | None = None,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """HO-3 Tier-3 → motors: the A* path + the (v, ω) it's about to command."""
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "tier": 3,
+        "cmd_id": int(cmd_id),
+        "goal_body": [float(goal_body[0]), float(goal_body[1])],
+        "plan_reason": plan_reason,
+        "v_mps": float(v_mps), "omega_radps": float(omega_radps),
+        "swept_blocked": bool(swept_blocked),
+    }
+    if path_body is not None:
+        msg["path_body"] = [[float(p[0]), float(p[1])] for p in path_body]
+    if lookahead is not None:
+        msg["lookahead"] = [float(lookahead[0]), float(lookahead[1])]
+    if grid_rows is not None:
+        msg["grid"] = grid_rows
+    gm = _grid_meta(meta)
+    if gm is not None:
+        msg["meta"] = gm
+    return msg
