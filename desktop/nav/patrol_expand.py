@@ -44,6 +44,10 @@ class ExpandResult:
     # (from_index, to_index) into the high-level route when a segment is
     # unreachable, for an operator-facing message. None on success.
     failed_segment: Optional[Tuple[int, int]] = None
+    # Routed one-time lead-in (start pose → first marker) as a resampled
+    # polyline, when ``start_xy`` was given. lead_in[0] ≈ the start pose,
+    # lead_in[-1] == the first marker. None when no lead-in was requested/needed.
+    lead_in: Optional[List[Pt]] = None
 
 
 def _wrap(a: float) -> float:
@@ -104,18 +108,36 @@ def _mk_patrol(src: Patrol, pts: List[Pt]) -> Patrol:
 
 def expand_patrol(
     patrol: Patrol, costmap, cfg: Optional[ExpandConfig] = None,
+    *, start_xy: Optional[Pt] = None,
 ) -> ExpandResult:
     """Globally route + resample each high-level segment into sub-waypoints.
 
     `costmap` is a `desktop.world_map.costmap.Costmap` over the reference map.
     Returns the expanded `Patrol`, or `ok=False` with the unreachable segment.
+
+    When ``start_xy`` is given (the robot's world pose at Go), the lead-in from
+    the start to the first marker is ALSO routed + resampled and returned in
+    ``lead_in`` — so the hierarchical drive follows a clear path from the start
+    instead of beelining. It's returned separately (not folded into the patrol)
+    so PatrolRunner's lap/terminal accounting stays anchored on the markers.
     """
     cfg = cfg or ExpandConfig()
     hi: List[Pt] = [(w.x_m, w.y_m) for w in patrol.waypoints]
     if not hi:
         return ExpandResult(False, None, "patrol has no waypoints")
+
+    lead_in: Optional[List[Pt]] = None
+    if start_xy is not None and not _close(start_xy, hi[0]):
+        res = plan_path(costmap, start_xy, hi[0], cfg.astar)
+        # Best-effort: if the lead-in can't be routed, leave it None and let the
+        # drive fall back to its greedy beeline (today's behavior) rather than
+        # blocking Go — the marker route below is the part that must succeed.
+        if res.ok:
+            lead_in = resample_path(res.waypoints_world, max_spacing_m=cfg.max_spacing_m,
+                                    corner_thresh_rad=cfg.corner_thresh_rad)
+
     if len(hi) == 1:
-        return ExpandResult(True, _mk_patrol(patrol, hi))
+        return ExpandResult(True, _mk_patrol(patrol, hi), lead_in=lead_in)
 
     # Route = consecutive high-level waypoints, closing back to the first when
     # the patrol loops. Indices are into this `route` list for error reporting.
@@ -148,4 +170,4 @@ def expand_patrol(
 
     if len(out) < 2:
         return ExpandResult(False, None, "expanded route degenerate")
-    return ExpandResult(True, _mk_patrol(patrol, out))
+    return ExpandResult(True, _mk_patrol(patrol, out), lead_in=lead_in)

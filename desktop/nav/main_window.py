@@ -2267,7 +2267,13 @@ class NavMainWindow(QMainWindow):
                 "No costmap yet — wait for the map to render before Go.",
             )
             return
-        exp = expand_patrol(patrol, self._last_costmap, ExpandConfig())
+        # Route the lead-in (start pose → first marker) too, so the start isn't
+        # a greedy beeline. Best-effort: a missing lead-in falls back to today's
+        # behavior, kept separate from the patrol so lap accounting is unchanged.
+        latest = self.fuser.pose_source.latest_pose()
+        start_xy = (latest[0][0], latest[0][1]) if latest is not None else None
+        exp = expand_patrol(patrol, self._last_costmap, ExpandConfig(),
+                            start_xy=start_xy)
         if not exp.ok:
             seg = exp.failed_segment
             QMessageBox.warning(
@@ -2277,17 +2283,20 @@ class NavMainWindow(QMainWindow):
             )
             return
         exec_patrol = exp.patrol
-        # Preview the dense routed path on the maps (cyan polyline).
+        lead_in = exp.lead_in or []
+        # Preview the dense routed path on the maps (cyan polyline) — lead-in
+        # (minus its shared last point) + markers.
         self._shared_view.set_planned_path(
-            [(w.x_m, w.y_m) for w in exec_patrol.waypoints]
+            list(lead_in[:-1]) + [(w.x_m, w.y_m) for w in exec_patrol.waypoints]
         )
-        logger.info("hier: expanded %d waypoints -> %d sub-waypoints",
-                    len(patrol.waypoints), len(exec_patrol.waypoints))
+        logger.info("hier: expanded %d waypoints -> %d sub-waypoints (+%d lead-in)",
+                    len(patrol.waypoints), len(exec_patrol.waypoints),
+                    max(0, len(lead_in) - 1))
         runner = PatrolRunner(exec_patrol)
         provider = self._make_pose_provider()
         self._hier_drive = HierarchicalDrive(
             runner, provider, self._drive_client, HierConfig(),
-            sink=self._ensure_handoff_gate(),
+            sink=self._ensure_handoff_gate(), lead_in=lead_in,
         )
         self._shared_view.set_patrol_active_wp_index(0)
         self._hier_drive.start()

@@ -139,6 +139,34 @@ class TestExpand(unittest.TestCase):
         self.assertTrue(res.ok)
         self.assertEqual(len(res.patrol.waypoints), 1)
 
+    def test_lead_in_routed_from_start(self):
+        cm = _costmap_from_driveable(np.full((40, 40), 1, np.int8))
+        pts = [(0.5, 0.5), (1.5, 0.5)]
+        start = (0.1, 0.1)
+        res = expand_patrol(_patrol(pts), cm, ExpandConfig(max_spacing_m=0.5),
+                            start_xy=start)
+        self.assertTrue(res.ok, res.reason)
+        self.assertIsNotNone(res.lead_in)
+        self.assertLess(math.hypot(res.lead_in[0][0] - start[0],
+                                   res.lead_in[0][1] - start[1]), 0.1)
+        self.assertLess(math.hypot(res.lead_in[-1][0] - pts[0][0],
+                                   res.lead_in[-1][1] - pts[0][1]), 0.1)
+        # The patrol (marker route) is byte-for-byte unchanged by the lead-in.
+        ref = expand_patrol(_patrol(pts), cm, ExpandConfig(max_spacing_m=0.5))
+        self.assertEqual([(w.x_m, w.y_m) for w in res.patrol.waypoints],
+                         [(w.x_m, w.y_m) for w in ref.patrol.waypoints])
+
+    def test_no_lead_in_without_start(self):
+        cm = _costmap_from_driveable(np.full((20, 20), 1, np.int8))
+        res = expand_patrol(_patrol([(0.2, 0.2), (0.8, 0.2)]), cm)
+        self.assertIsNone(res.lead_in)
+
+    def test_no_lead_in_when_already_at_first_marker(self):
+        cm = _costmap_from_driveable(np.full((20, 20), 1, np.int8))
+        res = expand_patrol(_patrol([(0.2, 0.2), (0.8, 0.2)]), cm,
+                            start_xy=(0.2, 0.2))
+        self.assertIsNone(res.lead_in)
+
 
 if __name__ == "__main__":
     unittest.main()

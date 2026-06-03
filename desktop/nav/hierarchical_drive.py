@@ -161,8 +161,15 @@ class HierarchicalDrive:
         io: DriveIO,
         cfg: Optional[HierConfig] = None,
         sink: Optional[HandoffSink] = None,
+        lead_in: Optional[list] = None,
     ):
         self._runner = runner
+        # One-time routed lead-in (start pose → first marker) the carrot follows
+        # BEFORE the patrol loop, so the start isn't an un-routed beeline. Kept
+        # OUT of the runner so lap/terminal accounting stays anchored on the
+        # markers. lead_in[0] ≈ the start pose, lead_in[-1] == the first marker.
+        self._lead_in: list = list(lead_in or [])
+        self._lead_idx: int = 1
         self._pose = pose
         self._io = io
         self._cfg = cfg or HierConfig()
@@ -202,7 +209,9 @@ class HierarchicalDrive:
         self._held_tier = None
         self._route_start = None
         self._prev_waypoint_xy = None
-        logger.info("hier: start (%d waypoints)", self._runner.n)
+        self._lead_idx = 1
+        logger.info("hier: start (%d waypoints, %d lead-in)",
+                    self._runner.n, max(0, len(self._lead_in) - 1))
         self._to(
             HierState.ALIGNING if self._runner.current_target() is not None
             else HierState.FAILED
@@ -254,11 +263,40 @@ class HierarchicalDrive:
                            reason, self._cfg.max_blocked_repicks)
         self._to(HierState.BLOCKED)
 
+    # ── Carrot: the one-time lead-in prefix, then the patrol runner ──────
+
+    def _in_lead_in(self) -> bool:
+        return self._lead_idx < len(self._lead_in)
+
+    def _carrot_xy(self) -> Optional[Tuple[float, float]]:
+        if self._in_lead_in():
+            return tuple(self._lead_in[self._lead_idx])
+        wp = self._runner.current_target()
+        return None if wp is None else (wp.x_m, wp.y_m)
+
+    def _carrot_terminal(self) -> bool:
+        return False if self._in_lead_in() else self._runner.is_terminal_leg()
+
+    def _display_route(self) -> list:
+        """The full route for the inspector: lead-in (minus its shared last
+        point) + the marker route."""
+        wps = [(w.x_m, w.y_m) for w in self._runner.patrol.waypoints]
+        return (list(self._lead_in[:-1]) + wps) if self._lead_in else wps
+
+    def _carrot_index_total(self) -> Tuple[int, int]:
+        total = len(self._display_route())
+        if self._in_lead_in():
+            return self._lead_idx, total
+        offset = (len(self._lead_in) - 1) if self._lead_in else 0
+        return offset + self._runner.wp_index, total
+
     def _prev_vertex(self) -> Tuple[float, float]:
-        """The route vertex just before the current carrot, to define the
-        segment for the passed-test. The vertex we last advanced *from* (handles
-        loop closure: prev is whatever we left); the captured start pose for the
-        very first vertex."""
+        """The vertex just before the current carrot, defining the segment for
+        the passed-test: the previous lead-in point in the lead-in; the vertex
+        we last advanced from (handles loop closure) or the captured start pose
+        in the patrol."""
+        if self._in_lead_in():
+            return tuple(self._lead_in[self._lead_idx - 1])
         if self._prev_waypoint_xy is not None:
             return self._prev_waypoint_xy
         if self._route_start is not None:
@@ -266,13 +304,13 @@ class HierarchicalDrive:
         return self._waypoint if self._waypoint is not None else (0.0, 0.0)
 
     def _reached_waypoint(self, pose: Pose) -> bool:
-        """Advance off the current vertex. Terminal: a tight proximity stop.
-        Intermediate: only once we've driven PAST the vertex along its route
-        segment, so closely spaced corner sub-waypoints aren't skipped and the
-        carrot (current target) stays the next un-passed vertex."""
+        """Advance off the current carrot. Terminal: a tight proximity stop.
+        Intermediate (incl. all lead-in points): only once we've driven PAST the
+        vertex along its route segment, so closely spaced corner sub-waypoints
+        aren't skipped and the carrot stays the next un-passed vertex."""
         if self._waypoint is None:
             return False
-        if self._runner.is_terminal_leg():
+        if self._carrot_terminal():
             return _dist(pose, self._waypoint) <= self._cfg.waypoint_tol_m
         return passed_waypoint((pose[0], pose[1]), self._prev_vertex(),
                                self._waypoint,
@@ -321,33 +359,35 @@ class HierarchicalDrive:
             # Lost the pose after we were already driving — gate the resume.
             self._enter_suspended("pose_lost")
             return
-        wp = self._runner.current_target()
-        if wp is None:
+        carrot = self._carrot_xy()
+        if carrot is None:
             self._to(HierState.FAILED)
             return
         if self._route_start is None:
             self._route_start = (pose[0], pose[1])   # prev for the first vertex
-        self._waypoint = (wp.x_m, wp.y_m)
+        self._waypoint = carrot
         wp_dist = _dist(pose, self._waypoint)
         if self._reached_waypoint(pose):
             self._to(HierState.ADVANCE_WAYPOINT)
             return
 
-        bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], wp.x_m, wp.y_m)
+        cx, cy = self._waypoint
+        bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], cx, cy)
 
-        # HO-1 Tier-1 → Tier-2: the chosen world-frame waypoint + bearing, plus
-        # the FULL dense Tier-1 route (Tier-1 builds the whole route; only this
-        # one waypoint is handed to Tier-2 each leg).
+        # HO-1 Tier-1 → Tier-2: the chosen world-frame carrot + bearing, plus the
+        # FULL route (lead-in + dense markers) — Tier-2 tracks the whole route
+        # vertex-by-vertex; this is just the current carrot.
+        terminal = self._carrot_terminal()
+        idx, total = self._carrot_index_total()
         self._sink.record(1, schemas.handoff_t1(
-            pose=pose, wp=(wp.x_m, wp.y_m),
-            wp_index=self._runner.wp_index, wp_total=self._runner.n,
+            pose=pose, wp=(cx, cy),
+            wp_index=idx, wp_total=total,
             lap_index=getattr(self._runner, "lap_index", 0),
-            terminal=self._runner.is_terminal_leg(),
-            arrival_tol_m=(self._cfg.waypoint_tol_m
-                           if self._runner.is_terminal_leg()
+            terminal=terminal,
+            arrival_tol_m=(self._cfg.waypoint_tol_m if terminal
                            else self._cfg.pass_proximity_m),
             bearing_rad=bearing, wp_dist_m=wp_dist,
-            route=[(w.x_m, w.y_m) for w in self._runner.patrol.waypoints]))
+            route=self._display_route()))
         if self._hold(1):
             return
 
@@ -388,9 +428,10 @@ class HierarchicalDrive:
         self._subgoal_body = (bx, by)
         self._block_reason = None
         logger.info(
-            "hier: goto cmd=%d pose=(%.2f,%.2f,%.0f°) wp=(%.2f,%.2f) "
+            "hier: goto cmd=%d pose=(%.2f,%.2f,%.0f°) wp=(%.2f,%.2f)%s "
             "bearing=%.0f° wp_dist=%.2f sub=(%.2f,%.2f) src=%s free=%.2f",
-            cid, pose[0], pose[1], math.degrees(pose[2]), wp.x_m, wp.y_m,
+            cid, pose[0], pose[1], math.degrees(pose[2]), cx, cy,
+            " [lead-in]" if self._in_lead_in() else "",
             math.degrees(bearing), wp_dist, bx, by, src, free_dist)
         self._to(HierState.DRIVING_SUBGOAL)
 
@@ -455,10 +496,10 @@ class HierarchicalDrive:
         # Waypoint reached (PF-judged) supersedes any sub-goal progress.
         if pose is not None and self._waypoint is not None:
             if self._reached_waypoint(pose):
-                # Only stop at the terminal waypoint. For intermediates, leave
-                # Tier-3 driving and let the next SELECT_SUBGOAL goto supersede
-                # it (seamless via cmd_id) — no decelerate-stop at each hop.
-                if self._runner.is_terminal_leg():
+                # Only stop at the terminal waypoint. For intermediates (incl.
+                # lead-in points), leave Tier-3 driving and let the next
+                # SELECT_SUBGOAL goto supersede it (seamless via cmd_id).
+                if self._carrot_terminal():
                     self._io.cancel()
                 self._to(HierState.ADVANCE_WAYPOINT)
                 return
@@ -488,6 +529,14 @@ class HierarchicalDrive:
                 self._to(HierState.SELECT_SUBGOAL)
 
     def _tick_advance(self) -> None:
+        # Lead-in prefix: just step the lead-in carrot. The patrol runner is
+        # untouched until the lead-in delivers us to the first marker.
+        if self._in_lead_in():
+            self._prev_waypoint_xy = tuple(self._lead_in[self._lead_idx])
+            self._lead_idx += 1
+            self._blocked_repicks = 0
+            self._to(HierState.SELECT_SUBGOAL)
+            return
         # Remember the vertex we're leaving — it's the prev for the passed-test
         # on the next carrot (handles loop closure: prev is whatever we left).
         left = self._runner.current_target()

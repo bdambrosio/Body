@@ -318,6 +318,40 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertAlmostEqual(bx, 1.46, places=2)
         self.assertAlmostEqual(by, 0.0, places=2)
 
+    def test_lead_in_followed_then_patrol(self):
+        # lead_in [start, (1,0), marker0] is followed vertex-by-vertex BEFORE
+        # the patrol runner engages; the runner stays at wp_index 0 until the
+        # lead-in delivers us to the first marker.
+        io = FakeDriveIO(scan=_clear_scan())
+        po = FakePose((0.0, 0.0, 0.0))
+        runner = _runner(((2.0, 0.0), (4.0, 0.0)))
+        hd = HierarchicalDrive(runner, po, io, HierConfig(),
+                               lead_in=[(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)])
+        hd.start()
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)    # ALIGNING→SELECT
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # carrot=(1,0)
+        self.assertTrue(hd._in_lead_in())
+        self.assertEqual(hd._waypoint, (1.0, 0.0))     # first lead-in carrot
+        self.assertEqual(runner.wp_index, 0)           # runner untouched
+
+        po.pose = (1.1, 0.0, 0.0)                       # passed (1,0)
+        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)    # step lead-in
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # carrot=marker0
+        self.assertTrue(hd._in_lead_in())
+        self.assertEqual(hd._waypoint, (2.0, 0.0))
+        self.assertEqual(runner.wp_index, 0)
+
+        po.pose = (2.1, 0.0, 0.0)                       # passed marker0
+        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)  # lead-in reached
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)    # lead-in ends
+        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)  # patrol: marker0
+        self.assertFalse(hd._in_lead_in())
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)    # on_arrived 0→1
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # carrot=marker1
+        self.assertEqual(runner.wp_index, 1)
+        self.assertEqual(hd._waypoint, (4.0, 0.0))
+
     # ── handoff breakpoints (HO-1 / HO-2) ────────────────────────────
     def _build_sink(self, sink, points=((2.0, 0.0),)):
         io = FakeDriveIO(scan=_clear_scan())
