@@ -2181,13 +2181,27 @@ class NavMainWindow(QMainWindow):
 
     # ── Stage-B hierarchical drive ───────────────────────────────────
 
+    def _new_drive_trace_path(self) -> Optional[str]:
+        """A per-session JSONL path for the Tier-3 status trace (every
+        body/drive/status: state, plan_reason, path_body, goal, v/omega,
+        blocked_reason) — for offline root-cause of a drive leg."""
+        try:
+            d = os.path.expanduser("~/body-logs")
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, f"drive-trace-{int(time.time())}.jsonl")
+        except OSError:
+            logger.exception("could not prepare drive-trace dir")
+            return None
+
     def _ensure_drive_client(self) -> bool:
         """Lazily open the DriveClient session (own zenoh session for
         body/drive/goto + status + scan) on the first Go. Returns True once
         a connected client is available; warns and returns False otherwise.
         Closed in closeEvent."""
         if self._drive_client is None:
-            self._drive_client = DriveClient(self.chassis_config.router)
+            self._drive_client = DriveClient(
+                self.chassis_config.router,
+                trace_path=self._new_drive_trace_path())
         ok, err = self._drive_client.connect()
         if not ok:
             QMessageBox.warning(

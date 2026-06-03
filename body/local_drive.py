@@ -198,14 +198,14 @@ def main() -> None:
 
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
                        dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
-                       path_body=None) -> None:
+                       path_body=None, plan_reason=None) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
                 cmd_id=cmd_id, state=state, goal_body_xy=goal_body,
                 dist_remaining_m=dist, v_mps=v, omega_radps=omega,
                 blocked_reason=reason, mode=mode, path_body_xy=path_body,
-                build=build,
+                plan_reason=plan_reason, build=build,
             ),
         )
 
@@ -340,7 +340,7 @@ def main() -> None:
         publish_cmd(v, omega)
         publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
                        dist=dist, v=v, omega=omega, mode="follow",
-                       path_body=plan.path_body)
+                       path_body=plan.path_body, plan_reason=plan.reason)
         next_tick = _sleep_to(next_tick, period)
 
     publish_cmd(0.0, 0.0)

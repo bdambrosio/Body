@@ -68,6 +68,7 @@ def drive_status(
     blocked_reason: str | None = None,
     mode: str | None = None,
     path_body_xy: list | None = None,
+    plan_reason: str | None = None,
     build: str | None = None,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
@@ -93,6 +94,8 @@ def drive_status(
         msg["blocked_reason"] = blocked_reason
     if mode is not None:
         msg["mode"] = mode
+    if plan_reason is not None:
+        msg["plan_reason"] = plan_reason          # ok|frontier (A* reach vs best-effort)
     if path_body_xy:
         msg["path_body_xy"] = [[float(p[0]), float(p[1])] for p in path_body_xy]
     if build is not None:
