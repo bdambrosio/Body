@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 
 _UNDO_DEPTH = 25
 _SCAN_MAX_RANGE_M = 12.0
-_STAMP_MAX_RANGE_M = 4.0  # only stamp live-scan hits within this range
 # Recognize re-stamps observed occupancy within this radius of the asserted
 # pose, rebuilt from the last few odom-stitched scans (Phase 1 of the
 # topological-localization plan; see docs/topological_localization_design.md).
@@ -90,8 +89,7 @@ class MapEditorWindow(QMainWindow):
         # only (no scan-match creep). None → use the MCL pose.
         self._overlay_pose: Optional[Tuple[float, float, float]] = None
         self._odom_anchor: Optional[Tuple[float, float, float]] = None
-        # Latest world-frame live-scan endpoints (what the cyan dots show),
-        # retained so "Stamp scan→wall" writes exactly what you see.
+        # Latest world-frame live-scan endpoints (what the cyan dots show).
         self._live_scan_world: Optional[np.ndarray] = None
         # Recent (world_scan, pose) snapshots in the *asserted* (align) frame,
         # for Recognize's odom-stitched multi-scan re-stamp. Filled only in
@@ -195,7 +193,6 @@ class MapEditorWindow(QMainWindow):
         self._act_connect = None
         self._act_relocate = None
         self._act_locate = None
-        self._act_stamp = None
         self._act_recognize = None
         self._act_test_match = None
         if self._router:
@@ -236,15 +233,6 @@ class MapEditorWindow(QMainWindow):
             for a in (self._act_rot_ccw, self._act_rot_cw):
                 a.setEnabled(False)
             tb2.addSeparator()
-            # Stamp the live scan into the occupancy Wall layer (WYSIWYG:
-            # exactly the cyan dots, within range, onto free/unknown cells).
-            self._act_stamp = tb2.addAction("Stamp scan→wall")
-            self._act_stamp.setToolTip(
-                f"Write live-scan hits (≤{_STAMP_MAX_RANGE_M:.0f} m) into the "
-                "occupancy Wall layer. Edits the localization map — stamp only "
-                "stable structure.")
-            self._act_stamp.setEnabled(False)
-            self._act_stamp.triggered.connect(self._on_stamp_scan)
             # Recognize: heal the map locally so the asserted pose scores best
             # here (replace observed occupancy within a radius from a few
             # odom-stitched scans). Requires an asserted pose (Align/Set loc).
@@ -451,7 +439,6 @@ class MapEditorWindow(QMainWindow):
             self._act_align.setEnabled(True)
             self._act_rot_ccw.setEnabled(True)
             self._act_rot_cw.setEnabled(True)
-            self._act_stamp.setEnabled(True)
             self._act_recognize.setEnabled(True)
             self._act_test_match.setEnabled(True)
             self._live_timer.start()
@@ -481,7 +468,6 @@ class MapEditorWindow(QMainWindow):
             self._act_align.setEnabled(False)
             self._act_rot_ccw.setEnabled(False)
             self._act_rot_cw.setEnabled(False)
-            self._act_stamp.setEnabled(False)
             self._act_recognize.setEnabled(False)
             self._act_test_match.setEnabled(False)
             self._match_lbl.setText("")
@@ -560,41 +546,6 @@ class MapEditorWindow(QMainWindow):
         x, y, th = self._overlay_pose
         self._overlay_pose = (x, y, th + sign * math.radians(1.0))
         self._scan_ring.clear()   # pose jumped → old-frame scans are stale
-
-    def _on_stamp_scan(self) -> None:
-        """One-shot: write the live scan's in-range hits into the Wall
-        layer (free/unknown cells only). Edits the localization map, so it
-        confirms first."""
-        if self._emap is None or self._link is None:
-            return
-        pose = self._live_pose
-        if self._live_scan_world is None or pose is None:
-            self._status.showMessage("No live scan to stamp.", 3000)
-            return
-        ii, jj = self._emap.stamp_cells_from_scan(
-            self._live_scan_world, pose, max_range_m=_STAMP_MAX_RANGE_M)
-        n = int(len(ii))
-        if n == 0:
-            self._status.showMessage(
-                f"Nothing to stamp (no free/unknown hits within "
-                f"{_STAMP_MAX_RANGE_M:.0f} m).", 4000)
-            return
-        r = QMessageBox.question(
-            self, "Stamp scan to wall?",
-            f"Write {n} live-scan cell(s) into the occupancy (Wall) layer?\n\n"
-            "This edits the LOCALIZATION map — stamp only stable structure, "
-            "not people or moved furniture.")
-        if r != QMessageBox.StandardButton.Yes:
-            return
-        self._undo.append(self._emap.snapshot_state())
-        if len(self._undo) > _UNDO_DEPTH:
-            self._undo.pop(0)
-        self._act_undo.setEnabled(True)
-        self._emap.paint(ii, jj, em.WALL)
-        self._dirty = True
-        self._rerender(fit=False)
-        self._update_title()
-        self._status.showMessage(f"Stamped {n} cell(s) to wall.", 4000)
 
     def _recent_distinct_scans(
         self, max_scans: int = 3, min_step_m: float = 0.03,
