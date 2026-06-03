@@ -127,6 +127,29 @@ class FakeSink:
         return [t for t, _ in self.records]
 
 
+class TestPassedWaypoint(unittest.TestCase):
+    def test_not_passed_when_short(self):
+        from desktop.nav.patrol import passed_waypoint
+        self.assertFalse(passed_waypoint((0.55, 0.0), (0.0, 0.0), (1.0, 0.0)))
+
+    def test_passed_when_beyond(self):
+        from desktop.nav.patrol import passed_waypoint
+        self.assertTrue(passed_waypoint((1.1, 0.0), (0.0, 0.0), (1.0, 0.0)))
+
+    def test_passed_abeam_even_if_offset(self):
+        from desktop.nav.patrol import passed_waypoint
+        # Abeam the vertex (t = 1) but laterally offset still counts as passed.
+        self.assertTrue(passed_waypoint((1.0, 0.5), (0.0, 0.0), (1.0, 0.0)))
+
+    def test_proximity_fallback(self):
+        from desktop.nav.patrol import passed_waypoint
+        # Short along the segment but within the small proximity guard.
+        self.assertTrue(passed_waypoint((0.0, 0.85), (0.0, 0.0), (0.0, 1.0),
+                                        proximity_m=0.2))
+        self.assertFalse(passed_waypoint((0.0, 0.7), (0.0, 0.0), (0.0, 1.0),
+                                         proximity_m=0.2))
+
+
 class TestHierarchicalDrive(unittest.TestCase):
     def _build(self, points=((2.0, 0.0),), pose=(0.0, 0.0, 0.0), scan=None, **cfg):
         io = FakeDriveIO(scan=scan if scan is not None else _clear_scan())
@@ -190,14 +213,18 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)   # toward wp1
         self.assertEqual(hd._runner.wp_index, 1)
 
-    def test_passthrough_advances_intermediate_without_stop(self):
-        # wp0 is non-terminal: a pose inside passthrough_tol (0.6) but outside
-        # the tight waypoint_tol (0.3) should advance (and not cancel).
+    def test_intermediate_advances_only_when_passed(self):
+        # Non-terminal wp0: a pose SHORT of it (not yet driven past along the
+        # start→wp0 segment) must NOT advance — the old proximity radius would
+        # have skipped it (and cut the corner). It advances only once passed.
         hd, io, po = self._build(points=((1.0, 0.0), (3.0, 0.0)))
-        self._drive_to_sending(hd)
-        po.pose = (0.55, 0.0, 0.0)       # 0.45 m from wp0
+        self._drive_to_sending(hd)       # _route_start captured at (0,0)
+        po.pose = (0.55, 0.0, 0.0)       # 0.45 m short of wp0 → not passed
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(hd._runner.wp_index, 0)
+        po.pose = (1.1, 0.0, 0.0)        # driven past wp0 (t ≥ 1) → advance
         self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
-        self.assertEqual(io.cancels, 0)
+        self.assertEqual(io.cancels, 0)  # seamless — Tier-3 not canceled
         self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
         self.assertEqual(hd._runner.wp_index, 1)
 

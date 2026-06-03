@@ -36,7 +36,7 @@ from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.tier2_subgoal import (
     Tier2Config, bearing_to_waypoint, furthest_free_point,
 )
-from desktop.nav.patrol import PatrolRunner
+from desktop.nav.patrol import PatrolRunner, passed_waypoint
 
 logger = logging.getLogger(__name__)
 
@@ -131,13 +131,13 @@ class HierState(enum.Enum):
 
 @dataclass(frozen=True)
 class HierConfig:
-    waypoint_tol_m: float = 0.30          # PF-pose distance to count a waypoint reached
-    # Intermediate (non-terminal) waypoints advance at this looser radius and
-    # WITHOUT canceling Tier-3 — the next goto supersedes seamlessly, so the
-    # bot doesn't decelerate-stop at every sub-waypoint. Must exceed Tier-3's
-    # slowdown_distance_m (~0.4) so the advance fires before it slows. The
-    # terminal waypoint still uses the tight waypoint_tol_m + a real stop.
-    passthrough_tol_m: float = 0.60
+    waypoint_tol_m: float = 0.30          # PF-pose distance to count the TERMINAL waypoint reached
+    # Intermediate sub-waypoints advance one at a time via a passed-vertex test
+    # (drove past the vertex along its route segment), NOT a radius — so closely
+    # spaced corner sub-waypoints aren't skipped (the old radius cut corners).
+    # The carrot is always the next un-passed vertex, so the bearing tracks the
+    # Tier-1 route. pass_proximity_m is only a small stall-guard fallback.
+    pass_proximity_m: float = 0.20
     subgoal_arrival_tol_m: float = 0.15   # tol passed to Tier-3 for each sub-goal
     repick_hysteresis_rad: float = 0.35   # re-pick mid-leg if the bearing drifts past this
     max_blocked_repicks: int = 3          # retries before BLOCKED becomes a pause
@@ -177,6 +177,8 @@ class HierarchicalDrive:
         # Handoff inspector sink (HO-1/HO-2 record + breakpoint). No-op default.
         self._sink: HandoffSink = sink or NullHandoffSink()
         self._held_tier: Optional[int] = None    # which handoff we're paused at
+        self._route_start: Optional[Tuple[float, float]] = None   # prev for vertex 0
+        self._prev_waypoint_xy: Optional[Tuple[float, float]] = None  # last vertex left
         self._state = HierState.IDLE
         self._cmd_id: Optional[int] = None
         self._sent_bearing: Optional[float] = None
@@ -198,6 +200,8 @@ class HierarchicalDrive:
         self._cmd_id = None
         self._subgoal_body = None
         self._held_tier = None
+        self._route_start = None
+        self._prev_waypoint_xy = None
         logger.info("hier: start (%d waypoints)", self._runner.n)
         self._to(
             HierState.ALIGNING if self._runner.current_target() is not None
@@ -250,11 +254,29 @@ class HierarchicalDrive:
                            reason, self._cfg.max_blocked_repicks)
         self._to(HierState.BLOCKED)
 
-    def _arrival_tol(self) -> float:
-        """Tight stop tolerance on the terminal leg, loose pass-through radius
-        for intermediates (so we advance + retarget before Tier-3 decelerates)."""
-        return (self._cfg.waypoint_tol_m if self._runner.is_terminal_leg()
-                else self._cfg.passthrough_tol_m)
+    def _prev_vertex(self) -> Tuple[float, float]:
+        """The route vertex just before the current carrot, to define the
+        segment for the passed-test. The vertex we last advanced *from* (handles
+        loop closure: prev is whatever we left); the captured start pose for the
+        very first vertex."""
+        if self._prev_waypoint_xy is not None:
+            return self._prev_waypoint_xy
+        if self._route_start is not None:
+            return self._route_start
+        return self._waypoint if self._waypoint is not None else (0.0, 0.0)
+
+    def _reached_waypoint(self, pose: Pose) -> bool:
+        """Advance off the current vertex. Terminal: a tight proximity stop.
+        Intermediate: only once we've driven PAST the vertex along its route
+        segment, so closely spaced corner sub-waypoints aren't skipped and the
+        carrot (current target) stays the next un-passed vertex."""
+        if self._waypoint is None:
+            return False
+        if self._runner.is_terminal_leg():
+            return _dist(pose, self._waypoint) <= self._cfg.waypoint_tol_m
+        return passed_waypoint((pose[0], pose[1]), self._prev_vertex(),
+                               self._waypoint,
+                               proximity_m=self._cfg.pass_proximity_m)
 
     # ── Introspection (for the UI overlay / status label) ────────────
 
@@ -303,9 +325,11 @@ class HierarchicalDrive:
         if wp is None:
             self._to(HierState.FAILED)
             return
+        if self._route_start is None:
+            self._route_start = (pose[0], pose[1])   # prev for the first vertex
         self._waypoint = (wp.x_m, wp.y_m)
         wp_dist = _dist(pose, self._waypoint)
-        if wp_dist <= self._arrival_tol():
+        if self._reached_waypoint(pose):
             self._to(HierState.ADVANCE_WAYPOINT)
             return
 
@@ -319,7 +343,9 @@ class HierarchicalDrive:
             wp_index=self._runner.wp_index, wp_total=self._runner.n,
             lap_index=getattr(self._runner, "lap_index", 0),
             terminal=self._runner.is_terminal_leg(),
-            arrival_tol_m=self._arrival_tol(),
+            arrival_tol_m=(self._cfg.waypoint_tol_m
+                           if self._runner.is_terminal_leg()
+                           else self._cfg.pass_proximity_m),
             bearing_rad=bearing, wp_dist_m=wp_dist,
             route=[(w.x_m, w.y_m) for w in self._runner.patrol.waypoints]))
         if self._hold(1):
@@ -428,7 +454,7 @@ class HierarchicalDrive:
             return
         # Waypoint reached (PF-judged) supersedes any sub-goal progress.
         if pose is not None and self._waypoint is not None:
-            if _dist(pose, self._waypoint) <= self._arrival_tol():
+            if self._reached_waypoint(pose):
                 # Only stop at the terminal waypoint. For intermediates, leave
                 # Tier-3 driving and let the next SELECT_SUBGOAL goto supersede
                 # it (seamless via cmd_id) — no decelerate-stop at each hop.
@@ -462,6 +488,11 @@ class HierarchicalDrive:
                 self._to(HierState.SELECT_SUBGOAL)
 
     def _tick_advance(self) -> None:
+        # Remember the vertex we're leaving — it's the prev for the passed-test
+        # on the next carrot (handles loop closure: prev is whatever we left).
+        left = self._runner.current_target()
+        if left is not None:
+            self._prev_waypoint_xy = (left.x_m, left.y_m)
         next_idx, _lap_done = self._runner.on_arrived()
         logger.info("hier: waypoint reached -> next=%s", next_idx)
         self._blocked_repicks = 0                  # fresh leg

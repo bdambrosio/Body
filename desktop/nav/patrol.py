@@ -37,6 +37,29 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def passed_waypoint(
+    pose_xy: Tuple[float, float], prev_xy: Tuple[float, float],
+    target_xy: Tuple[float, float], *, proximity_m: float = 0.2,
+) -> bool:
+    """True once the robot has driven PAST ``target_xy`` along the route segment
+    ``prev_xy → target_xy`` — projected arc-length t ≥ 1 — or is within
+    ``proximity_m`` of it (a small fallback so it can't stall just short).
+
+    This is how the carrot advances one vertex at a time: a *proximity-radius*
+    advance would skip any sub-waypoint within the radius (e.g. a corner vertex
+    a few cm to the side of a turn), which is exactly how Tier-2 used to cut the
+    corner Tier-1 routed around. The passed-test only advances when the robot
+    has actually moved *beyond* the vertex along the path."""
+    px, py = pose_xy[0], pose_xy[1]
+    sx, sy = target_xy[0] - prev_xy[0], target_xy[1] - prev_xy[1]
+    seg2 = sx * sx + sy * sy
+    if seg2 >= 1e-9:
+        t = ((px - prev_xy[0]) * sx + (py - prev_xy[1]) * sy) / seg2
+        if t >= 1.0:
+            return True
+    return math.hypot(px - target_xy[0], py - target_xy[1]) <= proximity_m
+
+
 # ── Data model ──────────────────────────────────────────────────────
 
 
