@@ -72,6 +72,8 @@ class SharedMapView:
         # right. None when no scan/pose available; toggle via _show_scan.
         self._scan_overlay_world: Optional[Any] = None
         self._show_scan_overlay: bool = True
+        # LPR checkpoints to draw: list of (x_m, y_m, radius_m, id).
+        self._checkpoints: List[Any] = []
         self._views: List["_WorldViewBase"] = []
         # Mission state shared across panels: a single goal pin in
         # world frame, and the most recently planned path. Both are
@@ -235,6 +237,16 @@ class SharedMapView:
 
     def set_show_scan_overlay(self, on: bool) -> None:
         self._show_scan_overlay = bool(on)
+        self._notify()
+
+    # ── Checkpoint overlay (LPR snap locations) ─────────────────────
+
+    def checkpoints(self) -> List[Any]:
+        return self._checkpoints
+
+    def set_checkpoints(self, cps: Optional[Sequence[Any]]) -> None:
+        """Install checkpoints to draw: each (x_m, y_m, radius_m, id)."""
+        self._checkpoints = list(cps) if cps else []
         self._notify()
 
     # ── Patrol overlay ──────────────────────────────────────────────
@@ -557,6 +569,9 @@ class _WorldViewBase(QWidget):
             # the pose/anchor markers so the markers stay legible).
             self._draw_scan_overlay(p, ox, oy, side_px)
 
+            # LPR checkpoints (rings + ids) — where Recognize snaps landed.
+            self._draw_checkpoints(p, ox, oy, side_px, side_world)
+
             # World origin (anchor) marker.
             self._draw_world_marker(
                 p, 0.0, 0.0, 0.0, ox, oy, side_px,
@@ -760,6 +775,32 @@ class _WorldViewBase(QWidget):
         p.setPen(QPen(QColor(80, 200, 255, 220), 2.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+        p.restore()
+
+    def _draw_checkpoints(
+        self, p: QPainter, ox: int, oy: int, side_px: int, side_world: float,
+    ) -> None:
+        """Draw each LPR checkpoint as a faint radius ring + centre dot + id,
+        so the operator can see where Recognize snaps landed."""
+        cps = self._shared.checkpoints()
+        if not cps:
+            return
+        ppm = side_px / side_world if side_world > 0 else 0.0
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        for cp in cps:
+            x, y, r = float(cp[0]), float(cp[1]), float(cp[2])
+            cid = str(cp[3]) if len(cp) > 3 else ""
+            cx, cy = self._world_to_widget(x, y)
+            r_px = max(2.0, r * ppm)
+            p.setPen(QPen(QColor(190, 130, 255, 150), 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), r_px, r_px)
+            p.setPen(QPen(QColor(200, 150, 255, 230), 1))
+            p.setBrush(QColor(200, 150, 255, 230))
+            p.drawEllipse(QPointF(cx, cy), 3.0, 3.0)
+            if cid:
+                p.drawText(QPointF(cx + 5, cy - 5), cid)
         p.restore()
 
     def _draw_scan_overlay(

@@ -18,6 +18,7 @@ import math
 import os
 import time
 from collections import deque
+from dataclasses import replace
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -28,11 +29,17 @@ from PyQt6.QtWidgets import (
     QToolBar, QWidget,
 )
 
+from desktop.localization.checkpoint_matcher import (
+    CheckpointMatchConfig,
+    CheckpointMatcher,
+    crop_disk,
+)
 from desktop.localization.checkpoints import (
     checkpoints_from_metadata,
     upsert_checkpoint,
     write_checkpoints_to_metadata,
 )
+from desktop.localization.raycast_match import RaycastConfig, score_pose
 from desktop.world_map.map_views import SharedMapView
 
 from . import editor_map as em
@@ -105,6 +112,10 @@ class MapEditorWindow(QMainWindow):
         self._pose_lbl = QLabel("")
         self._pose_lbl.setStyleSheet("color:#9cf; font-family:monospace;")
         self._status.addPermanentWidget(self._pose_lbl)
+        # Live checkpoint-recognition readout (nearest cp + inlier/short).
+        self._match_lbl = QLabel("")
+        self._match_lbl.setStyleSheet("color:#888; font-family:monospace;")
+        self._status.addPermanentWidget(self._match_lbl)
 
         # Live redraw timer (5 Hz). Inert until connected.
         self._live_timer = QTimer(self)
@@ -186,6 +197,7 @@ class MapEditorWindow(QMainWindow):
         self._act_locate = None
         self._act_stamp = None
         self._act_recognize = None
+        self._act_test_match = None
         if self._router:
             # Live controls live on a SECOND toolbar row so the top row
             # doesn't overflow the window width and bury buttons in the
@@ -244,6 +256,14 @@ class MapEditorWindow(QMainWindow):
                 "here. Edits the localization map.")
             self._act_recognize.setEnabled(False)
             self._act_recognize.triggered.connect(self._on_recognize)
+            # Validate recognition without wiring nav: run the matcher at the
+            # current pose and report the correction it would apply.
+            self._act_test_match = tb2.addAction("Test match")
+            self._act_test_match.setToolTip(
+                "Run the checkpoint matcher at the current pose against the "
+                "live scan and report the correction it would apply.")
+            self._act_test_match.setEnabled(False)
+            self._act_test_match.triggered.connect(self._on_test_match)
 
     def _set_kind(self, kind: str) -> None:
         self._brush_kind = kind
@@ -372,6 +392,15 @@ class MapEditorWindow(QMainWindow):
             pose=self._live_pose, bounds_ij=self._emap.bounds_ij(),
         )
         self._push_nogo_overlay()
+        self._refresh_checkpoint_markers()
+
+    def _refresh_checkpoint_markers(self) -> None:
+        """Draw the saved checkpoints (rings + ids) on the map."""
+        if self._emap is None:
+            return
+        cps = checkpoints_from_metadata(self._emap.metadata)
+        self._shared.set_checkpoints(
+            [(c.x_m, c.y_m, c.radius_m, c.id) for c in cps])
 
     def _push_nogo_overlay(self) -> None:
         """Hand the keep-out cell centers (world frame) to the view for the
@@ -424,6 +453,7 @@ class MapEditorWindow(QMainWindow):
             self._act_rot_cw.setEnabled(True)
             self._act_stamp.setEnabled(True)
             self._act_recognize.setEnabled(True)
+            self._act_test_match.setEnabled(True)
             self._live_timer.start()
             self._status.showMessage("Connected — Relocate to seat the pose.")
         else:
@@ -453,6 +483,8 @@ class MapEditorWindow(QMainWindow):
             self._act_rot_cw.setEnabled(False)
             self._act_stamp.setEnabled(False)
             self._act_recognize.setEnabled(False)
+            self._act_test_match.setEnabled(False)
+            self._match_lbl.setText("")
             self._view.set_align_mode(False)
         self._rerender(fit=False)
 
@@ -673,6 +705,82 @@ class MapEditorWindow(QMainWindow):
             self._pose_lbl.setText(
                 f"[{mode}] x={pose[0]:+.2f} y={pose[1]:+.2f} "
                 f"θ={math.degrees(pose[2]):+6.1f}°")
+        self._update_checkpoint_readout(pose)
+
+    def _scan_angles_ranges(self):
+        """Live scan as (angles_rad, ranges_m) in the body frame, or None."""
+        body = self._link.scan_body_xy(max_range_m=_SCAN_MAX_RANGE_M)
+        if body is None or len(body) == 0:
+            return None
+        return np.arctan2(body[:, 1], body[:, 0]), np.hypot(body[:, 0], body[:, 1])
+
+    def _update_checkpoint_readout(self, pose) -> None:
+        """Score the live scan at the current pose against the nearest
+        checkpoint patch — a cheap, continuous "is this spot recognized?"
+        signal (inlier high ✓ → the healed map fits here)."""
+        if self._emap is None or self._link is None or pose is None:
+            self._match_lbl.setText("")
+            return
+        cps = checkpoints_from_metadata(self._emap.metadata)
+        if not cps:
+            self._match_lbl.setText("")
+            return
+        near = min(cps, key=lambda c: math.hypot(c.x_m - pose[0], c.y_m - pose[1]))
+        if math.hypot(near.x_m - pose[0], near.y_m - pose[1]) > near.radius_m:
+            self._match_lbl.setText(f"cp: none ≤{near.radius_m:.0f}m")
+            self._match_lbl.setStyleSheet("color:#888; font-family:monospace;")
+            return
+        ar = self._scan_angles_ranges()
+        if ar is None:
+            self._match_lbl.setText("")
+            return
+        occ = self._emap.log_odds > 0.0
+        sub, sox, soy = crop_disk(
+            occ, self._emap.origin_x_m, self._emap.origin_y_m,
+            self._emap.resolution_m, (near.x_m, near.y_m), near.radius_m)
+        if sub.size == 0:
+            self._match_lbl.setText("")
+            return
+        rc = replace(RaycastConfig(),
+                     max_range_m=min(RaycastConfig().max_range_m, near.radius_m))
+        s = score_pose(sub, sox, soy, self._emap.resolution_m, pose, ar[0], ar[1], rc)
+        ok = s.inlier_frac >= 0.6 and s.short_frac <= 0.25
+        self._match_lbl.setText(
+            f"{near.id} {'✓' if ok else '·'} in={s.inlier_frac:.2f} sh={s.short_frac:.2f}")
+        self._match_lbl.setStyleSheet(
+            f"color:{'#8f8' if ok else '#fb6'}; font-family:monospace;")
+
+    def _on_test_match(self) -> None:
+        """Full checkpoint match at the current pose — reports the correction
+        the runtime localizer would apply (validates recognition end-to-end)."""
+        if self._emap is None or self._link is None:
+            return
+        pose = self._live_pose
+        cps = checkpoints_from_metadata(self._emap.metadata)
+        if not cps or pose is None:
+            self._status.showMessage("No checkpoints / no pose to test.", 4000)
+            return
+        ar = self._scan_angles_ranges()
+        if ar is None:
+            self._status.showMessage("No live scan to test.", 4000)
+            return
+        occ = self._emap.log_odds > 0.0
+        matcher = CheckpointMatcher(
+            occ, self._emap.origin_x_m, self._emap.origin_y_m,
+            self._emap.resolution_m, cps, CheckpointMatchConfig())
+        m = matcher.match(pose, ar[0], ar[1])
+        if m is None:
+            self._status.showMessage(
+                "Test match: NO checkpoint accepted here (none near, or the "
+                "scan doesn't fit the healed map).", 7000)
+            return
+        dx, dy = m.pose[0] - pose[0], m.pose[1] - pose[1]
+        dth = math.degrees(math.atan2(
+            math.sin(m.pose[2] - pose[2]), math.cos(m.pose[2] - pose[2])))
+        self._status.showMessage(
+            f"Test match: {m.checkpoint_id} inlier={m.inlier_frac:.2f} "
+            f"short={m.short_frac:.2f} → correction "
+            f"dx={dx:+.2f} dy={dy:+.2f} dθ={dth:+.1f}°", 8000)
 
     def _update_title(self) -> None:
         name = os.path.basename(self._path) if self._path else "(no map)"
