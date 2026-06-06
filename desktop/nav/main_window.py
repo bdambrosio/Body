@@ -1042,8 +1042,8 @@ class NavMainWindow(QMainWindow):
                 # the desktop (held_tier); HO-3 holds on the Pi (status mode).
                 held = hd.held_tier()
                 if held is None and self._drive_client is not None:
-                    st = self._drive_client.latest_status()
-                    if st is not None and st.get("mode") == "held":
+                    drive_st = self._drive_client.latest_status()
+                    if drive_st is not None and drive_st.get("mode") == "held":
                         held = 3
                 if held is not None:
                     self._follow_lbl.setText(
