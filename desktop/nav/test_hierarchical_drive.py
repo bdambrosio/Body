@@ -197,7 +197,7 @@ class TestHierarchicalDrive(unittest.TestCase):
         self._drive_to_sending(hd)
         runner_idx_before = hd._runner.wp_index
         io.set_status(cmd_id=1, state="ARRIVED")
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        # Same-tick handoff: ARRIVED → re-pick → next goto all in one tick.
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 2)                    # re-picked
         self.assertEqual(hd._runner.wp_index, runner_idx_before)  # same waypoint
@@ -206,12 +206,12 @@ class TestHierarchicalDrive(unittest.TestCase):
         hd, io, po = self._build(points=((1.0, 0.0), (3.0, 0.0)))
         self._drive_to_sending(hd)
         po.pose = (1.0, 0.0, 0.0)        # now sitting on wp0 (intermediate)
-        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
+        # Same-tick: reached wp0 → ADVANCE → SELECT toward wp1 → DRIVING.
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         # Intermediate advance is seamless — Tier-3 is NOT canceled; the next
         # SELECT_SUBGOAL goto supersedes it.
         self.assertEqual(io.cancels, 0)
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)   # toward wp1
-        self.assertEqual(hd._runner.wp_index, 1)
+        self.assertEqual(hd._runner.wp_index, 1)   # advanced toward wp1
 
     def test_intermediate_advances_only_when_passed(self):
         # Non-terminal wp0: a pose SHORT of it (not yet driven past along the
@@ -223,9 +223,9 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(hd._runner.wp_index, 0)
         po.pose = (1.1, 0.0, 0.0)        # driven past wp0 (t ≥ 1) → advance
-        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
+        # Same-tick: passed wp0 → ADVANCE → SELECT toward wp1 → DRIVING.
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(io.cancels, 0)  # seamless — Tier-3 not canceled
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
         self.assertEqual(hd._runner.wp_index, 1)
 
     def test_terminal_does_not_passthrough(self):
@@ -241,7 +241,7 @@ class TestHierarchicalDrive(unittest.TestCase):
         hd, io, po = self._build(points=((1.0, 0.0),))
         self._drive_to_sending(hd)
         po.pose = (1.0, 0.0, 0.0)
-        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
+        # Same-tick: reached terminal wp → ADVANCE → ARRIVED.
         self.assertEqual(hd.tick(0.0), HierState.ARRIVED)
         self.assertGreaterEqual(io.cancels, 1)
         self.assertIsNone(hd.current_subgoal_body())
@@ -252,7 +252,7 @@ class TestHierarchicalDrive(unittest.TestCase):
         hd, io, _ = self._build(points=((5.0, 0.0),))
         self._drive_to_sending(hd)
         io.set_status(cmd_id=1, state="IDLE")
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        # Same-tick handoff: IDLE → re-pick → next goto all in one tick.
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 2)
         self.assertEqual(hd._runner.wp_index, 0)
@@ -335,20 +335,17 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(runner.wp_index, 0)           # runner untouched
 
         po.pose = (1.1, 0.0, 0.0)                       # passed (1,0)
-        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)    # step lead-in
-        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # carrot=marker0
+        # Same-tick: ADVANCE (step lead-in) → SELECT → DRIVING toward marker0.
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertTrue(hd._in_lead_in())
         self.assertEqual(hd._waypoint, (2.0, 0.0))
         self.assertEqual(runner.wp_index, 0)
 
         po.pose = (2.1, 0.0, 0.0)                       # passed marker0
-        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)  # lead-in reached
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)    # lead-in ends
-        self.assertEqual(hd.tick(0.0), HierState.ADVANCE_WAYPOINT)  # patrol: marker0
+        # Same-tick: lead-in ends → patrol engages (on_arrived 0→1) → DRIVING
+        # toward marker1, all collapsed into one tick.
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertFalse(hd._in_lead_in())
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)    # on_arrived 0→1
-        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # carrot=marker1
         self.assertEqual(runner.wp_index, 1)
         self.assertEqual(hd._waypoint, (4.0, 0.0))
 
@@ -419,7 +416,9 @@ class TestHierarchicalDrive(unittest.TestCase):
         self._drive_to_sending(hd)
         # Robot rotated a lot in place → bearing to the waypoint moved well past hysteresis.
         po.pose = (0.0, 0.0, 1.0)
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        # Same-tick: drift past hysteresis → re-pick → new goto, settles in DRIVING.
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 2)
 
     def test_stop_cancels_and_idles(self):
         hd, io, _ = self._build()
@@ -464,13 +463,17 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
 
     def test_select_pose_loss_suspends(self):
-        # Pose lost at the SELECT step (between sub-goals) also suspends.
+        # Pose lost when a sub-goal completes (the re-pick step) must suspend
+        # rather than send a goto from a stale pose. With the same-tick handoff
+        # the completion and re-pick share a tick, so losing the pose first
+        # means that tick suspends and emits no new goto.
         hd, io, po = self._build(points=((5.0, 0.0),))
         self._drive_to_sending(hd)
+        sent_before = len(io.sent)
         io.set_status(cmd_id=1, state="ARRIVED")
-        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
         po.pose = None
         self.assertEqual(hd.tick(0.0), HierState.SUSPENDED)
+        self.assertEqual(len(io.sent), sent_before)   # no goto from a lost pose
 
 
 if __name__ == "__main__":

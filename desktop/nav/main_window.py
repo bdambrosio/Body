@@ -648,6 +648,17 @@ class NavMainWindow(QMainWindow):
         self._redraw_timer.timeout.connect(self._on_redraw_tick)
         self._redraw_timer.start()
 
+        # Hierarchical-drive loop on its own fast timer, decoupled from the
+        # (5 Hz, render-bound) redraw tick. The Tier-2 re-pick latency lives
+        # here; capture showed the ARRIVED->next-goto gap was ~all desktop-side
+        # (2 render ticks), so ticking at 20 Hz off the render path cuts it and
+        # removes the variance from heavy frames. tick() is inert when not
+        # driving, so a free-running timer is cheap.
+        self._hier_timer = QTimer(self)
+        self._hier_timer.setInterval(50)   # 20 Hz
+        self._hier_timer.timeout.connect(self._on_hier_tick)
+        self._hier_timer.start()
+
         # Streaming-RGB timer (off by default). The toggle action
         # starts/stops it. Rate is fixed at 2 Hz for v1; cheap to
         # adjust later if testing reveals a different sweet spot.
@@ -660,6 +671,11 @@ class NavMainWindow(QMainWindow):
         # Not started — _on_toggle_stream_rgb starts it on demand.
 
     # ── Tick ─────────────────────────────────────────────────────────
+
+    def _on_hier_tick(self) -> None:
+        # Fast, render-decoupled hierarchical-drive step (see _build_timer).
+        if self._stage_b_mode and self._hier_drive is not None:
+            self._hier_drive.tick(time.time())
 
     def _on_redraw_tick(self) -> None:
         self._safety_toolbar.refresh()
@@ -830,7 +846,8 @@ class NavMainWindow(QMainWindow):
         # via body/drive/goto). It is mutually exclusive with the old mission
         # path — Stage B never starts self._mission — so no cmd_vel contention.
         if self._stage_b_mode and self._hier_drive is not None:
-            self._hier_drive.tick(time.time())
+            # tick() runs on _hier_timer (fast, decoupled); here we only
+            # refresh the overlay at the render rate.
             self._refresh_hier_overlay(pose)
         # Trace lifecycle: close the per-mission file on the
         # active→terminal edge so each mission yields one self-

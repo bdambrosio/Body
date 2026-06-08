@@ -338,20 +338,36 @@ class HierarchicalDrive:
 
     # ── Tick ─────────────────────────────────────────────────────────
 
+    # States that do compute-only work and should chain within a single tick,
+    # so a sub-goal completion turns into the next goto in the SAME tick instead
+    # of bleeding a render tick per hop (ARRIVED->SELECT->send, ADVANCE->SELECT).
+    _CHAIN_STATES = (HierState.SELECT_SUBGOAL, HierState.ADVANCE_WAYPOINT)
+
     def tick(self, now: float) -> HierState:
-        s = self._state
-        if s == HierState.ALIGNING:
-            self._tick_aligning()
-        elif s == HierState.SELECT_SUBGOAL:
-            self._tick_select()
-        elif s == HierState.DRIVING_SUBGOAL:
-            self._tick_driving()
-        elif s == HierState.ADVANCE_WAYPOINT:
-            self._tick_advance()
-        elif s == HierState.BLOCKED:
-            self._tick_blocked()
-        # IDLE / ARRIVED / FAILED are terminal/inert. SUSPENDED is inert too —
-        # it only leaves via request_resume() (operator) or stop().
+        # Bounded same-tick handoff loop: keep running handlers while each one
+        # hands off into an immediately-actionable state. Normal worst case is
+        # DRIVING->SELECT->(ADVANCE->SELECT)->DRIVING (<=4 hops); the cap is a
+        # backstop against a pathological cycle, not an expected limit.
+        for _ in range(6):
+            prev = self._state
+            s = prev
+            if s == HierState.ALIGNING:
+                # Startup hop is its own tick — not latency-critical, and keeps
+                # the first SELECT (HO-1 record / breakpoint) on its own tick.
+                self._tick_aligning()
+                break
+            elif s == HierState.SELECT_SUBGOAL:
+                self._tick_select()
+            elif s == HierState.DRIVING_SUBGOAL:
+                self._tick_driving()
+            elif s == HierState.ADVANCE_WAYPOINT:
+                self._tick_advance()
+            elif s == HierState.BLOCKED:
+                self._tick_blocked()
+            # IDLE / ARRIVED / FAILED are terminal/inert. SUSPENDED is inert
+            # too — it only leaves via request_resume() (operator) or stop().
+            if self._state == prev or self._state not in self._CHAIN_STATES:
+                break
         return self._state
 
     def _tick_aligning(self) -> None:
