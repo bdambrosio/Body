@@ -48,6 +48,16 @@ class PoseProvider(Protocol):
         """Robot world pose, or None when unavailable/stale. Re-align seam."""
         ...
 
+    def correction_seq(self) -> int:
+        """Monotone count of *discrete* pose corrections the source has applied
+        (checkpoint re-anchor snaps, relocates, scan-match jumps). The driver
+        watches this: when it changes mid-leg, the world pose just stepped
+        (e.g. a bump corrected by the PF that odom never saw), so the current
+        odom-anchored sub-goal is steering on a stale heading and must be
+        re-picked. Optional — sources that never correct may omit it (the
+        driver reads it defensively and treats absence as a constant 0)."""
+        ...
+
 
 class DriveIO(Protocol):
     def latest_scan(self) -> Optional[Dict[str, Any]]: ...
@@ -111,6 +121,13 @@ class PFPoseProvider:
             return None
         pose = latest[0] if isinstance(latest, tuple) and len(latest) == 2 else latest
         return (float(pose[0]), float(pose[1]), float(pose[2]))
+
+    def correction_seq(self) -> int:
+        # Best-effort: PF scan-match/relocate count when the source tracks it.
+        try:
+            return int(self._fuser.pose_source.correction_summary().get("n_applied", 0))
+        except Exception:
+            return 0
 
 
 class HierState(enum.Enum):
@@ -193,6 +210,10 @@ class HierarchicalDrive:
         self._state = HierState.IDLE
         self._cmd_id: Optional[int] = None
         self._sent_bearing: Optional[float] = None
+        # Pose-correction count at the moment the live sub-goal was sent. If the
+        # provider's count moves past this mid-leg, the world pose stepped under
+        # us → re-pick from the corrected pose. -1 until the first goto.
+        self._sent_correction_seq: int = -1
         self._subgoal_body: Optional[Tuple[float, float]] = None
         self._waypoint: Optional[Tuple[float, float]] = None
         self._blocked_repicks = 0
@@ -312,6 +333,17 @@ class HierarchicalDrive:
         if self._route_start is not None:
             return self._route_start
         return self._waypoint if self._waypoint is not None else (0.0, 0.0)
+
+    def _pose_correction_seq(self) -> int:
+        """Provider's discrete-correction count, read defensively (providers /
+        test fakes without it report a constant 0 → the check never fires)."""
+        fn = getattr(self._pose, "correction_seq", None)
+        if fn is None:
+            return 0
+        try:
+            return int(fn())
+        except Exception:
+            return 0
 
     def _reached_waypoint(self, pose: Pose) -> bool:
         """Advance off the current carrot, for terminal and intermediate alike:
@@ -457,6 +489,7 @@ class HierarchicalDrive:
             return
         self._cmd_id = cid
         self._sent_bearing = bearing
+        self._sent_correction_seq = self._pose_correction_seq()
         self._subgoal_body = (bx, by)
         self._block_reason = None
         logger.info(
@@ -545,6 +578,7 @@ class HierarchicalDrive:
             # one toward the same waypoint.
             if state in ("ARRIVED", "IDLE"):
                 self._blocked_repicks = 0          # sub-goal progress
+                logger.info("hier: re-pick (sub-goal %s)", state)
                 self._to(HierState.SELECT_SUBGOAL)
                 return
             if state in ("BLOCKED", "FAULT"):
@@ -554,10 +588,24 @@ class HierarchicalDrive:
                 self._to(HierState.FAILED)
                 return
 
+        # World-pose correction (re-anchor snap / relocate the odom frame never
+        # saw): the current sub-goal is anchored in odom and now points the wrong
+        # way relative to the corrected pose — re-pick from the corrected pose
+        # at once instead of waiting for ARRIVED or for drift to cross the gate.
+        cur_seq = self._pose_correction_seq()
+        if self._sent_correction_seq >= 0 and cur_seq != self._sent_correction_seq:
+            logger.info("hier: re-pick (pose correction seq %d->%d)",
+                        self._sent_correction_seq, cur_seq)
+            self._to(HierState.SELECT_SUBGOAL)
+            return
+
         # Mid-leg drift: re-pick if the bearing to the waypoint has moved on.
         if pose is not None and self._waypoint is not None and self._sent_bearing is not None:
             b = bearing_to_waypoint(pose[0], pose[1], pose[2], self._waypoint[0], self._waypoint[1])
             if abs(b - self._sent_bearing) > self._cfg.repick_hysteresis_rad:
+                logger.info("hier: re-pick (bearing drift %.0f° > %.0f°)",
+                            math.degrees(abs(b - self._sent_bearing)),
+                            math.degrees(self._cfg.repick_hysteresis_rad))
                 self._to(HierState.SELECT_SUBGOAL)
 
     def _tick_advance(self) -> None:

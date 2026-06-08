@@ -89,9 +89,13 @@ class FakeDriveIO:
 class FakePose:
     def __init__(self, pose=None):
         self.pose = pose
+        self.corr_seq = 0          # bump to simulate a re-anchor/relocate snap
 
     def world_pose(self):
         return self.pose
+
+    def correction_seq(self):
+        return self.corr_seq
 
 
 class FakeSink:
@@ -419,6 +423,25 @@ class TestHierarchicalDrive(unittest.TestCase):
         # Same-tick: drift past hysteresis → re-pick → new goto, settles in DRIVING.
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 2)
+
+    def test_pose_correction_repicks_without_drift(self):
+        # A re-anchor snap moves the world pose without odom seeing it — the
+        # provider's correction_seq advances while the bearing hasn't drifted
+        # past the hysteresis gate. The driver must still re-pick at once (from
+        # the corrected pose), not wait for ARRIVED.
+        hd, io, po = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        self.assertEqual(len(io.sent), 1)
+        po.corr_seq += 1                 # re-anchor snap; pose otherwise unchanged
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)  # same-tick re-pick
+        self.assertEqual(len(io.sent), 2)
+
+    def test_no_repick_without_correction_or_drift(self):
+        # Steady driving with no correction and no drift must NOT re-pick.
+        hd, io, po = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 1)
 
     def test_stop_cancels_and_idles(self):
         hd, io, _ = self._build()

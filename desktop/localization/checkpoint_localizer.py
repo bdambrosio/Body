@@ -82,11 +82,19 @@ class CheckpointLocalizer:
         self._last_match: Optional[CheckpointMatch] = None
         self._last_reanchor_snap: Optional[ReanchorSnap] = None
         self._dist_since_anchor: float = 0.0
+        self._reanchor_count: int = 0
         self._seeded = False
 
     @property
     def seeded(self) -> bool:
         return self._seeded
+
+    @property
+    def reanchor_count(self) -> int:
+        """Number of successful re-anchor snaps applied since construction. The
+        hierarchical driver watches this to re-pick the moment a snap moves the
+        world pose under a sub-goal anchored in the (uncorrected) odom frame."""
+        return self._reanchor_count
 
     @property
     def last_match(self) -> Optional[CheckpointMatch]:
@@ -140,6 +148,7 @@ class CheckpointLocalizer:
             self._dist_since_anchor = 0.0
             self._map_pose = m.pose
             self._last_match = m
+            self._reanchor_count += 1
         return m
 
     def pose(self) -> Optional[Pose]:
@@ -208,3 +217,8 @@ class CheckpointPoseProvider:
                         s.checkpoint_id, s.trans_m, math.degrees(s.rot_rad),
                         s.dist_since_anchor_m, s.score)
         return self._loc.pose()
+
+    def correction_seq(self) -> int:
+        """PoseProvider hook: re-anchor snaps move the world pose without
+        touching odom, so the driver re-picks when this advances."""
+        return self._loc.reanchor_count
