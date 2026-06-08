@@ -131,7 +131,11 @@ class HierState(enum.Enum):
 
 @dataclass(frozen=True)
 class HierConfig:
-    waypoint_tol_m: float = 0.30          # PF-pose distance to count the TERMINAL waypoint reached
+    # Terminal stall-guard radius (PF-pose). The terminal is reached primarily
+    # by the passed-vertex test (drove past it along the final leg); this is
+    # only the fallback, so it MUST stay below the min waypoint spacing or it
+    # fires at the penultimate vertex and stops the patrol a leg short.
+    waypoint_tol_m: float = 0.15
     # Intermediate sub-waypoints advance one at a time via a passed-vertex test
     # (drove past the vertex along its route segment), NOT a radius — so closely
     # spaced corner sub-waypoints aren't skipped (the old radius cut corners).
@@ -310,17 +314,23 @@ class HierarchicalDrive:
         return self._waypoint if self._waypoint is not None else (0.0, 0.0)
 
     def _reached_waypoint(self, pose: Pose) -> bool:
-        """Advance off the current carrot. Terminal: a tight proximity stop.
-        Intermediate (incl. all lead-in points): only once we've driven PAST the
-        vertex along its route segment, so closely spaced corner sub-waypoints
-        aren't skipped and the carrot stays the next un-passed vertex."""
+        """Advance off the current carrot, for terminal and intermediate alike:
+        only once we've driven PAST the vertex along its route segment (t ≥ 1),
+        so closely spaced sub-waypoints aren't skipped and the carrot stays the
+        next un-passed vertex. The per-case proximity is just a stall-guard.
+
+        The terminal MUST use the same passed-test, not a bare proximity radius:
+        a radius >= the final leg length fires the instant we advance onto the
+        terminal (we're already within it from the penultimate vertex), stopping
+        the patrol a leg short. The passed-test is spacing-invariant — t ≥ 1
+        triggers only after the final leg is actually driven — and the terminal
+        just gets a looser proximity guard for PF-pose noise."""
         if self._waypoint is None:
             return False
-        if self._carrot_terminal():
-            return _dist(pose, self._waypoint) <= self._cfg.waypoint_tol_m
+        prox = (self._cfg.waypoint_tol_m if self._carrot_terminal()
+                else self._cfg.pass_proximity_m)
         return passed_waypoint((pose[0], pose[1]), self._prev_vertex(),
-                               self._waypoint,
-                               proximity_m=self._cfg.pass_proximity_m)
+                               self._waypoint, proximity_m=prox)
 
     # ── Introspection (for the UI overlay / status label) ────────────
 
