@@ -1,16 +1,15 @@
 # Tier-3 reactive drive (Pi-side) — interface spec
 
-Tier-3 is the lowest tier of the hierarchical navigator (see the nav
-roadmap): given **one subgoal that is currently observable**, drive there
-on the live body-frame `local_map`, avoiding what is seen, with no
-dependence on the global map or particle-filter pose. It runs **on the
-Pi** (`body.local_drive`) so the reactive loop sits next to the freshest
-`local_map` with no network round-trip.
+Tier-3 is the lowest tier of the hierarchical navigator (see
+`docs/tier_contract.md`): given **one subgoal**, drive there on the live
+**rasterized lidar scan** (not the fused `local_map`, which lags while
+moving), avoiding what is seen, with no dependence on the global map or
+particle-filter pose. It runs **on the Pi** (`body.local_drive`) so the
+reactive loop sits next to the freshest scan with no network round-trip.
 
-In Stage A the *operator* (via the `desktop.pi_drive` UI) plays the role
-of the upper tiers by clicking the next subgoal. Later, the Tier-2
-visible-waypoint stepper emits the identical `body/drive/goto` command —
-the contract below does not change.
+Production sender is the desktop hierarchical drive
+(`desktop/nav/hierarchical_drive.py`); the `desktop.pi_drive` debug consoles
+emit the identical `body/drive/goto` command.
 
 ## Topics
 
@@ -18,8 +17,8 @@ the contract below does not change.
 | field | type | meaning |
 |---|---|---|
 | `ts` | float | send time (wall clock) |
-| `cmd_id` | int | monotonic; a higher id supersedes a lower one |
-| `frame` | str | `"odom"` (only value in v1) |
+| `cmd_id` | int | monotonic; a higher id supersedes a lower one. A **cancel advances the watermark** to its own id, so a delayed duplicate goto cannot re-arm a revoked goal |
+| `frame` | str | `"odom"` (only value in v1; others rejected) |
 | `x_m`, `y_m` | float | goal point in the odom frame |
 | `final_heading_rad` | float? | face this on arrival; omit = don't care |
 | `arrival_tol_m` | float? | per-command override of config |
@@ -28,11 +27,11 @@ the contract below does not change.
 
 **Why odom frame.** A body-frame point is stale by the time the Pi acts;
 a world/global point would reintroduce the dependence on the global map
-we are trying to escape. The sender converts a body-frame click to odom
-using the displayed `local_map` message's `anchor_pose`. The Pi then
-tracks the fixed odom point as the robot moves, using its own odom — so
-only a *coarse direction* ever crosses from any higher tier into the
-metric drive loop; the point itself was observed live.
+we are trying to escape. The sender converts a body-frame point to odom
+using the live odom pose at send time (`DriveClient.send_goto_from_body`),
+so a constant world↔odom offset cancels. The Pi then tracks the fixed odom
+point as the robot moves, using its own odom — only a *coarse direction*
+ever crosses from any higher tier into the metric drive loop.
 
 ### `body/drive/status` (Pi → sender) — `schemas.drive_status`
 Published every control tick.
@@ -43,35 +42,59 @@ Published every control tick.
 | `goal_body_xy` | [float,float]? | active goal in the *live* body frame (for display) |
 | `dist_remaining_m` | float | range to goal |
 | `v_mps`, `omega_radps` | float | commanded velocity this tick |
-| `blocked_reason` | str? | `swept_block`\|`no_progress`\|`odom_stale`\|`out_of_local_map` |
+| `blocked_reason` | str? | `no_path`\|`boxed_in`\|`swept_block`\|`no_progress`\|`deadline`\|`no_scan` (FAULT carries `odom_stale`) |
+| `mode` | str? | `follow`\|`plan`\|`realign`\|`held` |
+| `path_body_xy` | list? | the A\* path being followed (display/inspector) |
+| `build` | str? | Pi git sha — the desktop flags a stale deploy |
 
 ## cmd_vel ownership (arbitration)
 
 Exactly one producer of `body/cmd_vel` at a time:
 
-- While a `goto` is active, **Tier-3 owns `body/cmd_vel`.** The
-  `desktop.pi_drive` UI keeps `StubController.live_command` **off**, so
-  the desktop publishes no cmd_vel and cannot fight the Pi. The desktop
-  still publishes **heartbeat** (always, while connected) — the watchdog
-  e-stops without it, so heartbeat is required for *any* motion including
-  Pi-initiated drives.
+- While a `goto` is active, **Tier-3 owns `body/cmd_vel`.** The desktop
+  keeps `StubController.live_command` **off**, so it publishes no cmd_vel
+  and cannot fight the Pi. The desktop still publishes **heartbeat**
+  (always, while connected) — the watchdog e-stops without it, so heartbeat
+  is required for *any* motion including Pi-initiated drives.
+- On `cancel`/`stop` (or goal drop), Tier-3 **publishes a zero cmd_vel
+  immediately** — the motors never coast on the last command waiting for
+  the 500 ms cmd timeout.
 - Manual teleop (live_command on) is mutually exclusive with an active
-  goto: enabling teleop cancels the active goto; issuing a goto requires
-  teleop off. The Pi watchdog / e-stop / motor timeout remain supreme
-  over both.
+  goto. The Pi watchdog / e-stop / motor timeout remain supreme over both.
 
-## Behaviour (v1, Stage A)
+## Behaviour
 
-- Steering is straight-line pure-pursuit toward the body-frame goal
-  (rotate-in-place when the bearing is large, else arc), gated by the
-  swept-footprint check on the live `local_map`.
-- **No dynamic avoidance yet** (Stage D): if the swept check fires, the
-  driver stops and reports `BLOCKED:swept_block`; the sender re-picks a
-  visible subgoal. This is correct because every subgoal is line-of-sight
-  clear when chosen.
-- Arrival: within `arrival_tol_m` → `ARRIVED`, stop (and rotate to
-  `final_heading_rad` if given). No goal progress for
-  `no_progress_timeout_s` → `BLOCKED:no_progress`. Stale odom → `FAULT`.
-  Goal outside local_map coverage → `BLOCKED:out_of_local_map`.
+Each control tick (10 Hz):
 
-Config lives under `config.json` → `local_drive` (see `body/local_drive.py`).
+1. Rasterize the latest lidar scan into a body-frame int8 grid
+   (`body/lib/scan_raster.py`).
+2. Build the footprint-inflated, clearance-graded costmap and run **local
+   A\*** to (or toward) the goal — `plan_local` → `astar_toward`
+   (`body/lib/local_costmap.py`, `local_planner.py`). The A\* is the single
+   local authority: if the goal cell is unreachable it routes to the
+   reachable cell closest to it; `no_path` only when genuinely boxed in.
+3. Pure-pursuit follow: steer to a lookahead point on the path
+   (`steer_to_body_point`, rotate-in-place hysteresis for large bearings).
+4. **Swept-footprint veto as last resort** (`body/lib/drive_safety.py`,
+   effective radius == the A\* footprint): a new obstacle on the commanded
+   arc between replans → re-aim in place toward the lookahead
+   (`mode=realign`, bounded by `swept_realign_timeout_s`), else stop +
+   `BLOCKED:swept_block`. The veto only stops, never steers.
+
+Terminal conditions:
+
+- Within `arrival_tol_m` → `ARRIVED` for one tick (after the optional
+  `final_heading_rad` rotate), then the goal drops → `IDLE`.
+- No goal progress while translating for `no_progress_timeout_s` →
+  `BLOCKED:no_progress`.
+- **Per-goal deadline** `goal_deadline_s` (default 30 s, 0 disables) →
+  stop + `BLOCKED:deadline`. This catches rotate/drive dithers the
+  translation-gated no-progress watchdog can't see; the goal stays active
+  (so the status doesn't decay to IDLE, which senders read as success)
+  until a superseding goto or cancel clears it.
+- Stale odom/scan (0.5 s) → `FAULT:odom_stale` / `BLOCKED:no_scan`, motors
+  zeroed.
+
+Config lives under `config.json` → `local_drive`. The planner/raster
+sections are built through `body/lib/drive_config.py` — the **same builders
+the desktop uses** to model Tier-3 (contract I8 in `docs/tier_contract.md`).
