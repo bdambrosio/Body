@@ -27,13 +27,10 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Protocol, Tuple
 
-from body.lib import schemas
-from body.lib.local_costmap import (
-    LocalCostmapConfig, build_local_costmap, dilate_bool,
-)
+from body.lib import drive_config, schemas, zenoh_helpers
+from body.lib.local_costmap import build_local_costmap, dilate_bool
 from body.lib.local_drive_core import wrap_pi
-from body.lib.local_planner import LocalPlanConfig
-from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
+from body.lib.scan_raster import rasterize_scan
 from body.lib.tier2_subgoal import (
     Tier2Config, bearing_to_waypoint, furthest_free_point,
 )
@@ -204,14 +201,17 @@ class HierarchicalDrive:
         self._pose = pose
         self._io = io
         self._cfg = cfg or HierConfig()
-        # Body-frame scan raster for the Tier-2 clear-run (must match Tier-3's
-        # grid so what we hand down lands on the same local map it routes on).
-        self._raster = ScanRasterConfig()
-        # Tier-3's own footprint/clearance model — the clear-run marches on this
-        # inflated mask so the sub-goal is a goal Tier-3 accepts without snapping
-        # (incl. walls lateral to the ray). Same config as the Pi → same lethal.
-        self._costmap_cfg = LocalCostmapConfig()
-        self._goal_clearance_cells = LocalPlanConfig().goal_clearance_cells
+        # Body-frame scan raster + Tier-3's footprint/clearance model for the
+        # Tier-2 clear-run: the sub-goal is marched on Tier-3's own inflated
+        # lethal mask so what we hand down is a goal Tier-3 accepts without
+        # snapping (incl. walls lateral to the ray). Built from config.json by
+        # the SAME body.lib.drive_config builders the Pi uses — same source,
+        # same lethal; parallel dataclass defaults would drift silently.
+        body_cfg = zenoh_helpers.load_body_config()
+        self._raster = drive_config.scan_raster_config(body_cfg)
+        plan_cfg = drive_config.local_plan_config(body_cfg)
+        self._costmap_cfg = plan_cfg.costmap
+        self._goal_clearance_cells = plan_cfg.goal_clearance_cells
         # Handoff inspector sink (HO-1/HO-2 record + breakpoint). No-op default.
         self._sink: HandoffSink = sink or NullHandoffSink()
         self._held_tier: Optional[int] = None    # which handoff we're paused at

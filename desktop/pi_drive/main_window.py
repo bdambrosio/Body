@@ -19,7 +19,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
+from body.lib import drive_config, zenoh_helpers
+from body.lib.scan_raster import rasterize_scan
 
 from .drive_client import DriveClient
 from .local_map_view import BodyLocalMapView
@@ -37,9 +38,9 @@ class PiDriveWindow(QMainWindow):
         self._view = BodyLocalMapView(self)
         self._view.set_click_callback(self._on_map_click)
         # Render exactly what Tier-3 sees: the live scan rasterized with the
-        # same pure code + default params as body.local_drive (defaults match
-        # config.json:local_drive.scan). Shared module → no divergence.
-        self._raster = ScanRasterConfig()
+        # same pure code AND the same config.json params as body.local_drive
+        # (shared body.lib.drive_config builder → no divergence).
+        self._raster = drive_config.scan_raster_config(zenoh_helpers.load_body_config())
 
         self._conn_lbl = QLabel("conn: —")
         self._state_lbl = QLabel("drive: —")

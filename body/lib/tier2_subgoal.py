@@ -39,14 +39,6 @@ class Tier2Config:
     backoff_m: float = 0.15
     min_subgoal_m: float = 0.20     # below this → "no usable free point"
     require_clear: bool = True      # treat unknown (-1) as non-free (conservative)
-    # Angular search: when the direct bearing is blocked/short, fan across
-    # nearby bearings and pick the clear one that best advances toward the
-    # target — so Tier-2 routes *around* an obstacle on the direct line
-    # instead of stalling. Re-picking each leg walks the robot around it.
-    fan_max_rad: float = math.radians(75.0)
-    fan_step_rad: float = math.radians(15.0)
-    progress_min_m: float = 0.05    # a hop must get at least this much closer
-    swing_penalty_m_per_rad: float = 0.15  # prefer the straighter of ~equal options
 
 
 @dataclass(frozen=True)

@@ -24,10 +24,6 @@ class MCLConfig:
     scan_max_range_m: float = 5.0
     scan_stride: int = 2
     beam_log_eps: float = 1e-4
-    relocate_spray_xy_m: float = 3.0
-    relocate_spray_theta_rad: float = math.pi
-    relocate_seed_sigma_xy_m: float = 0.5
-    relocate_seed_sigma_theta_rad: float = math.radians(20.0)
 
 
 class MCLLocalizer:
@@ -178,27 +174,6 @@ class MCLLocalizer:
         # Mean log-likelihood across rays per particle.
         log_lik = torch.log(lik).mean(dim=1)
         self._pf._log_w = self._pf._log_w + log_lik.to(pf_cfg.weight_dtype)
-
-    def spray_particles(
-        self,
-        center_x: float,
-        center_y: float,
-        center_theta: float,
-        *,
-        sigma_xy_m: Optional[float] = None,
-        sigma_theta_rad: Optional[float] = None,
-    ) -> None:
-        sx = (
-            sigma_xy_m
-            if sigma_xy_m is not None
-            else self._config.relocate_seed_sigma_xy_m
-        )
-        st = (
-            sigma_theta_rad
-            if sigma_theta_rad is not None
-            else self._config.relocate_seed_sigma_theta_rad
-        )
-        self._pf.seed_at(center_x, center_y, center_theta, sigma_xy_m=sx, sigma_theta_rad=st)
 
     def n_eff(self) -> float:
         return self._pf.n_eff()

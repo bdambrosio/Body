@@ -25,9 +25,10 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMainWindow, QPushButton, QVBoxLayout, QWidget,
 )
 
+from body.lib import drive_config, zenoh_helpers
 from body.lib.buildinfo import git_sha
 from body.lib.local_drive_core import body_to_odom
-from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
+from body.lib.scan_raster import rasterize_scan
 from desktop.world_map.map_views import SharedMapView, WorldDriveableView
 
 from .drive_client import DriveClient
@@ -49,7 +50,8 @@ class Tier2Window(QMainWindow):
         self.controller = controller
         self.drive = drive
         self.localizer = localizer       # PF; None → body-only mode
-        self._raster = ScanRasterConfig()
+        # Same raster as Tier-3, built from config.json by the shared builder.
+        self._raster = drive_config.scan_raster_config(zenoh_helpers.load_body_config())
         self.session = Tier2Session(drive, Tier2SessionConfig())
 
         self._view = BodyLocalMapView(self)

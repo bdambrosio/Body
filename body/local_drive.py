@@ -20,13 +20,12 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from body.lib import schemas, zenoh_helpers
+from body.lib import drive_config, schemas, zenoh_helpers
 from body.lib.buildinfo import git_sha
 from body.lib.drive_safety import FootprintConfig, swept_path_blocked
 from body.lib.handoff_gate import HandoffGate
-from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
-from body.lib.local_costmap import LocalCostmapConfig
-from body.lib.local_planner import LocalPlanConfig, lookahead_on_path, plan_local
+from body.lib.scan_raster import rasterize_scan
+from body.lib.local_planner import lookahead_on_path, plan_local
 from body.lib.local_drive_core import (
     STATE_ARRIVED, STATE_BLOCKED, STATE_DRIVING, STATE_FAULT, STATE_IDLE,
     DriveParams, odom_to_body, rotate_to_heading, steer_to_body_point,
@@ -81,42 +80,14 @@ def main() -> None:
         k_omega=float(cfg.get("k_omega", 1.5)),
         slowdown_distance_m=float(cfg.get("slowdown_distance_m", 0.4)),
     )
-    # Tier-3 obstacle field = the live lidar scan rasterized each tick (see
-    # body/lib/scan_raster.py). Lidar mount/range come from the existing
-    # lidar / local_map config so there's one source of truth.
-    lidar_cfg = body_cfg.get("lidar", {})
-    lm_cfg = body_cfg.get("local_map", {})
+    # Tier-3 obstacle field + local A* config, built by the SHARED builders in
+    # body/lib/drive_config.py — the desktop's Tier-2 clear-run and the debug
+    # consoles construct theirs through the same functions from the same
+    # config.json, so the two sides cannot drift apart silently.
     scan_cfg = cfg.get("scan", {})
-    raster = ScanRasterConfig(
-        resolution_m=float(scan_cfg.get("resolution_m", 0.08)),
-        half_extent_m=float(scan_cfg.get("half_extent_m", 2.5)),
-        lidar_x_m=float(lm_cfg.get("lidar_x_body_m", 0.0)),
-        lidar_y_m=float(lm_cfg.get("lidar_y_body_m", 0.0)),
-        lidar_yaw_rad=float(lm_cfg.get("lidar_yaw_rad", 0.0)),
-        range_min_m=float(lidar_cfg.get("range_min_m", 0.05)),
-        range_max_m=float(scan_cfg.get("range_max_m", 8.0)),
-        max_clear_range_m=float(
-            scan_cfg.get("max_clear_range_m", lm_cfg.get("lidar_max_clear_range_m", 6.0))
-        ),
-        clear_buffer_cells=float(scan_cfg.get("clear_buffer_cells", 2.0)),
-    )
-    # Local A* planner config (the single local-routing authority). The
-    # costmap footprint is THE footprint model; keep the swept-veto FootprintConfig
-    # ≤ this so they agree (see drive_safety).
-    lp = cfg.get("local_planner", {})
-    local_plan_cfg = LocalPlanConfig(
-        costmap=LocalCostmapConfig(
-            footprint_radius_m=float(lp.get("footprint_radius_m", 0.11)),
-            safety_margin_m=float(lp.get("safety_margin_m", 0.08)),
-            inflation_decay_m=float(lp.get("inflation_decay_m", 0.20)),
-            unknown_cost=float(lp.get("unknown_cost", 25.0)),
-            unknown_is_lethal=bool(lp.get("unknown_is_lethal", False)),
-        ),
-        min_clearance_cells=int(lp.get("min_clearance_cells", 0)),
-        cost_per_unit=float(lp.get("cost_per_unit", 0.10)),
-        max_expansions=int(lp.get("max_expansions", 50000)),
-    )
-    lookahead_m = float(lp.get("lookahead_m", 0.4))
+    raster = drive_config.scan_raster_config(body_cfg)
+    local_plan_cfg = drive_config.local_plan_config(body_cfg)
+    lookahead_m = float(cfg.get("local_planner", {}).get("lookahead_m", 0.4))
 
     # Last-resort swept veto (drive_safety). It must NOT be stricter than the
     # A* costmap or it rejects A*'s own feasible paths (the doorway/near-wall
@@ -125,7 +96,7 @@ def main() -> None:
     # keep its effective radius ≤ the A* lethal radius. The veto then only fires
     # on a genuine corner-cut off the path or a new obstacle, never on an
     # A*-blessed path.
-    half_cell = 0.5 * float(scan_cfg.get("resolution_m", 0.08))
+    half_cell = 0.5 * raster.resolution_m
     veto_foot = max(0.02, local_plan_cfg.costmap.footprint_radius_m - half_cell)
     foot = FootprintConfig(
         footprint_radius_m=veto_foot,

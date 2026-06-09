@@ -175,6 +175,19 @@ class TestHierarchicalDrive(unittest.TestCase):
         hd.tick(0.0)   # ALIGNING → SELECT
         hd.tick(0.0)   # SELECT → DRIVING (sends one goto)
 
+    def test_tier2_marches_on_pi_config(self):
+        # The Tier-2 clear-run must use Tier-3's EXACT costmap model. Pin that
+        # the drive builds it from config.json via the shared builders — not
+        # from parallel dataclass defaults that drift the moment someone tunes
+        # the Pi (the corner-stall class of bug the I3 redesign removed).
+        from body.lib import drive_config, zenoh_helpers
+        body_cfg = zenoh_helpers.load_body_config()
+        plan = drive_config.local_plan_config(body_cfg)
+        hd, _, _ = self._build()
+        self.assertEqual(hd._costmap_cfg, plan.costmap)
+        self.assertEqual(hd._goal_clearance_cells, plan.goal_clearance_cells)
+        self.assertEqual(hd._raster, drive_config.scan_raster_config(body_cfg))
+
     def test_idle_until_started(self):
         hd, io, _ = self._build()
         self.assertEqual(hd.tick(0.0), HierState.IDLE)

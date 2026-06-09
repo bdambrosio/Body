@@ -27,8 +27,13 @@ COLOR_TARGET = QColor(255, 220, 80)      # Tier-2 manual target
 COLOR_SUBGOAL = QColor(255, 170, 60)     # Tier-2 chosen sub-goal
 COLOR_RAY = QColor(120, 200, 255, 160)   # bearing ray
 MARGIN_PX = 8
-# Drawn footprint radius (m); match config.json:local_drive.footprint_radius_m.
-FOOTPRINT_M = 0.14
+# Drawn footprint radius (m): Tier-3's costmap footprint from config.json
+# (the value the lethal mask is actually inflated by).
+try:
+    from body.lib import drive_config as _dc, zenoh_helpers as _zh
+    FOOTPRINT_M = _dc.local_plan_config(_zh.load_body_config()).costmap.footprint_radius_m
+except Exception:                       # missing config: draw the default
+    FOOTPRINT_M = 0.11
 
 
 class BodyLocalMapView(QWidget):

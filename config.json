@@ -159,7 +159,7 @@
     "local_planner": {
       "footprint_radius_m": 0.11,
       "min_clearance_cells": 0,
-      "goal_clearance_cells": 1,
+      "goal_clearance_cells": 0,
       "safety_margin_m": 0.04,
       "inflation_decay_m": 0.20,
       "unknown_cost": 25.0,
