@@ -64,3 +64,44 @@ are libraries, not apps.
 - live standalone tests pass (`nav.test_patrol_expand`,
   `world_map.test_particle_filter_pose`, `nav.test_pose_health`)
 - smoke-import of every live module on the delete boundary: clean
+
+---
+
+# Second pass — executed 2026-06-09
+
+The hierarchical drive had been the production path since 2026-06-02 with the
+old reactive-follower mission stack still constructed-but-unreachable beside
+it. This pass deleted it, plus the chassis app corpse.
+
+## Removed
+
+**Retired reactive nav stack (nav/):** `mission.py`, `follower.py`,
+`recovery.py`, `primitives.py`, `safety.py` and their tests
+(`test_safety_swept.py`, `test_backup_rear_check.py`). `main_window.py` lost
+~900 lines of mission/recovery/stuck-relocate plumbing; Go/Stop/Resume now
+dispatch only to `HierarchicalDrive`. KEPT: `planner.py` (global A* — used by
+`patrol_expand` + the goal-pin path preview), `pose_health.py` (telemetry),
+`tracing.py`/`health.py` (LivenessWatcher + plan-edge events),
+`safety_toolbar.py` (live toolbar, also used by mapping).
+
+**chassis corpse:** `BodyStubWindow`, `QtUI`, `HostPanel`, `LidarView`,
+`_brief` deleted from `chassis/ui_qt.py` (1994 → ~1200 lines); `ui_base.py`
+and `jill_client.py` deleted (no importers). `ui_qt.py` is now explicitly a
+widget library (VisionDock, MotorTestDock, DifferentialPad, LocalMapView,
+DriveableView, depth/overlay helpers). Stale operator messages pointing at
+`python -m desktop.chassis` fixed in `nav/camera_panels.py`/`teleop_panels.py`.
+
+**duplication:** `world_map/transport.py` (byte-equivalent twin of
+`chassis/transport.py`) deleted — `localization/controller.py` and
+`mapping/controller.py` now import `desktop.chassis.transport`;
+`localization/config.py` re-exports `resolve_router`/`DEFAULT_ROUTER` from
+`chassis/config.py` instead of duplicating them.
+
+## Note on the recovery primitives
+
+`recovery.py`/`primitives.py` contained a drift-immune BackUp + Rotate360 +
+per-reason policy that were never wired into the hierarchical path. The hier
+drive now has a time-based BLOCKED retry window + operator Resume instead
+(see `hierarchical_drive.py`). If autonomous rotate/backup recovery is wanted
+later, recover the primitives from git history (deleted at this commit) and
+drive them through Tier-3 rather than desktop cmd_vel.

@@ -21,7 +21,7 @@ from desktop.reference_map.legacy_convert import load_map_auto
 from desktop.reference_map.reference_map import ReferenceMap
 from desktop.world_map.particle_filter_pose import ParticleFilterConfig
 from desktop.world_map.pose_source import PoseSource
-from desktop.world_map.transport import open_session
+from desktop.chassis.transport import open_session
 from desktop.world_map.world_grid import encode_for_publish
 
 logger = logging.getLogger(__name__)

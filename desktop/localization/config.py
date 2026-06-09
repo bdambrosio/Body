@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
-from typing import Optional
 
-DEFAULT_ROUTER = "tcp/127.0.0.1:7447"
-ENV_VAR = "ZENOH_CONNECT"
+# Router resolution (CLI > ZENOH_CONNECT env > default) is shared with the
+# chassis side — one implementation, re-exported here for existing callers.
+from desktop.chassis.config import DEFAULT_ROUTER, ENV_VAR, resolve_router
+
+__all__ = [
+    "DEFAULT_ROUTER", "ENV_VAR", "resolve_router",
+    "Topics", "LocalizationConfig",
+]
 
 
 @dataclass
@@ -51,15 +55,9 @@ class LocalizationConfig:
 
     map_stale_s: float = 2.0
     ui_redraw_hz: float = 5.0
+    # Tier-1 (global-planner) lethal radius. DELIBERATELY larger than the
+    # robot's true footprint (config.json local_planner.footprint_radius_m =
+    # 0.11): global routes get extra clearance; Tier-3 handles reality.
     footprint_radius_m: float = 0.15
 
     topics: Topics = field(default_factory=Topics)
-
-
-def resolve_router(cli_value: Optional[str]) -> str:
-    if cli_value:
-        return cli_value
-    env = os.environ.get(ENV_VAR)
-    if env:
-        return env
-    return DEFAULT_ROUTER

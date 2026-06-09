@@ -7,7 +7,8 @@ Two tabified QDockWidgets on the bottom area:
 
 VisionDriver wires VisionDock's send_chat / run_detect signals to the
 direct-VLM path via the existing _VisionWorker. Jill routing is not
-wired here — operators who want Jill still have `python -m desktop.chassis`.
+wired here (the old standalone chassis app that carried it was deleted
+in the 2026-06 cleanup).
 
 Exposed as CameraPanels, mirroring TeleopPanels' shape, so main_window
 gets a single toggle for the group.
@@ -396,8 +397,7 @@ class VisionDriver:
         if self.vision_dock.mode() == "jill":
             self.vision_dock.append_turn(
                 "error",
-                "Jill chat is not wired in nav yet. Use "
-                "`python -m desktop.chassis` for Jill chat.",
+                "Jill routing is not wired in nav — use Direct VLM mode.",
             )
             return
         if self._worker is not None:

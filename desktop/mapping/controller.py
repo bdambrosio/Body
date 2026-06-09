@@ -17,7 +17,7 @@ from desktop.mapping.export import export_mapping_session
 from desktop.mapping.pose_graph_mapper import PoseGraphMapper
 from desktop.nav.slam.types import ImuReading
 from desktop.reference_map.reference_map import ReferenceMap
-from desktop.world_map.transport import open_session
+from desktop.chassis.transport import open_session
 
 logger = logging.getLogger(__name__)
 

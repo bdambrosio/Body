@@ -8,8 +8,7 @@ Three tabified QDockWidgets on the right-hand side:
 
 Exposed as a single TeleopPanels manager so nav's View menu can toggle
 the whole group with one action. Wiring (signals → chassis controller)
-mirrors the chassis BodyStubWindow so behavior matches what you get
-running `python -m desktop.chassis` standalone.
+was carried over from the old standalone chassis app (deleted 2026-06).
 """
 from __future__ import annotations
 

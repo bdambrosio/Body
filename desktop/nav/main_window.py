@@ -13,8 +13,7 @@ import math
 import os
 import shutil
 import time
-from dataclasses import asdict
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -34,36 +33,17 @@ from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
 )
-from .follower import (
-    Follower, FollowerConfig, FollowerOutput,
-    STATUS_ARRIVED, STATUS_FOLLOWING, STATUS_NO_PATH, STATUS_ROTATING,
-)
 from .health import LivenessWatcher
 from .hierarchical_drive import (
     HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
 )
-from .mission import Mission, MissionConfig, MissionState
 from . import patrol as patrol_mod
-from .patrol import Patrol, PatrolRunner
+from .patrol import PatrolRunner
 from .patrol_expand import ExpandConfig, expand_patrol
 from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
-from .primitives import RotateToHeading
-from .recovery import (
-    PRIM_ABORTED, PRIM_DONE, PRIM_RUNNING,
-    REASON_NO_LIVE_CMD, REASON_NO_POSE, RecoveryPolicy, RecoveryPolicyConfig,
-    RecoveryPrimitive,
-    classify_replan_failure,
-)
 from .pose_health import PoseHealthMonitor
-from .safety import (
-    OmegaRateLimiter,
-    SafetyConfig,
-    swept_path_blocked_local,
-)
-from .tracing import (
-    CAT_FOLLOW, CAT_PLAN, CAT_SAFETY, LEVEL_WARN, Tracer, git_sha,
-)
+from .tracing import CAT_PLAN, LEVEL_WARN, Tracer
 
 from .camera_panels import CameraPanels, build_camera_snapshot
 from .safety_toolbar import SafetyToolbar
@@ -95,39 +75,6 @@ _RUNTIME_CP_CFG = CheckpointMatchConfig(
 logger = logging.getLogger(__name__)
 
 
-# Forward-arc block must persist this long before an auto-snapshot
-# fires. Transient cross-overs (a person walking past) shouldn't burn
-# disk; a real "stuck looking at an obstacle" should.
-_SUSTAINED_BLOCK_S = 3.0
-
-# Go stuck: forward local_map block with no progress — not mere
-# rotate-in-place (normal at corners). Short thresholds while moving.
-_STUCK_RELOCATE_MIN_S = 1.0
-_STUCK_RELOCATE_SCANS = 2
-_STUCK_RELOCATE_COOLDOWN_S = 15.0
-_STUCK_RELOCATE_MAX_PER_MISSION = 2
-_STUCK_PROGRESS_M = 0.08
-_STUCK_GRACE_AFTER_RECOVERY_S = 2.0
-
-# Pose-health halt: when scan-match quality stays collapsed (localization
-# has diverged), stop and force a relocate before the robot drives on a
-# wrong pose. Bounded per mission like the stuck escalation.
-_POSE_LOST_COOLDOWN_S = 15.0
-_POSE_LOST_MAX_PER_MISSION = 2
-
-# Patrol waypoint adaptation: when a saved waypoint sits in a lethal
-# cell or deep in inflation halo, snap to the nearest accessible cell
-# within this radius. Generous enough to escape inflation halo,
-# tight enough that a wall-buried wp isn't relocated halfway across
-# the room.
-_WP_SNAP_RADIUS_M = 1.0
-
-# Below this displacement, the snap is considered "no relocation" and
-# no trace event is emitted (avoids per-mission spam when the wp is
-# already in clear space and just rounds to a different sub-cell).
-_WP_SNAP_TRIVIAL_M = 0.05
-
-
 class NavMainWindow(QMainWindow):
     def __init__(
         self,
@@ -153,12 +100,8 @@ class NavMainWindow(QMainWindow):
         # Hierarchical drive (Tier-1/Tier-2/Tier-3) is the production drive
         # path — Go/Stop always route through it. The DriveClient (own zenoh
         # session, body/drive/goto + status + scan) is opened lazily on the
-        # first Go. The old reactive-follower mission path is retired and no
-        # longer reachable (its modules remain on disk pending cleanup).
-        # `_stage_b_mode` is kept as an always-on constant so the existing
-        # dispatch branches need no rewrite. Initialized before
-        # _build_toolbars so the ALL-STOP callback can reference them safely.
-        self._stage_b_mode: bool = True
+        # first Go. Initialized before _build_toolbars so the ALL-STOP
+        # callback can reference it safely.
         self._hier_drive: Optional[HierarchicalDrive] = None
         self._drive_client: Optional[DriveClient] = None
         # Handoff inspector seam: a dedicated zenoh session carrying the HO-1/
@@ -361,90 +304,23 @@ class NavMainWindow(QMainWindow):
         self._last_costmap = None  # cached for replanning when goal changes
         self._shared_view.set_goal_callback(self._on_goal_requested)
         self._shared_view.set_locate_callback(self._on_locate_requested)
-        # Stage 4: pure-pursuit follower computes the cmd_vel that
-        # *would* be published. Stage 5: when self._mission is in
-        # FOLLOWING, the redraw tick pushes the follower output to
-        # chassis.set_cmd_vel() and lets chassis publish it through
-        # its existing 5 Hz publisher.
-        self._follower = Follower(FollowerConfig())
-        self._last_follower: Optional[FollowerOutput] = None
-        self._mission = Mission()
-        self._mission_config = MissionConfig()
-        # Recovery policy + currently-running primitive (None unless
-        # mission is RECOVERING). Phase 1c ships the stub policy
-        # (WaitAndResume for every reason); Phase 2c upgrades.
-        self._recovery_policy = RecoveryPolicy(
-            RecoveryPolicyConfig(back_up_distance_m=0.12),
-            local_map_provider=self._fresh_local_map,
-        )
-        self._active_recovery: Optional[RecoveryPrimitive] = None
-        # Stage 5b: swept-footprint check overrides cmd_vel to zero when
-        # the footprint, traced along the commanded arc, would sweep an
-        # obstacle. Mission stays FOLLOWING so we resume when it clears.
-        # footprint_radius_m is shared with the costmap so the live veto
-        # and the planner agree on how wide the robot is.
-        self._safety_config = SafetyConfig(
-            arc_distance_m=0.35,
-            footprint_radius_m=self.fuser_config.footprint_radius_m,
-        )
-        self._local_fwd_blocked: bool = False
-        self._safety_blocked: bool = False
-        # Rate-limit ω before sending to chassis. 15 dps cap + 500 ms
-        # inter-reversal hold prevents wheel slip during left/right
-        # heading-hunt episodes (which would otherwise lose IMU yaw
-        # lock and encoder alignment). Doesn't slow continuous turning;
-        # only kicks in on sustained direction reversals.
-        self._omega_limiter = OmegaRateLimiter(
-            omega_max_radps=math.radians(15.0),
-            reversal_hold_s=0.5,
-        )
-        # Tracing: one JSONL file per mission, edge-triggered emits.
-        # Pose sampler + auto-snapshot callback are attached here so
-        # the Mission and LivenessWatcher can use them as soon as the
-        # first event fires. See `tracing.py` and `health.py`.
+        # Tracing: JSONL ring + edge-triggered emits (LivenessWatcher,
+        # plan-edge events). Pose sampler + auto-snapshot callback are
+        # attached so events can stamp a pose / write a bundle. See
+        # `tracing.py` and `health.py`.
         self._tracer = Tracer()
         self._tracer.attach_pose_sampler(self._sample_pose_for_trace)
         self._tracer.attach_snapshot_cb(self._auto_snapshot_for_trace)
-        self._mission.tracer = self._tracer
         self._liveness = LivenessWatcher(
             self._tracer, fuser=self.fuser, chassis=self.chassis,
         )
-        # Edge-trigger state. None = uninitialized (first observation
-        # establishes baseline without emitting).
+        # Edge-trigger state for plan tracing. None = uninitialized (first
+        # observation establishes baseline without emitting).
         self._last_plan_ok: Optional[bool] = None
-        self._last_safety_blocked: Optional[bool] = None
-        self._safety_block_started_at: Optional[float] = None
-        self._safety_block_snapped: bool = False
-        self._stuck_episode_active: bool = False
-        self._stuck_started_at: Optional[float] = None
-        self._stuck_start_dist_m: Optional[float] = None
-        self._stuck_start_scan_count: int = 0
-        self._stuck_relocate_cooldown_until: float = 0.0
-        self._stuck_relocate_mission_count: int = 0
-        self._stuck_relocate_grace_until: float = 0.0
-        # Pose-health divergence detector (Option 1). Fed each redraw
-        # from the scan matcher; drives the pre-collision relocate.
+        # Pose-health divergence detector: fed each redraw from the scan
+        # matcher so the rolling quality window is warm. Telemetry only —
+        # reset on relocate; no auto-action is wired to it.
         self._pose_health = PoseHealthMonitor()
-        self._pose_lost_cooldown_until: float = 0.0
-        self._pose_lost_mission_count: int = 0
-        self._mission_was_active: bool = False
-        # Patrol execution state. Populated by `_on_go` when a patrol
-        # with waypoints is loaded; None for single-goal missions.
-        # `_active_rotation` is the currently-running RotateToHeading
-        # primitive (only set while ROTATING_TO_NEXT). `_pending_advance`
-        # holds (new_wp_index, new_lap_index, lap_completed) — the
-        # values committed to the mission once the primitive reports
-        # DONE.
-        self._patrol_runner: Optional[PatrolRunner] = None
-        self._active_rotation: Optional[RotateToHeading] = None
-        self._pending_advance: Optional[Tuple[int, int, bool]] = None
-        # Per-mission cache of effective (snapped) waypoint coords,
-        # keyed by wp_index. Each entry is computed once per mission
-        # when the wp first becomes the active target, emits a
-        # `patrol.waypoint_snapped` event if relocation was needed,
-        # then is reused for the leg's goal + the rotate-to-face
-        # heading. Cleared on mission terminal.
-        self._snapped_wp_xys: Dict[int, Tuple[float, float]] = {}
         # Right-click append target for patrol-edit mode. Wired to
         # SharedMapView in `_build_ui` (next block).
         self._shared_view.set_patrol_append_callback(
@@ -675,7 +551,7 @@ class NavMainWindow(QMainWindow):
 
     def _on_hier_tick(self) -> None:
         # Fast, render-decoupled hierarchical-drive step (see _build_timer).
-        if self._stage_b_mode and self._hier_drive is not None:
+        if self._hier_drive is not None:
             self._hier_drive.tick(time.time())
 
     def _on_redraw_tick(self) -> None:
@@ -789,17 +665,11 @@ class NavMainWindow(QMainWindow):
                 pose_history=trail, bounds_ij=snap.get("bounds_ij"),
             )
             self._update_scan_match_overlay(st)
-            # Cache for replanning when goal changes; if a goal is
-            # already set, replan against the freshly-built costmap
-            # so the path keeps up as the map fills in. Skip during
-            # RECOVERING — the active primitive owns cmd_vel and we
-            # don't want a stale path replaced under it.
+            # Cache for replanning when goal changes; if a goal pin is
+            # set, replan against the freshly-built costmap so the path
+            # preview keeps up as the map fills in.
             self._last_costmap = cm
-            if (
-                cm is not None
-                and self._shared_view.goal() is not None
-                and not self._mission.is_recovering()
-            ):
+            if cm is not None and self._shared_view.goal() is not None:
                 self._replan(cm, pose)
         else:
             self._height_view.update_map(
@@ -816,17 +686,8 @@ class NavMainWindow(QMainWindow):
             )
             self._update_scan_match_overlay(st)
 
-        # Run the follower whenever a path exists and we have a
-        # live pose. The output renders on the map either way; in
-        # FOLLOWING state it also drives the chassis.
-        path = self._shared_view.planned_path()
-        out = self._follower.update(path, pose)
-        self._last_follower = out
-        self._shared_view.set_lookahead(out.lookahead_world)
-
-        # Feed the pose-health monitor every tick (independent of mission
-        # state) so the rolling window is warm the moment a mission
-        # starts. `scan_obs_run` dedupes repeat reads of the same match.
+        # Feed the pose-health monitor every tick so the rolling window
+        # is warm. `scan_obs_run` dedupes repeat reads of the same match.
         try:
             ms = self.fuser.pose_source.match_summary()
             self._pose_health.ingest(
@@ -835,44 +696,11 @@ class NavMainWindow(QMainWindow):
         except Exception:
             logger.exception("pose-health ingest failed; skipping")
 
-        # cmd_vel decision: hard gates → pose freshness → state dispatch.
-        # Single helper so the per-state logic is readable.
-        if self._mission.is_active():
-            self._drive_mission_tick(out, cm, pose, pose_age)
-        else:
-            self._safety_blocked = False
-            self._update_safety_block_trace(False)
-            self._active_recovery = None
-        # Stage-B hierarchical drive runs its own loop (Tier-3 owns cmd_vel
-        # via body/drive/goto). It is mutually exclusive with the old mission
-        # path — Stage B never starts self._mission — so no cmd_vel contention.
-        if self._stage_b_mode and self._hier_drive is not None:
-            # tick() runs on _hier_timer (fast, decoupled); here we only
-            # refresh the overlay at the render rate.
+        # The hierarchical drive runs its own loop (Tier-3 owns cmd_vel via
+        # body/drive/goto); tick() runs on _hier_timer (fast, decoupled).
+        # Here we only refresh the overlay at the render rate.
+        if self._hier_drive is not None:
             self._refresh_hier_overlay(pose)
-        # Trace lifecycle: close the per-mission file on the
-        # active→terminal edge so each mission yields one self-
-        # contained JSONL artifact.
-        if self._mission_was_active and not self._mission.is_active():
-            self._tracer.close()
-            self._mission_was_active = False
-            # Reset edge state so a fresh mission's first events
-            # (re)establish baselines silently.
-            self._last_plan_ok = None
-            self._last_safety_blocked = None
-            self._safety_block_started_at = None
-            self._safety_block_snapped = False
-            # Patrol bookkeeping: drop runner / pending advance so a
-            # subsequent Go on the same patrol starts at wp[0] again,
-            # clear the snap cache (next mission rebuilds against the
-            # current costmap), and unlock the patrol dock for edits.
-            self._patrol_runner = None
-            self._active_rotation = None
-            self._pending_advance = None
-            self._snapped_wp_xys.clear()
-            self._patrol_dock.set_mission_active(False)
-        elif self._mission.is_active():
-            self._mission_was_active = True
 
         # All status labels below use width-stable formats: every
         # numeric field has a fixed min-width via `:>N.Mf` / `:>Nd` so
@@ -960,129 +788,47 @@ class NavMainWindow(QMainWindow):
                 self._plan_lbl.setText(f"plan: {plan.msg[:14]}")
                 self._plan_lbl.setStyleSheet("color: #e8a;")
 
-        # Follow / mission status — kept compact so width never bursts.
-        f = self._last_follower
-        ms = self._mission.state
-        active = self._mission.is_active()
-        max_att = self._mission_config.max_recovery_attempts
-
-        def _short_reason(r: str, n: int = 18) -> str:
-            r2 = r[len("no_path:"):] if r.startswith("no_path:") else r
-            return r2[:n]
-
-        if ms == MissionState.ARRIVED:
-            self._follow_lbl.setText(
-                f"follow: ARRIVED  goal={f.distance_to_goal_m:>5.2f}m"
-                if f is not None else "follow: ARRIVED"
-            )
-            self._follow_lbl.setStyleSheet("color: #8f8;")
-        elif ms == MissionState.CANCELED:
-            self._follow_lbl.setText("follow: canceled")
-            self._follow_lbl.setStyleSheet("color: #cc8;")
-        elif ms == MissionState.FAILED:
-            self._follow_lbl.setText(
-                f"follow: FAILED  {self._mission.failure_reason[:24]}"
-            )
-            self._follow_lbl.setStyleSheet("color: #e8a;")
-        elif ms == MissionState.PAUSED:
-            grace = self._mission_config.pause_grace_s
-            elapsed = max(0.0, time.time() - self._mission.pause_started_at)
-            grace_left = max(0.0, grace - elapsed)
-            self._follow_lbl.setText(
-                f"follow: PAUSED  "
-                f"{_short_reason(self._mission.pause_reason)}  "
-                f"{grace_left:>3.1f}s  "
-                f"{self._mission.recovery_attempts}/{max_att}"
-            )
-            self._follow_lbl.setStyleSheet("color: #ec8;")
-        elif ms == MissionState.RECOVERING:
-            self._follow_lbl.setText(
-                f"follow: REC  {self._mission.recovery_action[:20]}  "
-                f"{self._mission.recovery_attempts}/{max_att}"
-            )
-            self._follow_lbl.setStyleSheet("color: #ec8;")
-        elif f is None or f.status == STATUS_NO_PATH:
-            self._follow_lbl.setText("follow: —")
+        # Drive status label + Go/Stop/Resume enable mirror the
+        # hierarchical-drive state.
+        hd = self._hier_drive
+        running = hd is not None and hd.state() not in (
+            HierState.IDLE, HierState.ARRIVED, HierState.FAILED,
+        )
+        self._go_act.setEnabled(not running)
+        self._cancel_act.setEnabled(running)
+        self._resume_act.setEnabled(hd is not None and hd.can_resume())
+        if hd is None:
+            self._follow_lbl.setText("hier: —")
             self._follow_lbl.setStyleSheet("color: #ccc;")
-        elif active and self._local_fwd_blocked:
-            rot_hint = (
-                f"  α={math.degrees(f.heading_error_rad):>+4.0f}°"
-                if f.status == STATUS_ROTATING else ""
-            )
-            self._follow_lbl.setText(
-                f"follow: GO LOCAL BLOCK{rot_hint}  "
-                f"goal={f.distance_to_goal_m:>5.2f}m"
-            )
-            self._follow_lbl.setStyleSheet("color: #e8a;")
-        elif active and self._safety_blocked:
-            self._follow_lbl.setText(
-                f"follow: GO BLOCKED  goal={f.distance_to_goal_m:>5.2f}m"
-            )
-            self._follow_lbl.setStyleSheet("color: #e8a;")
-        elif f.status == STATUS_ROTATING:
-            tag = "GO " if active else "dry"
-            self._follow_lbl.setText(
-                f"follow: {tag} ROT  "
-                f"α={math.degrees(f.heading_error_rad):>+4.0f}°  "
-                f"goal={f.distance_to_goal_m:>5.2f}m"
-            )
-            self._follow_lbl.setStyleSheet("color: #ec8;")
-        else:  # FOLLOWING (follower's view)
-            tag = "GO " if active else "dry"
-            self._follow_lbl.setText(
-                f"follow: {tag}  "
-                f"v={f.v_mps:>4.2f} ω={f.omega_radps:>+5.2f}  "
-                f"goal={f.distance_to_goal_m:>5.2f}m"
-            )
-            self._follow_lbl.setStyleSheet(
-                "color: #8f8;" if active else "color: #8cf;"
-            )
-
-        # Go/Stop button enable mirrors mission state.
-        self._go_act.setEnabled(self._mission.can_start())
-        self._cancel_act.setEnabled(self._mission.can_cancel())
-
-        # Stage-B overrides the follow label + Go/Stop enable with the
-        # hierarchical-drive state (the old mission is dormant here).
-        if self._stage_b_mode:
-            hd = self._hier_drive
-            running = hd is not None and hd.state() not in (
-                HierState.IDLE, HierState.ARRIVED, HierState.FAILED,
-            )
-            self._go_act.setEnabled(not running)
-            self._cancel_act.setEnabled(running)
-            self._resume_act.setEnabled(hd is not None and hd.can_resume())
-            if hd is not None:
-                # Held at an inspector breakpoint reads as "running" (the mission
-                # IS active, just paused) — make that obvious so a paused drive
-                # isn't mistaken for a stopped/finished one. HO-1/HO-2 hold on
-                # the desktop (held_tier); HO-3 holds on the Pi (status mode).
-                held = hd.held_tier()
-                if held is None and self._drive_client is not None:
-                    drive_st = self._drive_client.latest_status()
-                    if drive_st is not None and drive_st.get("mode") == "held":
-                        held = 3
-                if held is not None:
-                    self._follow_lbl.setText(
-                        f"⏸ PAUSED @ HO-{held} — breakpoint (Run free in inspector)")
-                    self._follow_lbl.setStyleSheet("color: #fd0; font-weight: bold;")
-                else:
-                    br = hd.block_reason()
-                    txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
-                    # Checkpoint-pose: show the last re-anchor (cp id + inlier) so
-                    # the operator sees it locking onto checkpoints while driving.
-                    if self._cp_localizer is not None:
-                        lm = self._cp_localizer.last_match
-                        txt += (f"  ⚓{lm.checkpoint_id} {lm.inlier_frac:.2f}"
-                                if lm is not None else "  ⚓cp?")
-                    self._follow_lbl.setText(txt)
-                    self._follow_lbl.setStyleSheet(
-                        "color: #fb4;" if suspended else
-                        "color: #e8a;" if hd.state() in (HierState.BLOCKED, HierState.FAILED)
-                        else "color: #8cf;"
-                    )
         else:
-            self._resume_act.setEnabled(False)
+            # Held at an inspector breakpoint reads as "running" (the drive
+            # IS active, just paused) — make that obvious so a paused drive
+            # isn't mistaken for a stopped/finished one. HO-1/HO-2 hold on
+            # the desktop (held_tier); HO-3 holds on the Pi (status mode).
+            held = hd.held_tier()
+            if held is None and self._drive_client is not None:
+                drive_st = self._drive_client.latest_status()
+                if drive_st is not None and drive_st.get("mode") == "held":
+                    held = 3
+            if held is not None:
+                self._follow_lbl.setText(
+                    f"⏸ PAUSED @ HO-{held} — breakpoint (Run free in inspector)")
+                self._follow_lbl.setStyleSheet("color: #fd0; font-weight: bold;")
+            else:
+                br = hd.block_reason()
+                txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
+                # Checkpoint-pose: show the last re-anchor (cp id + inlier) so
+                # the operator sees it locking onto checkpoints while driving.
+                if self._cp_localizer is not None:
+                    lm = self._cp_localizer.last_match
+                    txt += (f"  ⚓{lm.checkpoint_id} {lm.inlier_frac:.2f}"
+                            if lm is not None else "  ⚓cp?")
+                self._follow_lbl.setText(txt)
+                self._follow_lbl.setStyleSheet(
+                    "color: #fb4;" if hd.is_suspended() else
+                    "color: #e8a;" if hd.state() in (HierState.BLOCKED, HierState.FAILED)
+                    else "color: #8cf;"
+                )
 
         # Session id is fixed-8; pose-source label can be "odom" or
         # "imu+scan_match" — clamp so the label width is bounded.
@@ -1094,722 +840,20 @@ class NavMainWindow(QMainWindow):
         )
         self._notes_lbl.setText(st.get("notes") or "")
 
-    # ── Mission tick ────────────────────────────────────────────────
-
-    def _drive_mission_tick(
-        self,
-        out: FollowerOutput,
-        cm,
-        pose,
-        pose_age: Optional[float],
-    ) -> None:
-        """Decide cmd_vel for this tick. Called only when the mission
-        is in an active state (FOLLOWING / PAUSED / RECOVERING).
-
-        Order of concerns:
-            1. Chassis disconnect — terminal; recovery doesn't help.
-            2. Live cmd flag — pause if dropped, resume if restored,
-               fail on short timeout. Operator ALL-STOP / Live toggle /
-               chassis reconnect all drop the flag; the timeout still
-               ends the mission deliberately while cushioning transient
-               flag races. cmd_loop stops publishing while live=False,
-               so the Pi watchdog halts motors during the pause window
-               regardless.
-            3. Pose freshness — pause if stale, resume if fresh after
-               a no_pose pause. Stale pose is treated as universal:
-               applies in any active state and overrides the others.
-            4. Per-state behavior.
-        """
-        with self.chassis.state.lock:
-            connected = self.chassis.state.connected
-            live = self.chassis.state.live_command
-        if not connected:
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._mission.fail("chassis disconnect")
-            self._cancel_recovery()
-            self._safety_blocked = False
-            self._update_safety_block_trace(False)
-            return
-        if not live:
-            self._cancel_recovery()
-            # pause() is idempotent for the same reason — won't reset
-            # the pause clock if we're already in no_live_cmd pause.
-            self._mission.pause(REASON_NO_LIVE_CMD)
-            if (
-                self._mission.is_paused()
-                and self._mission.pause_reason == REASON_NO_LIVE_CMD
-            ):
-                elapsed = time.time() - self._mission.pause_started_at
-                if elapsed > self._mission_config.no_live_cmd_timeout_s:
-                    self._mission.fail(
-                        f"live cmd lost for {elapsed:.0f}s "
-                        f"(threshold {self._mission_config.no_live_cmd_timeout_s:.0f}s)"
-                    )
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._safety_blocked = False
-            self._update_safety_block_trace(False)
-            return
-        if (
-            self._mission.is_paused()
-            and self._mission.pause_reason == REASON_NO_LIVE_CMD
-        ):
-            self._mission.resume()
-
-        # Pose freshness applies regardless of current state. None pose
-        # is treated as max-stale.
-        threshold = self._mission_config.pose_age_threshold_s
-        stale = pose is None or (pose_age is not None and pose_age > threshold)
-        if stale:
-            self._cancel_recovery()
-            # pause() is idempotent for the same reason — won't reset
-            # the pause clock if we're already in no_pose pause.
-            self._mission.pause(REASON_NO_POSE)
-            # Bail out of the wait if pose has been gone too long. This
-            # is the hard escape from PAUSED("no_pose") — the recovery
-            # policy doesn't fire for no_pose (no primitive helps a
-            # missing pose), so without this the mission would idle in
-            # PAUSED forever on a dead Pi-side local_map publisher.
-            if self._mission.is_paused() and self._mission.pause_reason == REASON_NO_POSE:
-                elapsed = time.time() - self._mission.pause_started_at
-                if elapsed > self._mission_config.no_pose_timeout_s:
-                    self._mission.fail(
-                        f"pose lost for {elapsed:.0f}s "
-                        f"(threshold {self._mission_config.no_pose_timeout_s:.0f}s)"
-                    )
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._safety_blocked = False
-            self._update_safety_block_trace(False)
-            return
-        if (
-            self._mission.is_paused()
-            and self._mission.pause_reason == REASON_NO_POSE
-        ):
-            self._mission.resume()
-
-        # Pose-health gate: a fresh-but-wrong pose passes the freshness
-        # check above, so before driving on it, halt if scan-match
-        # quality says localization has diverged. Only while actively
-        # driving (not while already paused/recovering — those own their
-        # own cmd_vel and a relocate is already in flight).
-        if (
-            self._mission.is_following()
-            or self._mission.is_rotating_to_next()
-        ) and self._handle_pose_loss():
-            return
-
-        # Dispatch on state.
-        if self._mission.is_following():
-            self._tick_following(out, pose)
-        elif self._mission.is_rotating_to_next():
-            self._tick_rotating_to_next(pose, cm)
-        elif self._mission.is_paused():
-            self._tick_paused(cm, pose)
-        elif self._mission.is_recovering():
-            self._tick_recovering(pose, cm)
-
-    def _tick_following(self, out: FollowerOutput, pose) -> None:
-        if out.status == STATUS_ARRIVED:
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._update_safety_block_trace(False)
-            # Patrol arrival branch: advance to the next waypoint
-            # (rotating to face it first) instead of terminating, when
-            # there's another leg to drive.
-            if self._patrol_runner is not None:
-                self._handle_patrol_arrival(pose)
-                return
-            self._mission.arrive()
-            return
-        if out.status == STATUS_NO_PATH:
-            # Replan failed (or path degenerate). Classify the failure
-            # so the policy can pick an appropriate recovery action.
-            reason = classify_replan_failure(
-                self._last_costmap, pose, self._shared_view.goal(),
-            )
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._mission.pause(reason)
-            self._update_safety_block_trace(False)
-            return
-        # FOLLOWING / ROTATING — swept-footprint safety check.
-        # Reads the body-frame local_map.driveable directly (the freshest
-        # fused lidar+depth observation from the Pi), not the world-frame
-        # costmap. Drift-immune: a pose error doesn't shift our view of
-        # what's physically in front of the robot.
-        #
-        # Staleness rule: if local_map is missing or older than 2× its
-        # median publish period (fallback 1.0 s), treat as BLOCKED. We
-        # would rather refuse to drive than drive blind on stale data.
-        # (An all-unknown but *fresh* local_map is caught separately by
-        # the swept check's min_observed_cells guard.)
-        with self.chassis.state.lock:
-            lm_drive = self.chassis.state.local_map_driveable
-            lm_meta = self.chassis.state.local_map_meta
-            lm_ts = self.chassis.state.local_map_ts
-        lm_period = self.chassis.state.local_map_period_s() or 0.5
-        lm_stale_threshold_s = max(1.0, 2.0 * lm_period)
-        lm_age_s = time.time() - lm_ts if lm_ts > 0 else float("inf")
-        v_cmd = out.v_mps
-        omega_cmd = out.omega_radps
-        stale = lm_drive is None or lm_meta is None or lm_age_s > lm_stale_threshold_s
-        # Clip the *commanded translation* when the footprint, traced
-        # along the commanded (v, ω) arc, would sweep an obstacle —
-        # but always pass ω through. Rotation in place sweeps no new
-        # ground for a circular footprint, so an obstacle ahead must
-        # not prevent the bot from rotating to face a clear direction;
-        # rotation is precisely how it escapes. Zeroing ω here was a
-        # deadlock: facing a bookshelf, the check fires every tick and
-        # the bot is stuck unable to turn away.
-        if abs(v_cmd) < 1e-3:
-            motion_blocked = False  # pure rotation / stationary
-        elif stale:
-            motion_blocked = True   # refuse to drive blind on stale data
-        else:
-            motion_blocked = swept_path_blocked_local(
-                lm_drive, lm_meta,
-                v_mps=v_cmd, omega_radps=omega_cmd,
-                config=self._safety_config,
-            )
-        self._local_fwd_blocked = motion_blocked
-        if motion_blocked:
-            v_cmd = 0.0
-        # `_safety_blocked` drives the GO BLOCKED status label and the
-        # safety.* trace event. Edge on "the commanded forward motion
-        # was clipped" — purely-rotating ticks are not "blocked" in the
-        # user-facing sense, they're driving around the problem.
-        blocked = (v_cmd != out.v_mps)
-        self._safety_blocked = blocked
-        omega_cmd = self._omega_limiter.limit(omega_cmd, time.monotonic())
-        self.chassis.set_cmd_vel(v_cmd, omega_cmd)
-        self._update_safety_block_trace(blocked)
-        self._update_stuck_relocate(out, blocked, v_cmd)
-
-    def _reset_stuck_relocate_state(self) -> None:
-        self._stuck_episode_active = False
-        self._stuck_started_at = None
-        self._stuck_start_dist_m = None
-        self._stuck_start_scan_count = 0
-
-    def _scan_obs_count(self) -> int:
-        try:
-            summary = self.fuser.pose_source.match_summary()
-            return int(summary.get("scan_obs_run", 0))
-        except Exception:
-            return 0
-
-    def _is_go_stuck(
-        self, out: FollowerOutput, blocked: bool, v_cmd: float,
-    ) -> bool:
-        """True when local_map blocks forward motion with no progress."""
-        if out.distance_to_goal_m <= self._follower.config.arrival_tolerance_m + 0.25:
-            return False
-        if abs(v_cmd) > 0.02:
-            return False
-        # Rotate-in-place alone is normal; only escalate on local block.
-        return blocked and out.v_mps > 0.02
-
-    def _update_stuck_relocate(
-        self, out: FollowerOutput, blocked: bool, v_cmd: float,
-    ) -> None:
-        if time.time() < self._stuck_relocate_grace_until:
-            return
-        if not self._is_go_stuck(out, blocked, v_cmd):
-            self._reset_stuck_relocate_state()
-            return
-
-        now = time.time()
-        scan_count = self._scan_obs_count()
-        if not self._stuck_episode_active:
-            self._stuck_episode_active = True
-            self._stuck_started_at = now
-            self._stuck_start_dist_m = out.distance_to_goal_m
-            self._stuck_start_scan_count = scan_count
-            return
-
-        if (
-            self._stuck_start_dist_m is not None
-            and out.distance_to_goal_m <= self._stuck_start_dist_m - _STUCK_PROGRESS_M
-        ):
-            self._reset_stuck_relocate_state()
-            return
-
-        if self._stuck_started_at is None:
-            return
-        if now < self._stuck_relocate_cooldown_until:
-            return
-        if now - self._stuck_started_at < _STUCK_RELOCATE_MIN_S:
-            return
-        if scan_count - self._stuck_start_scan_count < _STUCK_RELOCATE_SCANS:
-            return
-
-        self._reset_stuck_relocate_state()
-        self._escalate_relocate_for_stuck(out.distance_to_goal_m)
-
-    def _escalate_relocate_for_stuck(self, dist_to_goal_m: float) -> None:
-        if self._stuck_relocate_mission_count >= _STUCK_RELOCATE_MAX_PER_MISSION:
-            logger.warning(
-                "stuck relocate exhausted (%d); pausing for recovery",
-                _STUCK_RELOCATE_MAX_PER_MISSION,
-            )
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._mission.pause("stuck:unresolved")
-            return
-
-        self._stuck_relocate_mission_count += 1
-        self._stuck_relocate_cooldown_until = (
-            time.time() + _STUCK_RELOCATE_COOLDOWN_S
-        )
-        self.chassis.set_cmd_vel(0.0, 0.0)
-        result = self._run_relocate(reason="stuck_escalation")
-        self._tracer.emit(
-            CAT_FOLLOW, "stuck_relocate",
-            {
-                "success": bool(result.get("success")),
-                "dist_to_goal_m": dist_to_goal_m,
-                "attempt": self._stuck_relocate_mission_count,
-                **{
-                    k: result[k]
-                    for k in ("dx", "dy", "dtheta", "reason")
-                    if k in result
-                },
-            },
-            level=LEVEL_WARN,
-        )
-        if result.get("success"):
-            logger.info(
-                "stuck escalate: MCL relocate ok dx=%+.2f dy=%+.2f dθ=%+.1f°",
-                float(result.get("dx", 0.0)),
-                float(result.get("dy", 0.0)),
-                math.degrees(float(result.get("dtheta", 0.0))),
-            )
-            self._omega_limiter.reset()
-            self._stuck_relocate_grace_until = time.time() + 1.0
-            return
-
-        logger.warning("stuck escalate: relocate failed: %s", result)
-        self._mission.pause("stuck:relocate_failed")
-
-    def _handle_pose_loss(self) -> bool:
-        """If localization has diverged (sustained low scan-match
-        quality), stop and force a relocate before the robot drives on a
-        wrong pose. Returns True when it handled the tick (caller should
-        stop further dispatch this tick).
-
-        Bounded per mission: after `_POSE_LOST_MAX_PER_MISSION` failed
-        attempts it pauses for operator intervention rather than looping.
-        """
-        now = time.time()
-        if now < self._pose_lost_cooldown_until:
-            return False
-        if not self._pose_health.is_lost(now):
-            return False
-
-        # Diverged. Stop immediately; don't drive another tick on a pose
-        # we no longer trust.
-        self.chassis.set_cmd_vel(0.0, 0.0)
-        self._safety_blocked = False
-        self._update_safety_block_trace(False)
-        median_q = self._pose_health.median_quality(now)
-
-        if self._pose_lost_mission_count >= _POSE_LOST_MAX_PER_MISSION:
-            logger.warning(
-                "pose-health: divergence unresolved after %d relocates; "
-                "pausing (median_quality=%.3f)",
-                _POSE_LOST_MAX_PER_MISSION,
-                median_q if median_q is not None else float("nan"),
-            )
-            self._mission.pause("pose_lost:unresolved")
-            return True
-
-        self._pose_lost_mission_count += 1
-        self._pose_lost_cooldown_until = now + _POSE_LOST_COOLDOWN_S
-        result = self._run_relocate(reason="pose_health")
-        self._tracer.emit(
-            CAT_FOLLOW, "pose_health_relocate",
-            {
-                "success": bool(result.get("success")),
-                "median_quality": median_q,
-                "attempt": self._pose_lost_mission_count,
-            },
-            level=LEVEL_WARN,
-        )
-        if result.get("success"):
-            logger.info(
-                "pose-health: relocate ok dx=%+.2f dy=%+.2f (median_q=%.3f)",
-                float(result.get("dx", 0.0)),
-                float(result.get("dy", 0.0)),
-                median_q if median_q is not None else float("nan"),
-            )
-            self._omega_limiter.reset()
-            return True
-
-        logger.warning("pose-health: relocate failed: %s", result)
-        self._mission.pause("pose_lost:relocate_failed")
-        return True
-
-    def _fresh_local_map(self):
-        """Return (driveable, meta) of the freshest trusted body-frame
-        local_map, or None when it's missing or stale. Used by BackUp's
-        drift-immune rear check. Same staleness gate as the per-tick
-        forward veto.
-        """
-        with self.chassis.state.lock:
-            drive = self.chassis.state.local_map_driveable
-            meta = self.chassis.state.local_map_meta
-            ts = self.chassis.state.local_map_ts
-        if drive is None or meta is None:
-            return None
-        period = self.chassis.state.local_map_period_s() or 0.5
-        stale_threshold_s = max(1.0, 2.0 * period)
-        age_s = time.time() - ts if ts > 0 else float("inf")
-        if age_s > stale_threshold_s:
-            return None
-        return drive, meta
+    # ── Relocate helper ─────────────────────────────────────────────
 
     def _run_relocate(self, *, reason: str) -> dict:
-        """MCL relocate without canceling an active mission."""
+        """MCL relocate (global scan-match) + patrol/goal frame shift."""
         self.chassis.set_cmd_vel(0.0, 0.0)
         result = dict(self.fuser.request_relocate(reason=reason))
         if result.get("success"):
             result["shift_count"] = self._apply_relocate_to_patrol(result)
-            self._snapped_wp_xys.clear()
             # Fresh fix — drop stale low-quality samples so the health
             # monitor judges the new pose from scratch.
             self._pose_health.reset()
         else:
             result["shift_count"] = 0
         return result
-
-    def _update_safety_block_trace(self, blocked: bool) -> None:
-        """Edge-triggered safety.* emits + sustained-block auto-snap.
-
-        The forward arc flicks on/off as the robot's heading sweeps past
-        nearby lethal cells — we want one event when an episode begins
-        and one when it ends, not per-tick spam. If the same episode
-        persists past `_SUSTAINED_BLOCK_S`, fire `safety.sustained_block`
-        (in AUTO_SNAP_EVENTS) so the trace gets a costmap snapshot at
-        the moment of trouble. Snap is rate-limited per episode — one
-        bundle per stuck-stretch, not one per tick after the threshold.
-        """
-        prev = self._last_safety_blocked
-        now = time.time()
-        if prev is None:
-            self._last_safety_blocked = blocked
-            if blocked:
-                self._safety_block_started_at = now
-                self._tracer.emit(
-                    CAT_SAFETY, "forward_arc_blocked", {},
-                    level=LEVEL_WARN,
-                )
-            return
-        if blocked != prev:
-            self._last_safety_blocked = blocked
-            if blocked:
-                self._safety_block_started_at = now
-                self._safety_block_snapped = False
-                self._tracer.emit(
-                    CAT_SAFETY, "forward_arc_blocked", {},
-                    level=LEVEL_WARN,
-                )
-            else:
-                self._safety_block_started_at = None
-                self._safety_block_snapped = False
-                self._tracer.emit(CAT_SAFETY, "cleared", {})
-            return
-        # No edge — but check sustained-block threshold while blocked.
-        if (
-            blocked
-            and not self._safety_block_snapped
-            and self._safety_block_started_at is not None
-            and (now - self._safety_block_started_at) > _SUSTAINED_BLOCK_S
-        ):
-            self._safety_block_snapped = True
-            self._tracer.emit(
-                CAT_SAFETY, "sustained_block",
-                {"duration_s": now - self._safety_block_started_at},
-                level=LEVEL_WARN,
-            )
-
-    def _tick_paused(self, cm, pose) -> None:
-        """While paused: hold cmd_vel zero, watch for the pause
-        condition to clear, and on grace-expiry escalate to recovery
-        (or fail if the policy is exhausted).
-        """
-        self.chassis.set_cmd_vel(0.0, 0.0)
-        self._safety_blocked = False
-        self._update_safety_block_trace(False)
-
-        # Auto-resume if the planner now has a path. Last tick's
-        # follower output already saw the freshly-replanned path; we
-        # consult its status to know whether the no_path condition has
-        # cleared.
-        if self._last_follower is not None:
-            follower_status = self._last_follower.status
-            if (
-                self._mission.pause_reason.startswith("no_path:")
-                and follower_status not in (STATUS_NO_PATH,)
-            ):
-                self._mission.resume()
-                return
-
-        # Grace window — give the world a moment before swinging at it.
-        elapsed = max(0.0, time.time() - self._mission.pause_started_at)
-        if elapsed < self._mission_config.pause_grace_s:
-            return
-
-        # Escalate. Reasons that recovery can't address (currently just
-        # NO_POSE — handled above) shouldn't reach here. Anything else
-        # goes through the policy.
-        action = self._recovery_policy.select(
-            reason=self._mission.pause_reason,
-            attempts=self._mission.recovery_attempts,
-            max_attempts=self._mission_config.max_recovery_attempts,
-        )
-        if action is None:
-            self._mission.fail(
-                f"recovery exhausted ({self._mission.recovery_attempts} "
-                f"attempts; last reason: {self._mission.pause_reason})"
-            )
-            return
-        self._active_recovery = action
-        self._mission.begin_recovery(action.name())
-
-    def _tick_recovering(self, pose, cm) -> None:
-        action = self._active_recovery
-        if action is None:
-            # State drift — recover by forcing back to PAUSED so the
-            # next tick selects fresh.
-            self._mission.end_recovery(success=False)
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._safety_blocked = False
-            self._update_safety_block_trace(False)
-            return
-        out = action.update(pose, cm)
-        self._safety_blocked = False
-        self._update_safety_block_trace(False)
-        if out.status == PRIM_RUNNING:
-            self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
-            return
-        # Primitive finished one way or another. Drop cmd_vel, clear the
-        # active handle, and notify the mission.
-        self.chassis.set_cmd_vel(0.0, 0.0)
-        self._active_recovery = None
-        self._mission.end_recovery(success=(out.status == PRIM_DONE))
-        if out.status == PRIM_DONE:
-            self._stuck_relocate_grace_until = (
-                time.time() + _STUCK_GRACE_AFTER_RECOVERY_S
-            )
-            self._reset_stuck_relocate_state()
-
-    # ── Patrol arrival / rotation ───────────────────────────────────
-
-    def _get_effective_wp_xy(
-        self, wp, wp_index: int,
-    ) -> Tuple[float, float]:
-        """Return the (x, y) the planner/follower should aim at for
-        `wp`. Snaps the saved waypoint to the nearest accessible cell
-        (cost < halo_max/2, non-lethal) within `_WP_SNAP_RADIUS_M` if
-        the saved cell isn't itself accessible. Cached per wp_index
-        for the duration of the mission so each leg gets a consistent
-        target and the trace event fires at most once per wp per run.
-
-        Emits:
-          - `patrol.waypoint_snapped` when a relocation > trivial
-            distance was applied.
-          - `patrol.waypoint_snap_failed` when no acceptable cell
-            exists within the radius (fall back to raw xy; planner
-            relaxation will still try its own 8-cell search).
-        """
-        cached = self._snapped_wp_xys.get(wp_index)
-        if cached is not None:
-            return cached
-        raw_xy = (float(wp.x_m), float(wp.y_m))
-        cm = self._last_costmap
-        if cm is None:
-            # No costmap yet — can't snap. Use raw and don't cache
-            # (so the next call retries once a costmap arrives).
-            return raw_xy
-        try:
-            result = patrol_mod.snap_to_accessible(
-                cm, raw_xy, radius_m=_WP_SNAP_RADIUS_M,
-            )
-        except Exception:
-            logger.exception("snap_to_accessible raised")
-            self._snapped_wp_xys[wp_index] = raw_xy
-            return raw_xy
-        if result is None:
-            # No accessible cell within radius — fall back to raw.
-            # Trace the failure so a reviewer can see *why* the
-            # planner relaxation took over.
-            self._snapped_wp_xys[wp_index] = raw_xy
-            try:
-                self._tracer.emit(
-                    "patrol", "waypoint_snap_failed",
-                    {
-                        "wp_index": wp_index,
-                        "original_xy": [raw_xy[0], raw_xy[1]],
-                        "radius_m": _WP_SNAP_RADIUS_M,
-                    },
-                    level=LEVEL_WARN,
-                )
-            except Exception:
-                logger.exception("waypoint_snap_failed emit raised")
-            return raw_xy
-        eff_xy = result.snapped_xy
-        self._snapped_wp_xys[wp_index] = eff_xy
-        if result.snapped and result.distance_m >= _WP_SNAP_TRIVIAL_M:
-            try:
-                self._tracer.emit(
-                    "patrol", "waypoint_snapped",
-                    {
-                        "wp_index": wp_index,
-                        "original_xy": [
-                            result.original_xy[0], result.original_xy[1],
-                        ],
-                        "snapped_xy": [eff_xy[0], eff_xy[1]],
-                        "distance_m": result.distance_m,
-                        "cost_at_original": result.cost_at_original,
-                        "cost_at_snapped": result.cost_at_snapped,
-                    },
-                )
-            except Exception:
-                logger.exception("waypoint_snapped emit raised")
-        return eff_xy
-
-    def _handle_patrol_arrival(self, pose) -> None:
-        """Called from `_tick_following` when the follower reports
-        ARRIVED *and* a patrol is active. Compute the next leg, decide
-        terminal vs. advance, and (if advancing) kick off a
-        RotateToHeading primitive aimed at the next waypoint's bearing.
-        """
-        runner = self._patrol_runner
-        if runner is None:
-            self._mission.arrive()
-            return
-        # `face_next` is a per-waypoint flag — if the just-reached
-        # waypoint says false, skip the rotation step.
-        face_next = bool(
-            runner.patrol.waypoints[runner.wp_index].face_next
-        )
-        new_idx, lap_completed = runner.on_arrived()
-        if new_idx is None:
-            # Patrol terminal. If this terminal arrival also closed a
-            # lap (loop=True, laps=K and K-th arrival at wp[0]), emit
-            # patrol.lap_complete before mission.arrive() so the trace
-            # records the closure — complete_rotation_to_next is the
-            # usual emit site but we skip it on terminate-via-lap.
-            if lap_completed:
-                # Sync the mission's lap counter to the runner's
-                # before emitting + arriving, so the trace event and
-                # the mission state agree on lap_index.
-                self._mission.lap_index = runner.lap_index
-                try:
-                    self._tracer.emit(
-                        "patrol", "lap_complete",
-                        {"lap_index": runner.lap_index},
-                    )
-                except Exception:
-                    logger.exception("lap_complete emit raised")
-            self._patrol_runner = None
-            self._active_rotation = None
-            self._pending_advance = None
-            self._mission.arrive()
-            return
-        # Cache the values to commit when rotation completes. We don't
-        # update the goal yet — the follower keeps reporting ARRIVED
-        # against wp[i] until we advance, which is fine since cmd_vel
-        # is owned by the rotation primitive while ROTATING_TO_NEXT.
-        self._pending_advance = (new_idx, runner.lap_index, lap_completed)
-        # Snap the NEW active wp to an accessible cell ONCE per
-        # mission. Used both as the rotation target's heading and (in
-        # _commit_pending_advance) as the goal for the next leg.
-        next_wp = runner.patrol.waypoints[new_idx]
-        eff_next_xy = self._get_effective_wp_xy(next_wp, new_idx)
-        if not face_next or pose is None:
-            # Skip rotation — commit advance immediately and resume
-            # FOLLOWING in the next tick. Use 0-radian dummy target;
-            # the begin/complete pair still fires patrol.advance.
-            self._mission.begin_rotation_to_next(0.0, to_wp_index=new_idx)
-            self._commit_pending_advance()
-            return
-        target_theta = math.atan2(
-            eff_next_xy[1] - pose[1], eff_next_xy[0] - pose[0],
-        )
-        self._mission.begin_rotation_to_next(
-            target_theta, to_wp_index=new_idx,
-        )
-        self._active_rotation = RotateToHeading(target_theta)
-
-    def _tick_rotating_to_next(self, pose, cm) -> None:
-        """RotateToHeading-driven cmd_vel until the primitive reports
-        DONE (or ABORTED), then commit the pending advance and resume
-        FOLLOWING."""
-        action = self._active_rotation
-        if action is None:
-            # State drift: shouldn't happen, but recover by aborting
-            # the rotation and resuming FOLLOWING with no advance.
-            self._mission.abort_rotation_to_next()
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            return
-        out = action.update(pose, cm)
-        self._update_safety_block_trace(False)
-        if out.status == PRIM_RUNNING:
-            self.chassis.set_cmd_vel(out.v_mps, out.omega_radps)
-            return
-        # DONE or ABORTED — drop cmd_vel and commit.
-        self.chassis.set_cmd_vel(0.0, 0.0)
-        self._active_rotation = None
-        if out.status == PRIM_DONE:
-            self._commit_pending_advance()
-        else:
-            # ABORTED — fall back to FOLLOWING with no advance; the
-            # next ARRIVED tick will re-enter this path. cmd_vel
-            # already zeroed.
-            self._mission.abort_rotation_to_next()
-            self._pending_advance = None
-
-    def _commit_pending_advance(self) -> None:
-        """Apply the (wp_index, lap_index, lap_completed) cached by
-        `_handle_patrol_arrival` and shift the goal pin to the new
-        waypoint so the planner / follower target it on the next tick.
-        """
-        adv = self._pending_advance
-        runner = self._patrol_runner
-        if adv is None or runner is None:
-            self._mission.abort_rotation_to_next()
-            return
-        new_idx, new_lap, lap_completed = adv
-        self._pending_advance = None
-        self._mission.complete_rotation_to_next(
-            new_wp_index=new_idx,
-            new_lap_index=new_lap,
-            lap_completed=lap_completed,
-        )
-        # Shift the goal pin to the new active waypoint's effective
-        # (snapped) position. The planner will replan against this on
-        # the next redraw tick. The effective xy was computed in
-        # _handle_patrol_arrival and cached, so the rotation target
-        # and the new goal agree exactly.
-        wp = runner.patrol.waypoints[new_idx]
-        eff_xy = self._get_effective_wp_xy(wp, new_idx)
-        self._shared_view.set_goal(eff_xy)
-        self._shared_view.set_patrol_active_wp_index(new_idx)
-
-    def _cancel_recovery(self) -> None:
-        if self._active_recovery is not None:
-            try:
-                self._active_recovery.cancel()
-            except Exception:
-                logger.exception("recovery primitive cancel raised")
-            self._active_recovery = None
-        # An active rotate-to-next primitive is the patrol equivalent
-        # of a recovery primitive — same teardown story (cancel +
-        # drop the handle; mission state transitioned by the caller).
-        if self._active_rotation is not None:
-            try:
-                self._active_rotation.cancel()
-            except Exception:
-                logger.exception("rotation primitive cancel raised")
-            self._active_rotation = None
-            self._pending_advance = None
 
     def _refresh_chassis_panel(self) -> None:
         """Text summary with values the pills can't convey (status age,
@@ -1900,14 +944,8 @@ class NavMainWindow(QMainWindow):
                 )
 
     def _on_clear_goal(self) -> None:
-        # Cancel any active mission first so we don't keep driving
-        # toward a goal the operator just cleared.
-        if self._mission.is_active():
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._mission.cancel()
-        self._cancel_recovery()
-        self._mission.reset()
         self._shared_view.set_goal(None)
+        self._shared_view.set_planned_path([])
         self._last_plan = None
 
     def _on_locate_action(self, checked: bool) -> None:
@@ -1928,14 +966,13 @@ class NavMainWindow(QMainWindow):
         self._shared_view.set_locate_mode(False)
 
         # relocate_at rewrites the pose frame, like relocate — stop motion.
+        # (A running hierarchical drive re-picks on its own: the relocate
+        # bumps the provider's discrete correction_seq.)
         self.chassis.set_cmd_vel(0.0, 0.0)
-        if self._mission.is_active():
-            self._mission.cancel()
 
         result = dict(self.fuser.request_relocate_at(x_w, y_w, reason="ui_locate"))
         if result.get("success"):
             result["shift_count"] = self._apply_relocate_to_patrol(result)
-            self._snapped_wp_xys.clear()
             shift = int(result.get("shift_count", 0))
             yaw_deg = math.degrees(float(result["best_pose"][2]))
             QMessageBox.information(
@@ -1996,10 +1033,10 @@ class NavMainWindow(QMainWindow):
     def _on_relocate(self) -> None:
         # Prefer checkpoint recognition (robust on a metrically-loose map);
         # fall back to the global scan-match only when no checkpoint matches.
-        # Zero cmd_vel first — a relocate rewrites the world offset.
-        if self._mission.is_active():
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._mission.cancel()
+        # Zero cmd_vel first — a relocate rewrites the world offset. (A
+        # running hierarchical drive re-picks on its own: the relocate bumps
+        # the provider's discrete correction_seq.)
+        self.chassis.set_cmd_vel(0.0, 0.0)
         if self._try_checkpoint_relocate():
             return
         result = self._run_relocate(reason="ui_relocate")
@@ -2119,104 +1156,13 @@ class NavMainWindow(QMainWindow):
 
         return n_transformed
 
-    def _on_go(self) -> None:
-        """Validate preconditions and transition the mission to
-        FOLLOWING. Each subsequent redraw tick pushes the follower's
-        cmd_vel to chassis until ARRIVED, CANCELED, or FAILED.
-
-        Patrol precedence: if a patrol with at least one waypoint is
-        loaded, Go drives the patrol (sets goal to wp[0]; advances on
-        each ARRIVED via the PatrolRunner). Otherwise Go drives to the
-        single goal pin as before. The toolbar Plan label / Stop /
-        Cancel paths are common between both modes.
-        """
-        if self._stage_b_mode:
-            return self._on_go_stage_b()
-        if not self._mission.can_start():
-            return  # already FOLLOWING — nothing to do
-        # If a patrol is loaded with waypoints, override the goal pin
-        # to wp[0]'s effective (snapped) position before validating the
-        # plan — the existing planner only knows about
-        # `_shared_view.goal()`, so we hand it the current target.
-        # The snap cache starts empty at each Go so a re-run sees the
-        # current costmap, not the prior mission's snap result.
-        patrol = self._shared_view.patrol()
-        patrol_runner: Optional[PatrolRunner] = None
-        self._snapped_wp_xys.clear()
-        if patrol is not None and len(patrol.waypoints) > 0:
-            wp0 = patrol.waypoints[0]
-            eff_xy = self._get_effective_wp_xy(wp0, 0)
-            self._shared_view.set_goal(eff_xy)
-            self._shared_view.set_patrol_active_wp_index(0)
-            patrol_runner = PatrolRunner(patrol)
-            # Force a synchronous replan so the plan precondition below
-            # sees a fresh result against the freshly-set wp[0] goal.
-            cm = self._last_costmap
-            latest = self.fuser.pose_source.latest_pose()
-            pose0 = latest[0] if latest is not None else None
-            if cm is not None and pose0 is not None:
-                self._replan(cm, pose0)
-        plan = self._last_plan
-        if plan is None or not plan.ok:
-            self._mission.fail("no plan — drop a goal pin first")
-            return
-        latest = self.fuser.pose_source.latest_pose()
-        if latest is None:
-            self._mission.fail("no pose — wait for odom before starting")
-            return
-        with self.chassis.state.lock:
-            connected = self.chassis.state.connected
-            live = self.chassis.state.live_command
-        if not connected:
-            self._mission.fail("chassis disconnected")
-            return
-        if not live:
-            self._mission.fail(
-                "Live cmd is OFF — enable it on the safety toolbar first"
-            )
-            return
-        # Open the per-mission trace file before start() so the very
-        # first emit (mission.start) lands in the file rather than only
-        # the ring buffer. A separate Go that fails a precondition above
-        # leaves no file behind — those fail() emits ring-only, which
-        # matches the operator-visible UI (nothing to report).
-        try:
-            self._tracer.open(
-                session_id=self.fuser.grid.session_id,
-                configs=self._trace_configs_snapshot(),
-                patrol=patrol.to_dict() if patrol_runner is not None else None,
-                git_sha=git_sha(),
-                snapshot_at_start=None,
-            )
-        except Exception:
-            logger.exception("tracer open failed; continuing without trace")
-        self._patrol_runner = patrol_runner
-        self._active_rotation = None
-        self._pending_advance = None
-        self._reset_stuck_relocate_state()
-        self._stuck_relocate_mission_count = 0
-        self._stuck_relocate_cooldown_until = 0.0
-        self._stuck_relocate_grace_until = 0.0
-        self._pose_health.reset()
-        self._pose_lost_mission_count = 0
-        self._pose_lost_cooldown_until = 0.0
-        self._mission_was_active = True
-        self._patrol_dock.set_mission_active(True)
-        self._mission.start()
-
     def _on_cancel(self) -> None:
-        """Operator-initiated stop. Zero cmd_vel and transition to
-        CANCELED. Live cmd is left ON so the operator can drive
+        """Operator-initiated stop: cancel the in-flight Tier-3 goto and
+        drop the drive. Live cmd is left as-is so the operator can drive
         manually without a second click."""
-        if self._stage_b_mode:
-            self._stop_hier_drive()
-            return
-        if self._mission.is_active():
-            self.chassis.set_cmd_vel(0.0, 0.0)
-        self._cancel_recovery()
-        self._mission.cancel()
+        self._stop_hier_drive()
 
-    # ── Stage-B hierarchical drive ───────────────────────────────────
+    # ── Hierarchical drive ───────────────────────────────────────────
 
     def _new_drive_trace_path(self) -> Optional[str]:
         """A per-session JSONL path for the Tier-3 status trace (every
@@ -2263,7 +1209,7 @@ class NavMainWindow(QMainWindow):
             self._handoff_gate = None
         return self._handoff_gate
 
-    def _on_go_stage_b(self) -> None:
+    def _on_go(self) -> None:
         """Start hierarchical drive over the loaded patrol. Live cmd stays
         OFF — Tier-3 owns cmd_vel; nav only keeps the heartbeat alive."""
         patrol = self._shared_view.patrol()
@@ -2459,12 +1405,8 @@ class NavMainWindow(QMainWindow):
         )
         if not path:
             return
-        # Cancel a running mission so we don't drive on stale
-        # follower state with a freshly-replaced grid underneath.
-        if self._mission.is_active():
-            self.chassis.set_cmd_vel(0.0, 0.0)
-            self._mission.cancel()
-        self._cancel_recovery()
+        # Stop a running drive so we don't drive on a freshly-replaced map.
+        self._stop_hier_drive()
         try:
             summary = self.fuser.load_snapshot(path)
         except Exception as e:
@@ -2581,35 +1523,6 @@ class NavMainWindow(QMainWindow):
             )
             return None
 
-    def _trace_configs_snapshot(self) -> Dict[str, Any]:
-        """Snapshot the frozen run-time config (mission, follower,
-        safety, A*, costmap, fuser, chassis) into the trace header so
-        a reviewer doesn't need access to the source tree to interpret
-        thresholds and tunables.
-        """
-        cfg: Dict[str, Any] = {}
-        try:
-            cfg["mission"] = asdict(self._mission_config)
-            cfg["follower"] = asdict(self._follower.config)
-            cfg["safety"] = asdict(self._safety_config)
-            cfg["astar"] = asdict(self._astar_config)
-            cfg["costmap"] = asdict(self._costmap_config)
-        except Exception:
-            logger.exception("config snapshot raised")
-        # Fuser + chassis configs include router; useful for "which Pi
-        # was this run against." Captured loosely so unrelated dataclass
-        # shape changes can't break trace opening.
-        try:
-            cfg["fuser"] = asdict(self.fuser_config)
-        except Exception:
-            cfg["fuser"] = {"router": getattr(self.fuser_config, "router", None)}
-        try:
-            cfg["chassis"] = asdict(self.chassis_config)
-        except Exception:
-            cfg["chassis"] = {"router": getattr(self.chassis_config, "router", None)}
-        cfg["sustained_block_s"] = _SUSTAINED_BLOCK_S
-        return cfg
-
     def _on_fit_maps(self) -> None:
         # Single call: shared view propagates to all attached panels.
         self._shared_view.reset_view()
@@ -2647,8 +1560,11 @@ class NavMainWindow(QMainWindow):
         start placing pins without an explicit New click), then appends
         the world point.
         """
-        if self._mission.is_active():
-            # Edit-mid-mission is locked by design.
+        hd = self._hier_drive
+        if hd is not None and hd.state() not in (
+            HierState.IDLE, HierState.ARRIVED, HierState.FAILED,
+        ):
+            # Edit-mid-drive is locked by design.
             return
         p = self._shared_view.patrol()
         if p is None:
