@@ -100,6 +100,29 @@ class TestRelocateAt(unittest.TestCase):
         self.assertIn("improvement", result)
         self.assertIn("evidence_cells", result)
 
+    def test_relocate_at_bumps_discrete_seq_and_reanchors_yaw(self):
+        from types import SimpleNamespace
+
+        from desktop.localization.mcl_pose_source import _wrap
+
+        src = self._seeded_source(
+            seed_pose=(3.0, 1.6, math.radians(90.0)),
+            true_pose=(3.0, 1.6, 0.0),
+        )
+        # Fake IMU: a fixed raw yaw reading so the re-anchor is checkable.
+        imu_yaw = 1.0
+        src._imu_tracker = SimpleNamespace(yaw_at=lambda ts: (imu_yaw, 0.0))
+        self.assertEqual(src.correction_summary()["n_discrete"], 0)
+        result = src.relocate_at(3.0, 1.6)
+        self.assertTrue(result["success"], result)
+        # An operator relocate is always a discrete correction.
+        self.assertEqual(src.correction_summary()["n_discrete"], 1)
+        # The IMU yaw constraint must be re-anchored to the relocated heading
+        # (offset = imu - θ_seeded), not left in the pre-relocate frame where
+        # every subsequent IMU observation drags the posterior back.
+        bth = result["best_pose"][2]
+        self.assertLess(abs(_wrap(src._yaw_offset - (imu_yaw - bth))), 0.10)
+
 
 class TestMCLScanMatch(unittest.TestCase):
     def test_scan_match_summary_populated(self) -> None:
@@ -120,6 +143,11 @@ class TestMCLScanMatch(unittest.TestCase):
         self.assertIn("best_pose", sm)
         self.assertIn("prior_pose", sm)
         self.assertIn("elapsed_ms", sm)
+        # Ordinary tracking observation: n_applied counts it, but a tightly
+        # seeded posterior barely moves, so it is NOT a discrete correction.
+        summary = src.correction_summary()
+        self.assertEqual(summary["n_applied"], 1)
+        self.assertEqual(summary["n_discrete"], 0)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,13 @@ class MCLPoseSourceConfig:
     # Operator "set location" override (relocate_at): trust the clicked
     # (x, y) within this small window and sweep the full 360° of yaw.
     relocate_at_xy_half_m: float = 0.10
+    # A scan-match observation counts as a *discrete* correction (the kind
+    # drive consumers must re-pick their sub-goal on) only when it steps the
+    # posterior by at least one of these; smaller nudges are ordinary
+    # tracking. Operator relocates always count. Without this gate the
+    # drive's correction_seq watch fires on every 10 Hz scan observation.
+    discrete_jump_xy_m: float = 0.10
+    discrete_jump_theta_rad: float = math.radians(8.0)
 
 
 class MCLPoseSource(PoseSource):
@@ -112,6 +119,11 @@ class MCLPoseSource(PoseSource):
         self._correction_total_m = 0.0
         self._correction_total_rad = 0.0
         self._correction_n_applied = 0
+        # Monotone count of *discrete* pose corrections (relocates, rebinds,
+        # posterior jumps past the discrete_jump_* gates). Never reset — the
+        # hierarchical drive compares values across a leg, so it must only
+        # ever grow.
+        self._correction_discrete_seq = 0
         self._last_scan_match: Dict[str, Any] = {
             "valid": False,
         }
@@ -253,6 +265,9 @@ class MCLPoseSource(PoseSource):
             self._correction_total_m = 0.0
             self._correction_total_rad = 0.0
             self._correction_n_applied = 0
+            # A rebind IS a discrete correction — bump (never reset) the seq
+            # so an in-flight drive leg re-picks from the rebased frame.
+            self._correction_discrete_seq += 1
             self._last_scan_match = {"valid": False}
             return (x, y, theta)
 
@@ -283,6 +298,7 @@ class MCLPoseSource(PoseSource):
                 "total_m": float(self._correction_total_m),
                 "total_rad": float(self._correction_total_rad),
                 "n_applied": int(self._correction_n_applied),
+                "n_discrete": int(self._correction_discrete_seq),
             }
 
     def _relocate_matcher(self) -> ScanMatcher:
@@ -406,6 +422,15 @@ class MCLPoseSource(PoseSource):
             self._correction_total_m += shift_m
             self._correction_total_rad += dtheta
             self._correction_n_applied += 1
+            # Discrete only when the *posterior* (what drive consumers see)
+            # actually jumped — the bounded reweight usually moves it far
+            # less than the raw match pose.
+            post_shift_m = math.hypot(
+                posterior[0] - prior_pose.x, posterior[1] - prior_pose.y)
+            post_dtheta = abs(_wrap(posterior[2] - prior_pose.theta))
+            if (post_shift_m > self._config.discrete_jump_xy_m
+                    or post_dtheta > self._config.discrete_jump_theta_rad):
+                self._correction_discrete_seq += 1
 
             self._store_scan_match(
                 result=result,
@@ -481,7 +506,14 @@ class MCLPoseSource(PoseSource):
                 sigma_xy_m=0.05,
                 sigma_theta_rad=math.radians(3.0),
             )
+            # Re-anchor the IMU yaw constraint to the relocated heading. The
+            # offset convention is offset = imu - θ_seeded (seed/rebind seed at
+            # θ=0 and store the raw imu yaw); left stale, every subsequent IMU
+            # observation drags the posterior back to the pre-relocate frame.
             if self._last_odom is not None:
+                imu = self._imu_tracker.yaw_at(self._last_odom[0])
+                if imu is not None:
+                    self._yaw_offset = _wrap(imu[0] - best.theta)
                 self._record_pose(self._last_odom[0])
             new_pose = self._mcl.posterior_mean()
             dx = new_pose[0] - prior_tuple[0]
@@ -490,6 +522,7 @@ class MCLPoseSource(PoseSource):
             self._correction_total_m += math.hypot(dx, dy)
             self._correction_total_rad += abs(dth)
             self._correction_n_applied += 1
+            self._correction_discrete_seq += 1   # operator relocate: always discrete
             self._store_scan_match(
                 result=result,
                 prior_pose=prior_pose,
@@ -586,7 +619,12 @@ class MCLPoseSource(PoseSource):
                 sigma_xy_m=0.05,
                 sigma_theta_rad=math.radians(3.0),
             )
+            # Re-anchor the IMU yaw constraint to the relocated heading (see
+            # relocate() — same offset = imu - θ_seeded convention).
             if self._last_odom is not None:
+                imu = self._imu_tracker.yaw_at(self._last_odom[0])
+                if imu is not None:
+                    self._yaw_offset = _wrap(imu[0] - best.theta)
                 self._record_pose(self._last_odom[0])
             new_pose = self._mcl.posterior_mean()
             dx = new_pose[0] - prior_tuple[0]
@@ -595,6 +633,7 @@ class MCLPoseSource(PoseSource):
             self._correction_total_m += math.hypot(dx, dy)
             self._correction_total_rad += abs(dth)
             self._correction_n_applied += 1
+            self._correction_discrete_seq += 1   # operator relocate_at: always discrete
             self._store_scan_match(
                 result=result,
                 prior_pose=prior_pose,

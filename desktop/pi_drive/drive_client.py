@@ -34,8 +34,11 @@ class DriveClient:
         # session's: the Pi's Tier-3 keeps its last cmd_id across our restarts
         # and rejects any goto with a lower id as superseded. A per-launch
         # counter from 0 would be silently dropped until it climbed back past
-        # the Pi's remembered value. Monotonic wall time avoids that.
-        self._cmd_id = int(time.time())
+        # the Pi's remembered value. Deciseconds, not seconds: a re-pick-heavy
+        # session can issue more than one command per second on average, ending
+        # with cmd_id > time(); a prompt restart would then seed LOWER and every
+        # goto would be silently rejected. Outrunning 10 ids/s is implausible.
+        self._cmd_id = int(time.time() * 10.0)
         # Optional post-hoc trace: one JSON object per received status,
         # stamped with the desktop wall-clock arrival time. Mirrors the
         # nav JSONL tracing pattern so a leg can be reviewed offline.
