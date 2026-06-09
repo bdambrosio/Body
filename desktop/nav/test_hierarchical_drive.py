@@ -44,6 +44,15 @@ class TestPFPoseProvider(unittest.TestCase):
         p = PFPoseProvider(_FakeFuser(src), max_pose_age_s=0.75)
         self.assertEqual(p.world_pose(), (1.0, 2.0, 0.5))
 
+    def test_correction_seq_counts_discrete_not_every_scan(self):
+        # n_applied increments on every 10 Hz scan observation; re-picking on
+        # it would defeat the bearing hysteresis. The provider must read the
+        # discrete-jump count instead.
+        src = _FakePoseSource()
+        src.correction_summary = lambda: {"n_applied": 570, "n_discrete": 2}
+        p = PFPoseProvider(_FakeFuser(src))
+        self.assertEqual(p.correction_seq(), 2)
+
 N = 360
 ANGLE_MIN = -math.pi
 ANGLE_INC = 2.0 * math.pi / N
@@ -442,6 +451,66 @@ class TestHierarchicalDrive(unittest.TestCase):
         self._drive_to_sending(hd)
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 1)
+
+    def test_no_spurious_repick_across_pi_bearing(self):
+        # Carrot dead-astern: both bearings live near ±π. A tiny real drift
+        # that crosses the seam must not read as ~2π and re-pick every tick.
+        hd, io, po = self._build(points=((-5.0, 0.0),), pose=(0.0, 0.0, 0.0))
+        self._drive_to_sending(hd)
+        self.assertEqual(len(io.sent), 1)
+        po.pose = (0.0, 0.01, 0.0)       # bearing flips sign across ±π
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 1)   # no re-pick
+
+    def test_blocked_retry_is_time_based(self):
+        hd, io, po = self._build(points=((5.0, 0.0),),
+                                 blocked_retry_interval_s=0.5,
+                                 blocked_retry_window_s=2.0)
+        self._drive_to_sending(hd)                          # goto #1
+        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="swept_block")
+        self.assertEqual(hd.tick(1.0), HierState.BLOCKED)   # block run starts t=1
+        # Inside the retry interval: hold, no goto churn (the old count-based
+        # cap burned all its retries in a fraction of a second at 20 Hz).
+        self.assertEqual(hd.tick(1.2), HierState.BLOCKED)
+        self.assertEqual(len(io.sent), 1)
+        # Interval elapsed: re-pick fires a fresh goto.
+        self.assertEqual(hd.tick(1.6), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 2)
+
+    def test_blocked_window_exhausts_then_operator_resume(self):
+        hd, io, po = self._build(points=((5.0, 0.0),),
+                                 blocked_retry_interval_s=0.5,
+                                 blocked_retry_window_s=2.0)
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="swept_block")
+        self.assertEqual(hd.tick(1.0), HierState.BLOCKED)
+        self.assertEqual(hd.tick(1.6), HierState.DRIVING_SUBGOAL)   # retry
+        io.set_status(cmd_id=2, state="BLOCKED", blocked_reason="swept_block")
+        self.assertEqual(hd.tick(3.1), HierState.BLOCKED)   # past window start+2.0
+        sent = len(io.sent)
+        self.assertEqual(hd.tick(3.6), HierState.BLOCKED)   # paused — no retries
+        self.assertEqual(hd.tick(9.9), HierState.BLOCKED)
+        self.assertEqual(len(io.sent), sent)
+        self.assertTrue(hd.can_resume())
+        # Operator resume restarts the window and drives again.
+        self.assertTrue(hd.request_resume())
+        self.assertEqual(hd.state(), HierState.ALIGNING)
+        self.assertEqual(hd.tick(10.0), HierState.SELECT_SUBGOAL)
+        self.assertEqual(hd.tick(10.1), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), sent + 1)
+
+    def test_send_failed_cancels_live_goto(self):
+        # A send failure enters BLOCKED — any still-live goto on the Pi must be
+        # revoked so the UI's BLOCKED matches an actually-stopped robot.
+        hd, io, po = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        cancels = io.cancels
+        io.set_status(cmd_id=1, state="ARRIVED")            # forces a re-pick
+        io.send_goto_from_body = lambda *a, **k: None       # next send fails
+        hd.tick(0.0)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "send_failed")
+        self.assertEqual(io.cancels, cancels + 1)
 
     def test_stop_cancels_and_idles(self):
         hd, io, _ = self._build()

@@ -145,6 +145,11 @@ def main() -> None:
     scan_stale_s = float(scan_cfg.get("scan_stale_s", 0.5))
     no_progress_timeout_s = float(cfg.get("no_progress_timeout_s", 4.0))
     no_progress_eps_m = float(cfg.get("no_progress_eps_m", 0.03))
+    # Hard per-goal deadline. The no-progress watchdog only runs while
+    # translating, so a rotate/drive dither (or A* homotopy flip-flop) could
+    # otherwise keep a goal alive forever. Tier-2 caps goals at ~1.5 m, so a
+    # healthy leg finishes in well under this. 0 disables.
+    goal_deadline_s = float(cfg.get("goal_deadline_s", 30.0))
     # On a swept-block, re-aim in place (swept-free) toward the path's lookahead
     # rather than stopping, until the lookahead is within this bearing or we've
     # been re-aiming longer than the timeout (then it's a genuine dead-end).
@@ -177,6 +182,10 @@ def main() -> None:
         kind = str(msg.get("kind", "goto"))
         with lock:
             if kind in ("cancel", "stop"):
+                # Advance the supersede watermark to the cancel's own id so a
+                # delayed/duplicate goto with an older id can't re-arm the
+                # goal the operator just revoked.
+                cur_cmd_id = max(cur_cmd_id, int(msg.get("cmd_id", 0)))
                 goal = None
                 return
             cmd_id = int(msg.get("cmd_id", 0))
@@ -227,6 +236,8 @@ def main() -> None:
     best_dist_at = 0.0
     final_aligned = False
     realign_since: Optional[float] = None   # start of the current swept-block re-aim
+    goal_started_at = 0.0                   # for the per-goal deadline
+    was_active = False                      # had a goal last tick (stop-on-cancel)
 
     print(f"local_drive: up; control_hz={control_hz} v_max={params.v_max}", flush=True)
     next_tick = time.monotonic()
@@ -240,9 +251,16 @@ def main() -> None:
             cmd_id = cur_cmd_id
 
         if g is None:
+            if was_active:
+                # Cancel/stop while driving: command zero NOW instead of
+                # letting the motors coast on the last cmd_vel until its
+                # 500 ms timeout (~9 cm at v_max).
+                publish_cmd(0.0, 0.0)
+                was_active = False
             publish_status(STATE_IDLE, cmd_id=cmd_id)
             next_tick = _sleep_to(next_tick, period)
             continue
+        was_active = True
 
         # New goal → reset bookkeeping.
         if cmd_id != tracked_cmd_id:
@@ -252,6 +270,7 @@ def main() -> None:
             final_aligned = False
             rotating = False
             realign_since = None
+            goal_started_at = now_mono
 
         gx, gy = float(g["x_m"]), float(g["y_m"])
         tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
@@ -295,6 +314,17 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
+        # Hard deadline: arrival/no-progress didn't end this goal in time
+        # (e.g. a rotate/drive dither that never translates). Stop and report;
+        # the goal stays active so the status doesn't decay to IDLE (which the
+        # desktop reads as success) — a superseding goto or cancel clears it.
+        if goal_deadline_s > 0 and now_mono - goal_started_at > goal_deadline_s:
+            publish_cmd(0.0, 0.0)
+            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
+                           dist=dist, reason="deadline")
+            next_tick = _sleep_to(next_tick, period)
+            continue
+
         # Live obstacle field (rasterized scan) — the substrate for steering.
         if scan is None or (now_wall - float(scan.get("ts", 0.0))) > scan_stale_s:
             publish_cmd(0.0, 0.0)
@@ -330,12 +360,14 @@ def main() -> None:
         blocked = swept_path_blocked(grid, meta, v_mps=v, omega_radps=omega, config=foot)
 
         # HO-3 Tier-3 → motors: record what we're about to command. Attach the
-        # costmap only when BP3 is armed (it's heavy at the control rate).
+        # costmap only when BP3 is armed — serializing 64×64 cells to JSON at
+        # the control rate is real jitter; the inspector synthesizes an
+        # all-unknown grid for lean records.
         gate.record(3, schemas.handoff_t3(
             cmd_id=cmd_id, goal_body=(bx, by), plan_reason=plan.reason,
             path_body=plan.path_body, lookahead=look, v_mps=v, omega_radps=omega,
             swept_blocked=blocked,
-            grid_rows=grid.tolist(),
+            grid_rows=(grid.tolist() if gate.is_armed(3) else None),
             meta=meta))
 
         if blocked:

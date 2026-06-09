@@ -271,9 +271,10 @@ class NavMainWindow(QMainWindow):
 
         self._resume_act = QAction("Resume", self)
         self._resume_act.setToolTip(
-            "Resume a hierarchical drive that SUSPENDED itself on a "
-            "connectivity drop (stale pose). The bot does NOT restart on its "
-            "own after a reconnect — click this to re-acquire and continue."
+            "Resume a paused hierarchical drive: a SUSPENDED connectivity hold "
+            "(stale pose), or a BLOCKED pause whose retry window ran out. The "
+            "bot does NOT restart on its own — click this to re-acquire and "
+            "continue."
         )
         self._resume_act.setEnabled(False)
         self._resume_act.triggered.connect(self._on_resume_hier)
@@ -1050,8 +1051,7 @@ class NavMainWindow(QMainWindow):
             )
             self._go_act.setEnabled(not running)
             self._cancel_act.setEnabled(running)
-            suspended = hd is not None and hd.is_suspended()
-            self._resume_act.setEnabled(suspended)
+            self._resume_act.setEnabled(hd is not None and hd.can_resume())
             if hd is not None:
                 # Held at an inspector breakpoint reads as "running" (the mission
                 # IS active, just paused) — make that obvious so a paused drive
@@ -2402,9 +2402,10 @@ class NavMainWindow(QMainWindow):
         self._use_checkpoint_pose = bool(on)
 
     def _on_resume_hier(self) -> None:
-        """Operator resume of a SUSPENDED (connectivity-paused) hier drive."""
+        """Operator resume of a paused hier drive (SUSPENDED connectivity hold
+        or a BLOCKED pause whose retry window ran out)."""
         hd = self._hier_drive
-        if hd is not None and hd.is_suspended():
+        if hd is not None:
             hd.request_resume()
 
     def _stop_hier_drive(self) -> None:

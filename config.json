@@ -146,6 +146,7 @@
     "slowdown_distance_m": 0.15,
     "no_progress_timeout_s": 4.0,
     "no_progress_eps_m": 0.03,
+    "goal_deadline_s": 30.0,
     "odom_stale_s": 0.5,
     "preview_distance_m": 0.35,
     "preview_min_distance_m": 0.15,

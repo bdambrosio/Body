@@ -31,6 +31,7 @@ from body.lib import schemas
 from body.lib.local_costmap import (
     LocalCostmapConfig, build_local_costmap, dilate_bool,
 )
+from body.lib.local_drive_core import wrap_pi
 from body.lib.local_planner import LocalPlanConfig
 from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
 from body.lib.tier2_subgoal import (
@@ -123,9 +124,12 @@ class PFPoseProvider:
         return (float(pose[0]), float(pose[1]), float(pose[2]))
 
     def correction_seq(self) -> int:
-        # Best-effort: PF scan-match/relocate count when the source tracks it.
+        # Best-effort: the PF's *discrete*-correction count (relocates,
+        # rebinds, posterior jumps past the discrete gates). NOT n_applied —
+        # that increments on every 10 Hz scan observation, which would re-pick
+        # the sub-goal continuously and defeat the bearing hysteresis.
         try:
-            return int(self._fuser.pose_source.correction_summary().get("n_applied", 0))
+            return int(self._fuser.pose_source.correction_summary().get("n_discrete", 0))
         except Exception:
             return 0
 
@@ -161,7 +165,13 @@ class HierConfig:
     pass_proximity_m: float = 0.20
     subgoal_arrival_tol_m: float = 0.15   # tol passed to Tier-3 for each sub-goal
     repick_hysteresis_rad: float = 0.35   # re-pick mid-leg if the bearing drifts past this
-    max_blocked_repicks: int = 3          # retries before BLOCKED becomes a pause
+    # After a block, retry selection at this interval for the window below (so
+    # a transient — a person stepping through the lidar — clears on its own),
+    # then hold as a pause for the operator (request_resume() restarts the
+    # window). Time-based, NOT count-based: a retry count silently changes
+    # meaning whenever the host tick rate does (it already did once, 5→20 Hz).
+    blocked_retry_interval_s: float = 0.5
+    blocked_retry_window_s: float = 10.0
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
     # Only horizon_m is used now (the cap on the projected sub-goal distance);
     # Tier-2 no longer rasterizes or does clearance — Tier-3 owns that.
@@ -216,8 +226,15 @@ class HierarchicalDrive:
         self._sent_correction_seq: int = -1
         self._subgoal_body: Optional[Tuple[float, float]] = None
         self._waypoint: Optional[Tuple[float, float]] = None
-        self._blocked_repicks = 0
+        # Consecutive-block retry window: start time of the current block run
+        # (None = no active block), last retry time, and a gave-up latch so
+        # the pause is logged once. Only real progress (sub-goal done or a
+        # waypoint advance) clears the window — a successful re-send does not.
+        self._block_started_at: Optional[float] = None
+        self._block_last_retry: float = 0.0
+        self._block_gave_up = False
         self._block_reason: Optional[str] = None
+        self._tick_now: float = 0.0   # tick() stamp, for handlers entered mid-tick
 
     # ── Control ──────────────────────────────────────────────────────
 
@@ -227,7 +244,8 @@ class HierarchicalDrive:
         self._state = state
 
     def start(self) -> None:
-        self._blocked_repicks = 0
+        self._block_started_at = None
+        self._block_gave_up = False
         self._block_reason = None
         self._cmd_id = None
         self._subgoal_body = None
@@ -259,22 +277,30 @@ class HierarchicalDrive:
         self._to(HierState.SUSPENDED)
 
     def request_resume(self) -> bool:
-        """Operator-initiated resume after a SUSPENDED (connectivity) hold.
+        """Operator-initiated resume after a SUSPENDED (connectivity) hold or
+        a BLOCKED pause that exhausted its retry window.
 
         Returns True if a resume was armed. Re-acquires via ALIGNING, which
         only advances to driving once a fresh pose is available again — so a
         resume clicked while still offline simply waits rather than lurching.
+        From BLOCKED, the retry window restarts fresh.
         """
-        if self._state is not HierState.SUSPENDED:
+        if self._state not in (HierState.SUSPENDED, HierState.BLOCKED):
             return False
-        logger.info("hier: operator resume from SUSPENDED")
-        self._blocked_repicks = 0
+        logger.info("hier: operator resume from %s", self._state.value)
+        self._block_started_at = None
+        self._block_gave_up = False
         self._block_reason = None
         self._to(HierState.ALIGNING)
         return True
 
     def is_suspended(self) -> bool:
         return self._state is HierState.SUSPENDED
+
+    def can_resume(self) -> bool:
+        """True when request_resume() would act: a SUSPENDED hold or a BLOCKED
+        pause (during the retry window a resume just restarts it — harmless)."""
+        return self._state in (HierState.SUSPENDED, HierState.BLOCKED)
 
     def held_tier(self) -> Optional[int]:
         """The handoff tier we're paused at for an armed inspector breakpoint
@@ -283,15 +309,14 @@ class HierarchicalDrive:
         return self._held_tier
 
     def _enter_blocked(self, reason: str) -> None:
-        # Count *consecutive* blocks (only reset by real progress — a sub-goal
-        # done or a waypoint advance), NOT by a successful re-send. Otherwise a
-        # standstill that Tier-3 vetoes every time loops SELECT↔BLOCKED forever,
-        # re-issuing the identical futile goto.
+        # The retry window spans *consecutive* blocks (only reset by real
+        # progress — a sub-goal done or a waypoint advance), NOT by a
+        # successful re-send. Otherwise a standstill that Tier-3 vetoes every
+        # time would loop SELECT↔BLOCKED forever, re-issuing the same goto.
         self._block_reason = reason
-        self._blocked_repicks += 1
-        if self._blocked_repicks > self._cfg.max_blocked_repicks:
-            logger.warning("hier: blocked (%s) — gave up after %d retries, pausing",
-                           reason, self._cfg.max_blocked_repicks)
+        if self._block_started_at is None:
+            self._block_started_at = self._tick_now
+            self._block_last_retry = self._tick_now
         self._to(HierState.BLOCKED)
 
     # ── Carrot: the one-time lead-in prefix, then the patrol runner ──────
@@ -390,6 +415,7 @@ class HierarchicalDrive:
         # hands off into an immediately-actionable state. Normal worst case is
         # DRIVING->SELECT->(ADVANCE->SELECT)->DRIVING (<=4 hops); the cap is a
         # backstop against a pathological cycle, not an expected limit.
+        self._tick_now = now
         for _ in range(6):
             prev = self._state
             s = prev
@@ -405,7 +431,7 @@ class HierarchicalDrive:
             elif s == HierState.ADVANCE_WAYPOINT:
                 self._tick_advance()
             elif s == HierState.BLOCKED:
-                self._tick_blocked()
+                self._tick_blocked(now)
             # IDLE / ARRIVED / FAILED are terminal/inert. SUSPENDED is inert
             # too — it only leaves via request_resume() (operator) or stop().
             if self._state == prev or self._state not in self._CHAIN_STATES:
@@ -485,6 +511,11 @@ class HierarchicalDrive:
             v_max=self._cfg.sub_v_max,
         )
         if cid is None:
+            # Send failed (no odom/connection). A previous goto may still be
+            # live on the Pi (intermediate advances deliberately leave it
+            # running) — revoke it so BLOCKED in the UI matches an actually
+            # stopped robot.
+            self._io.cancel()
             self._enter_blocked("send_failed")
             return
         self._cmd_id = cid
@@ -577,7 +608,8 @@ class HierarchicalDrive:
             # the IDLE. Both mean "this sub-goal is done" → re-pick the next
             # one toward the same waypoint.
             if state in ("ARRIVED", "IDLE"):
-                self._blocked_repicks = 0          # sub-goal progress
+                self._block_started_at = None      # sub-goal progress
+                self._block_gave_up = False
                 logger.info("hier: re-pick (sub-goal %s)", state)
                 self._to(HierState.SELECT_SUBGOAL)
                 return
@@ -600,11 +632,15 @@ class HierarchicalDrive:
             return
 
         # Mid-leg drift: re-pick if the bearing to the waypoint has moved on.
+        # The difference must be wrapped — both bearings live in (-π, π], so a
+        # tiny real drift across ±π (carrot near dead-astern) would otherwise
+        # read as ~2π and re-pick every tick.
         if pose is not None and self._waypoint is not None and self._sent_bearing is not None:
             b = bearing_to_waypoint(pose[0], pose[1], pose[2], self._waypoint[0], self._waypoint[1])
-            if abs(b - self._sent_bearing) > self._cfg.repick_hysteresis_rad:
+            drift = abs(wrap_pi(b - self._sent_bearing))
+            if drift > self._cfg.repick_hysteresis_rad:
                 logger.info("hier: re-pick (bearing drift %.0f° > %.0f°)",
-                            math.degrees(abs(b - self._sent_bearing)),
+                            math.degrees(drift),
                             math.degrees(self._cfg.repick_hysteresis_rad))
                 self._to(HierState.SELECT_SUBGOAL)
 
@@ -614,7 +650,8 @@ class HierarchicalDrive:
         if self._in_lead_in():
             self._prev_waypoint_xy = tuple(self._lead_in[self._lead_idx])
             self._lead_idx += 1
-            self._blocked_repicks = 0
+            self._block_started_at = None
+            self._block_gave_up = False
             self._to(HierState.SELECT_SUBGOAL)
             return
         # Remember the vertex we're leaving — it's the prev for the passed-test
@@ -624,7 +661,8 @@ class HierarchicalDrive:
             self._prev_waypoint_xy = (left.x_m, left.y_m)
         next_idx, _lap_done = self._runner.on_arrived()
         logger.info("hier: waypoint reached -> next=%s", next_idx)
-        self._blocked_repicks = 0                  # fresh leg
+        self._block_started_at = None              # fresh leg
+        self._block_gave_up = False
         if next_idx is None:
             self._io.cancel()
             self._subgoal_body = None
@@ -632,11 +670,24 @@ class HierarchicalDrive:
         else:
             self._to(HierState.SELECT_SUBGOAL)
 
-    def _tick_blocked(self) -> None:
-        # rotate_repick: retry selection up to the cap (the scan may clear, or
-        # Tier-3's own fan finds a way); past the cap, hold as a pause (the
-        # consecutive-block counter is only cleared by real progress) so we
-        # surface the block to the operator instead of thrashing gotos.
-        if self._blocked_repicks <= self._cfg.max_blocked_repicks:
+    def _tick_blocked(self, now: float) -> None:
+        # Retry selection (the scan may clear, or Tier-3's A* finds a way) at
+        # the configured interval while inside the retry window; past it, hold
+        # as a pause so the block surfaces to the operator instead of thrashing
+        # gotos. The window spans consecutive blocks — only real progress (or
+        # an operator resume) restarts it.
+        if self._block_started_at is None:        # defensive: never unset here
+            self._block_started_at = now
+            self._block_last_retry = now
+        if now - self._block_started_at > self._cfg.blocked_retry_window_s:
+            if not self._block_gave_up:
+                self._block_gave_up = True
+                logger.warning(
+                    "hier: blocked (%s) — retry window (%.1fs) exhausted, "
+                    "pausing for operator resume",
+                    self._block_reason, self._cfg.blocked_retry_window_s)
+            return
+        if now - self._block_last_retry >= self._cfg.blocked_retry_interval_s:
+            self._block_last_retry = now
             self._to(HierState.SELECT_SUBGOAL)
 
