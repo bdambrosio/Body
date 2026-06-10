@@ -346,6 +346,21 @@ drop-in for `PFPoseProvider` (reuse the PF as the local filter, or plain
 odom+IMU). Wire into `HierarchicalDrive` via the seam, selectable by flag;
 validate against the live scan overlay before making it default.
 
+*Dead-reckon yaw comes from the IMU, not the wheels* (2026-06-10). Wheel odom
+is blind to externally-forced rotation (a floor ridge kicking the chassis,
+slip) — exactly the rotation that pushes the prior outside the re-anchor
+search window, after which **every subsequent match fails silently** and the
+pose free-runs open-loop. `CheckpointLocalizer.on_odom` therefore takes the
+yaw *delta* between consecutive IMU samples in place of the wheel yaw delta
+(translation stays wheel-measured, composed along the IMU-corrected heading);
+with no IMU it degrades to wheel-only. The failure mode is also instrumented:
+rejected match attempts *with a checkpoint in range* (vs. cruising a
+checkpoint-free stretch) are counted (`failed_since_anchor`), warned on the
+nav console every 5th consecutive failure with the distance dead-reckoned
+since the last anchor, and reported on recovery. Field motivation: the
+2026-06-09 ridge-bump free-run; the plain-PF fallback lost orientation in the
+hallway on the diagnosis re-run, making this provider load-bearing.
+
 **Phase 4 — Recast `.nav` Re-localize + cold start.**
 - Re-localize button → checkpoint recognition (nearest / test-all); demote
   global `relocate()` to an explicit fallback. Keep `relocate_at`

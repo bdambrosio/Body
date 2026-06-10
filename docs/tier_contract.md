@@ -136,9 +136,21 @@ the full Tier-3 spec.
   re-anchor snaps, posterior jumps past the PF's discrete gates — NOT every
   scan observation) and re-selects immediately when it moves, so the heading
   tracks a corrected pose without waiting for bearing drift or ARRIVED.
+- **Forced rotation (ridge bump, slip) is absorbed by IMU yaw dead-reckoning
+  at both ends, not detected by thresholds.** Wheel odom is blind to chassis
+  rotation it didn't command, which used to corrupt two seams at once: the
+  Pi's goto transform (goal bearing wrong by the missed angle → follower arcs
+  off-route) and the desktop checkpoint prior (pushed outside the re-anchor
+  window → silent open-loop free-run). Both now dead-reckon yaw from the IMU:
+  Tier-3 adds the IMU-vs-wheel divergence since the goal started to the
+  transform heading (`ImuYawCorrector`, per-goal baseline — see
+  drive_tier3_spec), and `CheckpointLocalizer` advances its prior by the IMU
+  yaw delta. The published `body/odom` contract is untouched (I6 frames
+  unchanged); no IMU → wheel-only behavior at both ends.
 
 ## Shared inputs
 
 `body/odom` (pose), `body/lidar/scan` (the obstacle substrate — **not** the fused
-`local_map`, which lags while moving), and the PF/checkpoint world pose
-(desktop-internal, production only).
+`local_map`, which lags while moving), `body/imu` (yaw the wheels can't see —
+consumed by Tier-3's goal transform and the checkpoint prior, see Coherence),
+and the PF/checkpoint world pose (desktop-internal, production only).

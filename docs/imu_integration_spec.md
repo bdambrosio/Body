@@ -84,6 +84,8 @@ Raw gyro can come off the chip faster (400 Hz on the BNO085). Aggregating down f
 
 - **Scan-matcher** (desktop, future `desktop/nav/slam/`): yaw from `orientation` becomes the rotation prior. Search window ≈ 4 × `fusion.accuracy_rad`, or ±2° if that's smaller.
 - **World-map fuser pose source**: new `ImuPlusScanMatchPose` implementation reads this topic for rotation, blends with scan-match for translation.
+- **Tier-3 drive** (Pi, `body.local_drive`, 2026-06-10): the heading used to express the active goto goal in the body frame is wheel θ plus the IMU-vs-wheel yaw divergence since the goal started (`ImuYawCorrector`). Differences `orientation` yaw against a per-goal baseline, so absolute accuracy and long-term drift are irrelevant — only short-horizon delta stability matters. Catches externally-forced rotation (floor-ridge kick, slip) the wheels never see.
+- **Checkpoint localizer prior** (desktop, `CheckpointLocalizer.on_odom`, 2026-06-10): the dead-reckoned map-frame prior advances by the yaw delta between consecutive settled `ImuYawTracker` samples instead of the wheel yaw delta, keeping the prior inside the re-anchor search window through a bump. Same delta-only usage — reference and drift cancel.
 - **Chassis UI**: no change. The existing chassis state still reads the same fields from the new topic name.
 
 ## 7. What consumers will NOT do
