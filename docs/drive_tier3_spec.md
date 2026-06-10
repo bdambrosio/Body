@@ -33,6 +33,15 @@ so a constant world↔odom offset cancels. The Pi then tracks the fixed odom
 point as the robot moves, using its own odom — only a *coarse direction*
 ever crosses from any higher tier into the metric drive loop.
 
+**IMU yaw correction.** Wheel odom is blind to externally-forced rotation
+(a floor ridge kicking the chassis, wheel slip), which would rotate the
+goal's body-frame bearing by exactly the missed angle. The heading used for
+the goal transform is therefore wheel θ plus the IMU-vs-wheel yaw divergence
+accumulated since the goal started (`ImuYawCorrector`, fed by `body/imu`).
+The baseline resets per goal so long-term IMU drift never enters, and the
+published `body/odom` contract is untouched. No IMU (or a stale one) →
+zero correction, wheel-only behavior.
+
 ### `body/drive/status` (Pi → sender) — `schemas.drive_status`
 Published every control tick.
 | field | type | meaning |

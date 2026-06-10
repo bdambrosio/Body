@@ -107,6 +107,11 @@ class CheckpointMatcher:
         return [c for d, c in sorted(near, key=lambda t: t[0])
                 if d <= self._cfg.select_radius_m]
 
+    def n_candidates(self, prior: Pose) -> int:
+        """Checkpoints within ``select_radius_m`` of `prior` — lets a caller
+        tell "no checkpoint nearby" apart from "match attempted but rejected"."""
+        return len(self._candidates(prior))
+
     def match(
         self,
         prior: Pose,

@@ -70,6 +70,47 @@ def body_to_odom(body_pt: Point2, pose: Pose) -> Point2:
     )
 
 
+def quat_wxyz_to_yaw(w: float, x: float, y: float, z: float) -> float:
+    """Yaw about +z from a wxyz quaternion (z-up, CCW positive) — same
+    Tait-Bryan extraction the desktop's ImuYawTracker uses on body/imu."""
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+class ImuYawCorrector:
+    """Chassis yaw the wheels didn't see, folded into the goal transform.
+
+    Wheel odom is blind to externally-forced rotation (a floor ridge kicking
+    the chassis, wheel slip), so a goal held in the odom frame acquires a
+    bearing error of exactly that rotation and the follower arcs off-route.
+    The IMU sees every rotation. Track the IMU-vs-wheel yaw divergence since
+    the goal started and add it to the odom heading used to express the goal
+    in the body frame.
+
+    The baseline is per-goal (``reset()`` on every new cmd_id), so long-term
+    IMU drift never enters — only divergence accumulated over one goal's
+    lifetime (seconds) matters. No thresholds: this is ordinary
+    dead-reckoning, not a bump detector. With no IMU the correction is zero
+    and behavior is identical to wheel-only."""
+
+    def __init__(self) -> None:
+        self._ref: float | None = None
+
+    def reset(self) -> None:
+        self._ref = None
+
+    def corrected_theta(self, odom_theta: float, imu_yaw: float | None) -> float:
+        """Odom heading plus the IMU-vs-wheel divergence since the baseline.
+        ``imu_yaw`` None (no/stale IMU) re-arms the baseline and returns the
+        wheel heading unchanged — never differences across an IMU gap."""
+        if imu_yaw is None:
+            self._ref = None
+            return odom_theta
+        if self._ref is None:
+            self._ref = wrap_pi(imu_yaw - odom_theta)
+            return odom_theta
+        return wrap_pi(odom_theta + wrap_pi(imu_yaw - odom_theta - self._ref))
+
+
 def _clip(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 

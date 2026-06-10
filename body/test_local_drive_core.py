@@ -8,8 +8,9 @@ from body.lib.drive_safety import (
     FootprintConfig, driveable_from_rows, swept_path_blocked,
 )
 from body.lib.local_drive_core import (
-    DriveParams, body_to_odom, odom_to_body,
-    rotate_to_heading, steer_to_body_point, swept_block_response, wrap_pi,
+    DriveParams, ImuYawCorrector, body_to_odom, odom_to_body,
+    quat_wxyz_to_yaw, rotate_to_heading, steer_to_body_point,
+    swept_block_response, wrap_pi,
 )
 
 
@@ -219,6 +220,67 @@ class TestSweptBlockResponse(unittest.TestCase):
         # Off-axis but re-aiming too long → give up (bounded episode).
         resp, _omega = swept_block_response(math.radians(30), 2.5, **self.KW)
         self.assertEqual(resp, "block")
+
+
+class TestImuYawCorrector(unittest.TestCase):
+    def test_no_imu_passthrough(self):
+        c = ImuYawCorrector()
+        self.assertAlmostEqual(c.corrected_theta(0.7, None), 0.7)
+
+    def test_agreement_is_identity(self):
+        # Wheels and IMU report the same rotation → no correction, regardless
+        # of the (arbitrary) constant offset between the two yaw references.
+        c = ImuYawCorrector()
+        self.assertAlmostEqual(c.corrected_theta(0.0, 1.0), 0.0)   # baseline
+        self.assertAlmostEqual(c.corrected_theta(0.5, 1.5), 0.5)
+        self.assertAlmostEqual(c.corrected_theta(-0.3, 0.7), -0.3)
+
+    def test_bump_wheels_missed(self):
+        # Ridge kick: chassis rotates +12° but wheel odom is unchanged. The
+        # corrected heading must follow the IMU.
+        c = ImuYawCorrector()
+        bump = math.radians(12)
+        self.assertAlmostEqual(c.corrected_theta(0.2, 1.0), 0.2)   # baseline
+        self.assertAlmostEqual(c.corrected_theta(0.2, 1.0 + bump), 0.2 + bump)
+        # Subsequent commanded rotation stacks on top of the bump correction.
+        self.assertAlmostEqual(
+            c.corrected_theta(0.2 + 0.3, 1.0 + bump + 0.3), 0.2 + bump + 0.3)
+
+    def test_reset_rebaselines(self):
+        # A new goal swallows the accumulated divergence: the goal frame is
+        # the odom frame as of the re-pick (the sender used the odom pose).
+        c = ImuYawCorrector()
+        c.corrected_theta(0.0, 0.0)
+        self.assertAlmostEqual(c.corrected_theta(0.0, 0.4), 0.4)
+        c.reset()
+        self.assertAlmostEqual(c.corrected_theta(0.0, 0.4), 0.0)   # new baseline
+
+    def test_imu_gap_rebaselines(self):
+        # IMU goes stale mid-goal → fall back to wheel heading and never
+        # difference across the gap when it returns.
+        c = ImuYawCorrector()
+        c.corrected_theta(0.0, 0.0)
+        self.assertAlmostEqual(c.corrected_theta(0.1, None), 0.1)
+        self.assertAlmostEqual(c.corrected_theta(0.1, 5.0), 0.1)   # re-baseline
+        self.assertAlmostEqual(c.corrected_theta(0.1, 5.2), 0.1 + 0.2)
+
+    def test_wraps_across_pi(self):
+        c = ImuYawCorrector()
+        c.corrected_theta(3.0, 3.0)                                 # baseline 0
+        got = c.corrected_theta(3.1, 3.3)                           # +0.2 bump
+        self.assertAlmostEqual(got, wrap_pi(3.3), places=6)
+
+
+class TestQuatToYaw(unittest.TestCase):
+    def test_identity(self):
+        self.assertAlmostEqual(quat_wxyz_to_yaw(1.0, 0.0, 0.0, 0.0), 0.0)
+
+    def test_pure_z_rotation(self):
+        for deg in (-170, -90, -10, 45, 90, 135):
+            th = math.radians(deg)
+            w, z = math.cos(th / 2), math.sin(th / 2)
+            self.assertAlmostEqual(quat_wxyz_to_yaw(w, 0.0, 0.0, z), th,
+                                   places=6, msg=f"deg={deg}")
 
 
 if __name__ == "__main__":

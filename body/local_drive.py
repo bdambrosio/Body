@@ -28,8 +28,8 @@ from body.lib.scan_raster import rasterize_scan
 from body.lib.local_planner import lookahead_on_path, plan_local
 from body.lib.local_drive_core import (
     STATE_ARRIVED, STATE_BLOCKED, STATE_DRIVING, STATE_FAULT, STATE_IDLE,
-    DriveParams, odom_to_body, rotate_to_heading, steer_to_body_point,
-    swept_block_response, wrap_pi,
+    DriveParams, ImuYawCorrector, odom_to_body, quat_wxyz_to_yaw,
+    rotate_to_heading, steer_to_body_point, swept_block_response, wrap_pi,
 )
 
 
@@ -132,6 +132,7 @@ def main() -> None:
     lock = threading.Lock()
     last_odom: Optional[Dict[str, Any]] = None
     last_scan: Optional[Dict[str, Any]] = None
+    last_imu: Optional[Dict[str, Any]] = None
     goal: Optional[Dict[str, Any]] = None
     cur_cmd_id = 0
 
@@ -147,6 +148,11 @@ def main() -> None:
         nonlocal last_scan
         with lock:
             last_scan = msg
+
+    def on_imu(_k: str, msg: Dict[str, Any]) -> None:
+        nonlocal last_imu
+        with lock:
+            last_imu = msg
 
     def on_goto(_k: str, msg: Dict[str, Any]) -> None:
         nonlocal goal, cur_cmd_id
@@ -170,6 +176,7 @@ def main() -> None:
 
     zenoh_helpers.declare_subscriber_json(session, "body/odom", on_odom)
     zenoh_helpers.declare_subscriber_json(session, "body/lidar/scan", on_scan)
+    zenoh_helpers.declare_subscriber_json(session, "body/imu", on_imu)
     zenoh_helpers.declare_subscriber_json(session, "body/drive/goto", on_goto)
 
     # HO-3 handoff gate (Tier-3 → motors): records each command + obeys the
@@ -209,6 +216,7 @@ def main() -> None:
     realign_since: Optional[float] = None   # start of the current swept-block re-aim
     goal_started_at = 0.0                   # for the per-goal deadline
     was_active = False                      # had a goal last tick (stop-on-cancel)
+    yaw_corr = ImuYawCorrector()            # IMU-vs-wheel yaw divergence per goal
 
     print(f"local_drive: up; control_hz={control_hz} v_max={params.v_max}", flush=True)
     next_tick = time.monotonic()
@@ -219,6 +227,7 @@ def main() -> None:
             g = dict(goal) if goal is not None else None
             odom = dict(last_odom) if last_odom is not None else None
             scan = last_scan
+            imu = last_imu
             cmd_id = cur_cmd_id
 
         if g is None:
@@ -242,6 +251,7 @@ def main() -> None:
             rotating = False
             realign_since = None
             goal_started_at = now_mono
+            yaw_corr.reset()    # goal frame = odom frame as of now
 
         gx, gy = float(g["x_m"]), float(g["y_m"])
         tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
@@ -254,7 +264,19 @@ def main() -> None:
             next_tick = _sleep_to(next_tick, period)
             continue
 
-        pose = (float(odom["x"]), float(odom["y"]), float(odom["theta"]))
+        # Heading for the goal transform: wheel odom + the IMU-vs-wheel yaw
+        # divergence since the goal started. Wheel odom misses externally
+        # forced rotation (floor-ridge kick, slip); without this the goal's
+        # body-frame bearing is wrong by exactly that rotation and the
+        # follower arcs off-route until the desktop notices and re-picks.
+        imu_yaw = None
+        if imu is not None and (now_wall - float(imu.get("ts", 0.0))) <= odom_stale_s:
+            q = imu.get("orientation")
+            if isinstance(q, dict) and all(k in q for k in ("w", "x", "y", "z")):
+                imu_yaw = quat_wxyz_to_yaw(
+                    float(q["w"]), float(q["x"]), float(q["y"]), float(q["z"]))
+        theta = yaw_corr.corrected_theta(float(odom["theta"]), imu_yaw)
+        pose = (float(odom["x"]), float(odom["y"]), theta)
         bx, by = odom_to_body((gx, gy), pose)
         dist = (bx * bx + by * by) ** 0.5
 

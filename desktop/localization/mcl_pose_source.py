@@ -221,6 +221,13 @@ class MCLPoseSource(PoseSource):
             return None
         return time.monotonic() - recv
 
+    def imu_yaw(self) -> Optional[float]:
+        """Latest settled IMU yaw (unwrapped rad, IMU's own reference), or
+        None. The checkpoint-pose provider differences consecutive values so
+        its dead-reckon prior tracks chassis rotation the wheels can't see."""
+        latest = self._imu_tracker.latest()
+        return latest[1] if latest is not None else None
+
     def latest_scan_polar(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Latest cached lidar scan as (angles_rad, ranges_m), body frame, or
         None. Used by checkpoint relocalization (no DriveClient required)."""

@@ -117,6 +117,63 @@ class TestCheckpointLocalizer(unittest.TestCase):
         loc.on_odom((0.25, 0.0, 0.0))
         self.assertAlmostEqual(loc._dist_since_anchor, 0.05, places=5)
 
+    def test_imu_yaw_replaces_wheel_yaw(self):
+        # Ridge kick: wheels see nothing, IMU sees +12° — the map heading
+        # must follow the IMU so the prior stays inside the re-anchor window.
+        m, _ = _matcher()
+        loc = CheckpointLocalizer(m)
+        bump = math.radians(12)
+        loc.seed((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        loc.on_odom((0.0, 0.0, 0.0), imu_yaw=2.0)        # establish IMU ref
+        loc.on_odom((0.0, 0.0, 0.0), imu_yaw=2.0 + bump)
+        self.assertAlmostEqual(loc.pose()[2], bump, places=6)
+        # Wheel translation after the bump composes along the IMU-corrected
+        # heading, not the (stale) wheel heading.
+        loc.on_odom((0.5, 0.0, 0.0), imu_yaw=2.0 + bump)
+        x, y, _ = loc.pose()
+        self.assertAlmostEqual(x, 0.5 * math.cos(bump), places=6)
+        self.assertAlmostEqual(y, 0.5 * math.sin(bump), places=6)
+
+    def test_imu_gap_falls_back_to_wheel_yaw(self):
+        m, _ = _matcher()
+        loc = CheckpointLocalizer(m)
+        loc.seed((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        loc.on_odom((0.0, 0.0, 0.1), imu_yaw=None)       # wheel dθ applies
+        self.assertAlmostEqual(loc.pose()[2], 0.1, places=6)
+        # IMU reappears: this step still uses the wheel delta (no reference
+        # across the gap), the next one differences consecutive IMU samples.
+        loc.on_odom((0.0, 0.0, 0.3), imu_yaw=7.0)
+        self.assertAlmostEqual(loc.pose()[2], 0.3, places=6)
+        loc.on_odom((0.0, 0.0, 0.3), imu_yaw=7.2)
+        self.assertAlmostEqual(loc.pose()[2], 0.5, places=6)
+
+    def test_failed_reanchors_counted_until_recovery(self):
+        m, occ = _matcher()
+        loc = CheckpointLocalizer(m, reanchor_min_interval_s=0.0)
+        loc.seed((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        # A scan that matches nothing (uniform short returns) with cp_000 in
+        # range → counted as failures.
+        bad_angles = np.linspace(-math.pi, math.pi, 360, endpoint=False)
+        bad_ranges = np.full(360, 0.3)
+        for i in range(3):
+            self.assertIsNone(loc.try_reanchor(float(i), bad_angles, bad_ranges))
+        self.assertEqual(loc.failed_since_anchor, 3)
+        # A good scan recovers and resets the counter.
+        angles, ranges = _synth(occ, (0.0, 0.0, 0.0))
+        self.assertIsNotNone(loc.try_reanchor(10.0, angles, ranges))
+        self.assertEqual(loc.failed_since_anchor, 0)
+
+    def test_no_checkpoint_in_range_is_not_a_failure(self):
+        m, _ = _matcher()
+        loc = CheckpointLocalizer(m, reanchor_min_interval_s=0.0)
+        # Seeded far from cp_000 (select_radius_m=1.5): the matcher never
+        # runs, so a None result must not count as a rejected attempt.
+        loc.seed((10.0, 10.0, 0.0), (0.0, 0.0, 0.0))
+        bad_angles = np.linspace(-math.pi, math.pi, 360, endpoint=False)
+        bad_ranges = np.full(360, 0.3)
+        self.assertIsNone(loc.try_reanchor(0.0, bad_angles, bad_ranges))
+        self.assertEqual(loc.failed_since_anchor, 0)
+
     def test_reanchor_throttled(self):
         m, occ = _matcher()
         loc = CheckpointLocalizer(m, reanchor_min_interval_s=0.5)
@@ -163,6 +220,25 @@ class TestCheckpointPoseProvider(unittest.TestCase):
         self.src["odom"] = (0.0, 0.0, 0.0)
         self.src["age"] = 2.0                     # > max_pose_age_s
         self.assertIsNone(self.p.world_pose())
+
+    def test_imu_yaw_fn_feeds_dead_reckon(self):
+        imu = {"yaw": None}
+        p = CheckpointPoseProvider(
+            self.loc,
+            odom_fn=lambda: self.src["odom"],
+            scan_fn=lambda: None,
+            seed_fn=lambda: self.src["seed"],
+            imu_yaw_fn=lambda: imu["yaw"],
+            clock=lambda: self.t[0],
+        )
+        self.src["seed"] = (0.0, 0.0, 0.0)
+        self.src["odom"] = (0.0, 0.0, 0.0)
+        imu["yaw"] = 1.0
+        p.world_pose()                            # seeds
+        p.world_pose()                            # establishes the IMU ref
+        imu["yaw"] = 1.0 + math.radians(20)       # bump the wheels never saw
+        pose = p.world_pose()
+        self.assertAlmostEqual(pose[2], math.radians(20), places=6)
 
 
 if __name__ == "__main__":

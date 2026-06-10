@@ -78,11 +78,13 @@ class CheckpointLocalizer:
         self._reanchor_min_interval_s = reanchor_min_interval_s
         self._map_pose: Optional[Pose] = None
         self._last_odom: Optional[Pose] = None
+        self._last_imu_yaw: Optional[float] = None
         self._last_reanchor_t: float = -1e18
         self._last_match: Optional[CheckpointMatch] = None
         self._last_reanchor_snap: Optional[ReanchorSnap] = None
         self._dist_since_anchor: float = 0.0
         self._reanchor_count: int = 0
+        self._failed_since_anchor: int = 0
         self._seeded = False
 
     @property
@@ -95,6 +97,19 @@ class CheckpointLocalizer:
         hierarchical driver watches this to re-pick the moment a snap moves the
         world pose under a sub-goal anchored in the (uncorrected) odom frame."""
         return self._reanchor_count
+
+    @property
+    def failed_since_anchor(self) -> int:
+        """Consecutive re-anchor attempts that ran the matcher with a
+        checkpoint in range and were rejected. Nonzero while the pose
+        free-runs on dead-reckoning past a checkpoint it can't match —
+        the silent-failure mode this exists to make visible."""
+        return self._failed_since_anchor
+
+    @property
+    def dist_since_anchor_m(self) -> float:
+        """Path length dead-reckoned since the last successful anchor."""
+        return self._dist_since_anchor
 
     @property
     def last_match(self) -> Optional[CheckpointMatch]:
@@ -111,15 +126,28 @@ class CheckpointLocalizer:
         self._last_odom = (float(odom_pose[0]), float(odom_pose[1]), float(odom_pose[2]))
         self._seeded = True
 
-    def on_odom(self, odom_pose: Pose) -> None:
-        """Advance the map-frame pose by the odom motion since the last call."""
+    def on_odom(self, odom_pose: Pose, imu_yaw: Optional[float] = None) -> None:
+        """Advance the map-frame pose by the odom motion since the last call.
+
+        ``imu_yaw`` (unwrapped rad, any fixed reference) replaces the wheel
+        yaw increment when supplied on consecutive calls: the wheels are
+        blind to chassis rotation they didn't command (ridge bump, slip) —
+        exactly the rotation that pushes this prior outside the re-anchor
+        match window. Translation stays wheel-measured (body-frame), so it
+        is composed along the IMU-corrected heading."""
         if not self._seeded:
             return
         if self._last_odom is not None and self._map_pose is not None:
             d = pose_relative(self._last_odom, odom_pose)
+            if imu_yaw is not None and self._last_imu_yaw is not None:
+                d = (d[0], d[1], _wrap(imu_yaw - self._last_imu_yaw))
             self._map_pose = pose_compose(self._map_pose, d)
             self._dist_since_anchor += math.hypot(d[0], d[1])
         self._last_odom = (float(odom_pose[0]), float(odom_pose[1]), float(odom_pose[2]))
+        # None when absent → the next step falls back to the wheel yaw delta
+        # rather than differencing across an IMU gap (rotation during the gap
+        # is already covered by the wheel delta of those steps).
+        self._last_imu_yaw = imu_yaw
 
     def try_reanchor(
         self, now: float, angles: Sequence[float], ranges: Sequence[float],
@@ -134,21 +162,41 @@ class CheckpointLocalizer:
             return None
         self._last_reanchor_t = now
         m = self._matcher.match(self._map_pose, angles, ranges)
-        if m is not None:
-            # The correction (dead-reckoned pose → matched pose) IS the odom
-            # drift that accumulated over dist_since_anchor since the last fix.
-            rel = pose_relative(self._map_pose, m.pose)
-            self._last_reanchor_snap = ReanchorSnap(
-                checkpoint_id=m.checkpoint_id,
-                trans_m=math.hypot(rel[0], rel[1]),
-                rot_rad=rel[2],
-                dist_since_anchor_m=self._dist_since_anchor,
-                score=m.score,
-            )
-            self._dist_since_anchor = 0.0
-            self._map_pose = m.pose
-            self._last_match = m
-            self._reanchor_count += 1
+        if m is None:
+            # Only count (and report) failures with a checkpoint in range —
+            # cruising a checkpoint-free stretch is not a failure. A run of
+            # these means the pose is free-running on dead-reckoning right
+            # where it expected an anchor (e.g. the prior left the match
+            # window), which is otherwise invisible until the drive goes
+            # somewhere wrong.
+            if self._matcher.n_candidates(self._map_pose) > 0:
+                self._failed_since_anchor += 1
+                if self._failed_since_anchor % 5 == 0:
+                    logger.warning(
+                        "checkpoint: re-anchor FAILING — %d consecutive "
+                        "rejected attempts, %.2fm dead-reckoned since last "
+                        "anchor",
+                        self._failed_since_anchor, self._dist_since_anchor)
+            return None
+        # The correction (dead-reckoned pose → matched pose) IS the odom
+        # drift that accumulated over dist_since_anchor since the last fix.
+        rel = pose_relative(self._map_pose, m.pose)
+        self._last_reanchor_snap = ReanchorSnap(
+            checkpoint_id=m.checkpoint_id,
+            trans_m=math.hypot(rel[0], rel[1]),
+            rot_rad=rel[2],
+            dist_since_anchor_m=self._dist_since_anchor,
+            score=m.score,
+        )
+        self._dist_since_anchor = 0.0
+        self._map_pose = m.pose
+        self._last_match = m
+        self._reanchor_count += 1
+        if self._failed_since_anchor:
+            logger.info(
+                "checkpoint: re-anchor recovered after %d failed attempts",
+                self._failed_since_anchor)
+        self._failed_since_anchor = 0
         return m
 
     def pose(self) -> Optional[Pose]:
@@ -166,6 +214,10 @@ class CheckpointPoseProvider:
                        posterior or an operator Set-location), or None.
       * ``age_fn``   → odom age in seconds (skew-immune), or None — reported
                        stale past ``max_pose_age_s`` so the drive holds.
+      * ``imu_yaw_fn`` → latest IMU yaw (unwrapped rad), or None. Feeds the
+                       dead-reckon prior so it tracks chassis rotation the
+                       wheels can't see (ridge bump) and stays inside the
+                       re-anchor match window.
     """
 
     def __init__(
@@ -176,6 +228,7 @@ class CheckpointPoseProvider:
         scan_fn: Callable[[], Optional[Tuple[Sequence[float], Sequence[float]]]],
         seed_fn: Callable[[], Optional[Pose]],
         age_fn: Optional[Callable[[], Optional[float]]] = None,
+        imu_yaw_fn: Optional[Callable[[], Optional[float]]] = None,
         max_pose_age_s: float = 0.75,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -184,6 +237,7 @@ class CheckpointPoseProvider:
         self._scan_fn = scan_fn
         self._seed_fn = seed_fn
         self._age_fn = age_fn
+        self._imu_yaw_fn = imu_yaw_fn
         self._max_pose_age_s = max_pose_age_s
         self._clock = clock
 
@@ -201,7 +255,8 @@ class CheckpointPoseProvider:
                 return None
             self._loc.seed(seed, odom)
         else:
-            self._loc.on_odom(odom)
+            imu_yaw = self._imu_yaw_fn() if self._imu_yaw_fn is not None else None
+            self._loc.on_odom(odom, imu_yaw=imu_yaw)
         scan = self._scan_fn()
         if scan is not None:
             m = self._loc.try_reanchor(self._clock(), scan[0], scan[1])

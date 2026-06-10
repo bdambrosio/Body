@@ -1302,6 +1302,7 @@ class NavMainWindow(QMainWindow):
             scan_fn=self._cp_scan,
             seed_fn=self._cp_seed,
             age_fn=self.fuser.pose_source.odom_age_s,
+            imu_yaw_fn=self.fuser.pose_source.imu_yaw,
         )
 
     def _checkpoint_matcher(self, cfg: CheckpointMatchConfig):
