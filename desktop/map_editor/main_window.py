@@ -25,8 +25,8 @@ import numpy as np
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QActionGroup
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox, QSpinBox,
-    QToolBar, QWidget,
+    QApplication, QComboBox, QFileDialog, QLabel, QMainWindow, QMessageBox,
+    QSpinBox, QToolBar, QWidget,
 )
 
 from desktop.localization.checkpoint_matcher import (
@@ -188,6 +188,21 @@ class MapEditorWindow(QMainWindow):
 
         self._act_undo = tb.addAction("Undo", self._on_undo)
         self._act_undo.setShortcut("Ctrl+Z")
+        tb.addSeparator()
+
+        # Checkpoint management — works offline (no live link needed).
+        # The combo mirrors the rings drawn on the map; Delete removes the
+        # selected checkpoint from the map metadata (Save persists it).
+        tb.addWidget(QLabel(" Checkpoint "))
+        self._cp_combo = QComboBox()
+        self._cp_combo.setToolTip(
+            "Checkpoints stored in this map (Recognize adds them).")
+        tb.addWidget(self._cp_combo)
+        self._act_del_cp = tb.addAction("Delete cp", self._on_delete_checkpoint)
+        self._act_del_cp.setToolTip(
+            "Delete the selected checkpoint from the map metadata. The healed "
+            "occupancy stays — only the match anchor is removed. Save to "
+            "persist.")
 
         # Live (Phase 2) controls — only when a router is configured.
         self._act_connect = None
@@ -383,12 +398,52 @@ class MapEditorWindow(QMainWindow):
         self._refresh_checkpoint_markers()
 
     def _refresh_checkpoint_markers(self) -> None:
-        """Draw the saved checkpoints (rings + ids) on the map."""
+        """Draw the saved checkpoints (rings + ids) on the map and mirror
+        them into the toolbar combo."""
         if self._emap is None:
             return
         cps = checkpoints_from_metadata(self._emap.metadata)
         self._shared.set_checkpoints(
             [(c.x_m, c.y_m, c.radius_m, c.id) for c in cps])
+        # Rebuild the combo only when the set actually changed — this runs
+        # on every rerender (paint strokes included) and a no-op rebuild
+        # would clobber the operator's selection.
+        labels = [f"{c.id}  ({c.x_m:+.2f}, {c.y_m:+.2f})" for c in cps]
+        current = [self._cp_combo.itemText(i)
+                   for i in range(self._cp_combo.count())]
+        if labels != current:
+            selected = self._cp_combo.currentData()
+            self._cp_combo.clear()
+            for c, lbl in zip(cps, labels):
+                self._cp_combo.addItem(lbl, c.id)
+            if selected is not None:
+                idx = self._cp_combo.findData(selected)
+                if idx >= 0:
+                    self._cp_combo.setCurrentIndex(idx)
+        enable = bool(cps)
+        self._cp_combo.setEnabled(enable)
+        self._act_del_cp.setEnabled(enable)
+
+    def _on_delete_checkpoint(self) -> None:
+        """Remove the combo-selected checkpoint from the map metadata."""
+        if self._emap is None:
+            return
+        cp_id = self._cp_combo.currentData()
+        if cp_id is None:
+            return
+        r = QMessageBox.question(
+            self, "Delete checkpoint?",
+            f"Delete {cp_id} from this map?\n\nThe healed occupancy stays — "
+            "only the match anchor is removed. Save to persist.")
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        cps = [c for c in checkpoints_from_metadata(self._emap.metadata)
+               if c.id != cp_id]
+        write_checkpoints_to_metadata(self._emap.metadata, cps)
+        self._dirty = True
+        self._refresh_checkpoint_markers()
+        self._update_title()
+        self._status.showMessage(f"Deleted {cp_id} — Save to persist.", 5000)
 
     def _push_nogo_overlay(self) -> None:
         """Hand the keep-out cell centers (world frame) to the view for the
@@ -410,6 +465,10 @@ class MapEditorWindow(QMainWindow):
         for a in (self._act_save, self._act_save_as, self._act_edit):
             a.setEnabled(have)
         self._act_undo.setEnabled(have and bool(self._undo))
+        if not have:
+            self._cp_combo.clear()
+            self._cp_combo.setEnabled(False)
+            self._act_del_cp.setEnabled(False)
 
     # ── Live overlay (Phase 2) ──────────────────────────────────────
 
