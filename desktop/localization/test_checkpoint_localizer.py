@@ -134,6 +134,43 @@ class TestCheckpointLocalizer(unittest.TestCase):
         self.assertAlmostEqual(x, 0.5 * math.cos(bump), places=6)
         self.assertAlmostEqual(y, 0.5 * math.sin(bump), places=6)
 
+    def test_frozen_imu_falls_back_to_wheel_yaw(self):
+        # Hung BNO085: fresh messages, constant orientation, wheels rotating.
+        # Substituting the flat IMU delta froze the believed heading (observed
+        # live 2026-06-11: endless in-place spin). Once the wheels have turned
+        # MAX_DIVERGENCE unseen, the guard must trip and wheel yaw must reach
+        # the map pose again.
+        m, _ = _matcher()
+        loc = CheckpointLocalizer(m)
+        loc.seed((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        loc.on_odom((0.0, 0.0, 0.0), imu_yaw=2.0)        # establish IMU ref
+        step = math.radians(5)
+        for i in range(1, 13):                            # wheels sweep 60°
+            loc.on_odom((0.0, 0.0, i * step), imu_yaw=2.0)
+        before = loc.pose()[2]
+        loc.on_odom((0.0, 0.0, 12 * step + 0.2), imu_yaw=2.0)
+        self.assertAlmostEqual(loc.pose()[2] - before, 0.2, places=6)
+
+    def test_frozen_imu_revives_on_motion(self):
+        # After a frozen-IMU trip, real IMU motion (> REVIVE_RAD) restores
+        # trust — a ridge kick afterwards must reach the heading again.
+        m, _ = _matcher()
+        loc = CheckpointLocalizer(m)
+        loc.seed((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        loc.on_odom((0.0, 0.0, 0.0), imu_yaw=2.0)
+        step = math.radians(5)
+        for i in range(1, 13):                            # trip the guard
+            loc.on_odom((0.0, 0.0, i * step), imu_yaw=2.0)
+        th, yaw = 12 * step, 2.0
+        for _ in range(4):                                # IMU alive again
+            th += math.radians(3)
+            yaw += math.radians(3)
+            loc.on_odom((0.0, 0.0, th), imu_yaw=yaw)
+        before = loc.pose()[2]
+        loc.on_odom((0.0, 0.0, th), imu_yaw=yaw + math.radians(12))
+        self.assertAlmostEqual(
+            loc.pose()[2] - before, math.radians(12), places=6)
+
     def test_imu_gap_falls_back_to_wheel_yaw(self):
         m, _ = _matcher()
         loc = CheckpointLocalizer(m)

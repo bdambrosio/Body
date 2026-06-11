@@ -88,14 +88,35 @@ class ImuYawCorrector:
 
     The baseline is per-goal (``reset()`` on every new cmd_id), so long-term
     IMU drift never enters — only divergence accumulated over one goal's
-    lifetime (seconds) matters. No thresholds: this is ordinary
-    dead-reckoning, not a bump detector. With no IMU the correction is zero
-    and behavior is identical to wheel-only."""
+    lifetime (seconds) matters. With no IMU the correction is zero and
+    behavior is identical to wheel-only.
+
+    Frozen-IMU guard: a hung BNO085 keeps publishing fresh timestamps with a
+    constant orientation, which the staleness gate cannot catch — and inside
+    a goal the corrected heading tracks the IMU delta entirely, so a frozen
+    IMU freezes the heading while the wheels rotate (observed live
+    2026-06-11: endless in-place spin). A working gyro physically cannot
+    miss ``MAX_DIVERGENCE_RAD`` of wheel-reported rotation while itself
+    reading dead flat, so that contradiction declares the IMU dead → wheel
+    heading only, latched across goals until the IMU visibly moves again.
+    (The opposite trade — wheels slipping in place under a stalled chassis —
+    looks identical from these two signals; trusting the wheels there costs
+    a bounded heading error, trusting a frozen IMU costs an unbounded
+    rotation loop, so the guard sides with the wheels.)"""
+
+    MAX_DIVERGENCE_RAD = math.radians(30.0)  # ridge kicks are a few degrees
+    FROZEN_EPS_RAD = math.radians(2.0)       # "the IMU itself never moved"
+    REVIVE_RAD = math.radians(10.0)          # IMU motion that proves it's alive
 
     def __init__(self) -> None:
         self._ref: float | None = None
+        self._last_imu: float | None = None
+        self._imu_motion = 0.0   # |Δimu| accumulated since baseline / trip
+        self._dead = False
 
     def reset(self) -> None:
+        # New goal: re-arm the baseline. The dead latch survives — a hung
+        # IMU must not get MAX_DIVERGENCE of trust back every goal.
         self._ref = None
 
     def corrected_theta(self, odom_theta: float, imu_yaw: float | None) -> float:
@@ -104,11 +125,29 @@ class ImuYawCorrector:
         wheel heading unchanged — never differences across an IMU gap."""
         if imu_yaw is None:
             self._ref = None
+            self._last_imu = None
+            return odom_theta
+        if self._last_imu is not None:
+            self._imu_motion += abs(wrap_pi(imu_yaw - self._last_imu))
+        self._last_imu = imu_yaw
+        if self._dead:
+            if self._imu_motion > self.REVIVE_RAD:
+                self._dead = False
+                self._ref = None   # re-baseline below on the next call
             return odom_theta
         if self._ref is None:
             self._ref = wrap_pi(imu_yaw - odom_theta)
+            self._imu_motion = 0.0
             return odom_theta
-        return wrap_pi(odom_theta + wrap_pi(imu_yaw - odom_theta - self._ref))
+        div = wrap_pi(imu_yaw - odom_theta - self._ref)
+        if abs(div) > self.MAX_DIVERGENCE_RAD and self._imu_motion < self.FROZEN_EPS_RAD:
+            self._dead = True
+            self._imu_motion = 0.0   # now counts motion-since-trip (revival)
+            print("local_drive: IMU yaw FROZEN (wheels turned "
+                  f"{math.degrees(abs(div)):.0f}° unseen) — falling back to "
+                  "wheel heading until the IMU moves again", flush=True)
+            return odom_theta
+        return wrap_pi(odom_theta + div)
 
 
 def _clip(x: float, lo: float, hi: float) -> float:

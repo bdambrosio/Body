@@ -68,6 +68,21 @@ class CheckpointLocalizer:
     confident checkpoint match. Times are caller-supplied (monotonic seconds)
     so it stays testable."""
 
+    # Frozen-IMU guard (same trade as ImuYawCorrector on the Pi): a hung
+    # BNO085 publishes fresh timestamps with a constant orientation, and
+    # substituting its flat yaw delta freezes the believed heading while the
+    # chassis rotates — re-anchor then flails between checkpoints trying to
+    # explain a rotated scan. A live gyro cannot read dead flat while the
+    # wheels report MAX_DIVERGENCE of rotation → fall back to wheel yaw,
+    # latched until the IMU visibly moves again. Every REVIVE_RAD of observed
+    # IMU motion resets the divergence window (the IMU just proved itself
+    # alive), so a mid-session freeze is always caught against a fresh
+    # window. A long straight leg can false-trip on accumulated noise (no
+    # IMU motion to reset the window) — harmless: yaws agree while straight,
+    # and the next real turn revives the IMU.
+    MAX_DIVERGENCE_RAD = math.radians(30.0)
+    REVIVE_RAD = math.radians(10.0)
+
     def __init__(
         self,
         matcher: CheckpointMatcher,
@@ -79,6 +94,9 @@ class CheckpointLocalizer:
         self._map_pose: Optional[Pose] = None
         self._last_odom: Optional[Pose] = None
         self._last_imu_yaw: Optional[float] = None
+        self._imu_div = 0.0      # wheel-vs-IMU yaw divergence accumulated
+        self._imu_motion = 0.0   # |Δimu| accumulated (frozen vs alive)
+        self._imu_dead = False
         self._last_reanchor_t: float = -1e18
         self._last_match: Optional[CheckpointMatch] = None
         self._last_reanchor_snap: Optional[ReanchorSnap] = None
@@ -140,7 +158,28 @@ class CheckpointLocalizer:
         if self._last_odom is not None and self._map_pose is not None:
             d = pose_relative(self._last_odom, odom_pose)
             if imu_yaw is not None and self._last_imu_yaw is not None:
-                d = (d[0], d[1], _wrap(imu_yaw - self._last_imu_yaw))
+                di = _wrap(imu_yaw - self._last_imu_yaw)
+                self._imu_motion += abs(di)
+                self._imu_div += abs(_wrap(di - d[2]))
+                if self._imu_dead:
+                    if self._imu_motion > self.REVIVE_RAD:
+                        logger.info("imu yaw: moving again — trusting it")
+                        self._imu_dead = False
+                        self._imu_div = 0.0
+                        self._imu_motion = 0.0
+                elif self._imu_motion > self.REVIVE_RAD:
+                    # IMU demonstrably alive through this window — fresh start.
+                    self._imu_div = 0.0
+                    self._imu_motion = 0.0
+                elif self._imu_div > self.MAX_DIVERGENCE_RAD:
+                    self._imu_dead = True
+                    logger.error(
+                        "imu yaw FROZEN: wheels turned %.0f° unseen by the "
+                        "IMU — falling back to wheel yaw until it moves",
+                        math.degrees(self._imu_div))
+                    self._imu_motion = 0.0   # motion-since-trip → revival
+                if not self._imu_dead:
+                    d = (d[0], d[1], di)
             self._map_pose = pose_compose(self._map_pose, d)
             self._dist_since_anchor += math.hypot(d[0], d[1])
         self._last_odom = (float(odom_pose[0]), float(odom_pose[1]), float(odom_pose[2]))

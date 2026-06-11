@@ -264,6 +264,56 @@ class TestImuYawCorrector(unittest.TestCase):
         self.assertAlmostEqual(c.corrected_theta(0.1, 5.0), 0.1)   # re-baseline
         self.assertAlmostEqual(c.corrected_theta(0.1, 5.2), 0.1 + 0.2)
 
+    def test_frozen_imu_falls_back_to_wheels(self):
+        # Hung BNO085: fresh messages, constant yaw, wheels turning. Heading
+        # froze and the follower spun in place forever (observed live
+        # 2026-06-11). Past MAX_DIVERGENCE the guard must hand back wheel
+        # heading.
+        c = ImuYawCorrector()
+        c.corrected_theta(0.0, 1.0)                                 # baseline
+        step = math.radians(5)
+        out = 0.0
+        for i in range(1, 13):                                      # 60° sweep
+            out = c.corrected_theta(i * step, 1.0)
+        self.assertAlmostEqual(out, 12 * step)
+
+    def test_frozen_trip_latches_across_goals(self):
+        # reset() (new goal) must not hand a hung IMU 30° of fresh trust.
+        c = ImuYawCorrector()
+        c.corrected_theta(0.0, 1.0)
+        for i in range(1, 13):
+            c.corrected_theta(i * math.radians(5), 1.0)             # trip
+        c.reset()
+        c.corrected_theta(0.0, 1.0)
+        self.assertAlmostEqual(c.corrected_theta(0.3, 1.0), 0.3)
+
+    def test_frozen_imu_revives_on_motion(self):
+        # IMU motion past REVIVE re-baselines and restores trust.
+        c = ImuYawCorrector()
+        c.corrected_theta(0.0, 1.0)
+        for i in range(1, 13):
+            c.corrected_theta(i * math.radians(5), 1.0)             # trip
+        th, yaw = math.radians(60), 1.0
+        for _ in range(4):                                          # alive
+            th += math.radians(3)
+            yaw += math.radians(3)
+            c.corrected_theta(th, yaw)
+        c.corrected_theta(th, yaw)                                  # re-baseline
+        bump = math.radians(12)
+        self.assertAlmostEqual(c.corrected_theta(th, yaw + bump), th + bump)
+
+    def test_pickup_rotation_still_trusted(self):
+        # The case the corrector exists for, writ large: the chassis is
+        # physically turned 40° (IMU sees it, wheels don't). Big divergence
+        # WITH IMU motion is real rotation, not a hung sensor.
+        c = ImuYawCorrector()
+        c.corrected_theta(0.2, 1.0)                                 # baseline
+        yaw = 1.0
+        for _ in range(8):
+            yaw += math.radians(5)
+            out = c.corrected_theta(0.2, yaw)
+        self.assertAlmostEqual(out, 0.2 + math.radians(40))
+
     def test_wraps_across_pi(self):
         c = ImuYawCorrector()
         c.corrected_theta(3.0, 3.0)                                 # baseline 0
