@@ -13,6 +13,7 @@ docs/topological_localization_design.md §6 / Phase 3. Pure: numpy only.
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence, Tuple
@@ -25,7 +26,13 @@ from desktop.localization.raycast_match import (
     best_pose_in_window,
 )
 
+logger = logging.getLogger(__name__)
+
 Pose = Tuple[float, float, float]
+
+
+def _wrap(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def crop_disk(
@@ -149,6 +156,11 @@ class CheckpointMatcher:
         ranges: Sequence[float],
         *,
         yaw_hint: Optional[float] = None,
+        prior_xy: Optional[Tuple[float, float]] = None,
+        prior_sigma_m: float = 3.0,
+        min_margin: float = 0.05,
+        agree_xy_m: float = 0.75,
+        agree_theta_rad: float = math.radians(20.0),
         xy_half_m: float = 0.6,
         xy_step_m: float = 0.10,
         theta_half_rad: float = math.pi,
@@ -157,9 +169,20 @@ class CheckpointMatcher:
         """Cold-start / recovery: test **all** checkpoints, searching a window
         around *each checkpoint's own pose* (not an odom prior). Heading is
         swept around ``yaw_hint`` (IMU-primed) over ±``theta_half_rad``, or the
-        full circle when ``yaw_hint`` is None. Returns the best accepted match.
+        full circle when ``yaw_hint`` is None.
+
+        Self-similar patches (corridors look alike) make "best raw score"
+        unsafe, so two guards apply before a match is returned:
+          * ``prior_xy`` — believed position; each candidate's score is
+            demoted by a Gaussian in its distance from it (``prior_sigma_m``),
+            so a far checkpoint must beat a near one by a lot.
+          * ambiguity margin — if a runner-up that *disagrees* with the best
+            (pose differs by > ``agree_xy_m`` / ``agree_theta_rad``) comes
+            within ``min_margin`` of the best's weighted score, recognition is
+            ambiguous → None (reject rather than guess). Runners-up that agree
+            on essentially the same pose are not ambiguity.
         Slower than ``match`` — a deliberate operator action, not per-tick."""
-        best: Optional[CheckpointMatch] = None
+        accepted: List[Tuple[float, CheckpointMatch]] = []
         for c in self._checkpoints:
             sub, sox, soy = crop_disk(
                 self._occ, self._ox, self._oy, self._res,
@@ -179,6 +202,27 @@ class CheckpointMatcher:
             if (s.inlier_frac >= self._cfg.min_inlier_frac
                     and s.short_frac <= self._cfg.max_short_frac):
                 m = CheckpointMatch(c.id, pose, s.inlier_frac, s.short_frac, s.score)
-                if best is None or m.score > best.score:
-                    best = m
+                w = m.score
+                if prior_xy is not None:
+                    d = math.hypot(m.pose[0] - prior_xy[0],
+                                   m.pose[1] - prior_xy[1])
+                    w *= math.exp(-0.5 * (d / prior_sigma_m) ** 2)
+                accepted.append((w, m))
+        if not accepted:
+            return None
+        accepted.sort(key=lambda t: t[0], reverse=True)
+        best_w, best = accepted[0]
+        for w, m in accepted[1:]:
+            dxy = math.hypot(m.pose[0] - best.pose[0], m.pose[1] - best.pose[1])
+            dth = abs(_wrap(m.pose[2] - best.pose[2]))
+            if dxy <= agree_xy_m and dth <= agree_theta_rad:
+                continue  # same answer from an overlapping patch — not ambiguity
+            if best_w - w < min_margin:
+                logger.info(
+                    "relocalize: ambiguous — %s (w=%.3f) vs %s (w=%.3f) "
+                    "disagree by %.2fm/%.0f°; rejecting",
+                    best.checkpoint_id, best_w, m.checkpoint_id, w,
+                    dxy, math.degrees(dth))
+                return None
+            break  # closest disagreeing competitor cleared the margin
         return best

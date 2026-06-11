@@ -1008,10 +1008,12 @@ class NavMainWindow(QMainWindow):
             return False
         latest = self.fuser.pose_source.latest_pose()
         yaw = float(latest[0][2]) if latest is not None else None
+        prior_xy = ((float(latest[0][0]), float(latest[0][1]))
+                    if latest is not None else None)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             m = matcher.relocalize(
-                ar[0], ar[1], yaw_hint=yaw,
+                ar[0], ar[1], yaw_hint=yaw, prior_xy=prior_xy,
                 xy_half_m=0.6, theta_half_rad=math.radians(60.0))
         finally:
             QApplication.restoreOverrideCursor()
