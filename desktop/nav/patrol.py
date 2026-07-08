@@ -1,11 +1,17 @@
 """Patrols — closed-loop waypoint missions and waypoint-to-costmap
 adaptation.
 
-A patrol is an ordered list of waypoints the robot drives through, in
-sequence, rotating in place at each to face the next. When `loop=True`
-the last waypoint connects back to the first, and the robot drives
-the loop `laps` times before terminating (default: 1 — one full
-circuit and stop).
+A patrol is an ordered list of waypoints the robot drives through in
+sequence. When `loop=True` the last waypoint connects back to the first,
+and the robot drives the loop `laps` times before terminating (default: 1 —
+one full circuit and stop).
+
+Production execution is **hierarchical drive** (`HierarchicalDrive`): global
+A* expansion → Tier-2 clear-run sub-goals → Pi Tier-3 local A*. That path
+does **not** rotate in place at markers; `Waypoint.face_next` and `hold_s`
+are schema slots (serialized for future / tooling) and are ignored by the
+hierarchical runner (`patrol_expand` forces `face_next=False` on densified
+points).
 
 Two storage locations, one format:
 
@@ -67,13 +73,11 @@ def passed_waypoint(
 class Waypoint:
     x_m: float
     y_m: float
-    # If False, the patrol skips the rotate-to-face-next step at this
-    # waypoint (drives the next leg with whatever heading the follower
-    # picks). Defaults to True — "rotate before leaving" is the
-    # intended behavior.
+    # If False, skip rotate-to-face-next at this waypoint. Hierarchical drive
+    # ignores this field (path-following only); kept for schema compatibility.
     face_next: bool = True
-    # Optional pause after arrival, before rotating / advancing. v1.1
-    # — schema slot only; the runtime ignores it for now.
+    # Optional pause after arrival. Schema slot only — hierarchical drive
+    # ignores it.
     hold_s: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:

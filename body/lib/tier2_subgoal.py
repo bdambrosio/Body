@@ -8,9 +8,14 @@ bearing in the body-frame scan grid produced by ``scan_raster.rasterize_scan``
 — and hands *that* body-frame point to Tier-3 (``body/drive/goto``). Nothing
 from the world map crosses into the drive command except the bearing.
 
-Pure NumPy, no zenoh — importable on both the desktop orchestrator and the Pi
-(should Tier-2 ever move on-robot). Single ray, not a fan: Tier-3 runs its own
-reactive fan/centering around whatever point we hand it.
+Production (``HierarchicalDrive``) and the ``pi_drive`` Tier-2 console both
+use ``furthest_free_point`` / ``plan_tier2`` (the latter wraps the former into
+a ``Tier2Decision`` for the debug UI). Hierarchical drive additionally
+marches on Tier-3's footprint-inflated lethal mask before calling
+``furthest_free_point``; the debug console may pass a raw or pre-masked grid.
+
+Pure NumPy, no zenoh — importable on both the desktop orchestrator and the Pi.
+Single ray, not a fan: Tier-3 runs local A* around whatever point we hand it.
 """
 from __future__ import annotations
 
@@ -20,7 +25,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from body.lib.astar import nearest_non_lethal
 from body.lib.local_drive_core import wrap_pi
 
 
@@ -53,9 +57,9 @@ class Tier2Result:
 class Tier2Decision:
     """One Tier-2 step packaged for the orchestrator AND the debug console.
 
-    The single source of truth: ``plan_tier2`` produces this; production
-    (HierarchicalDrive) reads ``ok``/``body_xy``/``reason`` from it, and the
-    debug UI / JSONL trace render every field.
+    ``plan_tier2`` wraps ``furthest_free_point`` into this shape for the
+    pi_drive UI / JSONL trace. Production HierarchicalDrive calls
+    ``furthest_free_point`` directly (after footprint-masking the grid).
     """
     bearing_rad: float                       # the CHOSEN bearing (may be off the direct line)
     max_dist_m: float                        # cap = distance to the target/waypoint
@@ -178,42 +182,30 @@ def plan_tier2(
     max_dist_m: float,
     cfg: Optional[Tier2Config] = None,
 ) -> Tier2Decision:
-    """The Tier-2 step: **project** the target onto the local map.
-
-    Since the redesign, the Pi's local A* (``body/lib/local_planner.py``) is the
-    single local-routing authority — it inflates by the footprint and routes
-    *around* obstacles. So Tier-2 no longer does geometry: it just clamps the
-    target to within sensor range along ``bearing_rad`` (capped at the scan
-    horizon), nudged off any not-clear cell onto the nearest clear one so the
-    goal we hand Tier-3 is a sane point on the live grid. Tier-3 A* then snaps
-    + routes (or reports no path). ``max_dist_m`` is the target distance.
+    """Production Tier-2 step: clear-run along ``bearing_rad`` (same as
+    ``furthest_free_point``), packaged as a ``Tier2Decision`` for the debug
+    console. Callers that already footprint-mask the grid (HierarchicalDrive)
+    should call ``furthest_free_point`` directly; this wrapper is for
+    pi_drive / tests that want the Decision shape.
     """
     cfg = cfg or Tier2Config()
-    d = min(max_dist_m, cfg.horizon_m)
-    capped = d < max_dist_m - 1e-9
-    res = float(meta["resolution_m"]); ox = float(meta["origin_x_m"]); oy = float(meta["origin_y_m"])
-    nx = int(meta["nx"]); ny = int(meta["ny"])
-    c, s = math.cos(bearing_rad), math.sin(bearing_rad)
-    bx, by = d * c, d * s
-    i = int(math.floor((bx - ox) / res))
-    j = int(math.floor((by - oy) / res))
-    if not (0 <= i < nx and 0 <= j < ny):
-        return Tier2Decision(bearing_rad, d, False, None, d, "out_of_map", capped, False)
-
-    # Snap off any not-clear cell (Tier-3 A* does the real footprint snap; this
-    # just avoids handing Tier-3 an obviously-blocked goal). When the goal cell
-    # is already clear, return the exact clamped point (no cell quantization).
-    if grid[i, j] == 1:
+    r = furthest_free_point(grid, meta, bearing_rad, cfg, max_dist_m=max_dist_m)
+    limit = min(max_dist_m, cfg.horizon_m)
+    capped = max_dist_m > cfg.horizon_m + 1e-9
+    if not r.ok or r.body_xy is None:
         return Tier2Decision(
-            bearing_rad=bearing_rad, max_dist_m=max_dist_m, ok=True, body_xy=(bx, by),
-            free_dist_m=math.hypot(bx, by), reason="ok", capped_at_target=not capped,
-            backoff_applied=False, bearing_offset_rad=0.0)
-    found = nearest_non_lethal(grid != 1, i, j, radius=10)
-    if found is None:
-        return Tier2Decision(bearing_rad, d, False, None, d, "no_free_cell", capped, False)
-    gx = ox + (found[0] + 0.5) * res
-    gy = oy + (found[1] + 0.5) * res
+            bearing_rad=bearing_rad, max_dist_m=max_dist_m, ok=False,
+            body_xy=None, free_dist_m=r.free_dist_m, reason=r.reason,
+            capped_at_target=False, backoff_applied=False, bearing_offset_rad=0.0,
+        )
+    # Backoff was applied when we did not land exactly on the waypoint/limit.
+    reached_target = (
+        not capped and abs(r.free_dist_m - max_dist_m) <= 1e-6
+    )
+    backoff_applied = not reached_target and r.free_dist_m < limit - 1e-9
     return Tier2Decision(
-        bearing_rad=bearing_rad, max_dist_m=max_dist_m, ok=True, body_xy=(gx, gy),
-        free_dist_m=math.hypot(gx, gy), reason="ok", capped_at_target=not capped,
-        backoff_applied=True, bearing_offset_rad=0.0)
+        bearing_rad=bearing_rad, max_dist_m=max_dist_m, ok=True,
+        body_xy=r.body_xy, free_dist_m=r.free_dist_m, reason=r.reason,
+        capped_at_target=reached_target, backoff_applied=backoff_applied,
+        bearing_offset_rad=0.0,
+    )

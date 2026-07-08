@@ -344,6 +344,19 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertAlmostEqual(bx, 1.46, places=2)
         self.assertAlmostEqual(by, 0.0, places=2)
 
+    def test_select_clear_run_fail_blocks_not_blind(self):
+        # When a live scan is present but the clear-run finds no usable point,
+        # SELECT must BLOCKED (clear_run_failed) — never blind-project.
+        io = FakeDriveIO(scan=_clear_scan())
+        hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io)
+        hd.start()
+        self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
+        hd._select_subgoal_body = lambda *a, **k: None
+        self.assertEqual(hd.tick(0.0), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "clear_run_failed")
+        self.assertEqual(len(io.sent), 0)
+        self.assertGreaterEqual(io.cancels, 1)
+
     def test_lead_in_followed_then_patrol(self):
         # lead_in [start, (1,0), marker0] is followed vertex-by-vertex BEFORE
         # the patrol runner engages; the runner stays at wp_index 0 until the

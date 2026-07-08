@@ -74,11 +74,14 @@ def drive_status(
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
     ``state`` is one of IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT.
+    ``ARRIVED`` and ``CANCELED`` are each published for one tick (CANCELED
+    under the revoked goal's cmd_id after cancel/stop), then IDLE.
     ``goal_body_xy`` is the active goal transformed into the *live* body
     frame, for the operator UI to draw. ``blocked_reason`` is set only when
-    state==BLOCKED/FAULT: no_path | swept_block | no_progress | odom_stale |
-    goal_out_of_map | start_blocked | goal_unreachable. ``path_body_xy`` is the
-    local A* path (body frame, downsampled) when driving, for the operator UI.
+    state==BLOCKED/FAULT: no_path | boxed_in | swept_block | no_progress |
+    deadline | no_scan | odom_stale | goal_out_of_map | start_blocked |
+    goal_unreachable. ``path_body_xy`` is the local A* path (body frame,
+    downsampled) when driving, for the operator UI.
     """
     msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,

@@ -170,8 +170,9 @@ class HierConfig:
     blocked_retry_interval_s: float = 0.5
     blocked_retry_window_s: float = 10.0
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
-    # Only horizon_m is used now (the cap on the projected sub-goal distance);
-    # Tier-2 no longer rasterizes or does clearance — Tier-3 owns that.
+    # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
+    # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
+    # projection is only the no-scan fallback.
     tier2_cfg: Tier2Config = field(default_factory=Tier2Config)
 
 
@@ -481,11 +482,17 @@ class HierarchicalDrive:
         if self._hold(1):
             return
 
-        # Tier-2 (contract I3): the sub-goal is the furthest live-visible CLEAR
-        # point along the bearing in the body-frame scan grid (ray-march, back
-        # off the first block), so what we hand Tier-3 is reachable ON ITS OWN
-        # local map — not a blind projection that can land past a wall.
-        (bx, by), src, free_dist, grid, meta = self._select_subgoal_body(bearing, wp_dist)
+        # Tier-2 (contract I3): furthest live-visible CLEAR point along the
+        # bearing on Tier-3's footprint-inflated scan (advisory clear-run).
+        # Tier-3's A* snap remains the authority. No usable clear point with a
+        # live scan → BLOCKED (do not blind-project into obstacles). No scan →
+        # blind horizon projection; Tier-3 reports no_scan if it cannot plan.
+        selected = self._select_subgoal_body(bearing, wp_dist)
+        if selected is None:
+            self._io.cancel()
+            self._enter_blocked("clear_run_failed")
+            return
+        (bx, by), src, free_dist, grid, meta = selected
 
         # HO-2 Tier-2 → Tier-3: the body-frame sub-goal + the scan it sits on.
         # The scan grid is heavy, so only attach it when BP2 is armed.
@@ -546,16 +553,16 @@ class HierarchicalDrive:
 
     def _select_subgoal_body(
         self, bearing: float, wp_dist: float,
-    ) -> Tuple[Tuple[float, float], str, float, Optional[Any], Optional[Dict[str, Any]]]:
+    ) -> Optional[Tuple[Tuple[float, float], str, float, Optional[Any], Optional[Dict[str, Any]]]]:
         """Tier-2 sub-goal toward ``bearing``, capped at ``wp_dist``.
 
-        Restores the clear-run guarantee (I3): march the live scan along the
-        bearing and return the furthest confirmed-clear point (backed off the
-        first block/unknown), so the sub-goal is reachable on Tier-3's local
-        map. Only when there's no rasterizable scan do we fall back to the old
-        blind horizon projection. Returns ``((bx, by), source, free_dist_m,
-        grid, meta)`` — source ``clear`` (ray-march) or ``blind`` (fallback);
-        ``grid``/``meta`` are the rasterized scan (None when no scan)."""
+        March the live scan along the bearing on Tier-3's footprint-inflated
+        lethal mask; return the furthest confirmed-clear point. Returns None
+        when a scan is present but the clear-run finds no usable point (caller
+        should BLOCKED). Blind horizon projection only when there is no
+        rasterizable scan. Returns ``((bx, by), source, free_dist_m, grid,
+        meta)`` — source ``clear`` or ``blind``.
+        """
         t2 = self._cfg.tier2_cfg
         grid = meta = None
         scan = self._io.latest_scan()
@@ -578,6 +585,7 @@ class HierarchicalDrive:
                                       max_dist_m=wp_dist)
             if res.ok and res.body_xy is not None:
                 return res.body_xy, "clear", res.free_dist_m, grid, meta
+            return None
         dist = min(wp_dist, t2.horizon_m)
         return ((dist * math.cos(bearing), dist * math.sin(bearing)),
                 "blind", dist, grid, meta)

@@ -7,11 +7,11 @@ consecutive sub-waypoints stays in free space (routes *around* dead-end pockets)
 and is short enough to sit inside Tier-3's local horizon. The expanded patrol
 feeds the unchanged `PatrolRunner` → Tier-2 → Tier-3 pipeline.
 
-Scope (v1): only the **inter-waypoint** segments (Wi→Wi+1, plus Wn→W0 when the
-patrol loops) are globally routed. The one-time lead-in from the robot's current
-pose to the first waypoint still uses Tier-2's greedy projection, so place the
-first waypoint reachable from the start (typically the robot starts on the loop).
-Routing the lead-in is a clean v2 follow-up.
+When ``start_xy`` is given, the lead-in from the robot's current pose to the
+first waypoint is also A*-routed and returned separately in ``ExpandResult.lead_in``
+(not folded into the patrol, so lap/terminal accounting stays on the markers).
+If that lead-in cannot be routed, it is left ``None`` and the hierarchical
+drive falls back to a greedy beeline for the start leg only.
 """
 from __future__ import annotations
 

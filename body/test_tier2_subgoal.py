@@ -151,35 +151,39 @@ class TestFurthestFreePoint(unittest.TestCase):
 
 
 class TestPlanTier2(unittest.TestCase):
-    """plan_tier2 is now a projection: clamp the target onto the local map and
-    snap off not-clear cells. The Pi A* (local_planner) does the real routing."""
+    """plan_tier2 wraps furthest_free_point (same clear-run as production)."""
 
     def setUp(self):
-        self.cfg = Tier2Config(horizon_m=2.0)
+        self.cfg = Tier2Config(horizon_m=2.0, backoff_m=0.30, min_subgoal_m=0.20)
 
     def test_in_range_goal_passthrough(self):
         d = plan_tier2(_clear_grid(), META, 0.0, 1.0, self.cfg)
         self.assertTrue(d.ok)
-        self.assertTrue(d.capped_at_target)        # within horizon → not clamped
+        self.assertTrue(d.capped_at_target)        # clear to waypoint → aim at it
         self.assertAlmostEqual(d.body_xy[0], 1.0, delta=RES)
         self.assertAlmostEqual(d.body_xy[1], 0.0, delta=RES)
 
     def test_beyond_horizon_clamped(self):
         d = plan_tier2(_clear_grid(), META, 0.0, 5.0, self.cfg)   # target past horizon
         self.assertTrue(d.ok)
-        self.assertFalse(d.capped_at_target)       # clamped to the frontier
-        self.assertAlmostEqual(d.body_xy[0], self.cfg.horizon_m, delta=RES)
+        self.assertFalse(d.capped_at_target)       # horizon stop → backoff
+        self.assertAlmostEqual(
+            d.body_xy[0], self.cfg.horizon_m - self.cfg.backoff_m, places=6)
 
-    def test_goal_on_obstacle_snapped(self):
+    def test_blocked_ahead_backs_off(self):
         grid = _clear_grid()
-        for dx in (-RES, 0, RES):
-            for dy in (-RES, 0, RES):
-                _block(grid, 1.0 + dx, dy)          # blocked blob at the goal
-        d = plan_tier2(grid, META, 0.0, 1.0, self.cfg)
+        _block(grid, 1.0, 0.0)
+        d = plan_tier2(grid, META, 0.0, 1.5, self.cfg)
         self.assertTrue(d.ok)
-        self.assertTrue(d.backoff_applied)          # snapped off the blocked cell
-        self.assertEqual(grid[int((d.body_xy[0] + HALF) / RES),
-                              int((d.body_xy[1] + HALF) / RES)], 1)
+        self.assertTrue(d.backoff_applied)
+        self.assertAlmostEqual(d.body_xy[0], 1.0 - self.cfg.backoff_m, delta=2 * RES)
+
+    def test_blocked_at_origin_fails(self):
+        grid = _clear_grid()
+        _block(grid, 0.0, 0.0)
+        d = plan_tier2(grid, META, 0.0, 1.0, self.cfg)
+        self.assertFalse(d.ok)
+        self.assertEqual(d.reason, "blocked_at_origin")
 
     def test_as_dict_roundtrips_fields(self):
         d = plan_tier2(_clear_grid(), META, 0.0, 1.0, self.cfg)

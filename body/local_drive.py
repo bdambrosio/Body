@@ -1,14 +1,16 @@
 """Tier-3 reactive drive (Pi-side).
 
-Drives the robot to one observable subgoal using the live body-frame
-``local_map``, with no dependence on the global map or PF pose. Subscribes
-``body/drive/goto`` + ``body/odom`` + ``body/map/local_2p5d``; publishes
-``body/cmd_vel`` (only while a goal is active — see cmd_vel arbitration in
-docs/drive_tier3_spec.md) and ``body/drive/status`` every tick.
+Drives the robot to one observable subgoal on the live rasterized lidar
+scan (``body/lidar/scan``), with no dependence on the global map or PF pose.
+Subscribes ``body/drive/goto`` + ``body/odom`` + ``body/lidar/scan`` +
+``body/imu``; publishes ``body/cmd_vel`` (only while a goal is active — see
+cmd_vel arbitration in docs/drive_tier3_spec.md) and ``body/drive/status``
+every tick.
 
-v1 (Stage A): straight-line pure-pursuit toward the goal, gated by the
-swept-footprint check. No dynamic avoidance yet — a swept block stops and
-reports BLOCKED for the sender to re-pick. The watchdog/e-stop/motor
+Local A* + pure-pursuit follow the subgoal; the swept-footprint check is a
+last-resort stop. A swept block / no-path reports BLOCKED for the sender to
+re-pick. Cancel/stop publishes ``CANCELED`` for one tick (then ``IDLE``) so
+upstream does not treat revoke as sub-goal success. The watchdog/e-stop/motor
 timeout remain supreme; this process is just another cmd_vel producer.
 """
 from __future__ import annotations
@@ -27,8 +29,8 @@ from body.lib.handoff_gate import HandoffGate
 from body.lib.scan_raster import rasterize_scan
 from body.lib.local_planner import lookahead_on_path, plan_local
 from body.lib.local_drive_core import (
-    STATE_ARRIVED, STATE_BLOCKED, STATE_DRIVING, STATE_FAULT, STATE_IDLE,
-    DriveParams, ImuYawCorrector, odom_to_body, quat_wxyz_to_yaw,
+    STATE_ARRIVED, STATE_BLOCKED, STATE_CANCELED, STATE_DRIVING, STATE_FAULT,
+    STATE_IDLE, DriveParams, ImuYawCorrector, odom_to_body, quat_wxyz_to_yaw,
     rotate_to_heading, steer_to_body_point, swept_block_response, wrap_pi,
 )
 
@@ -135,6 +137,10 @@ def main() -> None:
     last_imu: Optional[Dict[str, Any]] = None
     goal: Optional[Dict[str, Any]] = None
     cur_cmd_id = 0
+    # After cancel/stop clears an active goal, publish CANCELED once before
+    # IDLE so senders (hierarchical drive) do not treat revoke as ARRIVED/IDLE
+    # success. None = nothing to announce.
+    pending_canceled_cmd_id: Optional[int] = None
 
     session = zenoh_helpers.open_session(body_cfg)
     stop = threading.Event()
@@ -155,15 +161,21 @@ def main() -> None:
             last_imu = msg
 
     def on_goto(_k: str, msg: Dict[str, Any]) -> None:
-        nonlocal goal, cur_cmd_id
+        nonlocal goal, cur_cmd_id, pending_canceled_cmd_id
         kind = str(msg.get("kind", "goto"))
         with lock:
             if kind in ("cancel", "stop"):
                 # Advance the supersede watermark to the cancel's own id so a
                 # delayed/duplicate goto with an older id can't re-arm the
-                # goal the operator just revoked.
+                # goal the operator just revoked. Announce CANCELED under the
+                # *revoked* goal's cmd_id so senders still watching that id
+                # see revoke (not a later IDLE that looks like success).
+                had_goal = goal is not None
+                revoked_id = int(goal.get("cmd_id", cur_cmd_id)) if had_goal else None
                 cur_cmd_id = max(cur_cmd_id, int(msg.get("cmd_id", 0)))
                 goal = None
+                if had_goal and revoked_id is not None:
+                    pending_canceled_cmd_id = revoked_id
                 return
             cmd_id = int(msg.get("cmd_id", 0))
             if cmd_id < cur_cmd_id:
@@ -173,6 +185,7 @@ def main() -> None:
                 return
             goal = dict(msg)
             cur_cmd_id = cmd_id
+            pending_canceled_cmd_id = None  # new goto supersedes a pending cancel announce
 
     zenoh_helpers.declare_subscriber_json(session, "body/odom", on_odom)
     zenoh_helpers.declare_subscriber_json(session, "body/lidar/scan", on_scan)
@@ -237,7 +250,15 @@ def main() -> None:
                 # 500 ms timeout (~9 cm at v_max).
                 publish_cmd(0.0, 0.0)
                 was_active = False
-            publish_status(STATE_IDLE, cmd_id=cmd_id)
+            with lock:
+                canceled_id = pending_canceled_cmd_id
+                if canceled_id is not None:
+                    pending_canceled_cmd_id = None
+            if canceled_id is not None:
+                # One-tick CANCELED (mirrors ARRIVED), then IDLE on later ticks.
+                publish_status(STATE_CANCELED, cmd_id=canceled_id)
+            else:
+                publish_status(STATE_IDLE, cmd_id=cmd_id)
             next_tick = _sleep_to(next_tick, period)
             continue
         was_active = True

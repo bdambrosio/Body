@@ -965,9 +965,11 @@ class NavMainWindow(QMainWindow):
             self._locate_act.blockSignals(blk)
         self._shared_view.set_locate_mode(False)
 
-        # relocate_at rewrites the pose frame, like relocate — stop motion.
-        # (A running hierarchical drive re-picks on its own: the relocate
-        # bumps the provider's discrete correction_seq.)
+        # Relocate rewrites the world frame. The hierarchical drive follows an
+        # *expanded* route (exec_patrol + lead_in) that is NOT the shared-view
+        # patrol — transforming only the authored patrol would leave stale
+        # carrots. Stop hier (cancels Tier-3 goto) and require Go again.
+        self._halt_hier_for_pose_rewrite()
         self.chassis.set_cmd_vel(0.0, 0.0)
 
         result = dict(self.fuser.request_relocate_at(x_w, y_w, reason="ui_locate"))
@@ -984,7 +986,8 @@ class NavMainWindow(QMainWindow):
                 + (
                     f"\n\nShifted {shift} waypoint(s) / goal pin to match "
                     f"the new frame." if shift > 0 else ""
-                ),
+                )
+                + "\n\nHierarchical drive stopped — press Go to resume.",
             )
         else:
             QMessageBox.warning(
@@ -1029,15 +1032,16 @@ class NavMainWindow(QMainWindow):
         QMessageBox.information(
             self, "Re-localize",
             f"Recognized checkpoint {m.checkpoint_id} "
-            f"(inlier {m.inlier_frac:.2f}) — pose seated there.")
+            f"(inlier {m.inlier_frac:.2f}) — pose seated there.\n\n"
+            "Hierarchical drive stopped — press Go to resume.")
         return True
 
     def _on_relocate(self) -> None:
         # Prefer checkpoint recognition (robust on a metrically-loose map);
         # fall back to the global scan-match only when no checkpoint matches.
-        # Zero cmd_vel first — a relocate rewrites the world offset. (A
-        # running hierarchical drive re-picks on its own: the relocate bumps
-        # the provider's discrete correction_seq.)
+        # Relocate rewrites the world frame — stop hierarchical drive (its
+        # expanded route is not the shared-view patrol) and cancel Tier-3.
+        self._halt_hier_for_pose_rewrite()
         self.chassis.set_cmd_vel(0.0, 0.0)
         if self._try_checkpoint_relocate():
             return
@@ -1065,7 +1069,8 @@ class NavMainWindow(QMainWindow):
                 + (
                     f"\n\nShifted {shift} waypoint(s) / goal pin to "
                     f"match the new frame." if shift > 0 else ""
-                ),
+                )
+                + "\n\nHierarchical drive stopped — press Go to resume.",
             )
         else:
             QMessageBox.warning(
@@ -1076,6 +1081,17 @@ class NavMainWindow(QMainWindow):
                     if k not in ("success", "reason")
                 ),
             )
+
+    def _halt_hier_for_pose_rewrite(self) -> None:
+        """Stop hierarchical drive when the world pose frame is rewritten.
+
+        Go expands the authored patrol into a separate exec route + lead-in.
+        Relocate only transforms the shared-view patrol; leaving hier running
+        would chase stale carrots. Cancel also revokes the Tier-3 goto (chassis
+        cmd_vel zero alone does not stop Pi-owned motion).
+        """
+        if self._hier_drive is not None:
+            self._stop_hier_drive()
 
     def _apply_relocate_to_patrol(self, result: Dict[str, Any]) -> int:
         """Transform the active patrol's waypoints and the single goal

@@ -1,31 +1,20 @@
-"""Mission tracing — JSONL artifact for post-hoc review.
+"""Mission / session tracing — JSONL artifact for post-hoc review.
 
-The audience for this trace is Claude reviewing/debugging a patrol or
-mission run after the fact, NOT a live operator. The artifact is the
-trace file; there's no live UI consumer in v1.
+The audience for this trace is a reviewer debugging a patrol or drive run
+after the fact, NOT a live operator. The artifact is the trace file; there's
+no live UI consumer required.
 
 Layout
 ------
 
-One trace file per mission, opened on `Mission.start` and closed on
-the terminal transition (ARRIVED/CANCELED/FAILED).
+One trace file per session when opened by the nav UI (relocate, health, and
+related events). Hierarchical drive does **not** yet open a dedicated per-Go
+mission trace; those breadcrumbs are primarily logs + handoff inspector.
 
     ~/Body/sessions/<session_id>/trace_<UTC ts>.jsonl
 
-First line is a single header record (kind="header") with the run
-context (patrol definition, frozen configs, git sha, snapshot bundle
-path at start, etc.). Subsequent lines are `TraceEvent` dicts —
-edge-triggered where possible to keep the file small and readable.
-
-    {"kind": "header", "ts": ..., "session_id": ..., "configs": {...},
-     "patrol": {...|null}, "git_sha": "...", "snapshot_at_start": "..."}
-    {"ts": ..., "category": "mission", "level": "info",
-     "event": "start", "data": {"pose": [x, y, theta], ...}}
-
-Every event carries `pose: [x, y, theta]` in its `data` field (stamped
-at emit time via an attached pose sampler) so a reviewer doesn't have
-to walk back through the file to know where the robot was at the
-moment of the event.
+First line may be a header record (kind="header") with run context.
+Subsequent lines are `TraceEvent` dicts — edge-triggered where possible.
 
 Auto-snapshot
 -------------
@@ -33,16 +22,13 @@ Auto-snapshot
 A small set of (category, event) tuples in `AUTO_SNAP_EVENTS` triggers
 the registered snapshot callback when emitted. The bundle path the
 callback returns is stamped into the triggering event's `data` as
-`auto_snapshot`. This gives a reviewer a costmap + map layers at the
-moment of trouble without needing the operator to click Save Snapshot.
+`auto_snapshot`.
 
 Threading
 ---------
 
-`emit()` is thread-safe. Mission transitions happen on the UI thread;
-the liveness watcher also runs on the UI thread; future producers
-(SLAM corrections, recovery primitives running off-thread) can call
-emit() from any thread.
+`emit()` is thread-safe. UI-thread producers (relocate, liveness) call it
+from the Qt thread; other producers may call from any thread.
 
 The file handle is line-buffered, so a `shutil.copy` of an active
 trace into a snapshot bundle yields a well-formed prefix.

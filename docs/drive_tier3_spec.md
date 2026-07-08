@@ -48,6 +48,11 @@ Published every control tick.
 |---|---|---|
 | `cmd_id` | int | the goal being serviced (0 = none) |
 | `state` | str | `IDLE`\|`DRIVING`\|`ARRIVED`\|`BLOCKED`\|`CANCELED`\|`FAULT` |
+
+`ARRIVED` is published for one tick, then the goal drops → `IDLE`.
+`CANCELED` is published for one tick after `cancel`/`stop` clears an **active**
+goal (under the revoked goal's `cmd_id`), then `IDLE`. Senders that treat
+`IDLE@cmd_id` as "sub-goal done" must handle `CANCELED` as revoke, not success.
 | `goal_body_xy` | [float,float]? | active goal in the *live* body frame (for display) |
 | `dist_remaining_m` | float | range to goal |
 | `v_mps`, `omega_radps` | float | commanded velocity this tick |

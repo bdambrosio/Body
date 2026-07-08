@@ -97,7 +97,10 @@ as a last-resort stop** (`drive_safety`, effective radius == the A\* footprint).
 Re-plans every tick. Reports:
 
 - `state` — IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT. (ARRIVED is
-  published for a *single* tick, then drops the goal → IDLE.)
+  published for a *single* tick, then drops the goal → IDLE. **CANCELED** is
+  likewise one tick after cancel/stop clears an active goal — under the
+  *revoked* goal's `cmd_id` — then IDLE; senders must not treat post-cancel
+  IDLE as sub-goal success.)
 - `blocked_reason` — `no_path` | `boxed_in` | `swept_block` | `no_progress` |
   `deadline` | `odom_stale` | `no_scan`. (`deadline` = the per-goal hard
   deadline `goal_deadline_s` expired — catches rotate/drive dithers the
