@@ -127,7 +127,7 @@ flowchart LR
 ```
 
 1. Start **`zenohd`** on the Pi (or your dev box for all-local tests).
-2. Start **`body.launcher`** on the Pi (motor, lidar, oakd, watchdog processes).
+2. Start **`body.launcher`** on the Pi (watchdog, motor, lidar, IMU, oakd, local_map, local_drive — see `body/launcher.py`).
 3. Optionally start **`desktop.nav`** (or `desktop.mapping` for the first map, or a Jill-side bridge) on a laptop so **`body/heartbeat`** and **`body/cmd_vel`** are published. Without heartbeats, the watchdog will treat the robot as not under command and can trigger **`body/emergency_stop`**.
 
 ## Running the stack (`body.launcher`)

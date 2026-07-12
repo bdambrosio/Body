@@ -101,7 +101,7 @@ Re-plans every tick. Reports:
   likewise one tick after cancel/stop clears an active goal — under the
   *revoked* goal's `cmd_id` — then IDLE; senders must not treat post-cancel
   IDLE as sub-goal success.)
-- `blocked_reason` — `no_path` | `boxed_in` | `swept_block` | `no_progress` |
+- `blocked_reason` — `no_path` | `boxed_in` | `swept_block` | `depth_block` | `no_progress` |
   `deadline` | `odom_stale` | `no_scan`. (`deadline` = the per-goal hard
   deadline `goal_deadline_s` expired — catches rotate/drive dithers the
   translation-gated no-progress watchdog can't see; the goal stays active so

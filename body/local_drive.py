@@ -3,15 +3,18 @@
 Drives the robot to one observable subgoal on the live rasterized lidar
 scan (``body/lidar/scan``), with no dependence on the global map or PF pose.
 Subscribes ``body/drive/goto`` + ``body/odom`` + ``body/lidar/scan`` +
-``body/imu``; publishes ``body/cmd_vel`` (only while a goal is active — see
-cmd_vel arbitration in docs/drive_tier3_spec.md) and ``body/drive/status``
-every tick.
+``body/imu`` + ``body/oakd/depth``; publishes ``body/cmd_vel`` (only while a
+goal is active — see cmd_vel arbitration in docs/drive_tier3_spec.md) and
+``body/drive/status`` every tick.
 
-Local A* + pure-pursuit follow the subgoal; the swept-footprint check is a
-last-resort stop. A swept block / no-path reports BLOCKED for the sender to
-re-pick. Cancel/stop publishes ``CANCELED`` for one tick (then ``IDLE``) so
-upstream does not treat revoke as sub-goal success. The watchdog/e-stop/motor
-timeout remain supreme; this process is just another cmd_vel producer.
+Local A* + pure-pursuit follow the subgoal on the lidar raster; the
+swept-footprint check and a short-range **depth near-field veto** are
+last-resort stops (they never steer). Depth does **not** enter the planner —
+see docs/drive_tier3_spec.md. A swept/depth block / no-path reports BLOCKED
+for the sender to re-pick. Cancel/stop publishes ``CANCELED`` for one tick
+(then ``IDLE``) so upstream does not treat revoke as sub-goal success. The
+watchdog/e-stop/motor timeout remain supreme; this process is just another
+cmd_vel producer.
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ from typing import Any, Dict, Optional
 
 from body.lib import drive_config, schemas, zenoh_helpers
 from body.lib.buildinfo import git_sha
+from body.lib.depth_veto import depth_nearfield_blocked
 from body.lib.drive_safety import FootprintConfig, swept_path_blocked
 from body.lib.handoff_gate import HandoffGate
 from body.lib.scan_raster import rasterize_scan
@@ -89,6 +93,7 @@ def main() -> None:
     scan_cfg = cfg.get("scan", {})
     raster = drive_config.scan_raster_config(body_cfg)
     local_plan_cfg = drive_config.local_plan_config(body_cfg)
+    depth_veto_cfg = drive_config.depth_veto_config(body_cfg)
     lookahead_m = float(cfg.get("local_planner", {}).get("lookahead_m", 0.4))
 
     # Last-resort swept veto (drive_safety). It must NOT be stricter than the
@@ -135,6 +140,7 @@ def main() -> None:
     last_odom: Optional[Dict[str, Any]] = None
     last_scan: Optional[Dict[str, Any]] = None
     last_imu: Optional[Dict[str, Any]] = None
+    last_depth: Optional[Dict[str, Any]] = None
     goal: Optional[Dict[str, Any]] = None
     cur_cmd_id = 0
     # After cancel/stop clears an active goal, publish CANCELED once before
@@ -159,6 +165,11 @@ def main() -> None:
         nonlocal last_imu
         with lock:
             last_imu = msg
+
+    def on_depth(_k: str, msg: Dict[str, Any]) -> None:
+        nonlocal last_depth
+        with lock:
+            last_depth = msg
 
     def on_goto(_k: str, msg: Dict[str, Any]) -> None:
         nonlocal goal, cur_cmd_id, pending_canceled_cmd_id
@@ -190,6 +201,7 @@ def main() -> None:
     zenoh_helpers.declare_subscriber_json(session, "body/odom", on_odom)
     zenoh_helpers.declare_subscriber_json(session, "body/lidar/scan", on_scan)
     zenoh_helpers.declare_subscriber_json(session, "body/imu", on_imu)
+    zenoh_helpers.declare_subscriber_json(session, "body/oakd/depth", on_depth)
     zenoh_helpers.declare_subscriber_json(session, "body/drive/goto", on_goto)
 
     # HO-3 handoff gate (Tier-3 → motors): records each command + obeys the
@@ -230,8 +242,13 @@ def main() -> None:
     goal_started_at = 0.0                   # for the per-goal deadline
     was_active = False                      # had a goal last tick (stop-on-cancel)
     yaw_corr = ImuYawCorrector()            # IMU-vs-wheel yaw divergence per goal
+    depth_hit_streak = 0                    # consecutive depth-veto hit frames
 
-    print(f"local_drive: up; control_hz={control_hz} v_max={params.v_max}", flush=True)
+    print(
+        f"local_drive: up; control_hz={control_hz} v_max={params.v_max} "
+        f"depth_veto={'on' if depth_veto_cfg.enabled else 'off'}",
+        flush=True,
+    )
     next_tick = time.monotonic()
     while not stop.is_set():
         now_wall = time.time()
@@ -241,6 +258,7 @@ def main() -> None:
             odom = dict(last_odom) if last_odom is not None else None
             scan = last_scan
             imu = last_imu
+            depth = last_depth
             cmd_id = cur_cmd_id
 
         if g is None:
@@ -273,6 +291,7 @@ def main() -> None:
             realign_since = None
             goal_started_at = now_mono
             yaw_corr.reset()    # goal frame = odom frame as of now
+            depth_hit_streak = 0
 
         gx, gy = float(g["x_m"]), float(g["y_m"])
         tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
@@ -368,10 +387,19 @@ def main() -> None:
         look = lookahead_on_path(plan.path_body, lookahead_m) or (bx, by)
         v, omega, _ld, _lb, rotating = steer_to_body_point(look, gp, rotating)
 
-        # Last-resort safety veto — A* won't route through lethal, but a
-        # dynamic/new obstacle can appear in the followed arc between replans.
-        # Strictly subordinate: it only stops, never steers.
+        # Last-resort safety vetoes — A* won't route through lethal lidar, but
+        # a dynamic/new obstacle can appear in the followed arc between
+        # replans, and the lidar plane misses near-ground structure the OAK
+        # sees. Both only stop, never steer.
         blocked = swept_path_blocked(grid, meta, v_mps=v, omega_radps=omega, config=foot)
+        depth_blocked, depth_hit_streak = depth_nearfield_blocked(
+            depth,
+            now_wall=now_wall,
+            v_mps=v,
+            omega_radps=omega,
+            cfg=depth_veto_cfg,
+            streak=depth_hit_streak,
+        )
 
         # HO-3 Tier-3 → motors: record what we're about to command. Attach the
         # costmap only when BP3 is armed — serializing 64×64 cells to JSON at
@@ -380,9 +408,20 @@ def main() -> None:
         gate.record(3, schemas.handoff_t3(
             cmd_id=cmd_id, goal_body=(bx, by), plan_reason=plan.reason,
             path_body=plan.path_body, lookahead=look, v_mps=v, omega_radps=omega,
-            swept_blocked=blocked,
+            swept_blocked=blocked or depth_blocked,
             grid_rows=(grid.tolist() if gate.is_armed(3) else None),
             meta=meta))
+
+        if depth_blocked:
+            # Something in the camera near-field slab (pet, chair rail, …).
+            # Do not realign — yaw rarely clears a head-on soft obstacle.
+            publish_cmd(0.0, 0.0)
+            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
+                           dist=dist, reason="depth_block", mode="follow")
+            best_dist = dist
+            best_dist_at = now_mono
+            next_tick = _sleep_to(next_tick, period)
+            continue
 
         if blocked:
             # The forward arc clips a wall. A pure rotation is swept-free (the

@@ -1,17 +1,19 @@
 # Body: Robot Body Software Project Specification
 
-**Version:** 0.2 draft
-**Date:** 2026-04-16
+**Version:** 0.3
+**Date:** 2026-07-12 (process inventory refreshed; original draft 2026-04-16)
 **Author:** Bruce + Claude (initial spec generation)
 **Hardware target:** Raspberry Pi 5 (assumed), differential drive chassis
 **Language:** Python 3.11+
 **Transport:** Zenoh (pyzenoh)
 
+**Authoritative process list:** `body/launcher.py` (`PROCESSES`). If this document and the launcher disagree, trust the launcher.
+
 ---
 
 ## 1. Purpose
 
-Body is the onboard software stack for a differential-drive robot chassis. It provides sensor acquisition, motor control, and safety supervision as a set of independent communicating processes linked by Zenoh. The desktop agent (Jill, running on the CW workstation) connects to the same Zenoh network and interacts with Body exclusively through published topics. Body has no knowledge of Jill's internals; Jill has no knowledge of Body's process structure. The Zenoh topic schema defined in this document is the contract between them.
+Body is the onboard software stack for a differential-drive robot chassis. It provides sensor acquisition, motor control, local perception, Tier-3 reactive drive, and safety supervision as a set of independent communicating processes linked by Zenoh. The desktop agent (Jill / operator `desktop.nav`, running on the CW workstation or laptop) connects to the same Zenoh network and interacts with Body exclusively through published topics. Body has no knowledge of Jill's internals; Jill has no knowledge of Body's process structure. The Zenoh topic schema defined in this document is the contract between them.
 
 ## 2. Hardware Inventory
 
@@ -42,28 +44,31 @@ These assignments avoid SPI/I2C/UART pins. Adjust as needed during physical buil
 ## 3. Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Raspberry Pi                                       │
-│                                                     │
-│  ┌──────────────┐  ┌─────────────┐  ┌───────────┐  │
-│  │ motor_       │  │ lidar_      │  │ oakd_     │  │
-│  │ controller   │  │ driver      │  │ driver    │  │
-│  └──────┬───────┘  └──────┬──────┘  └─────┬─────┘  │
-│         │                 │               │         │
-│         └────────┬────────┴───────┬───────┘         │
-│                  │   Zenoh bus    │                  │
-│            ┌─────┴─────┐         │                  │
-│            │ watchdog   │         │                  │
-│            └─────┬─────┘         │                  │
-│                  │               │                  │
-└──────────────────┼───────────────┼──────────────────┘
-                   │               │
-              ─────┴───────────────┴───── network
-                          │
-              ┌───────────┴───────────┐
-              │  Desktop workstation  │
-              │  (Jill / CW)          │
-              └───────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Raspberry Pi (`python -m body.launcher`)                    │
+│                                                              │
+│  sensors/actuators          perception / drive               │
+│  ┌────────────┐ ┌────────┐  ┌───────────┐ ┌──────────────┐ │
+│  │ motor_     │ │ lidar_ │  │ local_map │ │ local_drive  │ │
+│  │ controller │ │ driver │  │ (2.5D)    │ │ (Tier-3)     │ │
+│  └─────┬──────┘ └───┬────┘  └─────┬─────┘ └──────┬───────┘ │
+│  ┌─────┴──────┐ ┌───┴────┐        │              │         │
+│  │ imu_driver │ │ oakd_  │        │              │         │
+│  └─────┬──────┘ │ driver │        │              │         │
+│        │        └───┬────┘        │              │         │
+│        └────────────┴───────┬─────┴──────────────┘         │
+│                             │  Zenoh bus                   │
+│                       ┌─────┴─────┐                        │
+│                       │ watchdog  │                        │
+│                       └─────┬─────┘                        │
+└─────────────────────────────┼──────────────────────────────┘
+                              │
+                     ─────────┴───────── network
+                              │
+                   ┌──────────┴──────────┐
+                   │ Desktop workstation │
+                   │ desktop.nav / Jill  │
+                   └─────────────────────┘
 ```
 
 All inter-process communication, both local (Pi-to-Pi) and remote (Pi-to-desktop), uses the same Zenoh topics. There is no separate local IPC mechanism.
@@ -72,12 +77,16 @@ All inter-process communication, both local (Pi-to-Pi) and remote (Pi-to-desktop
 
 | Process | Owns | Publishes | Subscribes |
 |---|---|---|---|
+| `watchdog` | safety authority | `body/status`, `body/emergency_stop` | `body/heartbeat`, `body/cmd_vel`, `body/cmd_direct`, monitored process topics (`body/odom`, `body/lidar/scan`, `body/imu`) |
 | `motor_controller` | MDD10A GPIO, encoder GPIO | `body/odom`, `body/motor_state` | `body/cmd_vel`, `body/cmd_direct`, `body/emergency_stop`, `body/status` |
 | `lidar_driver` | STL-19P USB | `body/lidar/scan` | — |
+| `imu_driver` | BNO085 i2c + RST GPIO | `body/imu` | `body/imu/calibrate` |
 | `oakd_driver` | OAK-D-Lite USB | `body/oakd/depth`, `body/oakd/rgb` (optional) | `body/oakd/config` (optional) |
-| `imu_driver` | BNO085 i2c + RST GPIO | `body/imu` | — |
-| `watchdog` | safety authority | `body/status` | `body/heartbeat`, all `body/*` for monitoring |
+| `local_map` | egocentric lidar+depth fusion | `body/map/local_2p5d` | `body/lidar/scan`, `body/oakd/depth`, `body/odom` |
+| `local_drive` | Tier-3 reactive drive | `body/cmd_vel` (while goal active), `body/drive/status` | `body/drive/goto`, `body/odom`, `body/lidar/scan`, `body/imu`, `body/oakd/depth` (near-field veto only) |
 | `launcher` | process lifecycle | — | — |
+
+**Note — Tier-3 and `local_map`:** `local_drive` rasterizes the **live** `body/lidar/scan` for planning; it does **not** consume `body/map/local_2p5d`. That split is intentional — see [drive_tier3_spec.md](drive_tier3_spec.md) (fused map lags while moving). A separate **depth near-field veto** (`local_drive.depth_veto`) may stop on fresh `body/oakd/depth` without feeding depth into A\*. `local_map` remains for desktop visualization, sweep missions, and future consumers. Details: [local_map_spec.md](local_map_spec.md), [tier_contract.md](tier_contract.md).
 
 ### 3.2 Design Principles
 
@@ -114,21 +123,29 @@ All Body topics live under the `body/` prefix.
 
 ```
 body/
-  cmd_vel            # commanded twist velocity (from Jill)
-  cmd_direct         # direct wheel velocities (from Jill, low-level override)
-  heartbeat          # periodic heartbeat from Jill
+  cmd_vel            # commanded twist (desktop / Jill / local_drive)
+  cmd_direct         # direct wheel velocities (bring-up / calibration)
+  heartbeat          # periodic heartbeat from desktop / Jill
   odom               # encoder-derived odometry
   motor_state        # motor driver status
+  imu                # BNO085 fused orientation (primary IMU; see imu_driver_spec)
+  imu/calibrate      # request IMU calibration motion / status
   lidar/
     scan             # 2D laser scan
   oakd/
-    depth            # depth frame or point cloud
-    imu              # IMU readings
+    depth            # depth frame
     rgb              # color frame (optional, high bandwidth)
     config           # runtime pipeline reconfiguration (optional)
+  map/
+    local_2p5d       # egocentric fused height + optional driveable grid
+  drive/
+    goto             # Tier-3 goal / cancel / stop (desktop → local_drive)
+    status           # Tier-3 state machine feedback
   status             # system-level health from watchdog
   emergency_stop     # published by watchdog on safety violation
 ```
+
+Retired: `body/oakd/imu` — do not use; orientation is `body/imu` only.
 
 ## 5. Message Schemas
 
@@ -452,36 +469,47 @@ MONITORED_TOPICS = [
 - Monitors subprocess health. On unexpected exit, restarts with backoff (1s, 2s, 4s, max 30s).
 - On SIGTERM/SIGINT: sends SIGTERM to all children, waits up to 5s, then SIGKILL.
 
-**Process list (default):**
+**Process list (default):** matches `body/launcher.py` (module form):
 ```
 PROCESSES = [
-    {"name": "watchdog",         "cmd": ["python3", "watchdog.py"]},
-    {"name": "motor_controller", "cmd": ["python3", "motor_controller.py"]},
-    {"name": "lidar_driver",     "cmd": ["python3", "lidar_driver.py"]},
-    {"name": "oakd_driver",      "cmd": ["python3", "oakd_driver.py"]},
+    {"name": "watchdog",         "cmd": ["python", "-m", "body.watchdog"]},
+    {"name": "motor_controller", "cmd": ["python", "-m", "body.motor_controller"]},
+    {"name": "lidar_driver",     "cmd": ["python", "-m", "body.lidar_driver"]},
+    {"name": "imu_driver",       "cmd": ["python", "-m", "body.imu_driver"]},
+    {"name": "oakd_driver",      "cmd": ["python", "-m", "body.oakd_driver"]},
+    {"name": "local_map",        "cmd": ["python", "-m", "body.local_map"]},
+    {"name": "local_drive",      "cmd": ["python", "-m", "body.local_drive"]},
 ]
 ```
 
-Watchdog starts first. Motor controller before sensors (so it's listening for emergency stop before anything else is live).
+Watchdog starts first. Motor controller early (so it's listening for emergency stop before drive commands are live). `local_map` / `local_drive` may idle without publishing when `local_map.enabled` / `local_drive.enabled` is false (avoids launcher respawn storms).
 
 **Stub deliverable:** Fully functional launcher. This is not a stub — the launcher itself is hardware-independent and can be implemented completely in the first pass.
 
 ## 7. Project Structure
 
 ```
-body/
+Body/                      # repository root
   README.md
   config.json              # zenoh connection, hardware params
-  launcher.py
-  watchdog.py
-  motor_controller.py
-  lidar_driver.py
-  oakd_driver.py
-  lib/
-    zenoh_helpers.py       # session setup, common publish/subscribe patterns
-    schemas.py             # message construction/validation helpers
-    diff_drive.py          # kinematic math (twist↔wheel, odometry integration)
-  requirements.txt         # zenoh, gpiozero, depthai, pyserial
+  requirements.txt         # Pi-side pip deps (zenoh, depthai, opencv, numpy, pyserial)
+  body/
+    launcher.py
+    watchdog.py
+    motor_controller.py
+    lidar_driver.py
+    imu_driver.py
+    oakd_driver.py
+    local_map.py
+    local_drive.py
+    lib/
+      zenoh_helpers.py     # session setup, common publish/subscribe patterns
+      schemas.py           # message construction helpers
+      diff_drive.py        # kinematic math (twist↔wheel, odometry integration)
+      drive_config.py      # shared Tier-3 config builders (contract I8)
+  desktop/                 # operator apps + libraries (see README)
+  docs/                    # specs (this file, tier_contract, driver specs, …)
+  deploy/                  # systemd, udev, NETWORK.md
 ```
 
 ## 8. Desktop-Side Assumptions

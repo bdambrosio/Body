@@ -56,7 +56,7 @@ goal (under the revoked goal's `cmd_id`), then `IDLE`. Senders that treat
 | `goal_body_xy` | [float,float]? | active goal in the *live* body frame (for display) |
 | `dist_remaining_m` | float | range to goal |
 | `v_mps`, `omega_radps` | float | commanded velocity this tick |
-| `blocked_reason` | str? | `no_path`\|`boxed_in`\|`swept_block`\|`no_progress`\|`deadline`\|`no_scan` (FAULT carries `odom_stale`) |
+| `blocked_reason` | str? | `no_path`\|`boxed_in`\|`swept_block`\|`depth_block`\|`no_progress`\|`deadline`\|`no_scan` (FAULT carries `odom_stale`) |
 | `mode` | str? | `follow`\|`plan`\|`realign`\|`held` |
 | `path_body_xy` | list? | the A\* path being followed (display/inspector) |
 | `build` | str? | Pi git sha — the desktop flags a stale deploy |
@@ -94,6 +94,15 @@ Each control tick (10 Hz):
    arc between replans → re-aim in place toward the lookahead
    (`mode=realign`, bounded by `swept_realign_timeout_s`), else stop +
    `BLOCKED:swept_block`. The veto only stops, never steers.
+5. **Depth near-field veto** (`body/lib/depth_veto.py`, config
+   `local_drive.depth_veto`): while translating, if fresh `body/oakd/depth`
+   shows enough obstacle-slab hits in a short forward envelope (default
+   ~0.08–0.80 m, footprint half-width), stop immediately with
+   `BLOCKED:depth_block` (no realign — head-on soft obstacles rarely clear
+   by yaw). Fail-open when depth is missing/stale/rotating fast so a dead
+   OAK does not freeze the robot; lidar still owns planning. This is **not**
+   consumption of `body/map/local_2p5d` — the fused map still lags while
+   moving and stays off the planner path.
 
 Terminal conditions:
 

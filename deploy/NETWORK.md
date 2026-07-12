@@ -5,7 +5,7 @@ How the Raspberry Pi's WiFi should be configured for stable zenoh communication 
 ## Topology
 
 - **Pi** runs `body-launcher.service` and publishes the `body/**` zenoh topics.
-- **Desktop** runs `desktop.nav` (or `desktop.chassis` / `desktop.world_map`) and connects to the zenoh router.
+- **Desktop** runs `desktop.nav` (or `desktop.mapping` / `desktop.map_editor` / `desktop.pi_drive`) and connects to the zenoh router. Standalone `desktop.chassis` / `desktop.world_map` apps were removed 2026-06 — see `desktop/CLEANUP.md`.
 - **Bot router** is a [GL.iNet GL-MT3000 (Beryl AX)](https://www.gl-inet.com/products/gl-mt3000/) travel router carried with the bot. It exposes:
   - SSID `GL-MT3000-bee` (2.4 GHz) — **use this for the Pi**
   - SSID `GL-MT3000-bee-5G` (5 GHz) — **avoid for the Pi**; less range through walls
