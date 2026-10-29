@@ -335,10 +335,16 @@ class DepthVetoTracker:
         self.cfg = cfg
         self.streak = 0
         self._last_key: Optional[Any] = None
+        # Evidence for the last scored frame, reported with a depth_block so a
+        # desktop observer can tie the veto to a depth frame and camera image.
+        self.last_hits = 0
+        self.last_seq: Optional[int] = None
 
     def reset(self) -> None:
         self.streak = 0
         self._last_key = None
+        self.last_hits = 0
+        self.last_seq = None
 
     def update(
         self, depth_msg: Optional[Dict[str, Any]], *, now_wall: float,
@@ -355,6 +361,10 @@ class DepthVetoTracker:
         hits = depth_frame_hits(depth_msg, now_wall=now_wall, v_mps=v_mps,
                                 omega_radps=omega_radps, cfg=cfg)
         hit = hits >= cfg.min_hits
+        self.last_hits = int(hits)
+        seq = depth_msg.get("seq")
+        self.last_seq = (int(seq) if isinstance(seq, (int, float))
+                         and not isinstance(seq, bool) else None)
         key = depth_frame_key(depth_msg)
         if key is None or key != self._last_key:
             self.streak = self.streak + 1 if hit else 0

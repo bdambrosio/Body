@@ -195,6 +195,25 @@ class HierConfig:
     tier2_cfg: Tier2Config = field(default_factory=Tier2Config)
 
 
+@dataclass(frozen=True)
+class BlockAdvisory:
+    """Slow, advisory read of a block (e.g. a VLM looking at the camera frame).
+
+    Caution-only by construction — it can stop retries, never cause motion:
+      * ``hold``  — something that moves on its own (person, door): send no
+        retry gotos for ``hold_s``, then resume the normal retry cadence.
+      * ``pause`` — a static obstacle: give up the retry window now and wait
+        for the operator, as if the window had run out.
+      * ``note``  — no change in behaviour; ``label`` is shown to the operator.
+    """
+    action: str            # "hold" | "pause" | "note"
+    label: str
+    hold_s: float = 0.0
+
+
+ADVISORY_ACTIONS = ("hold", "pause", "note")
+
+
 def _dist(a: Pose, wp_xy: Tuple[float, float]) -> float:
     return math.hypot(a[0] - wp_xy[0], a[1] - wp_xy[1])
 
@@ -273,6 +292,14 @@ class HierarchicalDrive:
         self._block_last_retry: float = 0.0
         self._block_gave_up = False
         self._block_reason: Optional[str] = None
+        # Block runs are numbered so a slow advisory (answered seconds later)
+        # only applies to the run it was asked about — not to a later block
+        # after the robot has moved on.
+        self._block_run: int = 0
+        self._block_run_reason: Optional[str] = None   # reason that opened the run
+        self._advisory: Optional[BlockAdvisory] = None
+        self._advisory_run: int = -1
+        self._advisory_hold_until: float = 0.0
         self._tick_now: float = 0.0   # tick() stamp, for handlers entered mid-tick
 
     # ── Control ──────────────────────────────────────────────────────
@@ -385,7 +412,54 @@ class HierarchicalDrive:
         if self._block_started_at is None:
             self._block_started_at = self._tick_now
             self._block_last_retry = self._tick_now
+            self._block_run += 1
+            self._block_run_reason = reason
         self._to(HierState.BLOCKED)
+
+    # ── Block advisories (slow, caution-only) ────────────────────────
+
+    def block_run(self) -> int:
+        """Id of the current (or last) consecutive-block run. Increments when a
+        new run starts; retries inside a run keep the same id."""
+        return self._block_run
+
+    def apply_block_advisory(self, run: int, adv: BlockAdvisory) -> bool:
+        """Attach an advisory to block run ``run``. Ignored (returns False)
+        unless that run is still live — no sub-goal progress since it started
+        — so a late answer about a block the robot already got past can't stop
+        it now. A run is live across its own retries; if a retry is driving
+        when a hold/pause lands, the goal is revoked and we go back to BLOCKED
+        (the only effect is less motion)."""
+        if adv.action not in ADVISORY_ACTIONS:
+            raise ValueError(f"unknown advisory action {adv.action!r}")
+        if not self._block_run_live(run):
+            return False
+        self._advisory = adv
+        self._advisory_run = run
+        if adv.action != "note" and self._state is not HierState.BLOCKED:
+            self._enter_blocked(self._block_reason or self._block_run_reason
+                                or "advisory")
+        if adv.action == "hold":
+            self._advisory_hold_until = self._tick_now + max(0.0, adv.hold_s)
+            logger.info("hier: advisory hold %.1fs (%s)", adv.hold_s, adv.label)
+        elif adv.action == "pause" and not self._block_gave_up:
+            self._block_gave_up = True
+            self._io.cancel()
+            logger.warning("hier: blocked (%s) — advisory says %s, pausing for "
+                           "operator resume", self._block_reason, adv.label)
+        return True
+
+    def block_advisory(self) -> Optional[BlockAdvisory]:
+        """The advisory for the current block run, while that run is live."""
+        if self._advisory_run == self._block_run and self._block_run_live(self._block_run):
+            return self._advisory
+        return None
+
+    def _block_run_live(self, run: int) -> bool:
+        return (run == self._block_run
+                and self._block_started_at is not None
+                and self._state in (HierState.BLOCKED, HierState.SELECT_SUBGOAL,
+                                    HierState.DRIVING_SUBGOAL))
 
     # ── Carrot: the one-time lead-in prefix, then the patrol runner ──────
 
@@ -819,6 +893,8 @@ class HierarchicalDrive:
         # Leg deadline / repeated rejection are terminal for the leg: retrying
         # would just re-trip them (and churn goto+cancel) — pause at once.
         terminal = self._block_reason in ("leg_timeout", "rejected")
+        if self._block_gave_up:
+            return                 # paused (window spent, or a pause advisory)
         if terminal or now - self._block_started_at > self._cfg.blocked_retry_window_s:
             if not self._block_gave_up:
                 self._block_gave_up = True
@@ -831,6 +907,8 @@ class HierarchicalDrive:
                     self._block_reason,
                     "terminal for this leg" if terminal else
                     f"retry window ({self._cfg.blocked_retry_window_s:.1f}s) exhausted")
+            return
+        if self._advisory_run == self._block_run and now < self._advisory_hold_until:
             return
         if now - self._block_last_retry >= self._cfg.blocked_retry_interval_s:
             self._block_last_retry = now

@@ -174,7 +174,8 @@ def decode_depth(payload: bytes) -> Optional[Dict[str, Any]]:
 
 def decode_rgb(payload: bytes) -> Optional[Dict[str, Any]]:
     """Decode body/oakd/rgb. Returns dict with keys
-    ok, request_id, width, height, jpeg (bytes or None), error (str or None).
+    ok, request_id, width, height, jpeg (bytes or None), error (str or None),
+    ts (Pi-side float, 0.0 if absent).
     """
     msg = _decode_json(payload)
     if msg is None:
@@ -194,8 +195,12 @@ def decode_rgb(payload: bytes) -> Optional[Dict[str, Any]]:
                 logger.warning(f"rgb base64 decode failed: {e}")
                 ok = False
                 error = error or f"base64: {e}"
+    try:
+        ts = float(msg.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        ts = 0.0
     return {"ok": ok, "request_id": req_id, "width": width,
-            "height": height, "jpeg": jpeg, "error": error}
+            "height": height, "jpeg": jpeg, "error": error, "ts": ts}
 
 
 def decode_local_map(payload: bytes) -> Optional[Dict[str, Any]]:

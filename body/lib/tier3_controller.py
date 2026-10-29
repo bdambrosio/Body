@@ -109,6 +109,8 @@ class TickResult:
     plan_reason: Optional[str] = None
     done: bool = False                     # goal finished — caller clears it
     terminal: bool = False
+    depth_hits: Optional[int] = None       # depth_block evidence (slab hit count)
+    depth_seq: Optional[int] = None        # … and the depth frame's seq
 
 
 class Tier3Controller:
@@ -330,7 +332,9 @@ class Tier3Controller:
 
         if depth_blocked:
             self.prog_at = now_mono
-            return res(STATE_BLOCKED, (0.0, 0.0), reason="depth_block", mode="follow")
+            return res(STATE_BLOCKED, (0.0, 0.0), reason="depth_block", mode="follow",
+                       depth_hits=self._depth.last_hits,
+                       depth_seq=self._depth.last_seq)
 
         if blocked:
             look_bearing = math.atan2(look[1], look[0])

@@ -71,6 +71,8 @@ def drive_status(
     plan_reason: str | None = None,
     build: str | None = None,
     watermark: int | None = None,
+    depth_hits: int | None = None,
+    depth_seq: int | None = None,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
@@ -89,7 +91,9 @@ def drive_status(
     ARRIVED: snapped/frontier = reached the best reachable endpoint, with
     ``dist_remaining_m`` the residual to the requested goal).
     ``path_body_xy`` is the local A* path (body frame, downsampled) when
-    driving, for the operator UI.
+    driving, for the operator UI. ``depth_hits`` / ``depth_seq`` accompany a
+    ``depth_block``: the near-field slab hit count and the ``body/oakd/depth``
+    frame seq that tripped the veto.
     """
     msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
@@ -111,6 +115,10 @@ def drive_status(
         msg["watermark"] = int(watermark)
     if path_body_xy:
         msg["path_body_xy"] = [[float(p[0]), float(p[1])] for p in path_body_xy]
+    if depth_hits is not None:
+        msg["depth_hits"] = int(depth_hits)
+    if depth_seq is not None:
+        msg["depth_seq"] = int(depth_seq)
     if build is not None:
         msg["build"] = build
     return msg
@@ -405,7 +413,8 @@ def oakd_rgb_capture_ok(
     height: int,
     ts: float | None = None,
 ) -> dict[str, Any]:
-    """body/oakd/rgb — successful on-request JPEG (base64)."""
+    """body/oakd/rgb — successful on-request JPEG (base64). ``ts`` is the
+    frame's capture time (wall clock) when the caller has it."""
     return {
         "ts": now_ts() if ts is None else ts,
         "request_id": request_id,

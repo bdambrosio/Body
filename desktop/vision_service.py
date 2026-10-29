@@ -7,13 +7,14 @@ should work. Per-model tuning, if needed, lives in _DETECT_TEMPLATE.
 
 import base64
 import hashlib
+import io
 import logging
 import os
 import pathlib
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -28,6 +29,10 @@ VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "http://localhost:5000/v1")
 # If unset, we query /v1/models on first use and cache whatever's served.
 VISION_MODEL_OVERRIDE = os.environ.get("VISION_MODEL")
 VISION_TIMEOUT_S = float(os.environ.get("VISION_TIMEOUT_S", "60"))
+# Qwen3-family servers reason before answering unless told not to; with it on,
+# a one-line answer takes 5-20x longer and can exhaust max_tokens before any
+# content appears. Off by default; VISION_ENABLE_THINKING=1 turns it back on.
+VISION_ENABLE_THINKING = os.environ.get("VISION_ENABLE_THINKING", "0") == "1"
 
 _model_lock = threading.Lock()
 _resolved_model: Optional[str] = None
@@ -77,17 +82,19 @@ def cache_jpeg(jpeg_bytes: bytes) -> str:
     return str(path)
 
 # Canonical detect prompt. Per-model tuning lives here — swap the wording
-# if a new VLM responds better to a different grounding format.
+# if a new VLM responds better to a different grounding format. Qwen-VL
+# ignores a custom schema and answers in its native grounding format (a bare
+# list of {"bbox_2d", "label"} on a 0-1000 grid), so ask for exactly that.
 _DETECT_TEMPLATE = (
-    "Analyze the image and locate distinct objects. Return ONLY a JSON "
-    "object inside a ```json fenced block with a single field `boxes`, "
-    "a list of entries each having:\n"
-    "  - label: short object name (string)\n"
-    "  - bbox: [x1, y1, x2, y2] integer pixel coordinates\n"
-    "  - confidence: float between 0 and 1\n"
+    "Locate the distinct objects in the image. Return ONLY a JSON list; "
+    "each entry is {{\"bbox_2d\": [x1, y1, x2, y2], \"label\": short object "
+    "name}}. List each object once.\n"
     "{constraint}"
-    "Do not output any text outside the fenced block."
 )
+# Coordinate convention the model answers in: "norm1000" (Qwen-VL) or "pixel".
+_DETECT_COORDS = "norm1000"
+# Cluttered frames make the model list objects until it runs out of tokens.
+_DETECT_MAX_TOKENS = 512
 
 
 @dataclass
@@ -133,13 +140,17 @@ def _attach_images(messages, images):
     raise ValueError("no user message to attach images to")
 
 
-def _post_chat(messages, model=None, temperature=0.2, max_tokens=1024) -> str:
+def _post_chat(messages, model=None, temperature=0.2, max_tokens=1024,
+               response_format=None) -> str:
     payload = {
         "model": model or _resolve_model(),
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "chat_template_kwargs": {"enable_thinking": VISION_ENABLE_THINKING},
     }
+    if response_format is not None:
+        payload["response_format"] = response_format
     resp = requests.post(
         f"{VISION_BASE_URL}/chat/completions",
         json=payload,
@@ -162,6 +173,38 @@ def chat(messages, images=None, model=None, temperature=0.2, max_tokens=1024) ->
     )
 
 
+def chat_json(messages, schema: dict, images=None, model=None,
+              temperature=0.1, max_tokens=200, name="answer") -> Optional[dict]:
+    """Call the VLM with server-enforced JSON output (vLLM guided decoding).
+
+    schema: a JSON Schema object the answer must match. Free-form "return only
+    JSON" prompts are unreliable on this model (8/22 usable in the benchmark vs
+    22/22 enforced). Keep schemas small and max_tokens tight so a repetition
+    runaway ends fast. Returns the parsed object, or None if the reply (e.g.
+    truncated at max_tokens) doesn't parse.
+    """
+    text = _post_chat(
+        _attach_images(messages, images),
+        model=model, temperature=temperature, max_tokens=max_tokens,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": name, "schema": schema},
+        },
+    )
+    parsed = repair_json_string(text)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def jpeg_size(jpeg_bytes: bytes) -> Tuple[int, int]:
+    """(width, height) of a JPEG, or (0, 0) if it can't be read."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(jpeg_bytes)) as im:
+            return im.size
+    except Exception:
+        return 0, 0
+
+
 def detect(jpeg_bytes: bytes, labels=None, model=None) -> DetectResult:
     """Run open-vocab (or label-restricted) object detection on a JPEG.
 
@@ -175,31 +218,51 @@ def detect(jpeg_bytes: bytes, labels=None, model=None) -> DetectResult:
         images=[jpeg_bytes],
         model=model,
         temperature=0.1,
+        max_tokens=_DETECT_MAX_TOKENS,
     )
-    return DetectResult(text=text, boxes=_parse_boxes(text))
+    w, h = jpeg_size(jpeg_bytes)
+    return DetectResult(
+        text=text, boxes=_parse_boxes(text, w, h, coords=_DETECT_COORDS))
 
 
-def _parse_boxes(text: str) -> List[Box]:
+def _parse_boxes(text: str, img_w: int = 0, img_h: int = 0,
+                 coords: str = "pixel") -> List[Box]:
+    """Parse detect output into pixel-coordinate boxes.
+
+    Accepts either {"boxes": [...]} or a bare list, with the box under
+    "bbox" or "bbox_2d". coords="norm1000" rescales a 0-1000 grid to
+    img_w x img_h; boxes can't be placed without the image size, so none
+    are returned when it's missing.
+    """
     parsed = repair_json_string(text)
-    if not isinstance(parsed, dict):
-        return []
-    raw = parsed.get("boxes")
+    if isinstance(parsed, dict):
+        raw = parsed.get("boxes")
+    else:
+        raw = parsed
     if not isinstance(raw, list):
         return []
+    if coords == "norm1000":
+        if not img_w or not img_h:
+            return []
+        sx, sy = img_w / 1000.0, img_h / 1000.0
+    else:
+        sx = sy = 1.0
     out = []
     for entry in raw:
         if not isinstance(entry, dict):
             continue
         label = entry.get("label")
-        bbox = entry.get("bbox")
+        bbox = entry.get("bbox_2d", entry.get("bbox"))
         if not isinstance(label, str):
             continue
         if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
             continue
         try:
-            xyxy = tuple(int(v) for v in bbox)
+            x1, y1, x2, y2 = (float(v) for v in bbox)
         except (TypeError, ValueError):
             continue
+        xyxy = (int(round(x1 * sx)), int(round(y1 * sy)),
+                int(round(x2 * sx)), int(round(y2 * sy)))
         conf = entry.get("confidence")
         if not isinstance(conf, (int, float)):
             conf = None

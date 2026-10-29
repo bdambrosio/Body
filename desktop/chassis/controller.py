@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 import uuid
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import StubConfig
 from .state import (
@@ -65,6 +65,14 @@ class StubController:
         # any matching reply. Surfaced via streaming_rgb_misses for
         # the UI to flag a Pi-side stall.
         self._streaming_misses: int = 0
+
+        # Tagged captures (request_rgb_tagged): request_id → (callback,
+        # sent_ts). Their replies go to the callback only and never touch the
+        # shared state.rgb_* slot, so a VLM capture can't be overwritten by
+        # (or overwrite) the 320 px streaming preview. Guarded by its own
+        # lock; callbacks run outside it.
+        self._tagged_rgb: Dict[str, Tuple[Callable[[dict], None], float]] = {}
+        self._tagged_rgb_lock = threading.Lock()
 
     # ── Connection lifecycle ─────────────────────────────────────────
 
@@ -284,6 +292,15 @@ class StubController:
         if msg is None:
             return
         rid = msg.get("request_id")
+        with self._tagged_rgb_lock:
+            tagged = self._tagged_rgb.pop(rid, None) if rid else None
+        if tagged is not None:
+            msg["recv_ts"] = now_ts()
+            try:
+                tagged[0](msg)
+            except Exception:
+                logger.exception("tagged rgb callback raised")
+            return
         with self.state.lock:
             # Correlate against in-flight on-demand request; ignore
             # other on-demand ids. When `pending` is None (streaming
@@ -500,6 +517,45 @@ class StubController:
         with self.state.lock:
             self.state.pending_rgb_request_id = req_id
             self.state.pending_rgb_ts = now_ts()
+        return req_id
+
+    def request_rgb_tagged(
+        self,
+        on_reply: Callable[[dict], None],
+        max_width: Optional[int] = None,
+        jpeg_quality: Optional[int] = None,
+        expire_s: float = 5.0,
+    ) -> Optional[str]:
+        """Publish capture_rgb and route the reply to ``on_reply`` only.
+
+        ``on_reply`` gets the decode_rgb dict plus ``recv_ts`` (desktop wall
+        clock at arrival), on the Zenoh thread. The shared state.rgb_* slot is
+        left alone. Requests unanswered after ``expire_s`` are dropped
+        silently (the Pi may wait up to 3 s for a frame). Returns the
+        request_id, or None when there's no session or the put fails.
+        """
+        if self._session is None:
+            return None
+        now = now_ts()
+        req_id = str(uuid.uuid4())
+        with self._tagged_rgb_lock:
+            for rid in [r for r, (_, t) in self._tagged_rgb.items()
+                        if now - t > expire_s]:
+                del self._tagged_rgb[rid]
+            self._tagged_rgb[req_id] = (on_reply, now)
+        body: Dict[str, Any] = {"action": "capture_rgb", "request_id": req_id}
+        if max_width is not None:
+            body["max_width"] = int(max_width)
+        if jpeg_quality is not None:
+            body["jpeg_quality"] = int(jpeg_quality)
+        try:
+            self._session.put(self.config.topics.oakd_config,
+                              json.dumps(body).encode("utf-8"))
+        except Exception:
+            logger.exception("oakd_config put failed (tagged)")
+            with self._tagged_rgb_lock:
+                self._tagged_rgb.pop(req_id, None)
+            return None
         return req_id
 
     @property

@@ -269,6 +269,16 @@ class TestDepthVetoTracker(unittest.TestCase):
         t.update(self._msg(seq=1), now_wall=1000.0, v_mps=0.12, omega_radps=0.0)
         self.assertFalse(t.update(None, now_wall=1000.1, v_mps=0.12, omega_radps=0.0))
         self.assertEqual(t.streak, 0)
+        self.assertEqual(t.last_hits, 0)
+        self.assertIsNone(t.last_seq)
+
+    def test_records_evidence_of_last_frame(self):
+        t = DepthVetoTracker(_cfg(hit_streak=2, min_hits=5))
+        t.update(self._msg(seq=7), now_wall=1000.0, v_mps=0.12, omega_radps=0.0)
+        self.assertGreaterEqual(t.last_hits, 5)
+        self.assertEqual(t.last_seq, 7)
+        t.update(self._msg(), now_wall=1000.1, v_mps=0.12, omega_radps=0.0)
+        self.assertIsNone(t.last_seq)
 
 
 if __name__ == "__main__":

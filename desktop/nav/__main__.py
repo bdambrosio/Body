@@ -105,6 +105,14 @@ def _parse_args(argv):
              "posterior. Needs checkpoints in the map (Recognize). Toggleable "
              "live in View ▸ Checkpoint pose.",
     )
+    p.add_argument(
+        "--vlm-advisor", choices=("act", "log", "off"), default="act",
+        help="On each depth_block, ask the local VLM (VISION_BASE_URL) what is "
+             "in the camera frame. act: a person/door holds retries, a static "
+             "obstacle pauses for Resume (caution-only, never overrides the "
+             "Pi veto); log: record + show only; off: disabled. Verdicts and "
+             "frames go to ~/body-logs/vlm/<session>/.",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -192,7 +200,8 @@ def main(argv=None) -> int:
 
     try:
         return run_app(localizer, loc_config, chassis, chassis_config,
-                       use_checkpoint_pose=args.checkpoint_pose)
+                       use_checkpoint_pose=args.checkpoint_pose,
+                       vlm_advisor=args.vlm_advisor)
     finally:
         try:
             chassis.shutdown()

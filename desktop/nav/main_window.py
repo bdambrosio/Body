@@ -54,6 +54,12 @@ from desktop.localization.checkpoint_localizer import (
     CheckpointLocalizer,
     CheckpointPoseProvider,
 )
+from desktop.perception.block_adjudicator import (
+    AdjudicatorConfig,
+    BlockAdjudicator,
+    default_log_dir,
+)
+from desktop.perception.vlm_worker import VlmWorker
 from desktop.localization.checkpoint_matcher import (
     CheckpointMatchConfig,
     CheckpointMatcher,
@@ -84,6 +90,7 @@ class NavMainWindow(QMainWindow):
         chassis_config: StubConfig,
         *,
         use_checkpoint_pose: bool = False,
+        vlm_advisor: str = "act",
     ) -> None:
         super().__init__()
         self.setWindowTitle("Body Nav")
@@ -108,6 +115,21 @@ class NavMainWindow(QMainWindow):
         # HO-2 records + arm/continue, opened lazily on the first Go.
         self._handoff_session: Optional[Any] = None
         self._handoff_gate: Optional[HandoffGate] = None
+        # VLM depth-block adjudicator (desktop/perception): asks the local VLM
+        # what tripped each depth_block. "act" lets its caution-only verdict
+        # hold/pause the drive; "log" only records + shows it; "off" disables.
+        self._vlm_worker: Optional[VlmWorker] = None
+        self._block_adj: Optional[BlockAdjudicator] = None
+        if vlm_advisor != "off":
+            self._vlm_worker = VlmWorker()
+            self._vlm_worker.start()
+            self._block_adj = BlockAdjudicator(
+                chassis, self._vlm_worker,
+                cfg=AdjudicatorConfig(act=(vlm_advisor == "act")),
+                emit=lambda c, e, d: self._tracer.emit(c, e, d),
+                log_dir=default_log_dir(),
+            )
+            logger.info("vlm advisor: %s", vlm_advisor)
 
         self._build_toolbars()
         self._build_ui()
@@ -560,6 +582,13 @@ class NavMainWindow(QMainWindow):
             if live:
                 self._hier_drive.notify_teleop(True)
             self._hier_drive.tick(time.time())
+            if self._block_adj is not None:
+                self._block_adj.poll(
+                    self._hier_drive,
+                    self._drive_client.latest_status()
+                    if self._drive_client is not None else None,
+                    self._sample_pose_for_trace(),
+                )
         elif live and not getattr(self, "_live_was_on", False) and self._drive_client is not None:
             # No hier drive, but a Tier-3 goal from an earlier session may
             # still be live on the Pi — revoke it once on the rising edge.
@@ -832,6 +861,16 @@ class NavMainWindow(QMainWindow):
             else:
                 br = hd.block_reason()
                 txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
+                # VLM read of the current block run (applied or log-only).
+                vr = (self._block_adj.last_verdict()
+                      if self._block_adj is not None else None)
+                if (vr is not None and vr.get("advisory")
+                        and vr.get("run") == hd.block_run()
+                        and hd.state() is HierState.BLOCKED):
+                    adv = vr["advisory"]
+                    txt += (f"  vlm: {adv['label'][:20]}"
+                            + (f" → {adv['action']}" if vr.get("applied")
+                               and adv["action"] != "note" else ""))
                 # Checkpoint-pose: show the last re-anchor (cp id + inlier) so
                 # the operator sees it locking onto checkpoints while driving.
                 if self._cp_localizer is not None:
@@ -1659,6 +1698,8 @@ class NavMainWindow(QMainWindow):
             self._tracer.close()
         except Exception:
             pass
+        if self._vlm_worker is not None:
+            self._vlm_worker.stop(timeout_s=0.5)
         # Stop any in-flight hierarchical drive and close the DriveClient
         # session (opened lazily on the first Go).
         try:
@@ -1682,9 +1723,11 @@ def run_app(
     chassis_config: StubConfig,
     *,
     use_checkpoint_pose: bool = False,
+    vlm_advisor: str = "act",
 ) -> int:
     app = QApplication.instance() or QApplication([])
     win = NavMainWindow(fuser, fuser_config, chassis, chassis_config,
-                        use_checkpoint_pose=use_checkpoint_pose)
+                        use_checkpoint_pose=use_checkpoint_pose,
+                        vlm_advisor=vlm_advisor)
     win.show()
     return app.exec()

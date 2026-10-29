@@ -212,7 +212,8 @@ def main() -> None:
 
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
                        dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
-                       path_body=None, plan_reason=None, watermark=None) -> None:
+                       path_body=None, plan_reason=None, watermark=None,
+                       depth_hits=None, depth_seq=None) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
@@ -220,6 +221,7 @@ def main() -> None:
                 dist_remaining_m=dist, v_mps=v, omega_radps=omega,
                 blocked_reason=reason, mode=mode, path_body_xy=path_body,
                 plan_reason=plan_reason, build=build, watermark=watermark,
+                depth_hits=depth_hits, depth_seq=depth_seq,
             ),
         )
 
@@ -372,7 +374,8 @@ def main() -> None:
             was_active = abs(r.cmd[0]) > 0 or abs(r.cmd[1]) > 0
         publish_status(r.state, cmd_id=cmd_id, goal_body=r.goal_body, dist=r.dist,
                        v=r.v, omega=r.omega, reason=r.reason, mode=r.mode,
-                       path_body=r.path_body, plan_reason=r.plan_reason)
+                       path_body=r.path_body, plan_reason=r.plan_reason,
+                       depth_hits=r.depth_hits, depth_seq=r.depth_seq)
         if r.done:
             if r.state == STATE_ARRIVED and r.plan_reason:
                 print(f"local_drive: goal {cmd_id} ARRIVED at {r.plan_reason} "

@@ -411,6 +411,9 @@ def _handle_oakd_config_request(
         )
         return
     frame = _wait_rgb_frame(rgb_queue)
+    # Stamp with the frame's capture time, not reply-build time: a VLM pairs
+    # this frame with a pose, and encode + wait can add hundreds of ms.
+    arr_wall, arr_mono = time.time(), time.monotonic()
     if frame is None:
         zenoh_helpers.publish_json(
             session,
@@ -431,7 +434,10 @@ def _handle_oakd_config_request(
         zenoh_helpers.publish_json(
             session,
             "body/oakd/rgb",
-            schemas.oakd_rgb_capture_ok(rid, jpeg_b64, fw, fh),
+            schemas.oakd_rgb_capture_ok(
+                rid, jpeg_b64, fw, fh,
+                ts=capture_wall_ts(frame, arr_wall, arr_mono),
+            ),
         )
         print(f"[oakd] capture_rgb ok request_id={rid} {fw}x{fh}", flush=True)
     except Exception as e:

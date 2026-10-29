@@ -3,7 +3,7 @@ import math
 import unittest
 
 from desktop.nav.hierarchical_drive import (
-    HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
+    BlockAdvisory, HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
 )
 from desktop.nav.patrol import Patrol, PatrolRunner, Waypoint
 
@@ -653,6 +653,100 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.tick(10.0), HierState.SELECT_SUBGOAL)
         self.assertEqual(hd.tick(10.1), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), sent + 1)
+
+    # ── Block advisories (slow VLM verdicts; caution-only) ───────────
+
+    def _blocked(self, **cfg):
+        cfg.setdefault("blocked_retry_interval_s", 0.5)
+        cfg.setdefault("blocked_retry_window_s", 10.0)
+        hd, io, po = self._build(points=((5.0, 0.0),), **cfg)
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="depth_block")
+        self.assertEqual(hd.tick(1.0), HierState.BLOCKED)
+        return hd, io, po
+
+    def test_block_run_numbers_runs_not_retries(self):
+        hd, io, _ = self._blocked()
+        run = hd.block_run()
+        self.assertEqual(run, 1)
+        self.assertEqual(hd.tick(1.6), HierState.DRIVING_SUBGOAL)   # retry
+        io.set_status(cmd_id=2, state="BLOCKED", blocked_reason="depth_block")
+        self.assertEqual(hd.tick(1.7), HierState.BLOCKED)
+        self.assertEqual(hd.block_run(), run)                        # same run
+        self.assertEqual(hd.tick(2.3), HierState.DRIVING_SUBGOAL)   # retry → goto 3
+        io.set_status(cmd_id=3, state="ARRIVED")                     # progress
+        hd.tick(2.4)                                                 # re-pick → goto 4
+        io.set_status(cmd_id=4, state="BLOCKED", blocked_reason="depth_block")
+        self.assertEqual(hd.tick(2.5), HierState.BLOCKED)
+        self.assertEqual(hd.block_run(), run + 1)                    # new run
+
+    def test_hold_suppresses_retries_then_resumes(self):
+        hd, io, _ = self._blocked()
+        self.assertTrue(hd.apply_block_advisory(
+            hd.block_run(), BlockAdvisory("hold", "person", hold_s=3.0)))
+        sent = len(io.sent)
+        for t in (1.6, 2.5, 3.9):
+            self.assertEqual(hd.tick(t), HierState.BLOCKED)
+        self.assertEqual(len(io.sent), sent)                 # no retry gotos
+        self.assertEqual(hd.block_advisory().label, "person")
+        self.assertEqual(hd.tick(4.1), HierState.DRIVING_SUBGOAL)   # hold over
+        self.assertEqual(len(io.sent), sent + 1)
+
+    def test_pause_gives_up_window_now(self):
+        hd, io, _ = self._blocked()
+        cancels = io.cancels
+        self.assertTrue(hd.apply_block_advisory(
+            hd.block_run(), BlockAdvisory("pause", "box")))
+        self.assertEqual(io.cancels, cancels + 1)
+        sent = len(io.sent)
+        for t in (1.6, 5.0, 9.0):
+            self.assertEqual(hd.tick(t), HierState.BLOCKED)
+        self.assertEqual(len(io.sent), sent)
+        self.assertTrue(hd.can_resume())
+        self.assertTrue(hd.request_resume())
+        self.assertIsNone(hd.block_advisory())
+
+    def test_note_changes_nothing(self):
+        hd, io, _ = self._blocked()
+        self.assertTrue(hd.apply_block_advisory(
+            hd.block_run(), BlockAdvisory("note", "floor_transition")))
+        self.assertEqual(hd.tick(1.6), HierState.DRIVING_SUBGOAL)   # normal retry
+        self.assertEqual(hd.block_advisory().label, "floor_transition")
+
+    def test_advisory_for_old_run_is_ignored(self):
+        hd, io, _ = self._blocked()
+        old = hd.block_run()
+        self.assertEqual(hd.tick(1.6), HierState.DRIVING_SUBGOAL)
+        io.set_status(cmd_id=2, state="ARRIVED")                     # got past it
+        hd.tick(1.7)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        sent, cancels = len(io.sent), io.cancels
+        self.assertFalse(hd.apply_block_advisory(old, BlockAdvisory("pause", "box")))
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        self.assertEqual((len(io.sent), io.cancels), (sent, cancels))
+        self.assertIsNone(hd.block_advisory())
+
+    def test_advisory_landing_mid_retry_revokes_goal(self):
+        hd, io, _ = self._blocked()
+        self.assertEqual(hd.tick(1.6), HierState.DRIVING_SUBGOAL)   # retry in flight
+        cancels = io.cancels
+        self.assertTrue(hd.apply_block_advisory(
+            hd.block_run(), BlockAdvisory("pause", "chair")))
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        self.assertGreater(io.cancels, cancels)
+        self.assertEqual(hd.block_reason(), "depth_block")
+
+    def test_advisory_ignored_when_not_blocked(self):
+        hd, io, _ = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        self.assertFalse(hd.apply_block_advisory(
+            hd.block_run(), BlockAdvisory("pause", "box")))
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+
+    def test_unknown_advisory_action_rejected(self):
+        hd, _, _ = self._blocked()
+        with self.assertRaises(ValueError):
+            hd.apply_block_advisory(hd.block_run(), BlockAdvisory("go", "x"))
 
     def test_send_failed_cancels_live_goto(self):
         # A send failure enters BLOCKED — any still-live goto on the Pi must be
