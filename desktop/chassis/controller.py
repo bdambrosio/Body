@@ -20,7 +20,7 @@ from .state import (
     decode_local_map, decode_motor_state, decode_oakd_imu, decode_odom,
     decode_rgb, decode_status, now_ts,
 )
-from .transport import open_session
+from .transport import control_put, declare_control_publisher, open_session
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +43,14 @@ class StubController:
         # Zenoh thread invokes it with the parsed JSON dict.
         self._sweep_cmd_handler: Optional[Callable[[dict], None]] = None
 
-        # Monotonic-ts generator for outgoing cmd_vel/cmd_direct payloads.
-        # The Pi motor_controller uses payload ts to pick between the two
-        # last commands (direct_ts >= twist_ts → direct wins). We must
-        # never emit a ts that goes backwards, or a stale stored command
-        # on the other topic could re-win precedence. Protected by
-        # self.state.lock so publisher thread and supersede calls can't
-        # race.
+        # Non-decreasing ts generator for outgoing cmd_vel/cmd_direct
+        # payloads. The ts is informational only: the Pi motor_controller
+        # arbitrates on its OWN monotonic receipt time per topic (most
+        # recently received unexpired command wins) and never compares our
+        # desktop wall clock against its own (X2). Kept monotone so logs read
+        # sensibly across a desktop clock step. Protected by self.state.lock.
         self._last_sent_ts: float = 0.0
+        self._estop_rearm_pub: Optional[Any] = None
 
         # Streaming-RGB tracking. When the nav timer is calling
         # request_rgb_streaming() at a fixed rate, we record the most
@@ -127,6 +127,7 @@ class StubController:
         self._subscribers.clear()
         for pub in (
             self._heartbeat_pub, self._cmd_vel_pub, self._cmd_direct_pub,
+            self._estop_rearm_pub,
         ):
             if pub is not None:
                 try:
@@ -136,6 +137,7 @@ class StubController:
         self._heartbeat_pub = None
         self._cmd_vel_pub = None
         self._cmd_direct_pub = None
+        self._estop_rearm_pub = None
         if self._session is not None:
             try:
                 self._session.close()
@@ -148,9 +150,12 @@ class StubController:
     def _declare_publishers(self) -> None:
         assert self._session is not None
         t = self.config.topics
-        self._heartbeat_pub = self._session.declare_publisher(t.heartbeat)
-        self._cmd_vel_pub = self._session.declare_publisher(t.cmd_vel)
-        self._cmd_direct_pub = self._session.declare_publisher(t.cmd_direct)
+        # Control topics: BLOCK congestion control + high priority, so a
+        # stop/zero is never dropped or queued behind bulk sensor data (X5).
+        self._heartbeat_pub = declare_control_publisher(self._session, t.heartbeat)
+        self._cmd_vel_pub = declare_control_publisher(self._session, t.cmd_vel)
+        self._cmd_direct_pub = declare_control_publisher(self._session, t.cmd_direct)
+        self._estop_rearm_pub = declare_control_publisher(self._session, t.estop_rearm)
 
     def _declare_subscribers(self) -> None:
         assert self._session is not None
@@ -334,9 +339,8 @@ class StubController:
     def _next_ts_locked(self) -> float:
         """Return a ts strictly greater than any previously emitted ts.
 
-        Must be called with self.state.lock held. Protects the Pi's
-        ts-based precedence logic against our own local clock going
-        backwards (NTP step, VM suspend, etc).
+        Must be called with self.state.lock held. Informational only — the
+        Pi does not arbitrate on it (see __init__).
         """
         t = now_ts()
         if t <= self._last_sent_ts:
@@ -405,9 +409,9 @@ class StubController:
     def set_cmd_mode(self, mode: str) -> None:
         """Switch active publisher between 'cmd_vel' and 'cmd_direct'.
 
-        Supersedes the leaving topic with an explicit zero so the Pi's
-        ts-based precedence cannot keep a stale command from the old
-        topic winning over fresh commands on the new one.
+        Supersedes both topics with an explicit zero so the leaving topic's
+        last (possibly non-zero) command is not what the Pi holds until its
+        own timeout_ms expires.
         """
         if mode not in ("cmd_vel", "cmd_direct"):
             raise ValueError(f"unknown cmd mode: {mode!r}")
@@ -434,11 +438,14 @@ class StubController:
         self._supersede_both_zero()
 
     def _supersede_both_zero(self) -> None:
-        """Publish a zero command on both cmd_vel and cmd_direct with a
-        shared monotonic ts. At tie ts, the Pi's `direct_ts >= twist_ts`
-        rule makes direct win — but both payloads are zero so the motion
-        outcome is identical, and the next live publish gets a strictly
-        larger ts that resolves cleanly.
+        """Publish a zero command on both cmd_vel and cmd_direct.
+
+        The Pi arbitrates on its own monotonic receipt time per topic (the
+        most recently RECEIVED unexpired command wins; each expires under its
+        own clamped timeout_ms), so these zeros win until the next command
+        from anyone arrives — including Tier-3's own cmd_vel, which is why
+        hier cancels Tier-3 separately. The payload ts is informational and
+        never compared across hosts (X2).
         """
         if self._cmd_vel_pub is None or self._cmd_direct_pub is None:
             return
@@ -456,6 +463,26 @@ class StubController:
             }).encode("utf-8"))
         except Exception:
             logger.exception("supersede publish failed")
+
+    def rearm_estop(self, source: str = "desktop_operator") -> bool:
+        """Publish ``body/estop_rearm`` — the ONLY way to clear a latched
+        e-stop (watchdog and motor_controller latch). Motion commands no
+        longer clear it (E1). The Pi additionally requires heartbeat to be
+        ok at the moment of re-arm. Returns True if published."""
+        if self._session is None:
+            return False
+        payload = _estop_rearm_payload(source)
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            if self._estop_rearm_pub is not None:
+                self._estop_rearm_pub.put(data)
+            else:
+                control_put(self._session, self.config.topics.estop_rearm, data)
+        except Exception:
+            logger.exception("estop_rearm publish failed")
+            return False
+        logger.info("e-stop re-arm requested (source=%s)", source)
+        return True
 
     def request_rgb(self) -> Optional[str]:
         """Publish body/oakd/config capture_rgb; returns request_id or None."""
@@ -535,3 +562,16 @@ class StubController:
         self._streaming_in_flight = req_id
         self._streaming_in_flight_ts = now
         return req_id
+
+
+def _estop_rearm_payload(source: str) -> dict:
+    """Wire payload for body/estop_rearm: ``{"ts": float, "source": str}``.
+    Prefers the shared schema builder when present (older trees lack it)."""
+    try:
+        from body.lib import schemas
+        fn = getattr(schemas, "estop_rearm", None)
+        if fn is not None:
+            return fn(source)
+    except Exception:
+        pass
+    return {"ts": now_ts(), "source": str(source)}

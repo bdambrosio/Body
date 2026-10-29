@@ -17,6 +17,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from body.lib.local_costmap import dilate_bool
+
 
 @dataclass(frozen=True)
 class FootprintConfig:
@@ -39,6 +41,14 @@ class FootprintConfig:
     # pass (clearance ≈ hard_radius_m − true_half_width). This is what stops the
     # robot clipping a doorjamb that's abeam of the forward cone.
     hard_radius_m: float = 0.07
+    # Unknown cells within this many cells of an observed hit are "explained":
+    # they are the raster's pre-hit clear buffer (scan_raster stops clearing
+    # ``clear_buffer_cells`` short of a hit) or the hit's own shadow, so the
+    # hit itself — which the footprint test sees — is the obstacle. Only
+    # UNEXPLAINED unknown (no-information beams, never-observed cells) near
+    # the robot blocks. 0 = legacy (every near unknown blocks), which vetoes
+    # wall-following at 0.15–0.20 m (T5).
+    unknown_explained_cells: int = 0
 
 
 def _arc_samples(
@@ -62,6 +72,66 @@ def _arc_samples(
     return radius * np.sin(phi), radius * (1.0 - np.cos(phi)), theta
 
 
+def preview_reach_m(v_mps: float, cfg: FootprintConfig,
+                    max_reach_m: Optional[float] = None) -> float:
+    """Arc length the swept check previews for speed ``v_mps``."""
+    reach = min(cfg.preview_distance_m,
+                max(cfg.preview_min_distance_m, abs(v_mps) * cfg.preview_time_s))
+    if max_reach_m is not None:
+        reach = min(reach, max(0.0, float(max_reach_m)))
+    return reach
+
+
+def explained_unknown_mask(driveable: np.ndarray, cells: int) -> np.ndarray:
+    """Unknown cells within ``cells`` (8-connected) of an observed hit."""
+    if cells <= 0:
+        return np.zeros(driveable.shape, dtype=bool)
+    return (driveable == -1) & dilate_bool(driveable == 0, iters=int(cells))
+
+
+def unknown_block_mask(
+    driveable: np.ndarray, meta: Dict[str, Any], robot_xy: Tuple[float, float],
+    cfg: FootprintConfig, explained: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Unknown cells the swept veto would refuse to drive into (unexplained
+    and within ``unknown_block_range_m`` of the robot). The planner treats
+    these as obstacles so it never plans a path the veto then rejects."""
+    out = np.zeros(driveable.shape, dtype=bool)
+    if not cfg.block_on_unknown:
+        return out
+    res = float(meta.get("resolution_m", 0.0))
+    if res <= 0:
+        return out
+    ox = float(meta.get("origin_x_m", 0.0))
+    oy = float(meta.get("origin_y_m", 0.0))
+    xs = ox + (np.arange(driveable.shape[0], dtype=np.float64) + 0.5) * res - robot_xy[0]
+    ys = oy + (np.arange(driveable.shape[1], dtype=np.float64) + 0.5) * res - robot_xy[1]
+    near = np.hypot(xs[:, None], ys[None, :]) <= cfg.unknown_block_range_m
+    if explained is None:
+        explained = explained_unknown_mask(driveable, cfg.unknown_explained_cells)
+    return (driveable == -1) & near & ~explained
+
+
+def seed_clear_disk(
+    grid: np.ndarray, meta: Dict[str, Any], center_xy: Tuple[float, float],
+    radius_m: float,
+) -> None:
+    """In place: unknown cells whose centre is within ``radius_m`` of
+    ``center_xy`` become clear (the robot's body physically occupies that
+    disk, so nothing there went unseen). Observed hits are left alone."""
+    if radius_m <= 0:
+        return
+    res = float(meta.get("resolution_m", 0.0))
+    if res <= 0:
+        return
+    ox = float(meta.get("origin_x_m", 0.0))
+    oy = float(meta.get("origin_y_m", 0.0))
+    xs = ox + (np.arange(grid.shape[0], dtype=np.float64) + 0.5) * res - center_xy[0]
+    ys = oy + (np.arange(grid.shape[1], dtype=np.float64) + 0.5) * res - center_xy[1]
+    disk = (xs[:, None] ** 2 + ys[None, :] ** 2) <= radius_m * radius_m
+    grid[disk & (grid == -1)] = 1
+
+
 def swept_path_blocked(
     driveable: np.ndarray,
     meta: Dict[str, Any],
@@ -69,12 +139,22 @@ def swept_path_blocked(
     v_mps: float,
     omega_radps: float,
     config: Optional[FootprintConfig] = None,
+    start_pose: Optional[Tuple[float, float, float]] = None,
+    max_reach_m: Optional[float] = None,
+    explained_unknown: Optional[np.ndarray] = None,
 ) -> bool:
     """True if the footprint swept along the predicted (v, ω) arc hits an
     obstacle in the body-frame ``driveable`` grid (int8: -1 unknown, 0
-    blocked, 1 clear), treats close-range unknown as blocking, or finds the
-    swept region too empty to trust. Pure rotation (v≈0) returns False.
-    Fail-safe (malformed meta / path off the grid → True)."""
+    blocked, 1 clear), treats close-range unexplained unknown as blocking, or
+    finds the swept region too empty to trust. Pure rotation (v≈0) returns
+    False. Fail-safe (malformed meta / path off the grid → True).
+
+    ``start_pose`` (x, y, θ) is the robot's pose in the grid's frame when the
+    grid is older than the command (default: the grid origin). ``max_reach_m``
+    caps the preview arc — the caller passes the remaining path length (plus
+    a stopping margin) so the veto does not test space beyond where the robot
+    is going to stop (a sub-goal just in front of a wall, T2).
+    ``explained_unknown`` is a precomputed ``explained_unknown_mask``."""
     cfg = config or FootprintConfig()
     speed = abs(v_mps)
     if speed < 1e-3:
@@ -87,12 +167,15 @@ def swept_path_blocked(
     oy = float(meta.get("origin_y_m", 0.0))
     nx, ny = driveable.shape
 
-    reach_m = min(
-        cfg.preview_distance_m,
-        max(cfg.preview_min_distance_m, speed * cfg.preview_time_s),
-    )
+    reach_m = max(res * 0.5, preview_reach_m(v_mps, cfg, max_reach_m))
     n = int(max(3, min(25, math.ceil(reach_m / max(res, 1e-3)))))
     cx, cy, theta = _arc_samples(v_mps, omega_radps, reach_m, n)
+    x0 = y0 = 0.0
+    if start_pose is not None:
+        x0, y0, th0 = float(start_pose[0]), float(start_pose[1]), float(start_pose[2])
+        c0, s0 = math.cos(th0), math.sin(th0)
+        cx, cy = x0 + cx * c0 - cy * s0, y0 + cx * s0 + cy * c0
+        theta = theta + th0
     sgn = 1.0 if v_mps >= 0 else -1.0
 
     r_foot = cfg.footprint_radius_m + 0.5 * res
@@ -145,9 +228,16 @@ def swept_path_blocked(
         return True
 
     if cfg.block_on_unknown:
-        dist_origin = np.hypot(cell_x, cell_y)
-        if np.any((sub == -1) & in_swept & (dist_origin <= cfg.unknown_block_range_m)):
-            return True
+        dist_origin = np.hypot(cell_x - x0, cell_y - y0)
+        unk = (sub == -1) & in_swept & (dist_origin <= cfg.unknown_block_range_m)
+        if np.any(unk):
+            if explained_unknown is None and cfg.unknown_explained_cells > 0:
+                explained_unknown = explained_unknown_mask(
+                    driveable, cfg.unknown_explained_cells)
+            if explained_unknown is not None:
+                unk &= ~explained_unknown[i_lo:i_hi, j_lo:j_hi]
+            if np.any(unk):
+                return True
 
     if int(np.count_nonzero((sub != -1) & in_swept)) < cfg.min_observed_cells:
         return True

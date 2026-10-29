@@ -42,9 +42,12 @@ def _write_text(path: Path, value: str) -> None:
     path.write_text(value)
 
 
+PWM_SYSFS_ROOT = Path("/sys/class/pwm")
+
+
 def _find_pwmchip(motor_cfg: dict[str, Any]) -> Path:
     preferred_name = motor_cfg.get("sysfs_pwm_chip")
-    pwm_root = Path("/sys/class/pwm")
+    pwm_root = PWM_SYSFS_ROOT
     if preferred_name:
         preferred = pwm_root / preferred_name
         if preferred.exists():
@@ -121,6 +124,13 @@ def _set_pwm_duty(pwm_dir: Path, period_ns: int, duty_0_1: float) -> None:
         _write_text(dc, f"{duty_ns}\n")
         en = pwm_dir / "enable"
         if en.exists():
+            _write_text(en, "1\n")
+        return
+    if duty_ns > 0:
+        # zero_outputs() (error path) disables the channel; duty writes succeed on
+        # a disabled channel, so re-enable here or the wheel stays dead silently.
+        en = pwm_dir / "enable"
+        if en.exists() and _read_text(en) == "0":
             _write_text(en, "1\n")
 
 
@@ -390,22 +400,80 @@ def apply_outputs(
     lgpio.gpio_write(h, rd, _dir_pin_level(right_dir == "rev", False))
 
 
+def zero_outputs(pin_info: dict[str, Any]) -> None:
+    """Best-effort: duty 0 and disable both PWM channels. Never raises."""
+    for key in ("left_pwm_dir", "right_pwm_dir"):
+        pwm_dir = pin_info.get(key)
+        if pwm_dir is None:
+            continue
+        try:
+            _write_text(Path(pwm_dir) / "duty_cycle", "0\n")
+        except Exception:
+            pass
+        _disable_if_enabled(Path(pwm_dir))
+
+
 def shutdown(h: Any, pin_info: dict[str, Any]) -> None:
-    """Zero PWM duty, unexport sysfs channels we exported, then close chip."""
-    import lgpio
+    """Zero PWM duty, unexport sysfs channels we exported, then close chip.
 
-    left_pwm_dir = pin_info["left_pwm_dir"]
-    right_pwm_dir = pin_info["right_pwm_dir"]
+    PWM is forced off first and every later step is best-effort, so a failure
+    in unexport/close can never leave the motors driven.
+    """
+    zero_outputs(pin_info)
+
     sysfs_chip = pin_info["sysfs_chip"]
-    left_ch = int(pin_info["left_ch"])
-    right_ch = int(pin_info["right_ch"])
-
-    _disable_if_enabled(left_pwm_dir)
-    _disable_if_enabled(right_pwm_dir)
-
     if pin_info.get("left_exported"):
-        _unexport_channel(sysfs_chip, left_ch)
+        _unexport_channel(sysfs_chip, int(pin_info["left_ch"]))
     if pin_info.get("right_exported"):
-        _unexport_channel(sysfs_chip, right_ch)
+        _unexport_channel(sysfs_chip, int(pin_info["right_ch"]))
 
-    lgpio.gpiochip_close(h)
+    try:
+        import lgpio
+
+        lgpio.gpiochip_close(h)
+    except Exception:
+        pass
+
+
+def failsafe_zero_pwm(motor_cfg: dict[str, Any]) -> list[str]:
+    """Out-of-process failsafe: zero + disable the motor PWM channels via sysfs.
+
+    Used by the launcher when motor_controller exits or is killed (kernel PWM
+    state outlives the process) and by ``ExecStopPost`` in
+    deploy/body-launcher.service. Needs no lgpio and does not export channels.
+    Never raises; returns the channel dirs it touched (for logging).
+    """
+    touched: list[str] = []
+    try:
+        chip = _find_pwmchip(motor_cfg)
+    except Exception:
+        return touched
+    for ch_key, default in (("pwm_sysfs_left_channel", 0), ("pwm_sysfs_right_channel", 1)):
+        pwm_dir = chip / f"pwm{int(motor_cfg.get(ch_key, default))}"
+        if not pwm_dir.exists():
+            continue
+        try:
+            _write_text(pwm_dir / "duty_cycle", "0\n")
+        except Exception:
+            pass
+        _disable_if_enabled(pwm_dir)
+        touched.append(str(pwm_dir))
+    return touched
+
+
+if __name__ == "__main__":
+    # ``python -m body.lib.motor_gpio --zero-pwm`` — used by ExecStopPost.
+    # Deliberately avoids importing zenoh: this must work even if the venv is broken.
+    import json
+    import sys
+
+    if "--zero-pwm" not in sys.argv[1:]:
+        print("usage: python -m body.lib.motor_gpio --zero-pwm", file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        cfg_path = Path(__file__).resolve().parents[2] / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8")).get("motor", {})
+    except Exception:
+        cfg = {}
+    dirs = failsafe_zero_pwm(cfg)
+    print(f"motor_gpio: failsafe zero PWM on {dirs or 'nothing (no pwm channels found)'}", flush=True)

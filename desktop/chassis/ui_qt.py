@@ -893,9 +893,10 @@ class MotorTestDock(QDockWidget):
         slider snaps it back to 0.0 m/s (immediate published zero).
       * STOP button is the panic path: full stop and disengage.
       * Gate pills are diagnostic only — they do NOT block commands.
-        The negative gates (e-stop, timeout, stall) are all cleared on
-        the Pi by a fresh command, so blocking commands on their
-        account would be a deadlock.
+        Timeout and stall clear on the Pi with a fresh command; a latched
+        e-stop does NOT — it clears only on an explicit operator Re-arm
+        (body/estop_rearm, the safety toolbar's Re-arm button) while the
+        heartbeat is ok.
       * Feedback readouts come straight from body/motor_state (PWM,
         direction, flags) and body/odom (left_ticks/right_ticks,
         diffed locally for ticks/s). No wheel_base_m dependency.
@@ -1141,8 +1142,8 @@ class MotorTestDock(QDockWidget):
         Pre-engage states report setup problems (disconnected, missing
         topics). Once engaged, reports whatever condition on the Pi is
         inhibiting actual motion — but only as a diagnostic; the dock
-        keeps publishing regardless so a stuck latch can self-clear on
-        the next fresh command.
+        keeps publishing regardless (timeout/stall self-clear on the next
+        fresh command; an e-stop needs an explicit Re-arm).
         """
         if not connected:
             return "disconnected — press Connect"
@@ -1155,9 +1156,11 @@ class MotorTestDock(QDockWidget):
         if not hb_ok:
             return "engaged — heartbeat not ok at watchdog yet"
         if status_e_stop:
-            return "engaged — watchdog holds e-stop (status.e_stop_active)"
+            return ("engaged — watchdog holds e-stop (status.e_stop_active); "
+                    "press Re-arm")
         if e_stop:
-            return "engaged — motor holds e-stop (motor_state.e_stop_active)"
+            return ("engaged — motor holds e-stop (motor_state.e_stop_active); "
+                    "press Re-arm")
         if cmd_timeout:
             return "engaged — motor sees cmd_timeout_active"
         if stall:

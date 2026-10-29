@@ -38,9 +38,22 @@ class FusionNoiseConfig:
     odom_obs_hz: float = 50.0
     wheel_base_m: float = 0.181
     imu_settle_time_s: float = 2.0
-    mag_idle_fusion_enabled: bool = True
+    # Mag-idle fusion is OFF unless config.json explicitly enables it (I5):
+    # it pulls θ toward a mag yaw at rest and snaps back to GRV on motion.
+    mag_idle_fusion_enabled: bool = False
     mag_sigma_rad: float = 0.035
     mag_update_min_interval_s: float = 0.2
+    # Wheel-vs-IMU contradiction guard (I2): over a sliding window, if the
+    # wheels report ≥ imu_guard_rot_rad of net rotation while the IMU yaw
+    # moved < imu_guard_still_rad, the IMU is frozen → heading from wheel yaw
+    # until the IMU agrees again. The reverse case (IMU rotating, wheels
+    # still) is legitimately an uncommanded rotation (bump, slip) the IMU
+    # exists to see, so distrusting it there is opt-in.
+    imu_guard_enabled: bool = True
+    imu_guard_window_s: float = 1.0
+    imu_guard_rot_rad: float = 0.35
+    imu_guard_still_rad: float = 0.02
+    imu_guard_distrust_unmatched_imu_rotation: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,11 +106,17 @@ def load_slam_config(path: Optional[Path] = None) -> SlamFusionConfig:
         odom_obs_hz=_float(fusion_sec, "odom_obs_hz", 50.0),
         wheel_base_m=_float(motor, "wheel_base_m", 0.181),
         imu_settle_time_s=_float(imu, "settle_time_s", 2.0),
-        mag_idle_fusion_enabled=bool(fusion_sec.get("mag_idle_fusion_enabled", True)),
+        mag_idle_fusion_enabled=bool(fusion_sec.get("mag_idle_fusion_enabled", False)),
         mag_sigma_rad=_float(fusion_sec, "mag_sigma_rad", 0.035),
         mag_update_min_interval_s=_float(
             fusion_sec, "mag_update_min_interval_s", 0.2,
         ),
+        imu_guard_enabled=bool(fusion_sec.get("imu_guard_enabled", True)),
+        imu_guard_window_s=_float(fusion_sec, "imu_guard_window_s", 1.0),
+        imu_guard_rot_rad=_float(fusion_sec, "imu_guard_rot_rad", 0.35),
+        imu_guard_still_rad=_float(fusion_sec, "imu_guard_still_rad", 0.02),
+        imu_guard_distrust_unmatched_imu_rotation=bool(
+            fusion_sec.get("imu_guard_distrust_unmatched_imu_rotation", False)),
     )
     slam = SlamConfig(
         match_hz=_float(slam_sec, "match_hz", 2.0),

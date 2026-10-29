@@ -152,19 +152,21 @@ Sole owner of the BNO085 i²c transaction. Reads SH-2 FIFO reports, assembles a 
 
 - Initialize i²c (`/dev/i2c-1`) at 400 kHz.
 - Drive RST low for ≥ 10 µs, release, wait ≥ 100 ms for SH-2 boot.
-- Enable SH-2 reports at target rates:
-  - Rotation Vector **or** Game Rotation Vector: 100 Hz
-  - Accelerometer: 100 Hz
-  - Gyroscope: 400 Hz (aggregated down to 100 Hz for the wire — take the latest sample at publish time, or average)
-  - Linear Acceleration: optional, 100 Hz (see config)
-- Loop:
-  1. Block on INT falling edge (or poll the status register every 2 ms if INT is not wired).
-  2. Read all pending reports from the SH-2 FIFO (multiple report types may arrive per interrupt).
-  3. Cache the most recent of each report type.
-  4. If the cache has at least an orientation **and** an accel **and** a gyro newer than the last publish, assemble and publish.
-  5. Rate-limit publishes to `publish_hz` (default 100).
+- Enable SH-2 reports with an explicit `report_interval` (the Adafruit library default is 50 ms ≈ 20 Hz, which is what the driver used to get):
+  - Rotation Vector **or** Game Rotation Vector: `imu.report_interval_ms` (default 10 ms → 100 Hz)
+  - Accelerometer: `imu.accel_report_interval_ms` (10 ms); Gyroscope: `imu.gyro_report_interval_ms` (10 ms)
+  - Rotation Vector for mag-when-idle (only if enabled): `imu.mag_report_interval_ms` (50 ms)
+  - Linear Acceleration: optional, at the accel interval
+  - Older `adafruit_bno08x` without the `report_interval` kwarg: the driver sends the SH-2 Set Feature command itself via the library's private helpers, or logs a warning and accepts the default.
+- Loop (implemented, polling — INT is not used):
+  1. Every `imu.poll_interval_ms` (default 2 ms) drain the SH-2 FIFO (each property read does this).
+  2. `Bno085WithAccuracy._process_report` records, per report id, the **wall-clock arrival time**, a monotonically increasing **count**, and the SH-2 sequence byte. Channel 0/1 packets (advertisement, *reset complete*) are not parsed as sensor data; an unsolicited reset-complete is counted.
+  3. Publish **exactly once per new orientation report** (count advanced). Cached values are never re-published. Accel/gyro are the latest available samples (each also ≤ one interval old).
+  4. If no new orientation report arrives for `imu.stale_reinit_ms` (default 200 ms), or an unsolicited SH-2 reset is seen, publishing has already stopped; the driver pulses RST, re-creates the sensor object, re-enables reports and starts a **new `session_id`** (with `seq` restarting at 0). After `imu.max_reinit_attempts` (default 3) consecutive attempts without a new report it exits non-zero so the launcher restarts it.
 
-**Timestamps:** use the SH-2 per-report timestamp converted to wall time (subtract `time.monotonic() → time.time()` offset captured at boot). Not the publish time.
+**Timestamps:** `ts` = wall-clock arrival time of the orientation report (recorded when the FIFO is drained, so ≤ one poll interval + i²c latency after the sensor emitted it). Not the publish time. SH-2 per-report timebase deltas are not used yet.
+
+**Identity:** `session_id` (8 hex chars) changes at every driver start, every sensor re-init, and on the rotation_vector→game_rotation_vector fallback — i.e. whenever the quaternion's yaw origin may have changed. `seq` increments by one per published report.
 
 ### 6.4 Fusion mode selection
 
@@ -184,7 +186,7 @@ If `rotation_vector` accuracy exceeds the threshold for ≥ N consecutive report
 
 The BNO085 auto-calibrates gyro bias at rest in the first ~1–2 s. During that window the SH-2 accuracy field is high. The driver:
 
-- Holds off publishing until `fusion.accuracy_rad` first drops below `imu.calibration_stable_threshold_rad` (default 0.087 rad ≈ 5°), **and** at least `imu.settle_time_s` (default 2.0) of wall time has elapsed since driver start.
+- Holds off publishing until `fusion.accuracy_rad` first drops below `imu.calibration_stable_threshold_rad` (default 0.087 rad ≈ 5°), **and** at least `imu.settle_time_s` (default 2.0) of wall time has elapsed since driver start (or re-init), **and** `imu.settle_still_reports` (default 50) consecutive fresh reports had |gyro| ≤ `imu.settle_still_gyro_rad_s` (0.05 rad/s). The stillness requirement is waived after `imu.settle_max_wait_s` (10 s) with a log line; the accuracy requirement never is. Note: in `game_rotation_vector` mode accuracy is the constant `game_rotation_vector_accuracy_rad`, so the accuracy gate is effectively time-only — stillness is the real gate.
 - While settling, the driver publishes a one-shot stdout line at 1 Hz showing current accuracy so operators know to keep the robot stationary.
 - Optionally (§9), publishes a `calibrating`/`ready` status signal — TBD whether this rides on `body/status` or a new `body/imu_status` topic. v1: print-only.
 
@@ -199,7 +201,19 @@ Suggested keys (implementer may trim on first pass):
   "i2c_address": 75,                       // 0x4B
   "reset_gpio": 25,
   "interrupt_gpio": 17,
-  "publish_hz": 100,
+  "publish_hz": 100,                       // unused: rate = report rate
+  "report_interval_ms": 10,
+  "gyro_report_interval_ms": 10,
+  "accel_report_interval_ms": 10,
+  "mag_report_interval_ms": 50,
+  "poll_interval_ms": 2,
+  "stale_reinit_ms": 200,
+  "first_report_timeout_s": 2.0,
+  "max_reinit_attempts": 3,
+  "settle_still_gyro_rad_s": 0.05,
+  "settle_still_reports": 50,
+  "settle_max_wait_s": 10.0,
+  "mag_when_idle_enabled": false,
   "fusion_mode": "rotation_vector",
   "fusion_fallback": "game_rotation_vector",
   "mag_accuracy_fallback_rad": 0.087,
@@ -215,7 +229,8 @@ Suggested keys (implementer may trim on first pass):
 - **i²c open failure / NACK on probe at `0x4B`**: print a single diagnostic line (address used, bus, suggested fixes — check `i2cdetect -y 1`, check SJ1 pull-ups, check wiring), then exit nonzero so `watchdog` can detect and surface via `body/status`. Do not silently publish stale data.
 - **INT never fires for > 500 ms after enabling reports**: fall back to polling once, log, then treat as hardware failure if still dark. Same exit path.
 - **SH-2 report decode error** (bad checksum, unexpected length): skip the report, increment an internal counter. If error rate > 10% for > 1 s, log + restart the SH-2 (RST pulse) before giving up.
-- **Mid-run i²c bus error**: attempt one RST pulse + re-enable; if still failing, exit.
+- **Mid-run i²c bus error / frozen reports** (implemented): every read is inside the guarded block (including the mag-when-idle RV read). Errors are logged at most 1/s. If they persist, no new reports arrive and the stale path (§6.3 step 4) re-inits and finally exits.
+- **Mag-when-idle gate**: idle is never assumed until `body/motor_state` has been received at least once. The feature is off by default (`imu.mag_when_idle_enabled=false`, `fusion.mag_idle_fusion_enabled=false`) until it is re-validated as a GRV bias state.
 
 ### 6.8 Shutdown
 

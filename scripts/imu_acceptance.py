@@ -195,14 +195,18 @@ def _wait_estop_clear(
 ) -> bool:
     """Block until body/status shows heartbeat_ok and cleared e_stop.
 
-    Watchdog clears the latched e_stop only when a cmd_vel or cmd_direct arrives
-    (with heartbeat fresh), so we publish zero cmd_direct at 5 Hz while waiting.
+    Watchdog clears the latched e_stop only on body/estop_rearm (with heartbeat
+    fresh), so we publish a re-arm plus zero cmd_direct at 5 Hz while waiting.
     """
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout_s:
         st = status_ref.get("latest")
         if isinstance(st, dict) and st.get("heartbeat_ok") and not st.get("e_stop_active"):
             return True
+        # E-stop clears only on an explicit re-arm (heartbeat must be ok).
+        zenoh_helpers.publish_json(
+            session, "body/estop_rearm", schemas.estop_rearm("imu_acceptance")
+        )
         zenoh_helpers.publish_json(
             session,
             "body/cmd_direct",

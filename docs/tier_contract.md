@@ -43,10 +43,10 @@ grid. Production wiring is `desktop/nav/hierarchical_drive.py`.
 | **I1** | pose seam `world_pose()` | map-frame pose, or `None` when stale/unavailable; **no metric-accuracy guarantee** | `PFPoseProvider` / `CheckpointPoseProvider`; drive treats `None` as suspend/align | holds |
 | **I2** | Tier-1 → Tier-2 | next **world-frame** waypoint + `waypoint_tol_m`; **arrival judged by PF pose**, not Tier-3; Tier-1 owns ordering. A waypoint may be *topologically* right but its straight-line bearing blocked — that is legal **iff I3 absorbs it** | `PatrolRunner`, `hierarchical_drive` | holds |
 | **I3** | Tier-2 → Tier-3 | **the executed sub-goal is footprint-reachable** — because Tier-3 *selects* it from its own reachable set toward the Tier-2 direction (it never has to honor an unreachable point) | `plan_local` (reachable-frontier snap), `astar_toward` | holds *by construction* |
-| **I4** | Tier-3 → Tier-2 | `ARRIVED` for one tick → `IDLE` (consumers treat `IDLE@cmd_id` as done); `BLOCKED` carries a reason; status services a specific `cmd_id` | `local_drive.publish_status`, `hierarchical_drive._tick_driving` | holds |
+| **I4** | Tier-3 → Tier-2 | `ARRIVED` for one tick → `IDLE` (consumers treat `IDLE@cmd_id` as done); `BLOCKED` carries a reason; status services a specific `cmd_id` | `local_drive.publish_status`, `hierarchical_drive._tick_driving` | holds; a best-effort `ARRIVED` (snapped/frontier endpoint reached) carries `plan_reason` + residual `dist_remaining_m`; a goal the Pi drops reports `FAULT:<reason>` under its id until the next command (never decays to IDLE) |
 | **I5** | Tier-3 → motor | Tier-3 owns `body/cmd_vel` **only while a goal is active**; on cancel/stop it **commands zero immediately** (no coast on the last cmd until the 500 ms timeout); desktop **heartbeat still required**; the **motor 500 ms cmd-timeout + watchdog e-stop are supreme** | `local_drive.publish_cmd`, `motor_controller`, `watchdog` | holds |
-| **I6** | frames | waypoints in world; **goto goals in odom** (fixed as the robot moves); body→odom via the *live* odom at send time (world↔odom cancels) | `drive_client.send_goto_from_body`, `local_drive.on_goto` (rejects non-`odom`) | holds; *caveat:* a checkpoint re-anchor steps the map-frame yaw → steps the bearing (see Coherence) |
-| **I7** | cmd_id | strictly increasing; higher supersedes; **Pi rejects a lower id as stale**; a **cancel advances the watermark** to its own id (a delayed duplicate goto can't re-arm a revoked goal); wall-clock **decisecond** seed survives desktop restart even after a re-pick-heavy session | `DriveClient`, `local_drive.on_goto` | holds |
+| **I6** | frames | waypoints in world; **goto goals in odom** (fixed as the robot moves) — or `frame:"body"` + `anchor_ts` (the scan.ts the point was computed from), anchored by the Pi with its odom ring buffer interpolated at `anchor_ts`; odom reset (`session_id`/`seq`) drops the goal → `FAULT:odom_reset` | `drive_client.send_goto_from_body`, `GotoArbiter` + `OdomRing` (`local_drive_core`) | holds; *caveat:* a checkpoint re-anchor steps the map-frame yaw → steps the bearing (see Coherence) |
+| **I7** | cmd_id | strictly increasing; higher supersedes; **Pi rejects a lower id as stale with a one-shot `REJECTED` status carrying `watermark`**; a resend of the id already taken is absorbed idempotently; every accepted command is acked by the next tick's status cmd_id; a **cancel advances the watermark** to its own id (a delayed duplicate goto can't re-arm a revoked goal); wall-clock **decisecond** seed survives desktop restart even after a re-pick-heavy session | `DriveClient`, `local_drive.on_goto` | holds |
 | **I8** | config seam | both halves build Tier-3's raster/planner configs **from config.json through the same builders** — the desktop never models Tier-3 with parallel dataclass defaults | `body/lib/drive_config.py`; pinned by `body/test_drive_config.py` + `nav/test_hierarchical_drive.py::test_tier2_marches_on_pi_config` | holds |
 
 ## Tier 1 → Tier 2  (I2)
@@ -77,15 +77,17 @@ horizon projection; either way **Tier-3's A\* snap remains the authority**
 `DriveClient.send_goto_from_body` rotates the point to odom via the live odom
 pose (so world↔odom cancels).
 
-Goto fields: `cmd_id` (I7), `frame="odom"`, `x_m`, `y_m`, `arrival_tol_m`,
+Goto fields: `cmd_id` (I7), `frame="odom"` (or `"body"` + `anchor_ts`, I6), `x_m`, `y_m`, `arrival_tol_m`,
 `v_max`, `kind` (goto|cancel|stop). Tier 3 requires the desktop **heartbeat**
 even though the desktop keeps `live_command` OFF (Tier 3 owns `body/cmd_vel`).
 
 **Reachability (I3) is Tier-3's job:** given the requested point, `plan_local`
 runs footprint A\* (`astar_toward`); if the point is reachable it routes there,
 otherwise it routes to the **reachable cell closest to the point** (rounding the
-corner). It returns `no_path` **only** when genuinely boxed in (no reachable cell
-makes progress) — a real dead-end for Tier-1 / the operator, not a corner.
+corner; ties → cheapest path; latched in odom while reachable so it doesn't
+flip with grid quantization). Standing at that best reachable cell is
+`ARRIVED` with `plan_reason` `snapped`/`frontier`; `boxed_in` **only** when the
+robot cannot move at all — a real dead-end for Tier-1 / the operator.
 
 ## Tier 3 → Tier 2  (I4, `body/drive/status`)
 
@@ -96,17 +98,23 @@ pure-pursuit (`steer_to_body_point`), and keeps the **swept-footprint veto only
 as a last-resort stop** (`drive_safety`, effective radius == the A\* footprint).
 Re-plans every tick. Reports:
 
-- `state` — IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT. (ARRIVED is
+- `state` — IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT | REJECTED
+  (REJECTED: one-shot, stale goto id, carries `watermark`). (ARRIVED is
   published for a *single* tick, then drops the goal → IDLE. **CANCELED** is
   likewise one tick after cancel/stop clears an active goal — under the
   *revoked* goal's `cmd_id` — then IDLE; senders must not treat post-cancel
   IDLE as sub-goal success.)
-- `blocked_reason` — `no_path` | `boxed_in` | `swept_block` | `depth_block` | `no_progress` |
-  `deadline` | `odom_stale` | `no_scan`. (`deadline` = the per-goal hard
+- `blocked_reason` — BLOCKED: `boxed_in` | `start_blocked` | `goal_out_of_map` |
+  `swept_block` | `depth_block` | `no_progress` | `deadline` | `rotate_timeout` |
+  `no_scan`; FAULT: `odom_stale` | `odom_reset` | `e_stop` | `internal_error`.
+  (`rotate_timeout` = turned in place for `rotate_timeout_s` with no real
+  translation; `deadline` and `rotate_timeout` are terminal — Tier-3 goes
+  silent on cmd_vel after a few zeros. `deadline` = the per-goal hard
   deadline `goal_deadline_s` expired — catches rotate/drive dithers the
   translation-gated no-progress watchdog can't see; the goal stays active so
   the status can't decay to IDLE, which upstream reads as success.)
-- `mode` — `follow` | `plan` | `realign` | `held`.
+- `mode` — `follow` | `rotate` | `realign` | `held` | `plan` (`rotate`/`realign`
+  = turning in place).
 - `path_body_xy`, `goal_body_xy`, `dist_remaining_m`, `v_mps`, `omega_radps`,
   serviced `cmd_id`, `build`.
 

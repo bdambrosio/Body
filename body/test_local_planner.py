@@ -62,9 +62,11 @@ class TestPlanLocal(unittest.TestCase):
 
     def test_boxed_in_fails(self):
         # Robot walled in on all sides → no reachable cell beats the start.
+        # (Ring at 0.24 m: the robot's own cell stays legal under the padded
+        # lethal radius 0.11 + res/√2 ≈ 0.167 m, its neighbours do not.)
         grid = _clear()
-        for ang in np.arange(0.0, 2 * np.pi, 0.1):
-            _block(grid, 0.16 * np.cos(ang), 0.16 * np.sin(ang))
+        for ang in np.arange(0.0, 2 * np.pi, 0.05):
+            _block(grid, 0.24 * np.cos(ang), 0.24 * np.sin(ang))
         p = plan_local(grid, META, (1.2, 0.0), _cfg())
         self.assertFalse(p.ok)
         self.assertEqual(p.reason, "boxed_in")
@@ -89,6 +91,44 @@ class TestPlanLocal(unittest.TestCase):
         p = plan_local(grid, META, (0.45, 0.0), cfg)  # goal right by the wall
         self.assertTrue(p.ok)
         self.assertLess(p.goal_body_snapped[0], 0.45)   # pulled back off the wall
+
+    def test_lethal_start_never_hops_a_wall(self):
+        # Robot ringed tightly (its own cell lethal): relaxing the start must
+        # not jump across the ring to the free space outside it.
+        grid = _clear()
+        for ang in np.arange(0.0, 2 * np.pi, 0.05):
+            _block(grid, 0.16 * np.cos(ang), 0.16 * np.sin(ang))
+        p = plan_local(grid, META, (1.2, 0.0), _cfg())
+        self.assertFalse(p.ok)
+
+    def test_goal_on_wall_snaps_to_robot_side(self):
+        # T6: a goal on a wall line must resolve to the robot's side, not to
+        # a cell behind the wall that happens to come first in scan order.
+        grid = _clear()
+        for x in np.arange(-HALF, HALF, RES / 2):
+            _block(grid, float(x), -0.6)                # wall along y=-0.6
+        p = plan_local(grid, META, (0.8, -0.6), _cfg())
+        self.assertTrue(p.ok)
+        self.assertEqual(p.reason, "snapped")
+        self.assertGreater(p.goal_body_snapped[1], -0.6)
+        self.assertLess(abs(p.goal_body_snapped[0] - 0.8), 2 * RES)
+
+    def test_at_best_reachable_cell_reports_at_frontier(self):
+        # T8: standing at the closest reachable point to an unreachable goal
+        # is a (best-effort) arrival, distinct from being boxed in.
+        grid = _clear()
+        for y in np.arange(-HALF, HALF, RES / 2):
+            for x in (0.24, 0.28):
+                _block(grid, x, float(y))              # wall just ahead, full width
+        p = plan_local(grid, META, (1.2, 0.0), _cfg())
+        self.assertFalse(p.ok)
+        self.assertEqual(p.reason, "at_frontier")
+
+    def test_start_body_offsets_the_path(self):
+        p = plan_local(_clear(), META, (1.0, 0.3), _cfg(), start_body=(0.2, 0.3))
+        self.assertTrue(p.ok)
+        self.assertAlmostEqual(p.path_body[0][0], 0.2, delta=RES)
+        self.assertAlmostEqual(p.path_body[0][1], 0.3, delta=RES)
 
     def test_goal_out_of_map(self):
         p = plan_local(_clear(), META, (10.0, 0.0), _cfg())

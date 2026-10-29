@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from body.lib.drive_safety import FootprintConfig, swept_path_blocked
-from body.lib.scan_raster import ScanRasterConfig, rasterize_scan
+from body.lib.scan_raster import ScanRasterConfig, rasterize_scan, rasterize_scan_msg
 
 N = 360
 ANGLE_MIN = -math.pi
@@ -98,6 +98,64 @@ class TestRasterPlusSweptCheck(unittest.TestCase):
         grid, meta = rasterize_scan(None, ANGLE_MIN, ANGLE_INC, self.cfg)
         self.assertTrue(swept_path_blocked(
             grid, meta, v_mps=0.18, omega_radps=0.0, config=self.foot))
+
+
+class TestUnknownBins(unittest.TestCase):
+    """Beams with no information must stay unknown, never clear to the horizon."""
+
+    def setUp(self):
+        self.cfg = ScanRasterConfig()
+
+    def test_unknown_bins_neither_clear_nor_block(self):
+        # Wall ahead at 1.0 m in the unknown bins; all other beams no-return.
+        fwd = list(range(_idx(0.0) - 6, _idx(0.0) + 7))
+        hits = {i: 1.0 for i in fwd}
+        grid, meta = rasterize_scan(_scan(hits), ANGLE_MIN, ANGLE_INC, self.cfg,
+                                    unknown_bins=fwd)
+        self.assertEqual(_cell(grid, meta, 1.0, 0.0), -1)   # hit not stamped
+        self.assertEqual(_cell(grid, meta, 2.0, 0.0), -1)   # not cleared to horizon
+        # Without unknown_bins the null beams around clear as before.
+        grid2, _ = rasterize_scan(_scan(), ANGLE_MIN, ANGLE_INC, self.cfg)
+        self.assertEqual(_cell(grid2, meta, 2.0, 0.0), 1)
+
+    def test_null_unknown_bin_does_not_clear(self):
+        fwd = list(range(_idx(0.0) - 6, _idx(0.0) + 7))
+        grid, meta = rasterize_scan(_scan(), ANGLE_MIN, ANGLE_INC, self.cfg,
+                                    unknown_bins=fwd)
+        self.assertEqual(_cell(grid, meta, 2.0, 0.0), -1)
+        self.assertEqual(_cell(grid, meta, -2.0, 0.0), 1)    # other beams still clear
+
+    def test_bad_unknown_bin_entries_ignored(self):
+        grid, meta = rasterize_scan(_scan(), ANGLE_MIN, ANGLE_INC, self.cfg,
+                                    unknown_bins=["x", None, -1, 10_000])
+        self.assertEqual(_cell(grid, meta, 2.0, 0.0), 1)
+
+    def test_too_near_return_is_unknown(self):
+        fwd = list(range(_idx(0.0) - 6, _idx(0.0) + 7))
+        grid, meta = rasterize_scan(_scan({i: 0.03 for i in fwd}), ANGLE_MIN, ANGLE_INC,
+                                    self.cfg)
+        self.assertEqual(_cell(grid, meta, 2.0, 0.0), -1)
+
+    def test_rasterize_scan_msg_honours_unknown_bins(self):
+        n = 360
+        ranges = [None] * n
+        msg = {"ranges": ranges, "angle_min": 0.0, "angle_increment": 2 * math.pi / n,
+               "unknown_bins": list(range(0, 8)) + list(range(353, 360))}
+        grid, meta = rasterize_scan_msg(msg, self.cfg)
+        self.assertEqual(_cell(grid, meta, 2.0, 0.0), -1)
+        self.assertEqual(_cell(grid, meta, 0.0, 2.0), 1)
+        msg.pop("unknown_bins")                       # older Pi: no field
+        grid, meta = rasterize_scan_msg(msg, self.cfg)
+        self.assertEqual(_cell(grid, meta, 2.0, 0.0), 1)
+
+    def test_robot_clear_radius_seeds_own_cells(self):
+        cfg = ScanRasterConfig(robot_clear_radius_m=0.12)
+        everything = list(range(N))
+        grid, meta = rasterize_scan(_scan(), ANGLE_MIN, ANGLE_INC, cfg, unknown_bins=everything)
+        self.assertEqual(_cell(grid, meta, 0.0, 0.0), 1)
+        self.assertEqual(_cell(grid, meta, 0.5, 0.0), -1)
+        grid0, _ = rasterize_scan(_scan(), ANGLE_MIN, ANGLE_INC, self.cfg, unknown_bins=everything)
+        self.assertEqual(_cell(grid0, meta, 0.0, 0.0), -1)
 
 
 if __name__ == "__main__":

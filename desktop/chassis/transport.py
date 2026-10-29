@@ -41,3 +41,43 @@ def open_session(endpoint: str) -> Any:
     ep = normalize_endpoint(endpoint)
     logger.info(f"opening zenoh session → {ep}")
     return zenoh.open(make_remote_config(ep))
+
+
+def control_qos_kwargs(key_expr: str) -> dict:
+    """QoS kwargs for a desktop put/publisher on ``key_expr``.
+
+    Control topics (cmd_vel, cmd_direct, drive/goto, heartbeat, estop_rearm,
+    emergency_stop) go out with CongestionControl.BLOCK at INTERACTIVE_HIGH priority so a
+    goto/cancel/stop is never silently dropped or queued behind bulk sensor
+    traffic (X5). The topic list and kwargs come from the shared
+    ``body.lib.zenoh_helpers.put_kwargs``; empty for non-control topics or if
+    the helper is unavailable (older tree) — i.e. today's default QoS.
+    """
+    try:
+        from body.lib.zenoh_helpers import put_kwargs
+        return dict(put_kwargs(key_expr, sender="desktop"))
+    except Exception:
+        return {}
+
+
+def declare_control_publisher(session: Any, key_expr: str) -> Any:
+    """``session.declare_publisher`` with control-topic QoS when supported."""
+    kw = control_qos_kwargs(key_expr)
+    if kw:
+        try:
+            return session.declare_publisher(key_expr, **kw)
+        except TypeError:
+            logger.warning("zenoh declare_publisher rejected QoS kwargs for %s", key_expr)
+    return session.declare_publisher(key_expr)
+
+
+def control_put(session: Any, key_expr: str, payload: Any) -> None:
+    """``session.put`` with control-topic QoS when supported."""
+    kw = control_qos_kwargs(key_expr)
+    if kw:
+        try:
+            session.put(key_expr, payload, **kw)
+            return
+        except TypeError:
+            logger.warning("zenoh put rejected QoS kwargs for %s", key_expr)
+    session.put(key_expr, payload)

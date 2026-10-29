@@ -5,7 +5,18 @@ two sessions to the same router is fine). Publishes ``body/drive/goto``,
 subscribes ``body/drive/status`` + ``body/odom``. Converts an operator's
 body-frame click into an odom-frame goal using the latest odom pose, so
 the goal stays fixed in the world as the robot moves (the same rule the
-Pi uses — see docs/drive_tier3_spec.md).
+Pi uses — see docs/drive_tier3_spec.md). When the caller knows the instant
+the body-frame point was computed for (Tier-2: the scan ts), it is sent as
+``frame="body"`` + ``anchor_ts`` instead and Tier-3 anchors it from its own
+odom ring buffer at that instant (time-consistent; X6).
+
+Delivery (X5): goto/cancel go out with control QoS (BLOCK, high priority).
+Every command is tracked until a ``body/drive/status`` carrying its cmd_id
+arrives; if none does within ``ACK_TIMEOUT_S`` it is re-published verbatim
+(same cmd_id), at most ``MAX_RESENDS`` times, after which ``ack_failed``
+reports it. A ``REJECTED`` status (cmd_id at/below the Pi's watermark) — or
+any status with a higher cmd_id — re-seeds the counter past it so the next
+command is accepted.
 """
 from __future__ import annotations
 
@@ -16,12 +27,18 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from desktop.chassis.transport import open_session
+from desktop.chassis.transport import control_put, open_session
 
 logger = logging.getLogger(__name__)
 
 
+GOTO_TOPIC = "body/drive/goto"
+
+
 class DriveClient:
+    ACK_TIMEOUT_S = 1.0
+    MAX_RESENDS = 3
+
     def __init__(self, router: str, *, trace_path: Optional[str] = None):
         self._router = router
         self._session: Optional[Any] = None
@@ -39,6 +56,19 @@ class DriveClient:
         # with cmd_id > time(); a prompt restart would then seed LOWER and every
         # goto would be silently rejected. Outrunning 10 ids/s is implausible.
         self._cmd_id = int(time.time() * 10.0)
+        # Highest cmd_id seen on body/drive/status (any state) and the Pi's
+        # reported watermark (REJECTED). The next id is always above both, so
+        # a second client (or a Pi that outran our time seed) can't leave our
+        # gotos silently superseded (X5).
+        self._max_seen_cmd_id = 0
+        # Ack tracking for the newest command: (cmd_id, payload_json,
+        # last_send_mono, resends). Only the newest is tracked — a newer
+        # command supersedes the older on the Pi anyway.
+        self._pending: Optional[Tuple[int, str, float, int]] = None
+        self._acked: set = set()
+        self._ack_failed: set = set()
+        self._ack_stop = threading.Event()
+        self._ack_thread: Optional[threading.Thread] = None
         # Optional post-hoc trace: one JSON object per received status,
         # stamped with the desktop wall-clock arrival time. Mirrors the
         # nav JSONL tracing pattern so a leg can be reviewed offline.
@@ -69,9 +99,17 @@ class DriveClient:
         except Exception as e:
             logger.exception("drive client connect failed")
             return False, f"{type(e).__name__}: {e}"
+        self._ack_stop.clear()
+        self._ack_thread = threading.Thread(
+            target=self._ack_loop, name="drive-client-ack", daemon=True)
+        self._ack_thread.start()
         return True, None
 
     def shutdown(self) -> None:
+        self._ack_stop.set()
+        if self._ack_thread is not None and self._ack_thread.is_alive():
+            self._ack_thread.join(timeout=1.0)
+        self._ack_thread = None
         for s in self._subs:
             try:
                 s.undeclare()
@@ -101,6 +139,7 @@ class DriveClient:
         if isinstance(obj, dict):
             with self._lock:
                 self._status = obj
+                self._note_status_locked(obj)
                 if self._trace is not None:
                     try:
                         self._trace.write(
@@ -127,6 +166,89 @@ class DriveClient:
         if isinstance(obj, dict):
             with self._lock:
                 self._scan = obj
+
+    def _note_status_locked(self, obj: Dict[str, Any]) -> None:
+        """Ack bookkeeping + cmd_id re-seeding from one status (lock held)."""
+        try:
+            cid = int(obj.get("cmd_id") or 0)
+        except (TypeError, ValueError):
+            return
+        state = obj.get("state")
+        if state != "REJECTED":
+            self._max_seen_cmd_id = max(self._max_seen_cmd_id, cid)
+        wm = obj.get("watermark")
+        if wm is not None:
+            try:
+                self._max_seen_cmd_id = max(self._max_seen_cmd_id, int(wm))
+            except (TypeError, ValueError):
+                pass
+        p = self._pending
+        if p is not None and (cid == p[0] or (cid > p[0] and state != "REJECTED")):
+            # Matching status (incl. REJECTED: the Pi answered — the caller
+            # handles the rejection), or a newer accepted command from another
+            # client superseded ours. Either way stop resending.
+            self._acked.add(p[0])
+            self._pending = None
+
+    def _next_cmd_id_locked(self) -> int:
+        self._cmd_id = max(self._cmd_id, self._max_seen_cmd_id) + 1
+        return self._cmd_id
+
+    def _publish_tracked(self, cid: int, msg: Dict[str, Any]) -> None:
+        payload = json.dumps(msg)
+        with self._lock:
+            self._pending = (cid, payload, time.monotonic(), 0)
+            # Bound the bookkeeping sets; old ids are irrelevant.
+            if len(self._acked) > 256:
+                self._acked = {c for c in self._acked if c > cid - 128}
+            if len(self._ack_failed) > 256:
+                self._ack_failed = {c for c in self._ack_failed if c > cid - 128}
+        assert self._session is not None
+        control_put(self._session, GOTO_TOPIC, payload)
+
+    def pump_resends(self, now_mono: Optional[float] = None) -> None:
+        """Resend the pending command if unacknowledged for ACK_TIMEOUT_S;
+        after MAX_RESENDS mark it ack-failed. Called by the ack thread
+        (public for tests)."""
+        now = time.monotonic() if now_mono is None else now_mono
+        resend: Optional[str] = None
+        with self._lock:
+            p = self._pending
+            if p is None or now - p[2] < self.ACK_TIMEOUT_S:
+                return
+            cid, payload, _t, n = p
+            if n >= self.MAX_RESENDS:
+                logger.warning("drive: cmd_id=%d never acknowledged after %d resends",
+                               cid, n)
+                self._ack_failed.add(cid)
+                self._pending = None
+                return
+            self._pending = (cid, payload, now, n + 1)
+            resend = payload
+            logger.info("drive: no status for cmd_id=%d in %.1fs — resend %d/%d",
+                        cid, self.ACK_TIMEOUT_S, n + 1, self.MAX_RESENDS)
+        session = self._session
+        if session is not None and resend is not None:
+            try:
+                control_put(session, GOTO_TOPIC, resend)
+            except Exception:
+                logger.exception("drive: resend failed")
+
+    def _ack_loop(self) -> None:
+        while not self._ack_stop.wait(0.1):
+            try:
+                self.pump_resends()
+            except Exception:
+                logger.exception("drive: ack loop error")
+
+    def ack_failed(self, cmd_id: int) -> bool:
+        """True once ``cmd_id`` exhausted its resends with no matching status."""
+        with self._lock:
+            return cmd_id in self._ack_failed
+
+    def is_acked(self, cmd_id: int) -> bool:
+        with self._lock:
+            return cmd_id in self._acked
 
     def latest_status(self) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -156,38 +278,50 @@ class DriveClient:
         final_heading_rad: Optional[float] = None,
         arrival_tol_m: Optional[float] = None,
         v_max: Optional[float] = None,
+        anchor_ts: Optional[float] = None,
     ) -> Optional[int]:
-        """Convert a body-frame click to an odom goal and publish it.
-        Returns the cmd_id, or None if no odom/connection yet."""
+        """Publish a body-frame goal. Returns the cmd_id, or None if no
+        odom/connection yet.
+
+        With ``anchor_ts`` (Pi wall-clock instant the body frame refers to —
+        Tier-2 passes the scan ts) the goal goes out as ``frame="body"`` and
+        Tier-3 anchors it with its own odom interpolated at that instant.
+        Without it (operator click) it is converted here to an odom goal with
+        the latest odom pose."""
         pose = self.odom_pose()
         if pose is None or self._session is None:
             return None
-        c, s = math.cos(pose[2]), math.sin(pose[2])
-        ox = pose[0] + bx * c - by * s
-        oy = pose[1] + bx * s + by * c
         with self._lock:
-            self._cmd_id += 1
-            cid = self._cmd_id
-        msg: Dict[str, Any] = {
-            "ts": time.time(), "cmd_id": cid, "frame": "odom",
-            "x_m": ox, "y_m": oy, "kind": "goto",
-        }
+            cid = self._next_cmd_id_locked()
+        if anchor_ts is not None:
+            msg: Dict[str, Any] = {
+                "ts": time.time(), "cmd_id": cid, "frame": "body",
+                "anchor_ts": float(anchor_ts),
+                "x_m": float(bx), "y_m": float(by), "kind": "goto",
+            }
+        else:
+            c, s = math.cos(pose[2]), math.sin(pose[2])
+            ox = pose[0] + bx * c - by * s
+            oy = pose[1] + bx * s + by * c
+            msg = {
+                "ts": time.time(), "cmd_id": cid, "frame": "odom",
+                "x_m": ox, "y_m": oy, "kind": "goto",
+            }
         if final_heading_rad is not None:
             msg["final_heading_rad"] = final_heading_rad
         if arrival_tol_m is not None:
             msg["arrival_tol_m"] = arrival_tol_m
         if v_max is not None:
             msg["v_max"] = v_max
-        self._session.put("body/drive/goto", json.dumps(msg))
+        self._publish_tracked(cid, msg)
         return cid
 
     def cancel(self) -> None:
         if self._session is None:
             return
         with self._lock:
-            self._cmd_id += 1
-            cid = self._cmd_id
-        self._session.put(
-            "body/drive/goto",
-            json.dumps({"ts": time.time(), "cmd_id": cid, "kind": "cancel"}),
-        )
+            cid = self._next_cmd_id_locked()
+        # Tracked + resent like a goto: a lost cancel leaves Tier-3 chasing a
+        # goal the desktop believes revoked (E1/X3).
+        self._publish_tracked(
+            cid, {"ts": time.time(), "cmd_id": cid, "kind": "cancel"})

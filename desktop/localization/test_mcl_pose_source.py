@@ -149,6 +149,54 @@ class TestMCLScanMatch(unittest.TestCase):
         self.assertEqual(summary["n_applied"], 1)
         self.assertEqual(summary["n_discrete"], 0)
 
+    def test_scan_matched_around_pose_at_scan_ts(self) -> None:
+        # S4: the search is centred on the posterior at the scan's ts (from
+        # the pose buffer), not on the current (predicted-forward) posterior.
+        ref = _corridor_map()
+        src = MCLPoseSource(
+            ref,
+            pf_config=ParticleFilterConfig(n_particles=200, device="cpu"),
+            config=MCLPoseSourceConfig(min_evidence_cells=50),
+        )
+        src._mcl.seed_at(2.0, 1.6, 0.0, sigma_xy_m=0.01, sigma_theta_rad=0.01)
+        src._pose_buffer.append(10.0, (1.5, 1.6, 0.0))
+        src._pose_buffer.append(10.2, (2.0, 1.6, 0.0))
+        angles = np.linspace(-math.pi, math.pi, 90, endpoint=False)
+        points = src._scan_points(np.full(90, 2.5), angles)
+        self.assertTrue(src._apply_scan_match_observation(points, scan_ts=10.0))
+        prior = src.scan_match_summary()["prior_pose"]
+        self.assertAlmostEqual(prior[0], 1.5, places=6)
+        self.assertEqual(src.match_summary()["scan_prior_at_scan_ts"], 1)
+        # Robot motion since scan_ts must not count as a discrete jump.
+        self.assertEqual(src.correction_summary()["n_discrete"], 0)
+        # Outside the buffer → falls back to the current posterior.
+        self.assertTrue(src._apply_scan_match_observation(points, scan_ts=99.0))
+        self.assertEqual(src.match_summary()["scan_prior_fallback_now"], 1)
+
+
+class TestMCLOdomReset(unittest.TestCase):
+    def test_odom_session_change_does_not_predict_jump(self) -> None:
+        ref = _corridor_map()
+        src = MCLPoseSource(
+            ref,
+            pf_config=ParticleFilterConfig(n_particles=100, device="cpu"),
+            config=MCLPoseSourceConfig(min_evidence_cells=50),
+        )
+        src._mcl.seed_at(2.0, 1.6, 0.0, sigma_xy_m=0.001, sigma_theta_rad=0.001)
+        src._seeded = True
+        src._last_odom = (10.0, 3.0, 0.0, 0.0)
+        before = src._mcl.posterior_mean()
+        w_before = src.to_world(3.0, 0.0, 0.0)
+        # Force the EKF to report a reset on this sample.
+        src._ekf.update_odom = lambda *a, **k: True
+        src.update(10.02, 0.0, 0.0, 0.0, session_id="new", seq=0)
+        after = src._mcl.posterior_mean()
+        self.assertAlmostEqual(after[0], before[0], places=3)
+        self.assertEqual(src.match_summary()["odom_resets"], 1)
+        w_after = src.to_world(0.0, 0.0, 0.0)
+        for a, b in zip(w_before, w_after):
+            self.assertAlmostEqual(a, b, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

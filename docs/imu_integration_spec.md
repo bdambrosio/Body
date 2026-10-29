@@ -48,7 +48,9 @@ Field notes:
 
 | Field | Required? | Notes |
 |---|---|---|
-| `ts` | yes | Sensor sample time, not publish time. SH-2 timestamps are fine; just subtract boot-epoch offset to wall time. |
+| `ts` | yes | Wall-clock **arrival time** of the orientation report on the Pi (FIFO drained every ~2 ms), not publish time. One message per genuinely new report — values are never re-published. |
+| `session_id` | yes (since 2026-10) | 8 hex chars. Changes on driver start, sensor re-init after a stall/reset, and RV→GRV fallback — i.e. whenever the quaternion yaw origin may have jumped. **Consumers re-baseline their yaw offset on a change; never integrate the step.** Absent on older Pi builds. |
+| `seq` | yes (since 2026-10) | +1 per published report, restarts at 0 with each new `session_id`. |
 | `accel` | yes | Raw accel, m/s², body frame. Include gravity. |
 | `gyro` | yes | Raw rates, rad/s, body frame. |
 | `linear_accel` | optional | Gravity-removed accel from the BNO085 report. Skip if you don't enable it. |
@@ -56,6 +58,8 @@ Field notes:
 | `fusion.mode` | yes | `"rotation_vector"` \| `"game_rotation_vector"` \| `"raw"`. Tells consumer whether yaw is absolute or drift-bounded-only. |
 | `fusion.accuracy_rad` | yes | BNO085 per-report accuracy estimate. Consumer uses this as orientation σ. |
 | `fusion.*_status` | optional | SH-2 calibration status. Diagnostic. |
+
+**Freshness rule for consumers:** treat the IMU as stale if the newest `ts` is older than ~0.3 s or `seq` has not advanced. The driver stops publishing after `imu.stale_reinit_ms` (200 ms) without a new report and re-inits the sensor, so a frozen sensor appears as *silence*, then a new `session_id` — never as fresh-looking frozen values.
 
 Backwards compat: keep publishing the existing `body/oakd/imu` topic for one cycle with the same payload shape, or flip in a single atomic change. Prefer the atomic change — fewer topics = less confusion.
 
@@ -69,6 +73,8 @@ Body frame: **x-forward, y-left, z-up** (right-handed). This matches the lidar, 
 If mount rotation is applied, both accel and gyro and the quaternion must be rotated consistently.
 
 ## 4. Publish rate
+
+**Implemented:** one message per new orientation report; the driver requests a 10 ms report interval (`imu.report_interval_ms`), so ~100 Hz when the library honours it (before 2026-10 the driver used the library default of ~20 Hz and re-published each sample ~5×). Measure the real unique-report rate on the Pi before tuning σ.
 
 **Target:** 100 Hz. Quaternion updates at this rate give the scan-matcher a rotation prior with <10 ms of gyro propagation between IMU sample and lidar sample (scan at ~10 Hz).
 

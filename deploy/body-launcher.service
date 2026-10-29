@@ -1,7 +1,10 @@
 [Unit]
 Description=Body robot launcher
-After=network-online.target zenohd.service
-Wants=network-online.target zenohd.service
+# time-sync.target: start only after the clock has been synchronised (needs
+# chrony-wait.service enabled — see deploy/NETWORK.md "Time sync"), so wall-clock
+# timestamps on body/** topics are not stepped mid-session.
+After=network-online.target zenohd.service time-sync.target
+Wants=network-online.target zenohd.service time-sync.target
 
 [Service]
 Type=simple
@@ -10,11 +13,21 @@ Group=bruce
 SupplementaryGroups=gpio
 WorkingDirectory=/home/bruce/Body
 Environment=PYTHONPATH=/home/bruce/Body
+# Pi processes reach each other and the desktop through the local zenohd router
+# (connect_endpoints in config.json); multicast scouting only adds stray peer links.
+Environment=ZENOH_MULTICAST_SCOUTING=0
+# Opt-in: route every Pi process strictly through zenohd (see deploy/NETWORK.md).
+#Environment=ZENOH_MODE=client
 ExecStartPre=+/bin/sh /home/bruce/Body/deploy/prepare-pwm-sysfs.sh
 ExecStart=/home/bruce/Body/.venv/bin/python -m body.launcher
+# Motor failsafe: kernel PWM state outlives the processes. Whatever way the
+# launcher stopped (clean stop, crash, SIGKILL after TimeoutStopSec), force the
+# motor PWM channels to 0 / disabled. Runs as root ("+"), no zenoh import.
+ExecStopPost=+/home/bruce/Body/.venv/bin/python -m body.lib.motor_gpio --zero-pwm
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
+KillSignal=SIGTERM
 
 [Install]
 WantedBy=multi-user.target

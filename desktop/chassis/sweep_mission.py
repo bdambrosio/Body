@@ -477,8 +477,7 @@ class SweepMission(QThread):
         if scan_post is None:
             self._fail("stale_lidar")
             return None
-        # local_map threshold uses its own source.lidar_ts when available,
-        # falling back to receipt ts.
+        # Both waits compare desktop receipt time to this desktop threshold.
         local_map_post = self._wait_for_local_map(scan_threshold_ts, timeout_s=4.0)
         if local_map_post is None:
             self._fail("stale_local_map")
@@ -592,9 +591,10 @@ class SweepMission(QThread):
         return period
 
     def _scan_msg_ts(self, scan: Dict[str, Any], recv_ts: float) -> float:
-        ts = scan.get("ts")
-        if isinstance(ts, (int, float)) and ts > 0:
-            return float(ts)
+        # Freshness thresholds here are DESKTOP wall-clock instants, so judge
+        # them against the desktop receipt time, never the Pi-stamped ts — a
+        # Pi↔desktop clock offset would otherwise accept stale scans or time
+        # out on fresh ones (S7/X2: no cross-host clock comparisons).
         return recv_ts
 
     def _wait_for_scan(
@@ -624,15 +624,10 @@ class SweepMission(QThread):
                 drive = self.controller.state.local_map_driveable
                 map_recv_ts = self.controller.state.local_map_ts
             if grid is not None and meta is not None:
-                # local_map carries sources.lidar_ts / depth_ts; honor whichever
-                # the Pi has marked as freshest, fall back to recv ts.
-                src = meta.get("sources") or {}
-                src_ts = 0.0
-                for k in ("lidar_ts", "depth_ts"):
-                    v = src.get(k)
-                    if isinstance(v, (int, float)) and v > src_ts:
-                        src_ts = float(v)
-                eff_ts = src_ts if src_ts > 0 else map_recv_ts
+                # Desktop receipt time vs a desktop threshold. The map's own
+                # sources.lidar_ts/depth_ts are Pi-clock and must not be
+                # compared to a desktop instant (clock offset).
+                eff_ts = map_recv_ts
                 if eff_ts > threshold_ts:
                     return {
                         "grid": grid.copy(),

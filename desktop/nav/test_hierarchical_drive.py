@@ -74,8 +74,10 @@ class FakeDriveIO:
         self.scan = scan
         self.status = None
         self.sent = []          # list of (bx, by, arrival_tol_m, v_max)
+        self.anchor_ts = []     # anchor_ts per send (None = latest-odom anchoring)
         self.cancels = 0
         self._cid = 0
+        self.failed_acks = set()
 
     def latest_scan(self):
         return self.scan
@@ -83,16 +85,22 @@ class FakeDriveIO:
     def latest_status(self):
         return self.status
 
-    def send_goto_from_body(self, bx, by, *, arrival_tol_m=None, v_max=None):
+    def send_goto_from_body(self, bx, by, *, arrival_tol_m=None, v_max=None,
+                            anchor_ts=None):
         self._cid += 1
         self.sent.append((bx, by, arrival_tol_m, v_max))
+        self.anchor_ts.append(anchor_ts)
         return self._cid
 
     def cancel(self):
         self.cancels += 1
 
-    def set_status(self, cmd_id, state, blocked_reason=None):
-        self.status = {"cmd_id": cmd_id, "state": state, "blocked_reason": blocked_reason}
+    def ack_failed(self, cmd_id):
+        return cmd_id in self.failed_acks
+
+    def set_status(self, cmd_id, state, blocked_reason=None, **extra):
+        self.status = {"cmd_id": cmd_id, "state": state,
+                       "blocked_reason": blocked_reason, **extra}
 
 
 class FakePose:
@@ -453,11 +461,132 @@ class TestHierarchicalDrive(unittest.TestCase):
     def test_bearing_hysteresis_repicks(self):
         hd, io, po = self._build(points=((5.0, 0.0),), repick_hysteresis_rad=0.2)
         self._drive_to_sending(hd)
-        # Robot rotated a lot in place → bearing to the waypoint moved well past hysteresis.
-        po.pose = (0.0, 0.0, 1.0)
+        # Robot slid sideways off the line → the WORLD bearing to the waypoint
+        # moved past hysteresis (atan2(2, 5) ≈ 0.38 rad).
+        po.pose = (0.0, -2.0, 0.0)
         # Same-tick: drift past hysteresis → re-pick → new goto, settles in DRIVING.
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 2)
+
+    def test_rotation_in_place_is_not_drift(self):
+        # X1: Tier-3 rotating in place toward the sub-goal changes the body-
+        # relative bearing but not the world bearing — must NOT re-pick (each
+        # re-pick reset Tier-3's rotate hysteresis and per-goal bounds).
+        hd, io, po = self._build(points=((0.0, 5.0),), repick_hysteresis_rad=0.2)
+        self._drive_to_sending(hd)
+        for yaw in (0.2, 0.5, 0.9, 1.3):
+            po.pose = (0.0, 0.0, yaw)
+            self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 1)
+
+    def test_no_drift_repick_while_tier3_rotating(self):
+        hd, io, po = self._build(points=((5.0, 0.0),), repick_hysteresis_rad=0.2)
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="DRIVING", mode="rotate")
+        po.pose = (0.0, -2.0, 0.0)            # would be drift...
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 1)     # ...but Tier-3 is rotating
+        io.set_status(cmd_id=1, state="DRIVING", mode="follow")
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 2)     # now it re-picks
+
+    def test_leg_deadline_not_reset_by_repicks(self):
+        hd, io, po = self._build(points=((5.0, 0.0),), leg_deadline_s=10.0)
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)                                  # leg starts t=0, goto #1
+        for i, t in enumerate((3.0, 6.0, 9.0)):       # sub-goal ARRIVED re-picks
+            io.set_status(cmd_id=len(io.sent), state="ARRIVED")
+            self.assertEqual(hd.tick(t), HierState.DRIVING_SUBGOAL)
+        cancels = io.cancels
+        self.assertEqual(hd.tick(10.5), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "leg_timeout")
+        self.assertGreater(io.cancels, cancels)
+        # Terminal for the leg: no retry gotos, paused for the operator.
+        sent = len(io.sent)
+        self.assertEqual(hd.tick(11.0), HierState.BLOCKED)
+        self.assertEqual(hd.tick(30.0), HierState.BLOCKED)
+        self.assertEqual(len(io.sent), sent)
+        self.assertTrue(hd.request_resume())          # fresh leg budget
+        hd.tick(31.0)
+        self.assertEqual(hd.tick(31.0), HierState.DRIVING_SUBGOAL)
+
+    def test_leg_deadline_resets_on_waypoint_advance(self):
+        hd, io, po = self._build(points=((1.0, 0.0), (5.0, 0.0)), leg_deadline_s=10.0)
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        po.pose = (1.1, 0.0, 0.0)                     # passed waypoint 0 at t=8
+        self.assertEqual(hd.tick(8.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(hd._runner.wp_index, 1)
+        self.assertEqual(hd.tick(15.0), HierState.DRIVING_SUBGOAL)   # 7 s into leg 2
+
+    def test_tier3_blocked_cancels_goal(self):
+        # X3: entering BLOCKED revokes the Tier-3 goal (it would otherwise keep
+        # streaming cmd_vel and resume on its own if the block cleared).
+        hd, io, _ = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        cancels = io.cancels
+        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="swept_block")
+        self.assertEqual(hd.tick(0.0), HierState.BLOCKED)
+        self.assertEqual(io.cancels, cancels + 1)
+
+    def test_teleop_suspends_and_cancels(self):
+        hd, io, _ = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        cancels = io.cancels
+        hd.notify_teleop(True)
+        self.assertEqual(hd.state(), HierState.SUSPENDED)
+        self.assertEqual(hd.block_reason(), "teleop")
+        self.assertEqual(io.cancels, cancels + 1)
+        hd.notify_teleop(True)                        # idempotent
+        self.assertEqual(io.cancels, cancels + 1)
+        self.assertEqual(hd.tick(1.0), HierState.SUSPENDED)
+        hd2, io2, _ = self._build()
+        hd2.notify_teleop(True)                       # IDLE: no-op
+        self.assertEqual(hd2.state(), HierState.IDLE)
+        self.assertEqual(io2.cancels, 0)
+
+    def test_rejected_repicks_then_blocks(self):
+        hd, io, _ = self._build(points=((5.0, 0.0),), max_consecutive_rejects=2)
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="REJECTED", watermark=50)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # re-pick
+        self.assertEqual(len(io.sent), 2)
+        io.set_status(cmd_id=2, state="REJECTED", watermark=50)
+        self.assertEqual(hd.tick(0.1), HierState.DRIVING_SUBGOAL)
+        io.set_status(cmd_id=3, state="REJECTED", watermark=50)
+        self.assertEqual(hd.tick(0.2), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "rejected")
+
+    def test_rejected_at_watermark_is_real_rejection(self):
+        # Tier-3 absorbs resends of an accepted id silently; a REJECTED whose
+        # watermark equals our id means the goto itself was refused (malformed),
+        # so hier must re-pick rather than wait on a goal Tier-3 never took.
+        hd, io, _ = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="REJECTED", watermark=1)
+        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 2)
+
+    def test_no_ack_blocks(self):
+        hd, io, _ = self._build(points=((5.0, 0.0),))
+        self._drive_to_sending(hd)
+        io.failed_acks.add(1)
+        self.assertEqual(hd.tick(0.0), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "no_ack")
+
+    def test_clear_run_goal_anchored_at_scan_ts(self):
+        # X6: the body-frame sub-goal is stamped with the ts of the scan it was
+        # computed from; blind projection (no scan) uses latest-odom anchoring.
+        scan = dict(_clear_scan(), ts=123.25)
+        hd, io, _ = self._build(points=((5.0, 0.0),), scan=scan)
+        self._drive_to_sending(hd)
+        self.assertEqual(io.anchor_ts, [123.25])
+        io2 = FakeDriveIO(scan=None)
+        hd2 = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io2)
+        self._drive_to_sending(hd2)
+        self.assertEqual(io2.anchor_ts, [None])
 
     def test_pose_correction_repicks_without_drift(self):
         # A re-anchor snap moves the world pose without odom seeing it — the

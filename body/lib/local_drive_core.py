@@ -14,8 +14,9 @@ frame and steer toward it.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 
 # Drive states (mirrored in body/drive/status).
 STATE_IDLE = "IDLE"
@@ -24,6 +25,9 @@ STATE_ARRIVED = "ARRIVED"
 STATE_BLOCKED = "BLOCKED"
 STATE_CANCELED = "CANCELED"
 STATE_FAULT = "FAULT"
+# A goto whose cmd_id is ≤ the supersede watermark (published once, with the
+# rejected cmd_id and the current ``watermark``) — never goal-related.
+STATE_REJECTED = "REJECTED"
 
 Pose = Tuple[float, float, float]   # (x, y, theta) in odom
 Point2 = Tuple[float, float]
@@ -108,25 +112,88 @@ class ImuYawCorrector:
     FROZEN_EPS_RAD = math.radians(2.0)       # "the IMU itself never moved"
     REVIVE_RAD = math.radians(10.0)          # IMU motion that proves it's alive
 
-    def __init__(self) -> None:
+    def __init__(self, *, window_s: float = 1.0,
+                 window_wheel_min_rad: float = 0.35,
+                 window_imu_max_rad: float = 0.02,
+                 wheel_glitch_rate_radps: float = 4.0) -> None:
         self._ref: float | None = None
         self._last_imu: float | None = None
         self._imu_motion = 0.0   # |Δimu| accumulated since baseline / trip
         self._dead = False
+        # Sliding-window contradiction guard (fix 10, Pi side): over the last
+        # ``window_s`` the wheels turned > window_wheel_min_rad while the IMU
+        # moved < window_imu_max_rad → the IMU is not tracking (hung or
+        # re-initialising): use wheel heading for that window and re-bind a
+        # fresh baseline once the two agree again. Wheel steps faster than
+        # ``wheel_glitch_rate_radps`` are odom glitches, not rotation. Active
+        # only when the caller passes ``t``. window_s ≤ 0 disables.
+        self._win_s = float(window_s)
+        self._win_wheel = float(window_wheel_min_rad)
+        self._win_imu = float(window_imu_max_rad)
+        self._glitch = float(wheel_glitch_rate_radps)
+        self._hist: Deque[Tuple[float, float, float]] = deque()
+        self.distrusted = False
 
     def reset(self) -> None:
         # New goal: re-arm the baseline. The dead latch survives — a hung
         # IMU must not get MAX_DIVERGENCE of trust back every goal.
         self._ref = None
 
-    def corrected_theta(self, odom_theta: float, imu_yaw: float | None) -> float:
+    def rebaseline(self) -> None:
+        """IMU yaw origin may have jumped (driver restart: session_id change /
+        seq decrease): forget the baseline and IMU history — no yaw step."""
+        self._ref = None
+        self._last_imu = None
+        self._hist.clear()
+
+    def _window_contradicts(self, t: float, odom_theta: float, imu_yaw: float) -> bool:
+        if self._win_s <= 0:
+            return False
+        h = self._hist
+        h.append((t, odom_theta, imu_yaw))
+        while h and t - h[0][0] > self._win_s:
+            h.popleft()
+        wheel = imu = 0.0
+        for (t0, o0, i0), (t1, o1, i1) in zip(list(h)[:-1], list(h)[1:]):
+            dt = max(1e-3, t1 - t0)
+            dw = abs(wrap_pi(o1 - o0))
+            if dw / dt <= self._glitch:
+                wheel += dw
+            imu += abs(wrap_pi(i1 - i0))
+        return wheel > self._win_wheel and imu < self._win_imu
+
+    # Don't capture a baseline while turning faster than this: the IMU and
+    # odom samples are not time-paired, so mid-turn their skew (tens of ms ×
+    # ω) becomes a permanent heading offset for the whole goal (T10).
+    BASELINE_MAX_RATE_RADPS = 0.15
+
+    def corrected_theta(self, odom_theta: float, imu_yaw: float | None,
+                        yaw_rate: float | None = None,
+                        t: float | None = None) -> float:
         """Odom heading plus the IMU-vs-wheel divergence since the baseline.
         ``imu_yaw`` None (no/stale IMU) re-arms the baseline and returns the
-        wheel heading unchanged — never differences across an IMU gap."""
+        wheel heading unchanged — never differences across an IMU gap.
+        ``yaw_rate`` (odom vtheta, optional) defers capturing a new baseline
+        until the robot is turning slowly. ``t`` (monotonic seconds,
+        optional) enables the sliding-window contradiction guard."""
         if imu_yaw is None:
             self._ref = None
             self._last_imu = None
+            self._hist.clear()
             return odom_theta
+        if t is not None:
+            if self._window_contradicts(t, odom_theta, imu_yaw):
+                if not self.distrusted:
+                    print("local_drive: IMU yaw not tracking wheel rotation "
+                          "(window guard) — wheel heading until they agree",
+                          flush=True)
+                self.distrusted = True
+                self._ref = None
+                self._last_imu = imu_yaw
+                return odom_theta
+            if self.distrusted:
+                self.distrusted = False   # agree again → re-bind below
+                self._ref = None
         if self._last_imu is not None:
             self._imu_motion += abs(wrap_pi(imu_yaw - self._last_imu))
         self._last_imu = imu_yaw
@@ -136,6 +203,8 @@ class ImuYawCorrector:
                 self._ref = None   # re-baseline below on the next call
             return odom_theta
         if self._ref is None:
+            if yaw_rate is not None and abs(yaw_rate) > self.BASELINE_MAX_RATE_RADPS:
+                return odom_theta
             self._ref = wrap_pi(imu_yaw - odom_theta)
             self._imu_motion = 0.0
             return odom_theta
@@ -211,3 +280,267 @@ def swept_block_response(
     if abs(look_bearing) > thresh_rad and realign_elapsed_s <= timeout_s:
         return "realign", _clip(k_omega * look_bearing, -omega_max, omega_max)
     return "block", 0.0
+
+
+def latched_rotate_omega(
+    bearing: float, latch_dir: int, params: DriveParams, *,
+    flip_band_rad: float = 0.5, min_omega: float = 0.0,
+) -> Tuple[float, int]:
+    """Rotate-in-place command with a direction latch (T4).
+
+    ``latch_dir`` is the sign chosen when this rotation started (0 = none
+    yet). The latch holds while the target is roughly behind the robot
+    (|bearing| > π − ``flip_band_rad``), where noise flips the sign of the
+    bearing every tick; the robot keeps turning the way it started (the long
+    way round by at most ``flip_band_rad``). A target clearly on the other
+    side re-latches toward it. Returns (omega, new_latch_dir)."""
+    sign = 1 if bearing >= 0.0 else -1
+    if latch_dir == 0 or sign == latch_dir:
+        d = sign
+        err = abs(bearing)
+    elif abs(bearing) > math.pi - flip_band_rad:
+        d = latch_dir
+        err = 2.0 * math.pi - abs(bearing)
+    else:
+        d = sign
+        err = abs(bearing)
+    mag = min(params.omega_max, max(params.k_omega * err, min_omega))
+    return d * mag, d
+
+
+class OdomRing:
+    """Recent odom poses for time-consistent transforms + reset detection.
+
+    ``push`` stores each body/odom message and reports an odom-frame reset
+    (motor_controller restart): a ``session_id`` change or a ``seq``
+    decrease (both optional on the wire — older Pi builds send neither). On
+    a reset the history is dropped, since poses from the old frame are
+    meaningless in the new one. ``pose_at(ts)`` interpolates (x, y, θ) at a
+    wall-clock time, so a scan (stamped at its sweep mid-point) or a
+    body-frame goal (stamped with the scan it was computed from) is
+    expressed with the pose the robot had THEN, not the newest one."""
+
+    def __init__(self, max_age_s: float = 3.0, max_len: int = 400) -> None:
+        self._buf: Deque[Tuple[float, float, float, float]] = deque(maxlen=max_len)
+        self._max_age_s = max_age_s
+        self._session: Optional[str] = None
+        self._seq: Optional[int] = None
+
+    def clear(self) -> None:
+        self._buf.clear()
+
+    def push(self, msg: Dict[str, Any]) -> bool:
+        """Add one odom message. Returns True if it signals an odom reset."""
+        reset = False
+        sid = msg.get("session_id")
+        seq = msg.get("seq")
+        if isinstance(sid, str) and sid:
+            if self._session is not None and sid != self._session:
+                reset = True
+            self._session = sid
+        if isinstance(seq, (int, float)) and not isinstance(seq, bool):
+            seq_i = int(seq)
+            if not reset and self._seq is not None and seq_i < self._seq:
+                reset = True
+            self._seq = seq_i
+        if reset:
+            self._buf.clear()
+        try:
+            ts = float(msg["ts"])
+            entry = (ts, float(msg["x"]), float(msg["y"]), float(msg["theta"]))
+        except (KeyError, TypeError, ValueError):
+            return reset
+        if self._buf and ts < self._buf[-1][0] - 1.0:
+            # Wall clock stepped backward (chrony/NTP sync after boot): the old
+            # samples can never be matched again, so start over rather than
+            # freezing the ring until the clock catches up.
+            self._buf.clear()
+        elif self._buf and ts < self._buf[-1][0]:
+            # Out-of-order delivery: keep the ring monotonic.
+            return reset
+        self._buf.append(entry)
+        while self._buf and self._buf[-1][0] - self._buf[0][0] > self._max_age_s:
+            self._buf.popleft()
+        return reset
+
+    def latest(self) -> Optional[Tuple[float, Pose]]:
+        if not self._buf:
+            return None
+        ts, x, y, th = self._buf[-1]
+        return ts, (x, y, th)
+
+    def pose_at(self, ts: float, *, tol_s: float = 0.05) -> Optional[Pose]:
+        """Interpolated pose at ``ts``; None when ``ts`` is outside the ring
+        (beyond ``tol_s`` of either end)."""
+        buf = self._buf
+        if not buf:
+            return None
+        if ts <= buf[0][0]:
+            return buf[0][1:] if buf[0][0] - ts <= tol_s else None
+        if ts >= buf[-1][0]:
+            return buf[-1][1:] if ts - buf[-1][0] <= tol_s else None
+        lo, hi = 0, len(buf) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if buf[mid][0] <= ts:
+                lo = mid
+            else:
+                hi = mid
+        t0, x0, y0, th0 = buf[lo]
+        t1, x1, y1, th1 = buf[hi]
+        f = 0.0 if t1 <= t0 else (ts - t0) / (t1 - t0)
+        return (x0 + f * (x1 - x0), y0 + f * (y1 - y0),
+                wrap_pi(th0 + f * wrap_pi(th1 - th0)))
+
+
+def relative_pose(ref: Pose, pose: Pose) -> Pose:
+    """``pose`` expressed in the body frame of ``ref`` (both in odom)."""
+    x, y = odom_to_body((pose[0], pose[1]), ref)
+    return (x, y, wrap_pi(pose[2] - ref[2]))
+
+
+class GotoArbiter:
+    """``body/drive/goto`` acceptance, supersede watermark and the status that
+    stands in for "no active goal" (pure; the caller holds the lock).
+
+    * goto with ``cmd_id`` > watermark → becomes THE goal (watermark := id);
+      < watermark → queued for a one-shot ``REJECTED`` (with the watermark);
+      == watermark → a resend of the command already taken: absorbed
+      idempotently (status already carries that id — no restart, no
+      REJECTED). Malformed gotos (bad frame / non-numeric fields) are
+      REJECTED too.
+    * cancel / stop → drops the goal, advances the watermark to its id, and
+      queues a one-tick CANCELED under the revoked goal's id.
+    * while ``estop_active`` a goto is refused: watermark advances and the
+      refusal is latched as FAULT e_stop for that id.
+    * ``drop(reason)`` (e-stop, odom reset, internal error) latches FAULT
+      ``reason`` for the dropped goal's id until the next goto / cancel.
+    """
+
+    FRAMES = ("odom", "body")
+
+    def __init__(self) -> None:
+        self.goal: Optional[Dict[str, Any]] = None
+        self.watermark = -1
+        self.pending_canceled: Optional[int] = None
+        self.fault: Optional[Tuple[int, str]] = None
+        self._rejects: list = []
+
+    def on_command(self, msg: Dict[str, Any], *, estop_active: bool = False) -> str:
+        """Apply one goto/cancel/stop. Returns what happened (for logs/tests):
+        accepted | duplicate | rejected | refused_estop | canceled | malformed."""
+        kind = str(msg.get("kind", "goto"))
+        try:
+            cmd_id = int(msg.get("cmd_id", 0))
+        except (TypeError, ValueError):
+            return "malformed"
+        if kind in ("cancel", "stop"):
+            revoked = int(self.goal.get("cmd_id", self.watermark)) if self.goal else None
+            self.watermark = max(self.watermark, cmd_id)
+            self.goal = None
+            self.fault = None
+            if revoked is not None:
+                self.pending_canceled = revoked
+            return "canceled"
+        if cmd_id == self.watermark:
+            # A resend of the command already taken (the desktop re-sends
+            # until it sees a status with its cmd_id): idempotent — status
+            # for this id is already flowing, so neither restart nor reject.
+            return "duplicate"
+        if cmd_id < self.watermark:
+            self._rejects.append(cmd_id)
+            return "rejected"
+        frame = str(msg.get("frame", "odom"))
+        try:
+            float(msg["x_m"]); float(msg["y_m"])
+            for k in ("arrival_tol_m", "final_heading_rad", "v_max"):
+                if msg.get(k) is not None:
+                    float(msg[k])
+            if frame == "body" and msg.get("anchor_ts") is not None:
+                float(msg["anchor_ts"])
+            ok = frame in self.FRAMES
+        except (KeyError, TypeError, ValueError):
+            ok = False
+        if not ok:
+            self.watermark = cmd_id
+            self._rejects.append(cmd_id)
+            return "malformed"
+        self.watermark = cmd_id
+        self.pending_canceled = None
+        if estop_active:
+            self.goal = None
+            self.fault = (cmd_id, "e_stop")
+            return "refused_estop"
+        self.goal = dict(msg)
+        self.fault = None
+        return "accepted"
+
+    def take_rejects(self) -> list:
+        out, self._rejects = self._rejects, []
+        return out
+
+    def drop(self, reason: str) -> Optional[int]:
+        """Drop the active goal with a latched FAULT. Returns its cmd_id."""
+        if self.goal is None:
+            return None
+        cid = int(self.goal.get("cmd_id", self.watermark))
+        self.goal = None
+        self.fault = (cid, reason)
+        return cid
+
+    def finish(self, cmd_id: int) -> None:
+        """The goal ``cmd_id`` ended on its own (ARRIVED)."""
+        if self.goal is not None and int(self.goal.get("cmd_id", -1)) == cmd_id:
+            self.goal = None
+
+    def idle_status(self) -> Tuple[str, int, Optional[str]]:
+        """(state, cmd_id, reason) to publish while there is no goal. Consumes
+        a pending CANCELED (one tick)."""
+        if self.pending_canceled is not None:
+            cid, self.pending_canceled = self.pending_canceled, None
+            return STATE_CANCELED, cid, None
+        if self.fault is not None:
+            return STATE_FAULT, self.fault[0], self.fault[1]
+        return STATE_IDLE, max(0, self.watermark), None
+
+
+class EStopMonitor:
+    """Is the safety layer currently stopping the motors? (fix 9)
+
+    Sources: ``body/emergency_stop`` (an event), ``body/status``
+    (``e_stop_active``, watchdog latch) and ``body/motor_state``
+    (``e_stop_active``, ``stall_detected``). An emergency_stop event counts as
+    active until a LATER status / motor_state report says the latch is clear.
+    The robot boots e-stop-latched until ``body/estop_rearm``, so Tier-3 sits
+    in FAULT e_stop at startup and clears as soon as both reports go false."""
+
+    def __init__(self) -> None:
+        self._event_pending = False
+        self._status_estop = False
+        self._motor_estop = False
+        self._motor_stall = False
+
+    def on_event(self, _msg: Dict[str, Any]) -> None:
+        self._event_pending = True
+
+    def on_status(self, msg: Dict[str, Any]) -> None:
+        self._status_estop = bool(msg.get("e_stop_active", False))
+        if not self._status_estop:
+            self._event_pending = False
+
+    def on_motor_state(self, msg: Dict[str, Any]) -> None:
+        self._motor_estop = bool(msg.get("e_stop_active", False))
+        self._motor_stall = bool(msg.get("stall_detected", False))
+        if not self._motor_estop:
+            self._event_pending = False
+
+    def active(self) -> bool:
+        return (self._event_pending or self._status_estop
+                or self._motor_estop or self._motor_stall)
+
+    def describe(self) -> str:
+        parts = [n for n, on in (("event", self._event_pending),
+                                 ("watchdog", self._status_estop),
+                                 ("motor", self._motor_estop),
+                                 ("stall", self._motor_stall)) if on]
+        return "+".join(parts) or "clear"

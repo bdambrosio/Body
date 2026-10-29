@@ -15,10 +15,13 @@ resolves config.json from the repo root on either host).
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict
 
 from body.lib.depth_veto import DepthVetoConfig
+from body.lib.drive_safety import FootprintConfig
 from body.lib.local_costmap import LocalCostmapConfig
+from body.lib.local_drive_core import DriveParams
 from body.lib.local_planner import LocalPlanConfig
 from body.lib.scan_raster import ScanRasterConfig
 
@@ -42,6 +45,7 @@ def scan_raster_config(body_cfg: Dict[str, Any]) -> ScanRasterConfig:
             scan_cfg.get("max_clear_range_m", lm_cfg.get("lidar_max_clear_range_m", 6.0))
         ),
         clear_buffer_cells=float(scan_cfg.get("clear_buffer_cells", 2.0)),
+        robot_clear_radius_m=float(scan_cfg.get("robot_clear_radius_m", 0.0)),
     )
 
 
@@ -57,6 +61,9 @@ def local_plan_config(body_cfg: Dict[str, Any]) -> LocalPlanConfig:
             inflation_decay_m=float(lp.get("inflation_decay_m", 0.20)),
             unknown_cost=float(lp.get("unknown_cost", 25.0)),
             unknown_is_lethal=bool(lp.get("unknown_is_lethal", False)),
+            quantization_pad=bool(lp.get("quantization_pad", True)),
+            denoise=bool(lp.get("denoise", False)),
+            denoise_min_range_m=float(lp.get("denoise_min_range_m", 1.0)),
         ),
         min_clearance_cells=int(lp.get("min_clearance_cells", 0)),
         goal_clearance_cells=int(lp.get("goal_clearance_cells", 0)),
@@ -120,4 +127,86 @@ def depth_veto_config(body_cfg: Dict[str, Any]) -> DepthVetoConfig:
             dv.get("depth_pitch_rad", lm.get("depth_pitch_rad", 0.14))
         ),
         depth_roll_rad=float(dv.get("depth_roll_rad", lm.get("depth_roll_rad", 0.0))),
+        floor_band_per_m=float(dv.get("floor_band_per_m", 0.0)),
+        min_vertical_extent_m=float(dv.get("min_vertical_extent_m", 0.03)),
+        structure_free_height_m=float(dv.get("structure_free_height_m", 0.10)),
+        structure_cell_m=float(dv.get("structure_cell_m", 0.04)),
+    )
+
+
+def drive_params(body_cfg: Dict[str, Any]) -> DriveParams:
+    """Tier-3 follower speeds / steering gains (``local_drive`` section)."""
+    cfg = body_cfg.get("local_drive", {})
+    d = DriveParams()
+    return DriveParams(
+        v_max=float(cfg.get("v_max", d.v_max)),
+        omega_max=float(cfg.get("omega_max", d.omega_max)),
+        v_min_mps=float(cfg.get("v_min_mps", d.v_min_mps)),
+        arrival_tol_m=float(cfg.get("arrival_tol_m", d.arrival_tol_m)),
+        rotate_in_place_thresh_rad=float(
+            cfg.get("rotate_in_place_thresh_rad", d.rotate_in_place_thresh_rad)),
+        rotate_exit_thresh_rad=float(
+            cfg.get("rotate_exit_thresh_rad", d.rotate_exit_thresh_rad)),
+        k_omega=float(cfg.get("k_omega", d.k_omega)),
+        slowdown_distance_m=float(cfg.get("slowdown_distance_m", d.slowdown_distance_m)),
+    )
+
+
+def footprint_config(body_cfg: Dict[str, Any]) -> FootprintConfig:
+    """Last-resort swept veto, derived from the A* footprint so the two can't
+    drift: the swept check adds ½ cell internally, so subtract it to keep the
+    veto's effective radius == the A* footprint radius; the planner's lethal
+    radius adds the res/√2 quantization pad on top (``quantization_pad``), so
+    every A* path clears the veto with margin."""
+    cfg = body_cfg.get("local_drive", {})
+    raster = scan_raster_config(body_cfg)
+    plan = local_plan_config(body_cfg)
+    half_cell = 0.5 * raster.resolution_m
+    veto_foot = max(0.02, plan.costmap.footprint_radius_m - half_cell)
+    explained_default = int(math.ceil(raster.clear_buffer_cells)) + 1
+    return FootprintConfig(
+        footprint_radius_m=veto_foot,
+        preview_distance_m=float(cfg.get("preview_distance_m", 0.35)),
+        preview_min_distance_m=float(cfg.get("preview_min_distance_m", 0.15)),
+        preview_time_s=float(cfg.get("preview_time_s", 0.5)),
+        forward_cone_rad=math.radians(float(cfg.get("forward_cone_deg", 60.0))),
+        hard_radius_m=min(float(cfg.get("hard_radius_m", 0.05)), veto_foot),
+        block_on_unknown=bool(cfg.get("block_on_unknown", True)),
+        unknown_block_range_m=float(cfg.get("unknown_block_range_m", 0.25)),
+        min_observed_cells=int(cfg.get("min_observed_cells", 3)),
+        unknown_explained_cells=int(cfg.get("unknown_explained_cells", explained_default)),
+    )
+
+
+def tier3_config(body_cfg: Dict[str, Any]):
+    """Everything ``Tier3Controller`` needs, from the ``local_drive`` section
+    (imported lazily: tier3_controller depends on this module's siblings)."""
+    from body.lib.tier3_controller import Tier3Config
+    cfg = body_cfg.get("local_drive", {})
+    d = Tier3Config()
+    plan = local_plan_config(body_cfg)
+    return Tier3Config(
+        params=drive_params(body_cfg),
+        plan=plan,
+        foot=footprint_config(body_cfg),
+        depth=depth_veto_config(body_cfg),
+        lookahead_m=float(cfg.get("local_planner", {}).get("lookahead_m", d.lookahead_m)),
+        no_progress_timeout_s=float(cfg.get("no_progress_timeout_s", d.no_progress_timeout_s)),
+        no_progress_eps_m=float(cfg.get("no_progress_eps_m", d.no_progress_eps_m)),
+        goal_deadline_s=float(cfg.get("goal_deadline_s", d.goal_deadline_s)),
+        swept_realign_thresh_rad=float(
+            cfg.get("swept_realign_thresh_rad", d.swept_realign_thresh_rad)),
+        swept_realign_timeout_s=float(
+            cfg.get("swept_realign_timeout_s", d.swept_realign_timeout_s)),
+        rotate_timeout_s=float(cfg.get("rotate_timeout_s", d.rotate_timeout_s)),
+        translate_eps_m=float(cfg.get("translate_eps_m", d.translate_eps_m)),
+        rotate_flip_band_rad=float(cfg.get("rotate_flip_band_rad", d.rotate_flip_band_rad)),
+        min_rotate_omega_radps=float(
+            cfg.get("min_rotate_omega_radps", d.min_rotate_omega_radps)),
+        path_hysteresis=float(cfg.get("path_hysteresis", d.path_hysteresis)),
+        path_max_deviation_m=float(cfg.get("path_max_deviation_m", d.path_max_deviation_m)),
+        stop_margin_m=float(cfg.get("stop_margin_m", d.stop_margin_m)),
+        seed_clear_radius_m=float(
+            cfg.get("seed_clear_radius_m", plan.costmap.footprint_radius_m)),
+        slow_retry=bool(cfg.get("slow_retry", d.slow_retry)),
     )

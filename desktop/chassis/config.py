@@ -44,6 +44,7 @@ class Topics:
     heartbeat: str = "body/heartbeat"
     cmd_vel: str = "body/cmd_vel"
     cmd_direct: str = "body/cmd_direct"
+    estop_rearm: str = "body/estop_rearm"
     oakd_config: str = "body/oakd/config"
     # Subscribe
     status: str = "body/status"

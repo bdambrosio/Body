@@ -15,6 +15,7 @@ import base64
 import queue
 import signal
 import sys
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -24,6 +25,7 @@ import depthai as dai
 import numpy as np
 
 from body.lib import schemas, zenoh_helpers
+from body.lib.depth_temporal import DepthTemporalSmoother, capture_wall_ts
 
 # Populated once per device open by ``_log_oakd_calibration`` (stereo-L intrinsics at the configured
 # depth output resolution, adjusted for ``rgb_rotate_deg``). Consumed by ``_depth_frame_to_stream_msg``
@@ -206,13 +208,17 @@ def _depth_frame_to_stream_msg(
     out_w: int,
     out_h: int,
     oakd_cfg: dict[str, Any],
-    smooth_prev_holder: list[np.ndarray | None],
+    smoother: DepthTemporalSmoother,
+    *,
+    ts: float | None = None,
+    seq: int | None = None,
 ) -> dict[str, Any]:
-    """Resize (and optionally rotate) depth to ``out_w``×``out_h``, apply temporal IIR smoothing.
+    """Resize (and optionally rotate) depth to ``out_w``×``out_h``, apply temporal smoothing.
 
-    Smoothing: where the new sample ``D`` is valid (``D>0``), ``S = (1/3)*S_prev + (2/3)*D`` (mm).
-    Where ``D`` is invalid (0) but ``S_prev > 0``, **hold** ``S = S_prev``. Where both are invalid,
-    ``S = 0``. ``smooth_prev_holder[0]`` holds float64 ``S`` (same shape as output).
+    Smoothing (``body.lib.depth_temporal``): IIR ``S = (1/3)*S_prev + (2/3)*D`` where both are
+    valid and within ``oakd.depth_iir_max_delta_mm``; a larger step takes ``D``. An invalid pixel
+    holds ``S_prev`` for at most ``oakd.depth_hold_max_frames`` frames (default 1), then is 0.
+    ``ts`` is the frame's capture time (wall clock); ``seq`` the per-frame counter.
     """
     h0 = int(frame.getHeight())
     w0 = int(frame.getWidth())
@@ -224,24 +230,67 @@ def _depth_frame_to_stream_msg(
         arr = np.ascontiguousarray(arr, dtype=np.uint16)
     arr = _apply_oakd_image_rotate(arr, oakd_cfg)
     small = cv2.resize(arr, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
-    curr = small.astype(np.float64)
-    prev = smooth_prev_holder[0]
-    if prev is None or prev.shape != curr.shape:
-        prev = np.zeros_like(curr)
-        smooth_prev_holder[0] = prev
-    valid_c = curr > 0.0
-    valid_p = prev > 0.0
-    out = np.zeros_like(curr)
-    both = valid_c & valid_p
-    w_old, w_new = 1.0 / 3.0, 2.0 / 3.0
-    out[both] = w_old * prev[both] + w_new * curr[both]
-    out[valid_c & ~valid_p] = curr[valid_c & ~valid_p]
-    hold = ~valid_c & valid_p
-    out[hold] = prev[hold]
-    np.copyto(prev, out)
+    out = smoother.apply(small)
     small_out = np.clip(np.round(out), 0, 65535).astype(np.uint16)
     b64 = base64.standard_b64encode(small_out.tobytes()).decode("ascii")
-    return schemas.oakd_depth_stream_frame(out_w, out_h, b64, intrinsics=_DEPTH_INTRINSICS)
+    return schemas.oakd_depth_stream_frame(
+        out_w, out_h, b64, intrinsics=_DEPTH_INTRINSICS, ts=ts, seq=seq
+    )
+
+
+class _DepthPublisher:
+    """Drain the depth queue every loop iteration; publish the newest frame at most
+    once per ``depth_period`` with its capture time and a per-frame ``seq``."""
+
+    def __init__(
+        self, session: Any, oakd_cfg: dict[str, Any], depth_period: float, depth_queue: Any | None
+    ) -> None:
+        self.session = session
+        self.oakd_cfg = oakd_cfg
+        self.depth_period = depth_period
+        self.depth_queue = depth_queue
+        self.smoother = DepthTemporalSmoother(
+            hold_max_frames=int(oakd_cfg.get("depth_hold_max_frames", 1)),
+            iir_max_delta_mm=float(oakd_cfg.get("depth_iir_max_delta_mm", 200.0)),
+        )
+        self.seq = 0
+        self.next_pub = time.monotonic()
+        self.pending: tuple[Any, float, float] | None = None
+
+    def tick(self, now: float) -> None:
+        if self.depth_queue is None:
+            if now >= self.next_pub:
+                zenoh_helpers.publish_json(
+                    self.session, "body/oakd/depth", schemas.oakd_depth_placeholder()
+                )
+                self.next_pub += self.depth_period
+            return
+        df = _depth_drain_latest(self.depth_queue)
+        if df is not None:
+            # Arrival stamped BEFORE any processing (fallback if no device ts).
+            self.pending = (df, time.time(), time.monotonic())
+        if self.pending is None or now < self.next_pub:
+            return
+        df, arr_wall, arr_mono = self.pending
+        self.pending = None
+        self.next_pub += self.depth_period
+        if self.next_pub < now:
+            self.next_pub = now
+        dw, dh = _depth_output_dims(self.oakd_cfg)
+        try:
+            msg = _depth_frame_to_stream_msg(
+                df,
+                dw,
+                dh,
+                self.oakd_cfg,
+                self.smoother,
+                ts=capture_wall_ts(df, arr_wall, arr_mono),
+                seq=self.seq,
+            )
+            zenoh_helpers.publish_json(self.session, "body/oakd/depth", msg)
+            self.seq += 1
+        except Exception as e:
+            print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)
 
 
 def _create_v3_stereo_depth_queue(pipeline: Any, oakd_cfg: dict[str, Any]) -> Any:
@@ -309,61 +358,88 @@ def _jpeg_b64_from_imgframe(
     return b64, w, h
 
 
-def _process_oakd_config_queue(
+def _start_config_worker(
     session: Any,
     config_pending: queue.Queue[dict[str, Any]],
     rgb_queue: Any | None,
     oakd_cfg: dict[str, Any],
+) -> tuple[threading.Thread, threading.Event]:
+    """Serve ``body/oakd/config`` requests (RGB capture) on their own thread so a slow
+    RGB capture (up to 3 s) can never stall the depth stream. Returns (thread, stop)."""
+    stop_evt = threading.Event()
+
+    def _worker() -> None:
+        while not stop_evt.is_set():
+            try:
+                req = config_pending.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                _handle_oakd_config_request(session, req, rgb_queue, oakd_cfg)
+            except Exception as e:
+                print(f"[oakd] config request failed: {e}", file=sys.stderr, flush=True)
+
+    th = threading.Thread(target=_worker, name="oakd-config", daemon=True)
+    th.start()
+    return th, stop_evt
+
+
+def _stop_config_worker(worker: tuple[threading.Thread, threading.Event]) -> None:
+    th, stop_evt = worker
+    stop_evt.set()
+    th.join(timeout=4.0)
+
+
+def _handle_oakd_config_request(
+    session: Any,
+    req: dict[str, Any],
+    rgb_queue: Any | None,
+    oakd_cfg: dict[str, Any],
 ) -> None:
-    while True:
-        try:
-            req = config_pending.get_nowait()
-        except queue.Empty:
-            break
-        action = req.get("action")
-        rid = str(req.get("request_id", ""))
-        if action != "capture_rgb":
-            continue
-        if rgb_queue is None:
-            zenoh_helpers.publish_json(
-                session,
-                "body/oakd/rgb",
-                schemas.oakd_rgb_capture_error(
-                    rid,
-                    "no_rgb_pipeline_set_oakd_rgb_enabled_true_or_fix_imu_rgb_fallback",
-                ),
-            )
-            continue
-        frame = _wait_rgb_frame(rgb_queue)
-        if frame is None:
-            zenoh_helpers.publish_json(
-                session,
-                "body/oakd/rgb",
-                schemas.oakd_rgb_capture_error(rid, "no_rgb_frame_timeout"),
-            )
-            continue
-        # Optional per-request downscale/quality — streaming sends low values
-        # for bandwidth; on-demand (VLM) capture omits them → full res, q=85.
-        mw = req.get("max_width")
-        max_width = int(mw) if isinstance(mw, (int, float)) else None
-        jq = req.get("jpeg_quality")
-        jpeg_quality = int(jq) if isinstance(jq, (int, float)) else 85
-        try:
-            jpeg_b64, fw, fh = _jpeg_b64_from_imgframe(
-                frame, oakd_cfg, max_width=max_width, jpeg_quality=jpeg_quality,
-            )
-            zenoh_helpers.publish_json(
-                session,
-                "body/oakd/rgb",
-                schemas.oakd_rgb_capture_ok(rid, jpeg_b64, fw, fh),
-            )
-            print(f"[oakd] capture_rgb ok request_id={rid} {fw}x{fh}", flush=True)
-        except Exception as e:
-            zenoh_helpers.publish_json(
-                session,
-                "body/oakd/rgb",
-                schemas.oakd_rgb_capture_error(rid, f"encode_failed:{e}"),
-            )
+    action = req.get("action")
+    rid = str(req.get("request_id", ""))
+    if action != "capture_rgb":
+        return
+    if rgb_queue is None:
+        zenoh_helpers.publish_json(
+            session,
+            "body/oakd/rgb",
+            schemas.oakd_rgb_capture_error(
+                rid,
+                "no_rgb_pipeline_set_oakd_rgb_enabled_true_or_fix_imu_rgb_fallback",
+            ),
+        )
+        return
+    frame = _wait_rgb_frame(rgb_queue)
+    if frame is None:
+        zenoh_helpers.publish_json(
+            session,
+            "body/oakd/rgb",
+            schemas.oakd_rgb_capture_error(rid, "no_rgb_frame_timeout"),
+        )
+        return
+    # Optional per-request downscale/quality — streaming sends low values
+    # for bandwidth; on-demand (VLM) capture omits them → full res, q=85.
+    mw = req.get("max_width")
+    max_width = int(mw) if isinstance(mw, (int, float)) else None
+    jq = req.get("jpeg_quality")
+    jpeg_quality = int(jq) if isinstance(jq, (int, float)) else 85
+    try:
+        jpeg_b64, fw, fh = _jpeg_b64_from_imgframe(
+            frame, oakd_cfg, max_width=max_width, jpeg_quality=jpeg_quality,
+        )
+        zenoh_helpers.publish_json(
+            session,
+            "body/oakd/rgb",
+            schemas.oakd_rgb_capture_ok(rid, jpeg_b64, fw, fh),
+        )
+        print(f"[oakd] capture_rgb ok request_id={rid} {fw}x{fh}", flush=True)
+    except Exception as e:
+        zenoh_helpers.publish_json(
+            session,
+            "body/oakd/rgb",
+            schemas.oakd_rgb_capture_error(rid, f"encode_failed:{e}"),
+        )
 
 
 def _run_imu_loop(
@@ -377,6 +453,21 @@ def _run_imu_loop(
     rgb_queue: Any | None,
     depth_queue: Any | None = None,
 ) -> None:
+    depth_pub = _DepthPublisher(session, oakd_cfg, depth_period, depth_queue)
+    worker = _start_config_worker(session, config_pending, rgb_queue, oakd_cfg)
+    try:
+        _run_imu_loop_body(imu_queue, oakd_cfg, interval_s, continue_fn, depth_pub)
+    finally:
+        _stop_config_worker(worker)
+
+
+def _run_imu_loop_body(
+    imu_queue: Any,
+    oakd_cfg: dict[str, Any],
+    interval_s: float,
+    continue_fn: Callable[[], bool],
+    depth_pub: _DepthPublisher,
+) -> None:
     window_ax: list[float] = []
     window_ay: list[float] = []
     window_az: list[float] = []
@@ -384,13 +475,9 @@ def _run_imu_loop(
     window_gy: list[float] = []
     window_gz: list[float] = []
     last_quat: tuple[float, float, float, float] | None = None
-    depth_smooth_prev: list[np.ndarray | None] = [None]
-
     window_start = time.monotonic()
-    next_depth = time.monotonic()
 
     while continue_fn():
-        _process_oakd_config_queue(session, config_pending, rgb_queue, oakd_cfg)
         imu_data = imu_queue.tryGet()
         if imu_data is not None:
             for pkt in imu_data.packets:
@@ -438,26 +525,7 @@ def _run_imu_loop(
             window_gz.clear()
             window_start = now
 
-        if now >= next_depth:
-            if depth_queue is not None:
-                df = _depth_drain_latest(depth_queue)
-                if df is not None:
-                    dw, dh = _depth_output_dims(oakd_cfg)
-                    try:
-                        zenoh_helpers.publish_json(
-                            session,
-                            "body/oakd/depth",
-                            _depth_frame_to_stream_msg(
-                                df, dw, dh, oakd_cfg, depth_smooth_prev
-                            ),
-                        )
-                    except Exception as e:
-                        print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)
-            else:
-                zenoh_helpers.publish_json(
-                    session, "body/oakd/depth", schemas.oakd_depth_placeholder()
-                )
-            next_depth += depth_period
+        depth_pub.tick(now)
 
         if imu_data is None:
             time.sleep(0.001)
@@ -473,37 +541,21 @@ def _run_synthetic_imu_depth_config_loop(
     rgb_queue: Any | None,
     depth_queue: Any | None = None,
 ) -> None:
-    """Synthetic ``body/oakd/imu``; depth placeholder or StereoDepth stream; optional ``rgb_queue``."""
-    next_imu = time.monotonic()
-    next_depth = time.monotonic()
-    depth_smooth_prev: list[np.ndarray | None] = [None]
-    while not stop_ref[0]:
-        _process_oakd_config_queue(session, config_pending, rgb_queue, oakd_cfg)
-        now = time.monotonic()
-        if now >= next_imu:
-            # body/imu comes from body/imu_driver.py now; no synthetic publish here.
-            next_imu += interval_s
-        if now >= next_depth:
-            if depth_queue is not None:
-                df = _depth_drain_latest(depth_queue)
-                if df is not None:
-                    dw, dh = _depth_output_dims(oakd_cfg)
-                    try:
-                        zenoh_helpers.publish_json(
-                            session,
-                            "body/oakd/depth",
-                            _depth_frame_to_stream_msg(
-                                df, dw, dh, oakd_cfg, depth_smooth_prev
-                            ),
-                        )
-                    except Exception as e:
-                        print(f"[oakd] depth stream encode error: {e}", file=sys.stderr, flush=True)
-            else:
-                zenoh_helpers.publish_json(
-                    session, "body/oakd/depth", schemas.oakd_depth_placeholder()
-                )
-            next_depth += depth_period
-        time.sleep(0.02)
+    """Depth placeholder or StereoDepth stream; optional ``rgb_queue`` (no IMU publish).
+
+    The depth queue is drained every few ms so frames are stamped close to arrival (the
+    capture time comes from the device timestamp when available); RGB capture requests
+    run on their own thread.
+    """
+    depth_pub = _DepthPublisher(session, oakd_cfg, depth_period, depth_queue)
+    poll_s = 0.005 if depth_queue is not None else 0.02
+    worker = _start_config_worker(session, config_pending, rgb_queue, oakd_cfg)
+    try:
+        while not stop_ref[0]:
+            depth_pub.tick(time.monotonic())
+            time.sleep(poll_s)
+    finally:
+        _stop_config_worker(worker)
 
 
 def _run_stub_imu_publisher(
@@ -660,6 +712,12 @@ def _run_depthai_v2(
     def _continue() -> bool:
         return not stop_ref[0]
 
+    print(
+        "[oakd] WARNING: DepthAI v2 path has no StereoDepth node — body/oakd/depth carries "
+        "placeholders only, so depth-based obstacle checks have no data. Use DepthAI v3.",
+        file=sys.stderr,
+        flush=True,
+    )
     pipeline = dai.Pipeline()
     imu = pipeline.create(dai.node.IMU)
     xlink = pipeline.create(dai.node.XLinkOut)

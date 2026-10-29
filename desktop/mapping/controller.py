@@ -18,6 +18,7 @@ from desktop.mapping.pose_graph_mapper import PoseGraphMapper
 from desktop.nav.slam.types import ImuReading
 from desktop.reference_map.reference_map import ReferenceMap
 from desktop.chassis.transport import open_session
+from desktop.utils.stream_epoch import epoch_fields
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,8 @@ class MappingController:
         if triple is None:
             return
         ts, x, y, theta = triple
-        self.ekf.update_odom(ts, x, y, theta)
+        session_id, seq = epoch_fields(msg)
+        self.ekf.update_odom(ts, x, y, theta, session_id=session_id, seq=seq)
 
     def _on_imu(self, sample: Any) -> None:
         msg = _decode_json(self._payload_bytes(sample))
@@ -200,7 +202,10 @@ class MappingController:
         pose = self.mapper.display_pose()
         ekf_diag = self.ekf.diagnostics()
         slam_diag = self.mapper.diagnostics()
-        cov = self.ekf.cov_at(_now())
+        # Pi-clock ts of the newest EKF state — never the desktop clock (a
+        # cross-host comparison that returns None under any skew).
+        latest_ts = self.ekf.latest_state_ts()
+        cov = self.ekf.cov_at(latest_ts) if latest_ts is not None else None
         cov_xy = None
         if cov is not None:
             cov_xy = float(cov[0, 0] + cov[1, 1])
@@ -211,6 +216,8 @@ class MappingController:
             "imu_settled": ekf_diag.get("imu_settled"),
             "heading_source": ekf_diag.get("heading_source"),
             "yaw_at_misses": ekf_diag.get("yaw_at_misses"),
+            "imu_distrusted": ekf_diag.get("imu_distrusted"),
+            "odom_resets": ekf_diag.get("odom_resets"),
             "ekf_cov_trace_xy": cov_xy,
             "graph_nodes": slam_diag.get("node_count"),
             "graph_edges": slam_diag.get("edge_count"),

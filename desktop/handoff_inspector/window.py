@@ -238,6 +238,9 @@ class HandoffPanel(QWidget):
     def set_arm(self, checked: bool) -> None:
         self._arm.setChecked(checked)        # toggled signal emits the ctrl
 
+    def is_armed(self) -> bool:
+        return self._arm.isChecked()
+
     def update_from(self, rec, age_s: float) -> None:
         if rec is None:
             self._status.setText("waiting for a record…")
@@ -283,6 +286,15 @@ class HandoffPanel(QWidget):
 
 
 class HandoffInspectorWindow(QMainWindow):
+    # Arm lease (T14): while a tier is armed, the inspector re-sends "arm"
+    # every LEASE_REFRESH_S with lease_s = LEASE_S. A producer that honours
+    # the lease auto-disarms when refreshes stop (inspector crashed / closed
+    # without its closeEvent), so Tier-3 can't hold every goal forever.
+    # Producers that predate the lease ignore the extra field; re-arming is
+    # idempotent.
+    LEASE_REFRESH_S = 1.0
+    LEASE_S = 3.0
+
     def __init__(self, session, *, reference_map=None,
                  record_prefix: str = RECORD_PREFIX, ctrl_key: str = CTRL_KEY):
         super().__init__()
@@ -324,6 +336,11 @@ class HandoffInspectorWindow(QMainWindow):
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
 
+        self._lease_timer = QTimer(self)
+        self._lease_timer.setInterval(int(self.LEASE_REFRESH_S * 1000))
+        self._lease_timer.timeout.connect(self._refresh_leases)
+        self._lease_timer.start()
+
     # ── records in ──────────────────────────────────────────────────
     def _make_handler(self, tier: int):
         def handler(_key, msg):
@@ -333,12 +350,23 @@ class HandoffInspectorWindow(QMainWindow):
         return handler
 
     # ── control out ─────────────────────────────────────────────────
-    def _send(self, tier: int, action: str) -> None:
+    def _send(self, tier: int, action: str, **extra: Any) -> None:
         zenoh_helpers.publish_json(self._session, self._ctrl_key,
-                                   {"tier": tier, "action": action})
+                                   {"tier": tier, "action": action, **extra})
 
     def _send_arm(self, tier: int, checked: bool) -> None:
-        self._send(tier, "arm" if checked else "disarm")
+        if checked:
+            self._send(tier, "arm", lease_s=self.LEASE_S)
+        else:
+            self._send(tier, "disarm")
+
+    def _refresh_leases(self) -> None:
+        for t, panel in self._panels.items():
+            if panel.is_armed():
+                try:
+                    self._send(t, "arm", lease_s=self.LEASE_S)
+                except Exception:
+                    pass
 
     def _send_continue(self, tier: int) -> None:
         self._send(tier, "continue")
@@ -362,8 +390,16 @@ class HandoffInspectorWindow(QMainWindow):
             panel.update_from(rec, (now - recv[t]) if rec is not None else 0.0)
 
     def closeEvent(self, event) -> None:
-        try:
-            self._timer.stop()
-        except Exception:
-            pass
+        for timer in (self._timer, self._lease_timer):
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        # Never leave a producer holding on a breakpoint nobody can continue
+        # (T14): disarm every tier on the way out, armed or not.
+        for t in (1, 2, 3):
+            try:
+                self._send(t, "disarm")
+            except Exception:
+                pass
         super().closeEvent(event)

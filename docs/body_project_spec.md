@@ -143,6 +143,7 @@ body/
     status           # Tier-3 state machine feedback
   status             # system-level health from watchdog
   emergency_stop     # published by watchdog on safety violation
+  estop_rearm        # explicit operator re-arm after an e-stop (desktop / CLI → watchdog + motor_controller)
 ```
 
 Retired: `body/oakd/imu` — do not use; orientation is `body/imu` only.
@@ -166,7 +167,8 @@ Twist command in robot body frame. Linear is forward/back, angular is rotation (
 
 - `linear`: m/s, positive = forward. Clamped by motor_controller to hardware limits.
 - `angular`: rad/s, positive = CCW.
-- `timeout_ms`: if no new `cmd_vel` arrives within this window, motor_controller sets output to zero. Safety backstop independent of watchdog.
+- `timeout_ms`: if no new `cmd_vel` arrives within this window, motor_controller sets output to zero. Safety backstop independent of watchdog. Clamped on the Pi to `[50, motor.cmd_timeout_max_ms]` (default 1000).
+- Arbitration with `cmd_direct`: the motor controller uses the most recently **received** unexpired command (Pi monotonic receipt time, each topic expiring on its own `timeout_ms`); `ts` is informational only. Malformed messages (missing / non-numeric / non-finite fields) are ignored and logged. See [motor_controller_spec.md](motor_controller_spec.md) §4.7.
 
 ### 5.2 `body/cmd_direct` (Jill → motor_controller)
 
@@ -197,19 +199,23 @@ Dead-reckoned pose from encoder integration. Frame: robot starting position at o
   "vtheta": 0.0,
   "left_ticks": 0,
   "right_ticks": 0,
-  "dt_ms": 20,
-  "source": "commanded_vel_playback"
+  "dt_ms": 20.1,
+  "source": "wheel_encoders",
+  "session_id": "3fa9c01e",
+  "seq": 1234
 }
 ```
 
 - `x`, `y`: meters from origin.
 - `theta`: radians, normalized to [-π, π].
-- `vx`, `vtheta`: instantaneous velocity estimates. When encoder motion is present for the cycle (non-zero tick deltas), these are derived from wheel motion; otherwise the stub reports commanded velocities from the active `cmd_vel` / `cmd_direct`. They are zero when e-stop, command timeout, or software stall applies.
+- `vx`, `vtheta`: instantaneous velocity estimates. With both encoders live they are always the measured wheel velocities (over the measured `dt`), including coasting after a stop. Without encoders (`source: "none"`) they are the commanded velocities while a command is executing, else zero.
 - `left_ticks`, `right_ticks`: raw cumulative encoder counts. Allows Jill to do her own integration if desired.
-- `dt_ms`: time since last odom publication.
+- `dt_ms`: measured time since the previous odom publication (float ms, monotonic clock).
+- `session_id`: 8 hex chars, random per `motor_controller` process start. `seq`: 0-based, +1 per publish. **Odom-frame reset rule:** if `session_id` changes or `seq` decreases, the pose was reset to the origin (process restart) — consumers must re-baseline (not integrate the jump); Tier-3 drops its goal with FAULT `odom_reset`. Both are optional for consumers (older Pi builds omit them).
 - `source`: string identifying where the integrated pose came from. Lets consumers decide how much to trust `x`/`y`/`theta` as a prior (e.g. scan-matching weight, SLAM translation anchor). Defined values:
   - `"wheel_encoders"` — integrated from real GPIO quadrature encoder ticks. Best available prior. Published only once the encoder read path is live.
-  - `"commanded_vel_playback"` — integrated from the last commanded velocity via the diff-drive kinematic model. No physical feedback. Current default while encoders are not yet wired; usable as a coarse sanity check only.
+  - `"none"` — no usable pose integration (encoders disabled, or only one encoder live): `x`/`y`/`theta` stay fixed. Consumers must not use the pose as a prior.
+  - `"commanded_vel_playback"` — legacy label emitted by older Pi builds for the no-encoder case (their pose did not actually move either); treat like `"none"`.
   - `"stub"` — synthetic zero-motion publisher (reserved for future test harnesses; not currently emitted by `motor_controller`).
 
 ### 5.4 `body/motor_state` (motor_controller → all)
@@ -244,13 +250,19 @@ Dead-reckoned pose from encoder integration. Frame: robot starting position at o
   "range_max": 12.0,
   "ranges": [1.2, 1.3, 1.1, "..."],
   "intensities": [200, 195, 210, "..."],
-  "scan_time_ms": 100
+  "scan_time_ms": 100,
+  "ts_start": 1713264000.073456,
+  "ts_end": 1713264000.173456,
+  "seq": 812,
+  "unknown_bins": [118, 119, 120]
 }
 ```
 
-- Angles in radians. 0 = forward, increasing CCW.
-- Invalid/out-of-range readings: `null` in the array.
-- `intensities`: included if the STL-19P provides them, omit field otherwise.
+- Angles in radians. 0 = forward, increasing CCW. Bin i is centred on `i * angle_increment` (nearest-bin assignment); `angle_max = (N-1) * angle_increment`.
+- `null` in `ranges` = **no echo** in that bin this sweep (open space / beyond range) — consumers may clear along it.
+- `unknown_bins` (optional, since 2026-10): bins with **no information** this sweep — self-masked (`lidar.self_mask_sectors_deg`, applied per point), rejected as a mixed pixel, a return nearer than `range_min`, or never sampled (CRC-dropped packet). Their `ranges` entry is `null` but they must be treated as **unknown, never free** (`body.lib.scan_raster.rasterize_scan_msg`). Absent on older Pi builds.
+- Timing (since 2026-10): every point is stamped from the LD19 packet `timestamp_ms` mapped to Pi wall clock (windowed minimum arrival-minus-device offset, minus `lidar.device_latency_ms`), plus its in-packet angular offset. A sweep runs seam-to-seam with the **seam at the rear** (`lidar.seam_bearing_deg`, default 180°), so the forward sector is contiguous in time. `ts` = sweep **mid-point** (≈ capture time of the bearing opposite the seam, i.e. straight ahead); `ts_start`/`ts_end` bracket the sweep; `seq` +1 per published sweep. Older builds stamped `ts` at publish time (end of sweep + up to 50 ms of read batching). The first partial sweep and any sweep longer than `lidar.max_sweep_period_factor` × nominal are dropped. Optional rotation-only deskew to the mid-time using odom `vtheta` (`lidar.deskew_enabled`, default off). If device timestamps do not advance, arrival time is used.
+- `intensities`: included if the STL-19P provides them, omit field otherwise. Low-intensity points lying between a near and a far neighbour (door-jamb "veil" points) are dropped to `unknown_bins` when `lidar.mixed_pixel_max_intensity` > 0 (default 15, jump `lidar.mixed_pixel_jump_m` 0.15 m).
 
 ### 5.6 `body/imu` (imu_driver → Jill)
 
@@ -279,7 +291,12 @@ The old `body/oakd/imu` topic is retired — `body/imu` is now the sole IMU sour
 
 ### 5.7 `body/oakd/depth` (oakd_driver → Jill)
 
-**TBD.** This is the highest-bandwidth topic and the one most likely to need a non-JSON encoding or compression strategy. Options include publishing a downsampled depth map as a flat array, publishing only a local obstacle summary, or using Zenoh's raw bytes mode with a compact binary format. Defer detailed schema until the OAK-D pipeline design is done. For the initial skeleton, publish a placeholder.
+Implemented as `schemas.oakd_depth_stream_frame`: `format: "depth_uint16_mm"`, `width`/`height` (host-resized, `oakd.depth_out_*`), base64 row-major uint16 mm (`0` = invalid), optional `intrinsics` `{fx, fy, cx, cy}`, plus:
+
+- `ts` = **capture time**: DepthAI `getTimestamp()` (host-synced steady clock) mapped to wall clock; falls back to the dequeue time, taken before any processing. (Older builds stamped publish time.)
+- `seq` (since 2026-10): +1 per new device frame published. Consumers advance per-frame debounce (depth-veto streaks) only when `seq` changes.
+- Temporal smoothing (`body.lib.depth_temporal`): IIR blend only for steps ≤ `oakd.depth_iir_max_delta_mm` (200); an invalid pixel may hold its previous value for at most `oakd.depth_hold_max_frames` (default 1) frames — no indefinite hold.
+- RGB capture requests (`body/oakd/config`) run on their own thread and cannot stall the depth stream. The DepthAI v2 path has no StereoDepth node and publishes only placeholders (logged as a warning).
 
 ### 5.8 `body/heartbeat` (Jill → watchdog)
 
@@ -330,7 +347,18 @@ Jill publishes at 2 Hz minimum. Watchdog triggers safety stop if no heartbeat re
 }
 ```
 
-Motor controller immediately sets PWM to zero on receipt. Latched: motor output stays at zero until a new `cmd_vel` or `cmd_direct` is received AND `e_stop_active` is cleared by the watchdog (which requires heartbeat recovery).
+Motor controller immediately sets PWM to zero on receipt. Latched: motor output stays at zero until an explicit **re-arm** — a `body/estop_rearm` message received while the heartbeat is ok. Motion commands (`cmd_vel` / `cmd_direct`, including Tier-3's own stream) never clear an e-stop.
+
+### 5.10a `body/estop_rearm` (desktop / `python -m body.cli estop rearm` → watchdog, motor_controller)
+
+```json
+{
+  "ts": 1713264000.123456,
+  "source": "desktop"
+}
+```
+
+Clears the watchdog's latched `e_stop_active` (and the motor controller's own latch) **only if the heartbeat is currently ok**; otherwise it is refused and logged. The watchdog publishes `body/status` immediately after clearing. Note the watchdog also latches at boot until the first heartbeat + re-arm. Schema helper: `schemas.estop_rearm(source, ts=None)`.
 
 ## 6. Process Specifications
 
@@ -343,7 +371,7 @@ Motor controller immediately sets PWM to zero on receipt. Latched: motor output 
 **Loop structure:**
 - Main loop at 50 Hz (20ms cycle).
 - Each cycle: read encoders → compute odometry → check for cmd timeout → check software stall (when enabled) → compute PWM from latest command → write GPIO → publish odom and motor_state.
-- Zenoh: subscribe to `body/cmd_vel`, `body/cmd_direct`, `body/emergency_stop`, and `body/status` (for `e_stop_active`). Callbacks set shared state (protected by a lock since they run on Zenoh's internal thread).
+- Zenoh: subscribe to `body/cmd_vel`, `body/cmd_direct`, `body/emergency_stop`, `body/status` (for `e_stop_active`), `body/heartbeat` and `body/estop_rearm`. Callbacks validate and set shared state (protected by a lock since they run on Zenoh's internal thread); each control tick is exception-guarded and zeroes PWM on error.
 
 **Differential drive math:**
 ```
@@ -441,8 +469,9 @@ RGB_ENABLED = False           # keep off unless needed, saves bandwidth
 **Behavior:**
 - Subscribes to `body/heartbeat`. If no message received within `HEARTBEAT_TIMEOUT_MS`, publishes `body/emergency_stop` with reason `heartbeat_timeout`.
 - Periodically checks that all expected Zenoh topics are being published. If a process appears dead (no publications for `PROCESS_TIMEOUT_MS`), updates `body/status` accordingly.
-- On emergency stop: publishes `body/emergency_stop`. Clears stop condition only when heartbeat resumes AND Jill sends a new `cmd_vel` or `cmd_direct` (explicit re-engagement, not automatic).
-- Publishes `body/status` at 1 Hz.
+- On emergency stop: publishes `body/emergency_stop`. Clears the stop condition only on `body/estop_rearm` while the heartbeat is ok (explicit re-engagement, never on a motion command), then publishes `body/status` immediately.
+- Publishes `body/status` at 1 Hz. All timeouts use the monotonic clock (immune to NTP/chrony steps).
+- Liveness *restart* is done by the launcher (`launcher.liveness`): a process whose topic was flowing and goes stale is killed and respawned with backoff; when `motor_controller` exits or hangs, the launcher zeroes the motor PWM via sysfs.
 
 **Configuration:**
 ```
@@ -528,7 +557,7 @@ The following assumptions apply to the desktop agent (Jill / CW) and are **out o
 
 6. **No guaranteed delivery.** Zenoh pub/sub is best-effort. Messages can be lost, especially over wifi. Jill should not depend on receiving every scan or odom update. The `cmd_vel` timeout mechanism handles the inverse case (lost commands → robot stops).
 
-7. **Emergency stop acknowledgment.** When `body/emergency_stop` fires, the robot will not move until heartbeat recovers AND a new `cmd_vel` or `cmd_direct` is received. Jill should treat emergency stop as a state requiring explicit re-engagement, not automatic recovery.
+7. **Emergency stop acknowledgment.** When `body/emergency_stop` fires, the robot will not move until heartbeat recovers AND Jill publishes `body/estop_rearm` (§5.10a). Motion commands do not clear it. Jill should treat emergency stop as a state requiring explicit re-engagement, not automatic recovery.
 
 ## 9. Implementation Sequence
 

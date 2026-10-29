@@ -3,17 +3,28 @@
 Drives the robot to one observable subgoal on the live rasterized lidar
 scan (``body/lidar/scan``), with no dependence on the global map or PF pose.
 Subscribes ``body/drive/goto`` + ``body/odom`` + ``body/lidar/scan`` +
-``body/imu`` + ``body/oakd/depth``; publishes ``body/cmd_vel`` (only while a
-goal is active — see cmd_vel arbitration in docs/drive_tier3_spec.md) and
+``body/imu`` + ``body/oakd/depth`` + the safety layer (``body/emergency_stop``,
+``body/status``, ``body/motor_state``); publishes ``body/cmd_vel`` (only while
+a goal is active — see cmd_vel arbitration in docs/drive_tier3_spec.md) and
 ``body/drive/status`` every tick.
 
-Local A* + pure-pursuit follow the subgoal on the lidar raster; the
-swept-footprint check and a short-range **depth near-field veto** are
-last-resort stops (they never steer). Depth does **not** enter the planner —
-see docs/drive_tier3_spec.md. A swept/depth block / no-path reports BLOCKED
-for the sender to re-pick. Cancel/stop publishes ``CANCELED`` for one tick
-(then ``IDLE``) so upstream does not treat revoke as sub-goal success. The
-watchdog/e-stop/motor timeout remain supreme; this process is just another
+The per-goal control logic (local A* + pure-pursuit follow, swept/depth
+vetoes, rotation budget, path hysteresis) lives in
+``body/lib/tier3_controller.py``; this process is transport + lifecycle:
+
+* goto acceptance / supersede watermark / one-shot ``REJECTED`` / CANCELED
+  (``GotoArbiter``); every accepted command is acknowledged by the next
+  tick's status carrying its cmd_id;
+* ``frame: "body"`` goals are anchored with the odom pose interpolated at
+  their ``anchor_ts`` (odom ring buffer), and every scan is planned with the
+  pose the robot had at the scan's (mid-sweep) ``ts``;
+* odom reset (``session_id`` change / ``seq`` decrease) → drop the goal,
+  FAULT ``odom_reset``; e-stop / stall → drop the goal, FAULT ``e_stop``,
+  refuse gotos until clear;
+* every tick runs under try/except: an exception commands zero, drops the
+  goal with FAULT ``internal_error`` and the loop keeps running.
+
+The watchdog/e-stop/motor timeout remain supreme; this process is just another
 cmd_vel producer.
 """
 from __future__ import annotations
@@ -23,20 +34,23 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from typing import Any, Dict, Optional
 
 from body.lib import drive_config, schemas, zenoh_helpers
 from body.lib.buildinfo import git_sha
-from body.lib.depth_veto import depth_nearfield_blocked
-from body.lib.drive_safety import FootprintConfig, swept_path_blocked
 from body.lib.handoff_gate import HandoffGate
-from body.lib.scan_raster import rasterize_scan
-from body.lib.local_planner import lookahead_on_path, plan_local
 from body.lib.local_drive_core import (
-    STATE_ARRIVED, STATE_BLOCKED, STATE_CANCELED, STATE_DRIVING, STATE_FAULT,
-    STATE_IDLE, DriveParams, ImuYawCorrector, odom_to_body, quat_wxyz_to_yaw,
-    rotate_to_heading, steer_to_body_point, swept_block_response, wrap_pi,
+    STATE_ARRIVED, STATE_FAULT, STATE_REJECTED, EStopMonitor, GotoArbiter,
+    ImuYawCorrector, OdomRing, body_to_odom, quat_wxyz_to_yaw, wrap_pi,
 )
+from body.lib.scan_raster import rasterize_scan
+from body.lib.tier3_controller import Tier3Controller, Tier3Goal
+
+try:  # scan_raster grew a message-level entry point (honours unknown_bins)
+    from body.lib.scan_raster import rasterize_scan_msg
+except ImportError:  # pragma: no cover — older tree
+    rasterize_scan_msg = None
 
 
 def _idle_until_signal(reason: str) -> None:
@@ -49,17 +63,6 @@ def _idle_until_signal(reason: str) -> None:
     sys.exit(0)
 
 
-def _with_vmax(params: DriveParams, v_max: float) -> DriveParams:
-    return DriveParams(
-        v_max=v_max, omega_max=params.omega_max, v_min_mps=params.v_min_mps,
-        arrival_tol_m=params.arrival_tol_m,
-        rotate_in_place_thresh_rad=params.rotate_in_place_thresh_rad,
-        rotate_exit_thresh_rad=params.rotate_exit_thresh_rad,
-        k_omega=params.k_omega, slowdown_distance_m=params.slowdown_distance_m,
-        heading_tol_rad=params.heading_tol_rad,
-    )
-
-
 def _sleep_to(next_tick: float, period: float) -> float:
     next_tick += period
     sleep_for = next_tick - time.monotonic()
@@ -69,6 +72,24 @@ def _sleep_to(next_tick: float, period: float) -> float:
     return time.monotonic()
 
 
+def _rasterize(scan: Dict[str, Any], raster):
+    if rasterize_scan_msg is not None:
+        return rasterize_scan_msg(scan, raster)
+    return rasterize_scan(scan.get("ranges"), float(scan.get("angle_min", 0.0)),
+                          float(scan.get("angle_increment", 0.0)), raster)
+
+
+def _odom_usable(odom: Optional[Dict[str, Any]], now_wall: float, stale_s: float) -> bool:
+    if odom is None:
+        return False
+    if str(odom.get("source", "")) == "none":
+        return False   # encoders not live: the pose does not integrate motion
+    try:
+        return (now_wall - float(odom.get("ts", 0.0))) <= stale_s
+    except (TypeError, ValueError):
+        return False
+
+
 def main() -> None:
     body_cfg = zenoh_helpers.load_body_config()
     cfg = body_cfg.get("local_drive", {})
@@ -76,84 +97,43 @@ def main() -> None:
         _idle_until_signal("disabled (local_drive.enabled=false)")
         return
 
-    params = DriveParams(
-        v_max=float(cfg.get("v_max", 0.18)),
-        omega_max=float(cfg.get("omega_max", 0.6)),
-        v_min_mps=float(cfg.get("v_min_mps", 0.08)),
-        arrival_tol_m=float(cfg.get("arrival_tol_m", 0.12)),
-        rotate_in_place_thresh_rad=float(cfg.get("rotate_in_place_thresh_rad", 0.61)),
-        rotate_exit_thresh_rad=float(cfg.get("rotate_exit_thresh_rad", 0.26)),
-        k_omega=float(cfg.get("k_omega", 1.5)),
-        slowdown_distance_m=float(cfg.get("slowdown_distance_m", 0.4)),
-    )
-    # Tier-3 obstacle field + local A* config, built by the SHARED builders in
+    # Everything Tier-3 models comes from the SHARED builders in
     # body/lib/drive_config.py — the desktop's Tier-2 clear-run and the debug
-    # consoles construct theirs through the same functions from the same
-    # config.json, so the two sides cannot drift apart silently.
-    scan_cfg = cfg.get("scan", {})
+    # consoles construct theirs from the same functions and config.json.
+    t3_cfg = drive_config.tier3_config(body_cfg)
     raster = drive_config.scan_raster_config(body_cfg)
-    local_plan_cfg = drive_config.local_plan_config(body_cfg)
-    depth_veto_cfg = drive_config.depth_veto_config(body_cfg)
-    lookahead_m = float(cfg.get("local_planner", {}).get("lookahead_m", 0.4))
-
-    # Last-resort swept veto (drive_safety). It must NOT be stricter than the
-    # A* costmap or it rejects A*'s own feasible paths (the doorway/near-wall
-    # false swept_block). Derive its footprint from the A* footprint so they
-    # can't drift: the swept check adds ½ cell internally, so subtract that to
-    # keep its effective radius ≤ the A* lethal radius. The veto then only fires
-    # on a genuine corner-cut off the path or a new obstacle, never on an
-    # A*-blessed path.
-    half_cell = 0.5 * raster.resolution_m
-    veto_foot = max(0.02, local_plan_cfg.costmap.footprint_radius_m - half_cell)
-    foot = FootprintConfig(
-        footprint_radius_m=veto_foot,
-        preview_distance_m=float(cfg.get("preview_distance_m", 0.35)),
-        preview_min_distance_m=float(cfg.get("preview_min_distance_m", 0.15)),
-        preview_time_s=float(cfg.get("preview_time_s", 1.5)),
-        forward_cone_rad=math.radians(float(cfg.get("forward_cone_deg", 60.0))),
-        hard_radius_m=min(float(cfg.get("hard_radius_m", 0.05)), veto_foot),
-        block_on_unknown=bool(cfg.get("block_on_unknown", True)),
-        unknown_block_range_m=float(cfg.get("unknown_block_range_m", 0.25)),
-        min_observed_cells=int(cfg.get("min_observed_cells", 3)),
-    )
+    scan_cfg = cfg.get("scan", {})
     control_hz = float(cfg.get("control_hz", 10.0))
     period = 1.0 / max(1.0, control_hz)
     cmd_timeout_ms = max(500, int(3.0 * period * 1000.0))
     odom_stale_s = float(cfg.get("odom_stale_s", 0.5))
+    imu_stale_s = float(cfg.get("imu_stale_s", 0.3))
     scan_stale_s = float(scan_cfg.get("scan_stale_s", 0.5))
-    no_progress_timeout_s = float(cfg.get("no_progress_timeout_s", 4.0))
-    no_progress_eps_m = float(cfg.get("no_progress_eps_m", 0.03))
-    # Hard per-goal deadline. The no-progress watchdog only runs while
-    # translating, so a rotate/drive dither (or A* homotopy flip-flop) could
-    # otherwise keep a goal alive forever. Tier-2 caps goals at ~1.5 m, so a
-    # healthy leg finishes in well under this. 0 disables.
-    goal_deadline_s = float(cfg.get("goal_deadline_s", 30.0))
-    # On a swept-block, re-aim in place (swept-free) toward the path's lookahead
-    # rather than stopping, until the lookahead is within this bearing or we've
-    # been re-aiming longer than the timeout (then it's a genuine dead-end).
-    swept_realign_thresh_rad = float(cfg.get("swept_realign_thresh_rad", 0.10))
-    swept_realign_timeout_s = float(cfg.get("swept_realign_timeout_s", 2.0))
+    arm_lease_s = float(cfg.get("handoff_arm_lease_s", 5.0))
 
-    # Shared with zenoh callback threads. Callbacks only ever assign these;
-    # all per-goal bookkeeping lives in the main loop, keyed by cmd_id.
+    # Shared with zenoh callback threads (all under `lock`).
     lock = threading.Lock()
+    ring = OdomRing()
+    arb = GotoArbiter()
+    estop = EStopMonitor()
     last_odom: Optional[Dict[str, Any]] = None
     last_scan: Optional[Dict[str, Any]] = None
     last_imu: Optional[Dict[str, Any]] = None
     last_depth: Optional[Dict[str, Any]] = None
-    goal: Optional[Dict[str, Any]] = None
-    cur_cmd_id = 0
-    # After cancel/stop clears an active goal, publish CANCELED once before
-    # IDLE so senders (hierarchical drive) do not treat revoke as ARRIVED/IDLE
-    # success. None = nothing to announce.
-    pending_canceled_cmd_id: Optional[int] = None
+    odom_reset_pending = False
+    imu_session: Optional[str] = None
+    imu_seq: Optional[int] = None
+    imu_seq_at = 0.0                        # wall time the IMU seq last advanced
+    imu_rebaseline = False
 
     session = zenoh_helpers.open_session(body_cfg)
     stop = threading.Event()
 
     def on_odom(_k: str, msg: Dict[str, Any]) -> None:
-        nonlocal last_odom
+        nonlocal last_odom, odom_reset_pending
         with lock:
+            if ring.push(msg):
+                odom_reset_pending = True
             last_odom = msg
 
     def on_scan(_k: str, msg: Dict[str, Any]) -> None:
@@ -162,8 +142,22 @@ def main() -> None:
             last_scan = msg
 
     def on_imu(_k: str, msg: Dict[str, Any]) -> None:
-        nonlocal last_imu
+        nonlocal last_imu, imu_session, imu_seq, imu_seq_at, imu_rebaseline
         with lock:
+            sid = msg.get("session_id")
+            if isinstance(sid, str) and sid:
+                if imu_session is not None and sid != imu_session:
+                    imu_rebaseline = True   # fusion yaw origin may have jumped
+                imu_session = sid
+            seq = msg.get("seq")
+            if isinstance(seq, int) and not isinstance(seq, bool):
+                if imu_seq is not None and seq < imu_seq:
+                    imu_rebaseline = True   # driver restarted / sensor re-init
+                if imu_seq is None or seq != imu_seq:
+                    imu_seq_at = time.time()
+                imu_seq = seq
+            else:
+                imu_seq = None              # older driver: freshness by ts only
             last_imu = msg
 
     def on_depth(_k: str, msg: Dict[str, Any]) -> None:
@@ -172,41 +166,38 @@ def main() -> None:
             last_depth = msg
 
     def on_goto(_k: str, msg: Dict[str, Any]) -> None:
-        nonlocal goal, cur_cmd_id, pending_canceled_cmd_id
-        kind = str(msg.get("kind", "goto"))
         with lock:
-            if kind in ("cancel", "stop"):
-                # Advance the supersede watermark to the cancel's own id so a
-                # delayed/duplicate goto with an older id can't re-arm the
-                # goal the operator just revoked. Announce CANCELED under the
-                # *revoked* goal's cmd_id so senders still watching that id
-                # see revoke (not a later IDLE that looks like success).
-                had_goal = goal is not None
-                revoked_id = int(goal.get("cmd_id", cur_cmd_id)) if had_goal else None
-                cur_cmd_id = max(cur_cmd_id, int(msg.get("cmd_id", 0)))
-                goal = None
-                if had_goal and revoked_id is not None:
-                    pending_canceled_cmd_id = revoked_id
-                return
-            cmd_id = int(msg.get("cmd_id", 0))
-            if cmd_id < cur_cmd_id:
-                return  # superseded by a newer command
-            if str(msg.get("frame", "odom")) != "odom":
-                print(f"local_drive: rejecting goto frame={msg.get('frame')!r}", flush=True)
-                return
-            goal = dict(msg)
-            cur_cmd_id = cmd_id
-            pending_canceled_cmd_id = None  # new goto supersedes a pending cancel announce
+            outcome = arb.on_command(msg, estop_active=estop.active())
+        if outcome in ("rejected", "malformed", "refused_estop"):
+            print(f"local_drive: goto cmd_id={msg.get('cmd_id')!r} {outcome} "
+                  f"(frame={msg.get('frame')!r})", flush=True)
+
+    def on_estop(_k: str, msg: Dict[str, Any]) -> None:
+        with lock:
+            estop.on_event(msg)
+
+    def on_status(_k: str, msg: Dict[str, Any]) -> None:
+        with lock:
+            estop.on_status(msg)
+
+    def on_motor_state(_k: str, msg: Dict[str, Any]) -> None:
+        with lock:
+            estop.on_motor_state(msg)
 
     zenoh_helpers.declare_subscriber_json(session, "body/odom", on_odom)
     zenoh_helpers.declare_subscriber_json(session, "body/lidar/scan", on_scan)
     zenoh_helpers.declare_subscriber_json(session, "body/imu", on_imu)
     zenoh_helpers.declare_subscriber_json(session, "body/oakd/depth", on_depth)
     zenoh_helpers.declare_subscriber_json(session, "body/drive/goto", on_goto)
+    zenoh_helpers.declare_subscriber_json(session, "body/emergency_stop", on_estop)
+    zenoh_helpers.declare_subscriber_json(session, "body/status", on_status)
+    zenoh_helpers.declare_subscriber_json(session, "body/motor_state", on_motor_state)
 
     # HO-3 handoff gate (Tier-3 → motors): records each command + obeys the
-    # standalone Handoff Inspector's arm/continue. tier 3 only on this side.
-    gate = HandoffGate(session, tiers=(3,))
+    # standalone Handoff Inspector's arm/continue. The arm lease means a
+    # closed inspector cannot leave Tier-3 holding forever.
+    gate = HandoffGate(session, tiers=(3,), arm_lease_s=arm_lease_s)
+    ctrl = Tier3Controller(t3_cfg, gate=gate)
 
     signal.signal(signal.SIGTERM, lambda _s, _f: stop.set())
     signal.signal(signal.SIGINT, lambda _s, _f: stop.set())
@@ -221,269 +212,204 @@ def main() -> None:
 
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
                        dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
-                       path_body=None, plan_reason=None) -> None:
+                       path_body=None, plan_reason=None, watermark=None) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
                 cmd_id=cmd_id, state=state, goal_body_xy=goal_body,
                 dist_remaining_m=dist, v_mps=v, omega_radps=omega,
                 blocked_reason=reason, mode=mode, path_body_xy=path_body,
-                plan_reason=plan_reason, build=build,
+                plan_reason=plan_reason, build=build, watermark=watermark,
             ),
         )
 
-    # Per-goal bookkeeping (main loop only).
-    tracked_cmd_id = -1
-    rotating = False  # rotate-in-place hysteresis state (per goal)
-    best_dist: Optional[float] = None
-    best_dist_at = 0.0
-    final_aligned = False
-    realign_since: Optional[float] = None   # start of the current swept-block re-aim
-    goal_started_at = 0.0                   # for the per-goal deadline
-    was_active = False                      # had a goal last tick (stop-on-cancel)
-    yaw_corr = ImuYawCorrector()            # IMU-vs-wheel yaw divergence per goal
-    depth_hit_streak = 0                    # consecutive depth-veto hit frames
+    # Main-loop-only state.
+    tracked_cmd_id: Optional[int] = None
+    was_active = False                      # commanded motion last tick
+    imu_guard = cfg.get("imu_guard", {})
+    yaw_corr = ImuYawCorrector(             # IMU-vs-wheel yaw divergence per goal
+        window_s=float(imu_guard.get("window_s", 1.0)),
+        window_wheel_min_rad=float(imu_guard.get("wheel_min_rad", 0.35)),
+        window_imu_max_rad=float(imu_guard.get("imu_max_rad", 0.02)),
+        wheel_glitch_rate_radps=float(imu_guard.get("wheel_glitch_rate_radps", 4.0)),
+    )
+    last_exc_print = 0.0
+
+    def drop_goal(reason: str) -> None:
+        nonlocal tracked_cmd_id
+        with lock:
+            cid = arb.drop(reason)
+        ctrl.clear()
+        tracked_cmd_id = None
+        if cid is not None:
+            print(f"local_drive: goal {cid} dropped ({reason})", flush=True)
+
+    def tick(now_wall: float, now_mono: float) -> None:
+        nonlocal tracked_cmd_id, was_active, odom_reset_pending, imu_rebaseline
+        with lock:
+            rejects = arb.take_rejects()
+            watermark = arb.watermark
+            g = dict(arb.goal) if arb.goal is not None else None
+            odom = dict(last_odom) if last_odom is not None else None
+            scan = last_scan
+            imu = last_imu
+            depth = last_depth
+            reset = odom_reset_pending
+            odom_reset_pending = False
+            rebase = imu_rebaseline
+            imu_rebaseline = False
+            imu_seq_fresh = imu_seq is None or (now_wall - imu_seq_at) <= imu_stale_s
+            estop_on = estop.active()
+            estop_desc = estop.describe()
+
+        for rid in rejects:
+            publish_status(STATE_REJECTED, cmd_id=rid, watermark=watermark)
+        if rebase:
+            yaw_corr.rebaseline()
+
+        if reset:
+            print("local_drive: odom frame reset (motor_controller restart)", flush=True)
+            yaw_corr.reset()
+            if g is not None:
+                drop_goal("odom_reset")
+                g = None
+
+        if estop_on:
+            if g is not None:
+                drop_goal("e_stop")
+                print(f"local_drive: e-stop active ({estop_desc})", flush=True)
+                g = None
+            if was_active:
+                publish_cmd(0.0, 0.0)
+                was_active = False
+            with lock:
+                fault = arb.fault
+                wm = arb.watermark
+            publish_status(STATE_FAULT, cmd_id=(fault[0] if fault else max(0, wm)),
+                           reason="e_stop")
+            return
+
+        if g is None:
+            if was_active:
+                # Cancel/stop/drop while driving: command zero NOW instead of
+                # letting the motors coast on the last cmd_vel until timeout.
+                publish_cmd(0.0, 0.0)
+                was_active = False
+            ctrl.clear()
+            tracked_cmd_id = None
+            with lock:
+                state, cid, reason = arb.idle_status()
+            publish_status(state, cmd_id=cid, reason=reason)
+            return
+
+        cmd_id = int(g.get("cmd_id", 0))
+
+        # Odom freshness — can't hold or transform the goal without a pose.
+        if not _odom_usable(odom, now_wall, odom_stale_s):
+            if was_active:
+                publish_cmd(0.0, 0.0)
+                was_active = False
+            publish_status(STATE_FAULT, cmd_id=cmd_id, reason="odom_stale")
+            return
+
+        odom_theta = float(odom["theta"])
+        imu_yaw = None
+        if (imu is not None and imu_seq_fresh
+                and (now_wall - float(imu.get("ts", 0.0))) <= imu_stale_s):
+            q = imu.get("orientation")
+            if isinstance(q, dict) and all(k in q for k in ("w", "x", "y", "z")):
+                imu_yaw = quat_wxyz_to_yaw(
+                    float(q["w"]), float(q["x"]), float(q["y"]), float(q["z"]))
+
+        # New goal → anchor it in odom and reset per-goal state.
+        if cmd_id != tracked_cmd_id:
+            tracked_cmd_id = cmd_id
+            yaw_corr.reset()    # goal frame = odom frame as of now
+            gx, gy = float(g["x_m"]), float(g["y_m"])
+            if str(g.get("frame", "odom")) == "body":
+                anchor = None
+                with lock:
+                    if g.get("anchor_ts") is not None:
+                        anchor = ring.pose_at(float(g["anchor_ts"]))
+                    latest = ring.latest()
+                if anchor is None:
+                    anchor = latest[1] if latest else (
+                        float(odom["x"]), float(odom["y"]), odom_theta)
+                    print(f"local_drive: body goal {cmd_id} anchor_ts "
+                          f"{g.get('anchor_ts')!r} outside odom buffer — "
+                          "anchored at latest odom", flush=True)
+                gx, gy = body_to_odom((gx, gy), anchor)
+            ctrl.start_goal(Tier3Goal(
+                cmd_id=cmd_id, x=gx, y=gy,
+                tol=float(g.get("arrival_tol_m") or t3_cfg.params.arrival_tol_m),
+                final_heading=(float(g["final_heading_rad"])
+                               if g.get("final_heading_rad") is not None else None),
+                v_max=float(g["v_max"]) if g.get("v_max") is not None else None,
+            ), now_mono, (float(odom["x"]), float(odom["y"]), odom_theta))
+
+        # Heading = wheel odom + the IMU-vs-wheel divergence since the goal
+        # started (wheel odom misses externally forced rotation).
+        theta = yaw_corr.corrected_theta(odom_theta, imu_yaw,
+                                         yaw_rate=float(odom.get("vtheta", 0.0) or 0.0),
+                                         t=now_mono)
+        div = wrap_pi(theta - odom_theta)
+        pose_now = (float(odom["x"]), float(odom["y"]), theta)
+
+        grid = meta = pose_scan = None
+        if scan is not None and (now_wall - float(scan.get("ts", 0.0))) <= scan_stale_s:
+            grid, meta = _rasterize(scan, raster)
+            # Plan in the scan's own body frame: the pose at its (mid-sweep)
+            # timestamp, not the newest one (T10).
+            with lock:
+                p_scan = ring.pose_at(float(scan.get("ts", 0.0)))
+            pose_scan = (pose_now if p_scan is None
+                         else (p_scan[0], p_scan[1], wrap_pi(p_scan[2] + div)))
+
+        r = ctrl.step(now_mono=now_mono, now_wall=now_wall, pose_now=pose_now,
+                      pose_scan=pose_scan, grid=grid, meta=meta, depth=depth)
+        if r.cmd is not None:
+            publish_cmd(r.cmd[0], r.cmd[1])
+            was_active = abs(r.cmd[0]) > 0 or abs(r.cmd[1]) > 0
+        publish_status(r.state, cmd_id=cmd_id, goal_body=r.goal_body, dist=r.dist,
+                       v=r.v, omega=r.omega, reason=r.reason, mode=r.mode,
+                       path_body=r.path_body, plan_reason=r.plan_reason)
+        if r.done:
+            if r.state == STATE_ARRIVED and r.plan_reason:
+                print(f"local_drive: goal {cmd_id} ARRIVED at {r.plan_reason} "
+                      f"endpoint (residual {r.dist:.2f} m)", flush=True)
+            with lock:
+                arb.finish(cmd_id)
+            ctrl.clear()
+            tracked_cmd_id = None
 
     print(
-        f"local_drive: up; control_hz={control_hz} v_max={params.v_max} "
-        f"depth_veto={'on' if depth_veto_cfg.enabled else 'off'}",
+        f"local_drive: up; control_hz={control_hz} v_max={t3_cfg.params.v_max} "
+        f"depth_veto={'on' if t3_cfg.depth.enabled else 'off'}",
         flush=True,
     )
     next_tick = time.monotonic()
     while not stop.is_set():
         now_wall = time.time()
         now_mono = time.monotonic()
-        with lock:
-            g = dict(goal) if goal is not None else None
-            odom = dict(last_odom) if last_odom is not None else None
-            scan = last_scan
-            imu = last_imu
-            depth = last_depth
-            cmd_id = cur_cmd_id
-
-        if g is None:
-            if was_active:
-                # Cancel/stop while driving: command zero NOW instead of
-                # letting the motors coast on the last cmd_vel until its
-                # 500 ms timeout (~9 cm at v_max).
+        try:
+            tick(now_wall, now_mono)
+        except Exception as e:  # noqa: BLE001 — never let one bad tick kill Tier-3
+            if now_mono - last_exc_print > 5.0:
+                last_exc_print = now_mono
+                print(f"local_drive: tick exception {e!r}\n{traceback.format_exc()}",
+                      flush=True)
+            try:
                 publish_cmd(0.0, 0.0)
                 was_active = False
-            with lock:
-                canceled_id = pending_canceled_cmd_id
-                if canceled_id is not None:
-                    pending_canceled_cmd_id = None
-            if canceled_id is not None:
-                # One-tick CANCELED (mirrors ARRIVED), then IDLE on later ticks.
-                publish_status(STATE_CANCELED, cmd_id=canceled_id)
-            else:
-                publish_status(STATE_IDLE, cmd_id=cmd_id)
-            next_tick = _sleep_to(next_tick, period)
-            continue
-        was_active = True
-
-        # New goal → reset bookkeeping.
-        if cmd_id != tracked_cmd_id:
-            tracked_cmd_id = cmd_id
-            best_dist = None
-            best_dist_at = now_mono
-            final_aligned = False
-            rotating = False
-            realign_since = None
-            goal_started_at = now_mono
-            yaw_corr.reset()    # goal frame = odom frame as of now
-            depth_hit_streak = 0
-
-        gx, gy = float(g["x_m"]), float(g["y_m"])
-        tol = float(g.get("arrival_tol_m", params.arrival_tol_m))
-        gp = params if "v_max" not in g else _with_vmax(params, float(g["v_max"]))
-
-        # Odom freshness — can't transform the goal without a live pose.
-        if odom is None or (now_wall - float(odom.get("ts", 0.0))) > odom_stale_s:
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_FAULT, cmd_id=cmd_id, reason="odom_stale")
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        # Heading for the goal transform: wheel odom + the IMU-vs-wheel yaw
-        # divergence since the goal started. Wheel odom misses externally
-        # forced rotation (floor-ridge kick, slip); without this the goal's
-        # body-frame bearing is wrong by exactly that rotation and the
-        # follower arcs off-route until the desktop notices and re-picks.
-        imu_yaw = None
-        if imu is not None and (now_wall - float(imu.get("ts", 0.0))) <= odom_stale_s:
-            q = imu.get("orientation")
-            if isinstance(q, dict) and all(k in q for k in ("w", "x", "y", "z")):
-                imu_yaw = quat_wxyz_to_yaw(
-                    float(q["w"]), float(q["x"]), float(q["y"]), float(q["z"]))
-        theta = yaw_corr.corrected_theta(float(odom["theta"]), imu_yaw)
-        pose = (float(odom["x"]), float(odom["y"]), theta)
-        bx, by = odom_to_body((gx, gy), pose)
-        dist = (bx * bx + by * by) ** 0.5
-
-        # Arrival (+ optional final-heading rotate).
-        if dist <= tol:
-            seek_odom = None
-            fh = g.get("final_heading_rad")
-            if fh is not None and not final_aligned:
-                omega, aligned = rotate_to_heading(pose[2], float(fh), gp)
-                if aligned:
-                    final_aligned = True
-                    publish_cmd(0.0, 0.0)
-                    publish_status(STATE_ARRIVED, cmd_id=cmd_id, goal_body=(bx, by), dist=dist)
-                    with lock:
-                        if cur_cmd_id == cmd_id:
-                            goal = None
-                else:
-                    publish_cmd(0.0, omega)
-                    publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                                   dist=dist, omega=omega)
-                next_tick = _sleep_to(next_tick, period)
-                continue
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_ARRIVED, cmd_id=cmd_id, goal_body=(bx, by), dist=dist)
-            with lock:
-                if cur_cmd_id == cmd_id:
-                    goal = None
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        # Hard deadline: arrival/no-progress didn't end this goal in time
-        # (e.g. a rotate/drive dither that never translates). Stop and report;
-        # the goal stays active so the status doesn't decay to IDLE (which the
-        # desktop reads as success) — a superseding goto or cancel clears it.
-        if goal_deadline_s > 0 and now_mono - goal_started_at > goal_deadline_s:
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="deadline")
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        # Live obstacle field (rasterized scan) — the substrate for steering.
-        if scan is None or (now_wall - float(scan.get("ts", 0.0))) > scan_stale_s:
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="no_scan")
-            next_tick = _sleep_to(next_tick, period)
-            continue
-        grid, meta = rasterize_scan(
-            scan.get("ranges"), float(scan.get("angle_min", 0.0)),
-            float(scan.get("angle_increment", 0.0)), raster,
-        )
-
-        # Local A* over the footprint-inflated scan grid: the single authority
-        # for local feasibility/routing. Returns a body-frame path the body can
-        # follow the whole way, or an honest "no path".
-        plan = plan_local(grid, meta, (bx, by), local_plan_cfg)
-        if not plan.ok:
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason=plan.reason, mode="plan")
-            best_dist = dist            # stopped → reset the no-progress window
-            best_dist_at = now_mono
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        # Pure-pursuit follow: steer toward a lookahead point on the path.
-        look = lookahead_on_path(plan.path_body, lookahead_m) or (bx, by)
-        v, omega, _ld, _lb, rotating = steer_to_body_point(look, gp, rotating)
-
-        # Last-resort safety vetoes — A* won't route through lethal lidar, but
-        # a dynamic/new obstacle can appear in the followed arc between
-        # replans, and the lidar plane misses near-ground structure the OAK
-        # sees. Both only stop, never steer.
-        blocked = swept_path_blocked(grid, meta, v_mps=v, omega_radps=omega, config=foot)
-        depth_blocked, depth_hit_streak = depth_nearfield_blocked(
-            depth,
-            now_wall=now_wall,
-            v_mps=v,
-            omega_radps=omega,
-            cfg=depth_veto_cfg,
-            streak=depth_hit_streak,
-        )
-
-        # HO-3 Tier-3 → motors: record what we're about to command. Attach the
-        # costmap only when BP3 is armed — serializing 64×64 cells to JSON at
-        # the control rate is real jitter; the inspector synthesizes an
-        # all-unknown grid for lean records.
-        gate.record(3, schemas.handoff_t3(
-            cmd_id=cmd_id, goal_body=(bx, by), plan_reason=plan.reason,
-            path_body=plan.path_body, lookahead=look, v_mps=v, omega_radps=omega,
-            swept_blocked=blocked or depth_blocked,
-            grid_rows=(grid.tolist() if gate.is_armed(3) else None),
-            meta=meta))
-
-        if depth_blocked:
-            # Something in the camera near-field slab (pet, chair rail, …).
-            # Do not realign — yaw rarely clears a head-on soft obstacle.
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="depth_block", mode="follow")
-            best_dist = dist
-            best_dist_at = now_mono
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        if blocked:
-            # The forward arc clips a wall. A pure rotation is swept-free (the
-            # footprint is a circle), so re-aim in place toward the lookahead to
-            # straighten the approach instead of giving up. Only when already
-            # aligned (or re-aiming too long) is it a genuine dead-end.
-            if realign_since is None:
-                realign_since = now_mono
-            look_bearing = math.atan2(look[1], look[0])
-            resp, omega_r = swept_block_response(
-                look_bearing, now_mono - realign_since,
-                thresh_rad=swept_realign_thresh_rad,
-                timeout_s=swept_realign_timeout_s,
-                k_omega=gp.k_omega, omega_max=gp.omega_max)
-            if resp == "realign":
-                publish_cmd(0.0, omega_r)
-                publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                               dist=dist, v=0.0, omega=omega_r, mode="realign")
-                rotating = True
-                next_tick = _sleep_to(next_tick, period)
-                continue
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="swept_block", mode="follow")
-            best_dist = dist
-            best_dist_at = now_mono
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        # HO-3 breakpoint: hold here with motors at 0 (heartbeat + cmd_vel keep
-        # flowing so the watchdog stays happy and the link alive) until the
-        # inspector single-steps. Reset the no-progress window so holding here
-        # never trips it.
-        if gate.should_hold(3):
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, v=0.0, omega=0.0, mode="held")
-            best_dist = dist
-            best_dist_at = now_mono
-            next_tick = _sleep_to(next_tick, period)
-            continue
-        gate.consume_continue(3)
-
-        # No-progress watchdog — only while actually translating.
-        if v < 1e-3:
-            best_dist = dist
-            best_dist_at = now_mono
-        elif best_dist is None or dist < best_dist - no_progress_eps_m:
-            best_dist = dist
-            best_dist_at = now_mono
-        elif now_mono - best_dist_at > no_progress_timeout_s:
-            publish_cmd(0.0, 0.0)
-            publish_status(STATE_BLOCKED, cmd_id=cmd_id, goal_body=(bx, by),
-                           dist=dist, reason="no_progress")
-            next_tick = _sleep_to(next_tick, period)
-            continue
-
-        realign_since = None        # real forward motion → reset the re-aim window
-        publish_cmd(v, omega)
-        publish_status(STATE_DRIVING, cmd_id=cmd_id, goal_body=(bx, by),
-                       dist=dist, v=v, omega=omega, mode="follow",
-                       path_body=plan.path_body, plan_reason=plan.reason)
+                with lock:
+                    cid = arb.drop("internal_error")
+                    wm = arb.watermark
+                ctrl.clear()
+                tracked_cmd_id = None
+                publish_status(STATE_FAULT, cmd_id=(cid if cid is not None else max(0, wm)),
+                               reason="internal_error")
+            except Exception:  # noqa: BLE001
+                pass
         next_tick = _sleep_to(next_tick, period)
 
     publish_cmd(0.0, 0.0)

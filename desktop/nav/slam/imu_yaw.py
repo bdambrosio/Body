@@ -31,6 +31,21 @@ Boot-time settle:
 
 After settle, all readings count and the gate never re-arms.
 
+Stream resets (I4): a ``session_id`` change (imu_driver restart → the GRV
+yaw origin is arbitrary), a ``seq`` decrease, or a backward Pi clock step
+re-baselines the tracker: subsequent raw yaws are shifted by a continuity
+offset so the reported (unwrapped) yaw continues from the last pre-reset
+value instead of stepping by the origin difference. ``epoch()`` counts these
+so consumers holding their own yaw offsets can re-bind. A ``seq`` equal to
+the last one is a re-publish of an already-ingested report and is dropped
+(not new data → does not refresh freshness). Rotation that happened during
+the gap itself is lost here; the EKF covers it with wheel yaw.
+
+Freshness: ``yaw_at(ts)`` returns None once ``ts`` runs past the newest
+sample by more than one inter-arrival (Pi ts vs Pi ts — no cross-host
+comparison). ``is_stale(ref_ts)`` exposes the coarser contract test (newest
+report older than ``stale_after_s``, default 0.3 s).
+
 Thread-safety: Ingest and query may be called from different threads
 (Zenoh callback thread ingests; fuser thread queries). All public
 methods take an internal lock.
@@ -42,6 +57,8 @@ import math
 import threading
 from collections import deque
 from typing import Deque, Optional, Tuple
+
+from desktop.utils.stream_epoch import StreamEpoch
 
 from .types import FusionMode, ImuReading, quaternion_to_yaw
 
@@ -62,6 +79,7 @@ class ImuYawTracker:
         buffer_seconds: float = 2.0,
         settle_accuracy_rad: float = DEFAULT_SETTLE_ACCURACY_RAD,
         min_settle_samples: int = DEFAULT_MIN_SETTLE_SAMPLES,
+        stale_after_s: float = 0.3,
     ) -> None:
         self._lock = threading.RLock()
         # (ts, unwrapped_yaw_rad, accuracy_rad) samples, sorted by ts.
@@ -76,6 +94,13 @@ class ImuYawTracker:
         # fusion modes this becomes the "boot heading." Consumers can
         # ignore it and use raw unwrapped yaw if they prefer.
         self._yaw_zero: Optional[float] = None
+        self._stale_after_s = float(stale_after_s)
+        # Stream-reset handling (see module doc).
+        self._stream = StreamEpoch()
+        self._cont_offset = 0.0
+        self._epoch = 0
+        self._last_yaw: Optional[float] = None
+        self._duplicates = 0
 
     # ── Ingest ───────────────────────────────────────────────────────
 
@@ -87,9 +112,28 @@ class ImuYawTracker:
             return
         raw_yaw = quaternion_to_yaw(reading.quat_wxyz)
         with self._lock:
+            if self._stream.is_duplicate_seq(reading.session_id, reading.seq):
+                # Same report re-published (older driver) — not new data.
+                self._duplicates += 1
+                return
+            reason = self._stream.check(reading.session_id, reading.seq, reading.ts)
+            if reason is not None and self._last_yaw is not None:
+                # Re-baseline: continue from the last yaw instead of stepping
+                # to the new stream's arbitrary origin.
+                self._cont_offset = self._last_yaw - raw_yaw
+                self._epoch += 1
+                if reason == "clock_step":
+                    # Timestamps before/after are incomparable.
+                    self._buf.clear()
+                logger.warning(
+                    "imu_yaw: stream reset (%s) — re-baselined yaw at %.1f° "
+                    "(epoch %d)", reason, math.degrees(self._last_yaw), self._epoch)
+            raw_yaw = raw_yaw + self._cont_offset
             if self._buf:
                 prev_yaw = self._buf[-1][1]
                 yaw = _unwrap_to(prev_yaw, raw_yaw)
+            elif self._last_yaw is not None:
+                yaw = _unwrap_to(self._last_yaw, raw_yaw)
             else:
                 yaw = raw_yaw
 
@@ -97,6 +141,7 @@ class ImuYawTracker:
                 # Out-of-order sample — skip (IMU ought to be monotonic;
                 # treat any inversion as a glitch).
                 return
+            self._last_yaw = yaw
 
             self._buf.append((reading.ts, yaw, reading.accuracy_rad))
             self._mode = reading.fusion_mode
@@ -185,6 +230,22 @@ class ImuYawTracker:
             # one we can't honor).
             sigma = max(s0, s1)
             return (yaw, sigma)
+
+    def epoch(self) -> int:
+        """Count of stream resets (session change / seq decrease / clock
+        step) re-baselined so far. Consumers that keep their own offset
+        against this yaw re-bind it when the value changes."""
+        with self._lock:
+            return self._epoch
+
+    def is_stale(self, ref_ts: float) -> bool:
+        """True when there is no sample, or the newest sample is older than
+        ``stale_after_s`` relative to ``ref_ts`` (a Pi-clock ts, e.g. the
+        odom ts being fused)."""
+        with self._lock:
+            if not self._buf:
+                return True
+            return ref_ts - self._buf[-1][0] > self._stale_after_s
 
     def latest(self) -> Optional[Tuple[float, float, float]]:
         """Return (ts, yaw, sigma) of the newest sample, or None."""

@@ -1,6 +1,7 @@
 {
   "zenoh": {
-    "connect_endpoints": ["tcp/127.0.0.1:7447"]
+    "connect_endpoints": ["tcp/127.0.0.1:7447"],
+    "control_qos_enabled": true
   },
   "motor": {
     "wheel_base_m": 0.181,
@@ -28,7 +29,15 @@
     "velocity_kp": 0.8,
     "velocity_ki": 2.0,
     "velocity_integ_limit": 0.5,
-    "min_drive_pwm": 0.16
+    "velocity_integ_max_duty": 0.2,
+    "min_drive_pwm": 0.16,
+    "ff_kinetic_pwm": 0.08,
+    "kinetic_threshold_ms": 0.02,
+    "static_threshold_ms": 0.01,
+    "regime_confirm_ticks": 2,
+    "kick_ramp_ticks": 5,
+    "kick_escalation_per_s": 0.25,
+    "cmd_timeout_max_ms": 1000
   },
   "lidar": {
     "stub_only": false,
@@ -40,7 +49,17 @@
     "range_max_m": 12.0,
     "include_intensities": true,
     "height_above_ground_m": 0.10,
-    "self_mask_sectors_deg": [[80, 170, 0.2]]
+    "self_mask_sectors_deg": [[80, 170, 0.2]],
+    "serial_timeout_s": 0.005,
+    "device_timestamps_enabled": true,
+    "device_ts_wrap_ms": 30000,
+    "device_latency_ms": 2.0,
+    "device_ts_offset_ms": 0.0,
+    "seam_bearing_deg": 180.0,
+    "max_sweep_period_factor": 1.5,
+    "mixed_pixel_max_intensity": 15,
+    "mixed_pixel_jump_m": 0.15,
+    "deskew_enabled": false
   },
   "imu": {
     "enabled": true,
@@ -48,7 +67,7 @@
     "publish_hz": 100,
     "fusion_mode": "game_rotation_vector",
     "fusion_fallback": "game_rotation_vector",
-    "mag_when_idle_enabled": true,
+    "mag_when_idle_enabled": false,
     "mag_idle_pwm_threshold": 0.02,
     "mag_idle_settle_ms": 300,
     "mag_idle_max_accuracy_rad": 0.087,
@@ -59,7 +78,18 @@
     "settle_time_s": 2.0,
     "linear_accel_enabled": false,
     "reset_gpio": 25,
-    "gpio_chip": 0
+    "gpio_chip": 0,
+    "report_interval_ms": 10,
+    "gyro_report_interval_ms": 10,
+    "accel_report_interval_ms": 10,
+    "mag_report_interval_ms": 50,
+    "poll_interval_ms": 2,
+    "stale_reinit_ms": 200,
+    "first_report_timeout_s": 2.0,
+    "max_reinit_attempts": 3,
+    "settle_still_gyro_rad_s": 0.05,
+    "settle_still_reports": 50,
+    "settle_max_wait_s": 10.0
   },
   "oakd": {
     "depth_resolution": "400p",
@@ -82,7 +112,9 @@
     "rotation_vector_enabled": true,
     "imu_enable_firmware_update": false,
     "imu_hardware_present": false,
-    "device_id": null
+    "device_id": null,
+    "depth_hold_max_frames": 1,
+    "depth_iir_max_delta_mm": 200
   },
   "local_map": {
     "enabled": true,
@@ -131,7 +163,10 @@
     "lidar_slab_min_hits": 1,
     "depth_slab_block_frames": 2,
     "depth_max_range_m": 1.5,
-    "lidar_max_clear_range_m": 6.0
+    "lidar_max_clear_range_m": 6.0,
+    "lidar_max_age_s": 0.35,
+    "depth_max_age_s": 0.35,
+    "driveable_depth_memory_frames": 3
   },
   "local_drive": {
     "enabled": true,
@@ -150,14 +185,34 @@
     "odom_stale_s": 0.5,
     "preview_distance_m": 0.35,
     "preview_min_distance_m": 0.15,
-    "preview_time_s": 1.5,
+    "preview_time_s": 0.5,
     "forward_cone_deg": 60.0,
     "hard_radius_m": 0.07,
     "block_on_unknown": true,
     "unknown_block_range_m": 0.25,
+    "unknown_explained_cells": 3,
     "min_observed_cells": 3,
+    "imu_stale_s": 0.3,
+    "rotate_timeout_s": 10.0,
+    "translate_eps_m": 0.05,
+    "rotate_flip_band_rad": 0.5,
+    "min_rotate_omega_radps": 0.0,
+    "path_hysteresis": 0.25,
+    "path_max_deviation_m": 0.15,
+    "stop_margin_m": 0.05,
+    "slow_retry": true,
+    "handoff_arm_lease_s": 5.0,
+    "imu_guard": {
+      "window_s": 1.0,
+      "wheel_min_rad": 0.35,
+      "imu_max_rad": 0.02,
+      "wheel_glitch_rate_radps": 4.0
+    },
     "local_planner": {
       "footprint_radius_m": 0.11,
+      "quantization_pad": true,
+      "denoise": false,
+      "denoise_min_range_m": 1.0,
       "min_clearance_cells": 0,
       "goal_clearance_cells": 0,
       "safety_margin_m": 0.04,
@@ -173,7 +228,8 @@
       "half_extent_m": 2.5,
       "scan_stale_s": 0.5,
       "max_clear_range_m": 6.0,
-      "clear_buffer_cells": 2.0
+      "clear_buffer_cells": 2.0,
+      "robot_clear_radius_m": 0.11
     },
     "depth_veto": {
       "enabled": true,
@@ -187,7 +243,11 @@
       "roi_u0": 0.20,
       "roi_u1": 0.80,
       "roi_v0": 0.25,
-      "roi_v1": 0.85
+      "roi_v1": 0.85,
+      "floor_band_per_m": 0.0,
+      "min_vertical_extent_m": 0.03,
+      "structure_free_height_m": 0.10,
+      "structure_cell_m": 0.04
     }
   },
   "fusion": {
@@ -197,9 +257,14 @@
     "imu_sigma_rad": 0.00123,
     "imu_obs_hz": 50.0,
     "odom_obs_hz": 50.0,
-    "mag_idle_fusion_enabled": true,
+    "mag_idle_fusion_enabled": false,
     "mag_sigma_rad": 0.035,
-    "mag_update_min_interval_s": 0.2
+    "mag_update_min_interval_s": 0.2,
+    "imu_guard_enabled": true,
+    "imu_guard_window_s": 1.0,
+    "imu_guard_rot_rad": 0.35,
+    "imu_guard_still_rad": 0.02,
+    "imu_guard_distrust_unmatched_imu_rotation": false
   },
   "slam": {
     "match_hz": 2.0,
@@ -224,7 +289,25 @@
     "monitored_topics": [
       "body/odom",
       "body/lidar/scan",
-      "body/imu"
+      "body/imu",
+      "body/oakd/depth",
+      "body/map/local_2p5d",
+      "body/drive/status"
     ]
+  },
+  "launcher": {
+    "zero_pwm_on_motor_exit": true,
+    "liveness_enabled": true,
+    "liveness_kill_grace_s": 3.0,
+    "liveness_transport_window_s": 2.0,
+    "liveness": {
+      "watchdog": {"topic": "body/status", "timeout_ms": 5000},
+      "motor_controller": {"topic": "body/odom", "timeout_ms": 2000},
+      "lidar_driver": {"topic": "body/lidar/scan", "timeout_ms": 3000},
+      "imu_driver": {"topic": "body/imu", "timeout_ms": 12000},
+      "oakd_driver": {"topic": "body/oakd/depth", "timeout_ms": 5000},
+      "local_map": {"topic": "body/map/local_2p5d", "timeout_ms": 5000},
+      "local_drive": {"topic": "body/drive/status", "timeout_ms": 3000}
+    }
   }
 }

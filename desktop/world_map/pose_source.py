@@ -13,6 +13,8 @@ from typing import Deque, Optional, Tuple
 
 import numpy as np
 
+from desktop.utils.stream_epoch import StreamEpoch
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,11 +31,19 @@ class PoseSource:
         """Return (pose, ts) of the newest sample, or None if none yet."""
         raise NotImplementedError
 
-    def update(self, ts: float, x: float, y: float, theta: float) -> None:
+    def update(
+        self, ts: float, x: float, y: float, theta: float, *,
+        session_id: Optional[str] = None, seq: Optional[int] = None,
+    ) -> None:
         """Ingest a body/odom sample. Called from FuserController's odom
         subscriber callback. Implementations that don't consume odom
         directly may override as a no-op (none today; both v1 OdomPose
-        and v1.1 ImuPlusScanMatchPose route translation through odom)."""
+        and v1.1 ImuPlusScanMatchPose route translation through odom).
+
+        ``session_id`` / ``seq`` are the optional odom epoch fields (absent
+        from an older Pi → None): a session change or a seq decrease means
+        motor_controller restarted and its odom frame was reset to zero —
+        implementations re-baseline rather than integrate the jump (X4)."""
         raise NotImplementedError
 
     def rebind_world_to_current(self) -> Optional[Pose]:
@@ -140,11 +150,35 @@ class OdomPose(PoseSource):
         self._off_x = 0.0
         self._off_y = 0.0
         self._off_theta = 0.0
+        self._epoch = StreamEpoch()
+        self.odom_resets = 0
 
     # ── Ingest ───────────────────────────────────────────────────────
 
-    def update(self, ts: float, x: float, y: float, theta: float) -> None:
+    def update(
+        self, ts: float, x: float, y: float, theta: float, *,
+        session_id: Optional[str] = None, seq: Optional[int] = None,
+        reset: bool = False,
+    ) -> None:
+        """Ingest one odom sample. A stream reset (``reset=True`` from a
+        caller that already detected it, a session/seq epoch change, or a
+        backward Pi clock step > 1 s) re-baselines: the buffer is dropped and
+        the world offset is recomputed so the new odom frame continues from
+        the last world pose instead of jumping back to the old origin."""
         with self._lock:
+            reason = self._epoch.check(session_id, seq, ts)
+            if (reset or reason is not None) and self._buf:
+                _t, lx, ly, lth = self._buf[-1]
+                wx, wy, wth = self.to_world(lx, ly, lth)
+                # Solve to_world(x, y, theta) == (wx, wy, wth) for the offset.
+                self._off_theta = _wrap(float(theta) - wth)
+                c, s_ = math.cos(self._off_theta), math.sin(self._off_theta)
+                self._off_x = float(x) - (c * wx - s_ * wy)
+                self._off_y = float(y) - (s_ * wx + c * wy)
+                self._buf.clear()
+                self.odom_resets += 1
+                logger.warning("odom_pose: odom stream reset (%s) — re-baselined "
+                               "world pose (%.2f, %.2f)", reason or "caller", wx, wy)
             if self._buf and ts <= self._buf[-1][0]:
                 # Ignore out-of-order samples; ts from a lagging publisher
                 # would otherwise corrupt interpolation.

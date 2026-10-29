@@ -24,13 +24,28 @@ class LocalCostmapConfig:
     # blocked cell are lethal (robot centre cannot go there). ≈ true half-width
     # (7.5 cm) + margin. Keep the swept-veto footprint ≤ this so they agree.
     footprint_radius_m: float = 0.11
+    # Footprint quantization pad (T12): the path runs through cell CENTRES but
+    # the robot (and the swept veto) is continuous, so a cell whose centre is
+    # just outside the footprint can still put the body within it of an
+    # obstacle — up to half a cell diagonal (res/√2). True → lethal radius is
+    # footprint_radius_m + res/√2, so every A* path keeps the veto's
+    # footprint clear with that margin (the planner/veto invariant).
+    quantization_pad: bool = True
     safety_margin_m: float = 0.08      # full-cost band just outside lethal
     inflation_decay_m: float = 0.20    # exp halo length-scale (clearance pref)
     halo_max: float = 100.0
+    # Unknown cells cost at least this, and never LESS than the clearance halo
+    # they sit in (L2): the unknown pre-hit band in front of a wall must not be
+    # the cheapest way past it.
     unknown_cost: float = 25.0         # prefer observed-clear; route unknown if needed
     unknown_is_lethal: bool = False    # scan_raster clears no-return to horizon
-    denoise: bool = True
-    denoise_min_neighbors: int = 2
+    # Speckle removal (T1). OFF by default: the planner must never see FEWER
+    # obstacles than the swept veto, and at 8 cm cells legs/posts/jamb edges
+    # ARE 1-2 cells. When enabled it only drops fully isolated cells (never
+    # line ends) farther than denoise_min_range_m from the robot.
+    denoise: bool = False
+    denoise_min_neighbors: int = 1     # clamped to ≤ 1 (line ends are kept)
+    denoise_min_range_m: float = 1.0
 
 
 @dataclass
@@ -55,35 +70,69 @@ def build_local_costmap(
     blocked = (grid == 0)
     unknown = (grid == -1)
     if cfg.denoise:
-        blocked = drop_speckle(blocked, min_neighbors=cfg.denoise_min_neighbors)
+        isolated = blocked & ~drop_speckle(
+            blocked, min_neighbors=min(1, int(cfg.denoise_min_neighbors)))
+        if np.any(isolated):
+            far = _cell_range_m(meta, blocked.shape) > cfg.denoise_min_range_m
+            blocked = blocked & ~(isolated & far)
 
-    halo_extent_m = (
-        cfg.footprint_radius_m + cfg.safety_margin_m + 5.0 * cfg.inflation_decay_m
-    )
+    lethal_r = lethal_radius_m(cfg, res)
+    halo_extent_m = lethal_r + cfg.safety_margin_m + 5.0 * cfg.inflation_decay_m
     max_cells = max(2, int(math.ceil(halo_extent_m / res)))
     dist_m = (wavefront_distance(blocked, max_cells=max_cells) * res).astype(np.float32)
 
-    lethal = blocked | (dist_m < cfg.footprint_radius_m)
+    # Exact-disk dilation for the lethal set (the chamfer wavefront distance
+    # over-estimates off-axis distances, which is exactly where corner clips
+    # hide); the wavefront distance only grades the halo.
+    lethal = blocked | dilate_disk(blocked, lethal_r / res)
     if cfg.unknown_is_lethal:
         lethal = lethal | unknown
 
     cost = np.zeros_like(dist_m, dtype=np.float32)
     halo = (~lethal) & (dist_m < halo_extent_m)
     if np.any(halo):
-        d_excess = dist_m[halo] - cfg.footprint_radius_m
+        d_excess = np.maximum(0.0, dist_m[halo] - lethal_r)
         in_safety = d_excess <= cfg.safety_margin_m
         decay_d = np.maximum(0.0, d_excess - cfg.safety_margin_m)
         cost[halo] = np.where(
             in_safety, cfg.halo_max,
             cfg.halo_max * np.exp(-decay_d / cfg.inflation_decay_m))
-    cost[unknown] = cfg.unknown_cost
+    cost[unknown] = np.maximum(cost[unknown], np.float32(cfg.unknown_cost))
     cost[lethal] = np.inf
 
     return LocalCostmap(cost=cost, lethal=lethal, unknown=unknown,
                         distance_m=dist_m, meta=dict(meta))
 
 
+def lethal_radius_m(cfg: LocalCostmapConfig, res: float) -> float:
+    """Robot-centre exclusion radius around a blocked cell centre (strict <)."""
+    pad = res / math.sqrt(2.0) if cfg.quantization_pad else 0.0
+    return float(cfg.footprint_radius_m) + pad
+
+
+def _cell_range_m(meta: Dict[str, Any], shape) -> np.ndarray:
+    res = float(meta["resolution_m"])
+    ox = float(meta.get("origin_x_m", 0.0))
+    oy = float(meta.get("origin_y_m", 0.0))
+    xs = ox + (np.arange(shape[0], dtype=np.float64) + 0.5) * res
+    ys = oy + (np.arange(shape[1], dtype=np.float64) + 0.5) * res
+    return np.hypot(xs[:, None], ys[None, :])
+
+
 # ── numpy helpers (shared with the planner) ─────────────────────────
+
+
+def dilate_disk(mask: np.ndarray, radius_cells: float) -> np.ndarray:
+    """True wherever a True cell's centre is strictly within ``radius_cells``
+    (Euclidean, cell units) — an exact disk dilation via shifted ORs."""
+    out = mask.copy()
+    r = int(math.ceil(radius_cells))
+    for di in range(-r, r + 1):
+        for dj in range(-r, r + 1):
+            if (di == 0 and dj == 0) or math.hypot(di, dj) >= radius_cells:
+                continue
+            out |= _shift(mask, di, dj, fill=False)
+    return out
 
 
 def _shift(arr: np.ndarray, di: int, dj: int, fill) -> np.ndarray:

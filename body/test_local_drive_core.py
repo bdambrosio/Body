@@ -8,8 +8,10 @@ from body.lib.drive_safety import (
     FootprintConfig, driveable_from_rows, swept_path_blocked,
 )
 from body.lib.local_drive_core import (
-    DriveParams, ImuYawCorrector, body_to_odom, odom_to_body,
-    quat_wxyz_to_yaw, rotate_to_heading, steer_to_body_point,
+    STATE_CANCELED, STATE_FAULT, STATE_IDLE,
+    DriveParams, EStopMonitor, GotoArbiter, ImuYawCorrector, OdomRing,
+    body_to_odom, latched_rotate_omega, odom_to_body, quat_wxyz_to_yaw,
+    relative_pose, rotate_to_heading, steer_to_body_point,
     swept_block_response, wrap_pi,
 )
 
@@ -331,6 +333,226 @@ class TestQuatToYaw(unittest.TestCase):
             w, z = math.cos(th / 2), math.sin(th / 2)
             self.assertAlmostEqual(quat_wxyz_to_yaw(w, 0.0, 0.0, z), th,
                                    places=6, msg=f"deg={deg}")
+
+
+class TestLatchedRotate(unittest.TestCase):
+    P = DriveParams()
+
+    def test_first_call_follows_bearing(self):
+        w, d = latched_rotate_omega(1.0, 0, self.P)
+        self.assertGreater(w, 0)
+        self.assertEqual(d, 1)
+
+    def test_latch_holds_near_pi(self):
+        # Goal behind: bearing noise flips ±π every tick; keep turning +.
+        w, d = latched_rotate_omega(-3.0, 1, self.P)
+        self.assertGreater(w, 0)
+        self.assertEqual(d, 1)
+
+    def test_clear_side_change_relatches(self):
+        w, d = latched_rotate_omega(-1.0, 1, self.P)
+        self.assertLess(w, 0)
+        self.assertEqual(d, -1)
+
+    def test_min_omega(self):
+        w, _d = latched_rotate_omega(0.01, 0, self.P, min_omega=0.25)
+        self.assertAlmostEqual(w, 0.25)
+
+
+class TestOdomRing(unittest.TestCase):
+    def _msg(self, ts, x, th=0.0, **kw):
+        m = {"ts": ts, "x": x, "y": 0.0, "theta": th}
+        m.update(kw)
+        return m
+
+    def test_interpolates(self):
+        r = OdomRing()
+        r.push(self._msg(10.0, 0.0, 0.0))
+        r.push(self._msg(10.1, 0.1, 0.2))
+        p = r.pose_at(10.05)
+        self.assertAlmostEqual(p[0], 0.05)
+        self.assertAlmostEqual(p[2], 0.1)
+
+    def test_interpolates_heading_across_pi(self):
+        r = OdomRing()
+        r.push(self._msg(0.0, 0.0, 3.1))
+        r.push(self._msg(1.0, 0.0, -3.1))
+        self.assertAlmostEqual(abs(r.pose_at(0.5)[2]), math.pi, places=3)
+
+    def test_backward_clock_step_restarts_ring(self):
+        r = OdomRing()
+        r.push(self._msg(100.0, 0.0))
+        r.push(self._msg(100.1, 0.1))
+        r.push(self._msg(50.0, 0.2))          # clock stepped back 50 s
+        r.push(self._msg(50.1, 0.3))
+        self.assertAlmostEqual(r.latest()[1][0], 0.3)
+        self.assertIsNotNone(r.pose_at(50.05))
+
+    def test_outside_buffer_is_none(self):
+        r = OdomRing()
+        r.push(self._msg(10.0, 0.0))
+        r.push(self._msg(10.1, 0.1))
+        self.assertIsNone(r.pose_at(9.0))
+        self.assertIsNone(r.pose_at(11.0))
+        self.assertIsNotNone(r.pose_at(10.12))      # within tolerance
+
+    def test_reset_on_session_change_or_seq_decrease(self):
+        r = OdomRing()
+        self.assertFalse(r.push(self._msg(1.0, 0.0, session_id="aaaa0000", seq=5)))
+        self.assertFalse(r.push(self._msg(1.1, 0.1, session_id="aaaa0000", seq=6)))
+        self.assertTrue(r.push(self._msg(1.2, 0.0, session_id="bbbb1111", seq=0)))
+        self.assertIsNone(r.pose_at(1.05))           # old frame dropped
+        self.assertFalse(r.push(self._msg(1.3, 0.0, session_id="bbbb1111", seq=1)))
+        self.assertTrue(r.push(self._msg(1.4, 0.0, session_id="bbbb1111", seq=0)))
+
+    def test_legacy_odom_without_fields_never_resets(self):
+        r = OdomRing()
+        for k in range(5):
+            self.assertFalse(r.push(self._msg(k * 0.1, 0.0)))
+
+    def test_relative_pose(self):
+        rel = relative_pose((1.0, 0.0, math.pi / 2), (1.0, 1.0, math.pi / 2 + 0.1))
+        self.assertAlmostEqual(rel[0], 1.0)
+        self.assertAlmostEqual(rel[1], 0.0, places=9)
+        self.assertAlmostEqual(rel[2], 0.1)
+
+
+class TestGotoArbiter(unittest.TestCase):
+    def _goto(self, cid, **kw):
+        m = {"kind": "goto", "cmd_id": cid, "frame": "odom", "x_m": 1.0, "y_m": 0.0}
+        m.update(kw)
+        return m
+
+    def test_accept_and_supersede(self):
+        a = GotoArbiter()
+        self.assertEqual(a.on_command(self._goto(0)), "accepted")
+        self.assertEqual(a.on_command(self._goto(3)), "accepted")
+        self.assertEqual(a.goal["cmd_id"], 3)
+        self.assertEqual(a.watermark, 3)
+
+    def test_stale_goto_rejected_with_watermark(self):
+        a = GotoArbiter()
+        a.on_command(self._goto(7))
+        self.assertEqual(a.on_command(self._goto(5)), "rejected")
+        self.assertEqual(a.take_rejects(), [5])
+        self.assertEqual(a.take_rejects(), [])
+        self.assertEqual(a.goal["cmd_id"], 7)        # active goal untouched
+
+    def test_resend_is_idempotent(self):
+        # Desktop resends until it sees a status with its id: same id again
+        # must neither restart the goal nor be REJECTED.
+        a = GotoArbiter()
+        a.on_command(self._goto(4, x_m=1.0))
+        goal = a.goal
+        self.assertEqual(a.on_command(self._goto(4, x_m=1.0)), "duplicate")
+        self.assertIs(a.goal, goal)
+        self.assertEqual(a.take_rejects(), [])
+
+    def test_body_frame_accepted_bad_frame_rejected(self):
+        a = GotoArbiter()
+        self.assertEqual(a.on_command(self._goto(1, frame="body", anchor_ts=12.5)), "accepted")
+        self.assertEqual(a.on_command(self._goto(2, frame="map")), "malformed")
+        self.assertEqual(a.on_command(self._goto(3, x_m="nan?")), "malformed")
+        self.assertEqual(a.take_rejects(), [2, 3])
+
+    def test_cancel_announces_once_then_idle(self):
+        a = GotoArbiter()
+        a.on_command(self._goto(2))
+        a.on_command({"kind": "cancel", "cmd_id": 3})
+        self.assertIsNone(a.goal)
+        self.assertEqual(a.idle_status(), (STATE_CANCELED, 2, None))
+        self.assertEqual(a.idle_status(), (STATE_IDLE, 3, None))
+        self.assertEqual(a.on_command(self._goto(3)), "duplicate")
+
+    def test_drop_latches_fault_until_next_command(self):
+        a = GotoArbiter()
+        a.on_command(self._goto(2))
+        self.assertEqual(a.drop("odom_reset"), 2)
+        self.assertEqual(a.idle_status(), (STATE_FAULT, 2, "odom_reset"))
+        self.assertEqual(a.idle_status(), (STATE_FAULT, 2, "odom_reset"))
+        a.on_command(self._goto(5))
+        self.assertIsNone(a.fault)
+
+    def test_refused_while_estop(self):
+        a = GotoArbiter()
+        self.assertEqual(a.on_command(self._goto(9), estop_active=True), "refused_estop")
+        self.assertIsNone(a.goal)
+        self.assertEqual(a.idle_status(), (STATE_FAULT, 9, "e_stop"))
+
+    def test_finish_only_matching(self):
+        a = GotoArbiter()
+        a.on_command(self._goto(2))
+        a.finish(1)
+        self.assertIsNotNone(a.goal)
+        a.finish(2)
+        self.assertIsNone(a.goal)
+
+
+class TestEStopMonitor(unittest.TestCase):
+    def test_boot_latched_then_clear(self):
+        m = EStopMonitor()
+        m.on_status({"e_stop_active": True})
+        self.assertTrue(m.active())
+        m.on_status({"e_stop_active": False})
+        m.on_motor_state({"e_stop_active": False, "stall_detected": False})
+        self.assertFalse(m.active())
+
+    def test_event_active_until_a_later_clear_report(self):
+        m = EStopMonitor()
+        m.on_event({"reason": "heartbeat_timeout"})
+        self.assertTrue(m.active())
+        m.on_motor_state({"e_stop_active": True})
+        self.assertTrue(m.active())
+        m.on_motor_state({"e_stop_active": False})
+        self.assertFalse(m.active())
+
+    def test_stall_counts(self):
+        m = EStopMonitor()
+        m.on_motor_state({"e_stop_active": False, "stall_detected": True})
+        self.assertTrue(m.active())
+        self.assertEqual(m.describe(), "stall")
+
+
+class TestImuWindowGuard(unittest.TestCase):
+    def test_wheels_turn_imu_still_falls_back_then_rebinds(self):
+        c = ImuYawCorrector()
+        t, th, yaw = 0.0, 0.0, 1.0
+        c.corrected_theta(th, yaw, t=t)                     # baseline
+        out = None
+        for _ in range(10):                                 # 0.6 rad/s for 1 s, IMU frozen
+            t += 0.1
+            th += 0.06
+            out = c.corrected_theta(th, yaw, t=t)
+        self.assertTrue(c.distrusted)
+        self.assertAlmostEqual(out, th)                     # wheel heading
+        for _ in range(15):                                 # IMU tracks again
+            t += 0.1
+            th += 0.03
+            yaw += 0.03
+            out = c.corrected_theta(th, yaw, t=t)
+        self.assertFalse(c.distrusted)
+        bump = 0.1                                          # and is trusted again
+        self.assertAlmostEqual(c.corrected_theta(th, yaw + bump, t=t + 0.1), th + bump, places=6)
+
+    def test_wheel_glitch_step_ignored(self):
+        c = ImuYawCorrector()
+        c.corrected_theta(0.0, 1.0, t=0.0)
+        c.corrected_theta(1.0, 1.0, t=0.1)                  # 10 rad/s "step" = glitch
+        self.assertFalse(c.distrusted)
+
+    def test_rebaseline_no_step(self):
+        c = ImuYawCorrector()
+        c.corrected_theta(0.0, 0.0)
+        self.assertAlmostEqual(c.corrected_theta(0.0, 0.2), 0.2)
+        c.rebaseline()                                      # IMU driver restarted
+        self.assertAlmostEqual(c.corrected_theta(0.0, 2.5), 0.0)
+
+    def test_baseline_deferred_while_turning_fast(self):
+        c = ImuYawCorrector()
+        self.assertAlmostEqual(c.corrected_theta(0.0, 1.0, yaw_rate=0.5), 0.0)
+        self.assertAlmostEqual(c.corrected_theta(0.1, 1.3, yaw_rate=0.5), 0.1)  # no ref yet
+        c.corrected_theta(0.2, 1.4, yaw_rate=0.0)                              # baseline now
+        self.assertAlmostEqual(c.corrected_theta(0.2, 1.5, yaw_rate=0.0), 0.3)
 
 
 if __name__ == "__main__":

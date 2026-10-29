@@ -11,7 +11,9 @@ from __future__ import annotations
 import dataclasses
 import unittest
 
-from body.lib.drive_config import local_plan_config, scan_raster_config
+from body.lib.drive_config import (
+    footprint_config, local_plan_config, scan_raster_config, tier3_config,
+)
 from body.lib.local_costmap import LocalCostmapConfig
 from body.lib.local_planner import LocalPlanConfig
 from body.lib.scan_raster import ScanRasterConfig
@@ -73,6 +75,32 @@ class TestNoDeadConfigKeys(unittest.TestCase):
                 key, raster_fields | extras,
                 f"config.json local_drive.scan.{key} is read by nothing",
             )
+
+
+class TestTier3Builders(unittest.TestCase):
+    def test_tier3_config_reflects_config_json(self):
+        cfg = load_body_config()
+        ld = cfg["local_drive"]
+        t3 = tier3_config(cfg)
+        self.assertAlmostEqual(t3.rotate_timeout_s, float(ld["rotate_timeout_s"]))
+        self.assertAlmostEqual(t3.foot.preview_time_s, float(ld["preview_time_s"]))
+        self.assertEqual(t3.foot.unknown_explained_cells, int(ld["unknown_explained_cells"]))
+        self.assertAlmostEqual(t3.params.v_max, float(ld["v_max"]))
+
+    def test_veto_footprint_never_exceeds_planner_lethal(self):
+        # The invariant's precondition: veto radius (+½ cell it adds) is the
+        # footprint; the planner's lethal radius adds the res/√2 pad on top.
+        cfg = load_body_config()
+        foot = footprint_config(cfg)
+        plan = local_plan_config(cfg)
+        res = scan_raster_config(cfg).resolution_m
+        self.assertLessEqual(foot.footprint_radius_m + 0.5 * res,
+                             plan.costmap.footprint_radius_m + 1e-9)
+
+    def test_builders_total_on_empty_config(self):
+        t3 = tier3_config({})
+        self.assertGreater(t3.rotate_timeout_s, 0)
+        self.assertAlmostEqual(footprint_config({}).preview_time_s, 0.5)
 
 
 if __name__ == "__main__":

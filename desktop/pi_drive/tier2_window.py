@@ -98,6 +98,9 @@ class Tier2Window(QMainWindow):
         connect_btn = QPushButton("Connect"); connect_btn.clicked.connect(self._connect)
         clear_btn = QPushButton("Clear target"); clear_btn.clicked.connect(self._clear)
         stop_btn = QPushButton("STOP / Cancel"); stop_btn.clicked.connect(self._stop)
+        # The Pi latches e-stop at boot; only body/estop_rearm clears it.
+        rearm_btn = QPushButton("Re-arm e-stop")
+        rearm_btn.clicked.connect(lambda: self.controller.rearm_estop("pi_drive_tier2"))
 
         self._events = QListWidget()
 
@@ -121,6 +124,7 @@ class Tier2Window(QMainWindow):
             reloc_btn = QPushButton("Relocate"); reloc_btn.clicked.connect(self._on_relocate)
             pl.addWidget(reloc_btn)
         pl.addWidget(stop_btn)
+        pl.addWidget(rearm_btn)
         pl.addWidget(QLabel(
             "right-click world map = target; left-click = set location"
             if self.localizer is not None else "click the map to set a target"))
@@ -230,7 +234,8 @@ class Tier2Window(QMainWindow):
             if scan.get("ranges"):
                 grid, meta = rasterize_scan(
                     scan.get("ranges"), float(scan.get("angle_min", 0.0)),
-                    float(scan.get("angle_increment", 0.0)), self._raster)
+                    float(scan.get("angle_increment", 0.0)), self._raster,
+                    unknown_bins=scan.get("unknown_bins"))
         status = self.drive.latest_status()
         e_stop, hb_ok = self._chassis_flags()
 

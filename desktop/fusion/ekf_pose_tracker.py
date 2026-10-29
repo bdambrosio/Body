@@ -1,11 +1,28 @@
 """2D EKF pose tracker — IMU predict, encoder odom + IMU yaw update.
 
-When ``mag_idle_fusion_enabled``, applies an additional θ update from
-``body/imu.mag`` while the Pi marks ``mag.valid`` (motors-off snapshots).
+When ``mag_idle_fusion_enabled`` (off by default, I5), applies an additional
+θ update from ``body/imu.mag`` while the Pi marks ``mag.valid`` (motors-off
+snapshots).
+
+Robustness (fragility review S1/S6/X4/I2/I4):
+- Encoder ``ds`` is NEVER dropped. When no IMU yaw covers the odom ts (WiFi
+  jitter, IMU stale or restarting) the step is projected along the wheel-
+  propagated heading (θ + ½·dθ_enc) and θ advances by dθ_enc; the next IMU
+  yaw update pulls θ back. Counted in ``yaw_at_misses`` / ``wheel_heading_steps``.
+- Odom stream resets (``session_id`` change / ``seq`` decrease / backward
+  clock step) re-baseline instead of integrating the jump.
+- IMU stream resets (ImuYawTracker epoch) re-bind the yaw offset to the
+  current θ instead of stepping.
+- Wheel-vs-IMU contradiction guard: a sliding window comparing wheel and IMU
+  rotation; a frozen IMU (wheels turned, IMU flat) is distrusted — heading
+  from wheels, with the missed rotation restored at trip time — until the
+  IMU visibly moves again, then the offset is re-bound.
+- State interpolation is wrap-safe in θ.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from collections import deque
@@ -17,7 +34,10 @@ import numpy as np
 from desktop.fusion.load_slam_config import FusionNoiseConfig
 from desktop.nav.slam.imu_yaw import ImuYawTracker
 from desktop.nav.slam.types import ImuReading, quaternion_to_yaw
+from desktop.utils.stream_epoch import StreamEpoch
 from desktop.world_map.pose_source import OdomPose, Pose
+
+logger = logging.getLogger(__name__)
 
 PoseTuple = Tuple[float, float, float]
 _OdomSample = Tuple[float, float, float, float]
@@ -81,19 +101,69 @@ class EkfPoseTracker:
         self._imu_update_count = 0
         self._mag_update_count = 0
 
+        # Odom epoch (motor_controller restart / clock step) detection.
+        self._odom_epoch = StreamEpoch()
+        self._odom_resets = 0
+        self._wheel_heading_steps = 0
+        # IMU stream epoch last bound against (ImuYawTracker.epoch()).
+        self._imu_epoch_seen = 0
+        self._imu_rebind_pending = False
+        # Wheel-vs-IMU contradiction guard state.
+        self._guard_win: Deque[Tuple[float, float, float]] = deque()  # (ts, dθ_enc, dθ_imu)
+        self._last_imu_world_yaw: Optional[float] = None
+        self._imu_distrusted = False
+        self._imu_guard_trips = 0
+        # Bumped whenever the IMU→world yaw mapping is re-bound (IMU stream
+        # reset, guard revival). Consumers that keep their own offset against
+        # the raw IMU yaw (MCL) re-bind when it changes.
+        self._imu_rebind_epoch = 0
+
     def update_imu(self, reading: ImuReading) -> None:
         self._last_mag_valid = reading.mag_valid
         self._imu.update(reading)
         self._maybe_update_mag(reading)
 
-    def update_odom(self, ts: float, x: float, y: float, theta: float) -> None:
-        self._odom.update(ts, x, y, theta)
+    def update_odom(
+        self, ts: float, x: float, y: float, theta: float, *,
+        session_id: Optional[str] = None, seq: Optional[int] = None,
+    ) -> bool:
+        """Ingest one body/odom sample. ``session_id``/``seq`` are the
+        optional odom epoch fields. Returns True when this sample started a
+        new odom epoch (the EKF re-baselined instead of integrating the
+        jump)."""
+        reason = self._odom_epoch.check(session_id, seq, ts)
+        if reason is not None:
+            self._on_odom_reset(reason)
+        self._odom.update(ts, x, y, theta, reset=reason is not None)
         if not self._seeded and self._imu.is_settled() and self._odom.latest_pose() is not None:
             self.rebind_world_to_current()
-            return
+            return reason is not None
         if not self._seeded:
-            return
+            return reason is not None
         self._integrate_odom(ts, x, y, theta)
+        return reason is not None
+
+    def _on_odom_reset(self, reason: str) -> None:
+        with self._lock:
+            self._odom_resets += 1
+            # The next sample is the new baseline (no ds across the reset).
+            self._last_raw_odom = None
+            self._guard_win.clear()
+            if reason == "clock_step":
+                # Timestamps before/after the step are incomparable.
+                self._state_buf.clear()
+        logger.warning("ekf: odom stream reset (%s) — re-baselined, not integrated",
+                       reason)
+
+    def imu_trusted(self) -> bool:
+        """False while the wheel-vs-IMU guard has the IMU distrusted."""
+        with self._lock:
+            return not self._imu_distrusted
+
+    def imu_rebind_epoch(self) -> int:
+        """Changes whenever the raw-IMU→world yaw mapping was re-bound."""
+        with self._lock:
+            return self._imu_rebind_epoch
 
     def rebind_world_to_current(self) -> Optional[Pose]:
         with self._lock:
@@ -112,6 +182,11 @@ class EkfPoseTracker:
             self._last_heading_source = "none"
             self._state_buf.clear()
             self._last_raw_odom = None
+            self._guard_win.clear()
+            self._last_imu_world_yaw = None
+            self._imu_distrusted = False
+            self._imu_epoch_seen = self._imu.epoch()
+            self._imu_rebind_pending = False
             self._x = 0.0
             self._y = 0.0
             self._theta = 0.0
@@ -160,6 +235,11 @@ class EkfPoseTracker:
                 dtype=np.float64,
             )
 
+    def latest_state_ts(self) -> Optional[float]:
+        """Pi-clock ts of the newest fused state, or None."""
+        with self._lock:
+            return self._state_buf[-1][0] if self._state_buf else None
+
     def pose(self) -> PoseTuple:
         latest = self._odom.latest_pose()
         if latest is None:
@@ -182,6 +262,11 @@ class EkfPoseTracker:
                 "predict_count": self._predict_count,
                 "imu_update_count": self._imu_update_count,
                 "mag_update_count": self._mag_update_count,
+                "wheel_heading_steps": self._wheel_heading_steps,
+                "odom_resets": self._odom_resets,
+                "imu_distrusted": self._imu_distrusted,
+                "imu_guard_trips": self._imu_guard_trips,
+                "imu_epoch": self._imu.epoch(),
             }
 
     def _maybe_update_mag(self, reading: ImuReading) -> None:
@@ -218,11 +303,24 @@ class EkfPoseTracker:
     ) -> None:
         yaw = self._yaw_at_world(ts)
         with self._lock:
+            # IMU stream reset (driver restart): its yaw origin moved. Re-bind
+            # the offset so the IMU's current yaw maps to the current θ.
+            ep = self._imu.epoch()
+            if ep != self._imu_epoch_seen:
+                self._imu_epoch_seen = ep
+                self._imu_rebind_pending = True
+                self._guard_win.clear()
+                self._last_imu_world_yaw = None
+            if yaw is not None and self._imu_rebind_pending:
+                yaw = self._rebind_yaw_offset_locked(ts, yaw)
+                self._imu_rebind_pending = False
+
             if self._last_raw_odom is None:
                 self._last_raw_odom = (ts, x, y, theta)
-                if yaw is not None:
+                if yaw is not None and not self._imu_distrusted:
                     self._theta = yaw
-                    self._append_state(ts)
+                self._last_imu_world_yaw = yaw
+                self._append_state(ts)
                 return
 
             _pts, lx, ly, lth = self._last_raw_odom
@@ -232,36 +330,122 @@ class EkfPoseTracker:
             th_mid = lth + 0.5 * dth_enc
             ds = dx * math.cos(th_mid) + dy * math.sin(th_mid)
 
-            if yaw is None:
-                self._yaw_at_misses += 1
-                self._last_heading_source = "none"
-                self._last_raw_odom = (ts, x, y, theta)
-                return
+            if yaw is not None:
+                yaw = self._imu_guard_locked(ts, _pts, dth_enc, yaw)
 
-            use_game_yaw = not (
-                self._noise.mag_idle_fusion_enabled and self._last_mag_valid
-            )
-            self._predict_motion(ds, dth_enc, yaw, adopt_imu_yaw=use_game_yaw)
-            if use_game_yaw:
-                self._update_yaw_observation(yaw, self._noise.imu_sigma_rad)
-                self._imu_update_count += 1
-                self._last_heading_source = "imu"
+            if yaw is None:
+                # No usable IMU yaw at this ts (stale, not yet arrived, or
+                # distrusted). Never drop ds (S1): project along the wheel-
+                # propagated heading and advance θ by the wheel rotation.
+                self._yaw_at_misses += 1
+                self._wheel_heading_steps += 1
+                self._last_heading_source = (
+                    "wheel_imu_distrusted" if self._imu_distrusted else "wheel")
+                self._predict_motion(ds, dth_enc, None)
             else:
-                self._last_heading_source = "mag_idle"
+                use_game_yaw = not (
+                    self._noise.mag_idle_fusion_enabled and self._last_mag_valid
+                )
+                self._predict_motion(ds, dth_enc, yaw, adopt_imu_yaw=use_game_yaw)
+                if use_game_yaw:
+                    self._update_yaw_observation(yaw, self._noise.imu_sigma_rad)
+                    self._imu_update_count += 1
+                    self._last_heading_source = "imu"
+                else:
+                    self._last_heading_source = "mag_idle"
             self._append_state(ts)
             self._last_raw_odom = (ts, x, y, theta)
             self._trim_state_buf()
 
+    def _rebind_yaw_offset_locked(self, ts: float, yaw_world: float) -> float:
+        """Re-bind ``_yaw_offset`` so the IMU's yaw at ``ts`` maps to the
+        current θ. Returns the re-mapped world yaw (== θ)."""
+        self._yaw_offset = _wrap(self._yaw_offset + (yaw_world - self._theta))
+        self._imu_rebind_epoch += 1
+        self._last_imu_world_yaw = self._theta
+        return self._theta
+
+    def _imu_guard_locked(
+        self, ts: float, prev_ts: float, dth_enc: float, yaw: float,
+    ) -> Optional[float]:
+        """Sliding-window wheel-vs-IMU contradiction guard (I2). Returns the
+        yaw to fuse, or None while the IMU is distrusted."""
+        n = self._noise
+        prev_imu = self._last_imu_world_yaw
+        self._last_imu_world_yaw = yaw
+        if not n.imu_guard_enabled or prev_imu is None:
+            return None if self._imu_distrusted else yaw
+        dimu = _wrap(yaw - prev_imu)
+        dt = max(ts - prev_ts, 1e-3)
+        # A wheel-yaw step faster than any real chassis rotation is a glitch
+        # (or a reset the epoch fields didn't flag), not evidence.
+        enc_ev = dth_enc if abs(dth_enc) / dt <= 4.0 else 0.0
+        self._guard_win.append((ts, enc_ev, dimu))
+        cutoff = ts - n.imu_guard_window_s
+        while self._guard_win and self._guard_win[0][0] < cutoff:
+            self._guard_win.popleft()
+        enc_net = sum(e for _t, e, _i in self._guard_win)
+        imu_net = sum(i for _t, _e, i in self._guard_win)
+        frozen = abs(enc_net) >= n.imu_guard_rot_rad and abs(imu_net) < n.imu_guard_still_rad
+        unmatched = (n.imu_guard_distrust_unmatched_imu_rotation
+                     and abs(imu_net) >= n.imu_guard_rot_rad
+                     and abs(enc_net) < n.imu_guard_still_rad)
+        if not self._imu_distrusted:
+            if frozen or unmatched:
+                self._imu_distrusted = True
+                self._imu_guard_trips += 1
+                if frozen:
+                    # Restore the rotation the frozen IMU hid during the
+                    # window's earlier ticks (θ followed the flat IMU yaw
+                    # until now); this tick's dθ_enc is applied by the
+                    # wheel-heading predict.
+                    self._theta = _wrap(
+                        self._theta + (enc_net - enc_ev) - (imu_net - dimu))
+                logger.error(
+                    "ekf: IMU yaw %s — wheels %.0f° vs IMU %.0f° over %.1fs; "
+                    "heading from wheel yaw until the IMU agrees again",
+                    "FROZEN" if frozen else "rotating unseen by wheels",
+                    math.degrees(enc_net), math.degrees(imu_net),
+                    n.imu_guard_window_s)
+                self._guard_win.clear()
+                return None
+            return yaw
+        # Distrusted: revive once the IMU visibly moves in agreement with
+        # the wheels (alive again), then re-bind its offset to the current θ.
+        alive = abs(imu_net) >= 0.5 * n.imu_guard_rot_rad
+        agrees = abs(imu_net - enc_net) <= 0.5 * abs(imu_net)
+        if alive and agrees:
+            self._imu_distrusted = False
+            self._guard_win.clear()
+            logger.info("ekf: IMU yaw moving with the wheels again — trusting it")
+            # θ has advanced by dθ_enc for this tick only once predicted;
+            # bind so the IMU maps to θ + dθ_enc (this tick's end heading).
+            self._yaw_offset = _wrap(self._yaw_offset + (yaw - (self._theta + dth_enc)))
+            self._imu_rebind_epoch += 1
+            yaw_mapped = _wrap(self._theta + dth_enc)
+            self._last_imu_world_yaw = yaw_mapped
+            return yaw_mapped
+        return None
+
     def _predict_motion(
-        self, ds: float, dth_enc: float, yaw: float, *, adopt_imu_yaw: bool = True,
+        self, ds: float, dth_enc: float, yaw: Optional[float], *,
+        adopt_imu_yaw: bool = True,
     ) -> None:
-        """Propagate (x,y) with ds along heading; grow covariance."""
-        heading = yaw if adopt_imu_yaw else self._theta
+        """Propagate (x,y) with ds along heading; grow covariance.
+
+        ``yaw=None`` → wheel heading: project along θ + ½·dθ_enc and advance
+        θ by dθ_enc."""
+        if yaw is None:
+            heading = self._theta + 0.5 * dth_enc
+        else:
+            heading = yaw if adopt_imu_yaw else self._theta
         c = math.cos(heading)
         s = math.sin(heading)
         self._x += ds * c
         self._y += ds * s
-        if adopt_imu_yaw:
+        if yaw is None:
+            self._theta = _wrap(self._theta + dth_enc)
+        elif adopt_imu_yaw:
             self._theta = yaw
 
         n = self._noise
@@ -351,7 +535,9 @@ class EkfPoseTracker:
         out[0] = ts
         for i in range(1, 10):
             out[i] = s0[i] + alpha * (s1[i] - s0[i])
-        out[3] = _wrap(out[3])
+        # θ wrap-safe (S6): interpolate along the short arc. Linear on the raw
+        # values between 3.13 and -3.13 would give ~0 (pointing backwards).
+        out[3] = _wrap(s0[3] + alpha * _wrap(s1[3] - s0[3]))
         return tuple(out)  # type: ignore[return-value]
 
     def _yaw_at_world(self, ts: float) -> Optional[float]:

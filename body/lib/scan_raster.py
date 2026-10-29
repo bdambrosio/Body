@@ -20,12 +20,17 @@ beam (black/specular/too-close) returns nothing and is then cleared as open
 — a genuine false-clear risk that the depth low-obstacle overlay (later) is
 meant to cover. Tune ``max_clear_range_m`` down if absorptive false-clears
 show up before the overlay lands.
+
+*No-information beams stay unknown.* Beams listed in the scan's
+``unknown_bins`` (self-masked, mixed-pixel filtered, never sampled because a
+packet was dropped) and returns nearer than ``range_min_m`` are NOT no-return
+beams: they neither clear nor block (use ``rasterize_scan_msg``).
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -41,6 +46,9 @@ class ScanRasterConfig:
     range_max_m: float = 8.0           # returns beyond → treated as no-return
     max_clear_range_m: float = 6.0     # cap a beam's free-space clearing
     clear_buffer_cells: float = 2.0    # stop clearing this many cells short of a hit
+    # Seed a disk of this radius around the lidar origin as clear (the robot
+    # physically occupies it). 0 disables. Hits inside it still win.
+    robot_clear_radius_m: float = 0.0
 
 
 def _meta(cfg: ScanRasterConfig, n: int) -> Dict[str, Any]:
@@ -59,6 +67,7 @@ def rasterize_scan(
     angle_min: float,
     angle_increment: float,
     cfg: Optional[ScanRasterConfig] = None,
+    unknown_bins: Optional[Iterable[Any]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """One scan → (int8 grid (n, n): -1 unknown / 0 blocked / 1 clear, meta).
 
@@ -68,6 +77,11 @@ def rasterize_scan(
     for a no-return beam) are cleared; everything else is unknown. Returns an
     all-unknown grid if there are no ranges (fail-safe: the swept check's
     empty-region guard then blocks).
+
+    ``unknown_bins`` (the scan message's optional ``unknown_bins``) are beams
+    with NO information this sweep (self-masked, filtered, never sampled):
+    they neither clear nor block, so their cells stay unknown unless another
+    beam observes them. Without it, a null range means "no echo" (cleared).
     """
     cfg = cfg or ScanRasterConfig()
     res = cfg.resolution_m
@@ -91,10 +105,25 @@ def rasterize_scan(
     sin_t = np.sin(thetas)
     lx, ly = cfg.lidar_x_m, cfg.lidar_y_m
 
-    has_return = (rs > cfg.range_min_m) & (rs <= cfg.range_max_m)
-    # No-return / beyond-range beams clear to the horizon (open space).
+    no_info = np.zeros(N, dtype=bool)
+    if unknown_bins is not None:
+        for b in unknown_bins:
+            try:
+                bi = int(b)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= bi < N:
+                no_info[bi] = True
+    # A return nearer than range_min is "something too close to measure",
+    # not open space: never let it clear to the horizon.
+    no_info |= (rs > 0.0) & (rs <= cfg.range_min_m)
+
+    has_return = (rs > cfg.range_min_m) & (rs <= cfg.range_max_m) & ~no_info
+    # No-return / beyond-range beams clear to the horizon (open space);
+    # no-information beams clear nothing.
     r_clear = np.where(has_return, np.minimum(rs, cfg.max_clear_range_m),
                        cfg.max_clear_range_m)
+    r_clear = np.where(no_info, 0.0, r_clear)
 
     # Ray-trace clear: sample every cell along each beam.
     max_samples = int(math.ceil(cfg.max_clear_range_m / res))
@@ -109,6 +138,12 @@ def rasterize_scan(
         if np.any(inside):
             grid[ix[inside], iy[inside]] = 1
 
+    if cfg.robot_clear_radius_m > 0.0:
+        centers = origin + (np.arange(n, dtype=np.float64) + 0.5) * res
+        dx = centers[:, None] - lx
+        dy = centers[None, :] - ly
+        grid[(dx * dx + dy * dy) <= cfg.robot_clear_radius_m ** 2] = 1
+
     # Hits (blocked) — written after clears so blocked wins on conflict.
     if np.any(has_return):
         rr = rs[has_return]
@@ -121,3 +156,18 @@ def rasterize_scan(
             grid[ix[inside], iy[inside]] = 0
 
     return grid, _meta(cfg, n)
+
+
+def rasterize_scan_msg(
+    scan: Mapping[str, Any],
+    cfg: Optional[ScanRasterConfig] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Rasterize a ``body/lidar/scan`` message, honouring its optional
+    ``unknown_bins``. Tolerates older scans without it."""
+    return rasterize_scan(
+        scan.get("ranges"),
+        float(scan.get("angle_min", 0.0)),
+        float(scan.get("angle_increment", 0.0)),
+        cfg,
+        unknown_bins=scan.get("unknown_bins"),
+    )

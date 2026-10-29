@@ -22,10 +22,13 @@ def _reading(
     accuracy_rad: float = 0.02,
     mode: FusionMode = FusionMode.GAME_ROTATION_VECTOR,
     gyro_z: float = 0.0,
+    session_id=None,
+    seq=None,
 ) -> ImuReading:
     return ImuReading(
         ts=ts, gyro_z=gyro_z, quat_wxyz=_quat_for_yaw(yaw),
         fusion_mode=mode, accuracy_rad=accuracy_rad,
+        session_id=session_id, seq=seq,
     )
 
 
@@ -157,6 +160,45 @@ class TestImuYawTracker(unittest.TestCase):
         t.update(_reading(ts=0.02, yaw=0.0,
                           mode=FusionMode.ROTATION_VECTOR, accuracy_rad=0.20))
         self.assertFalse(t.is_settled())
+
+
+class TestImuYawTrackerStreamResets(unittest.TestCase):
+    def _settled(self):
+        t = ImuYawTracker(min_settle_samples=1, settle_accuracy_rad=0.05)
+        for i in range(10):
+            t.update(_reading(ts=i * 0.01, yaw=0.3, session_id="a", seq=i))
+        return t
+
+    def test_session_change_continues_yaw(self):
+        # I4: driver restart → new GRV origin (yaw reads 1.5 instead of 0.3).
+        # The tracker must continue from 0.3, not step by 1.2 rad.
+        t = self._settled()
+        t.update(_reading(ts=0.10, yaw=1.5, session_id="b", seq=0))
+        t.update(_reading(ts=0.11, yaw=1.6, session_id="b", seq=1))
+        self.assertEqual(t.epoch(), 1)
+        y, _ = t.yaw_at(0.10)
+        self.assertAlmostEqual(y, 0.3, places=6)
+        y, _ = t.yaw_at(0.11)
+        self.assertAlmostEqual(y, 0.4, places=6)    # real motion still tracked
+
+    def test_duplicate_seq_dropped(self):
+        t = self._settled()
+        t.update(_reading(ts=0.20, yaw=0.3, session_id="a", seq=9))  # re-publish
+        self.assertAlmostEqual(t.latest()[0], 0.09, places=6)
+        self.assertTrue(t.is_stale(0.5))
+        self.assertFalse(t.is_stale(0.2))
+
+    def test_backward_clock_step_rebaselines(self):
+        t = self._settled()
+        t.update(_reading(ts=-50.0, yaw=0.3))      # Pi clock stepped back
+        self.assertEqual(t.epoch(), 1)
+        self.assertAlmostEqual(t.latest()[0], -50.0)
+
+    def test_absent_fields_never_reset(self):
+        t = ImuYawTracker(min_settle_samples=1, settle_accuracy_rad=0.05)
+        for i in range(5):
+            t.update(_reading(ts=i * 0.01, yaw=0.1 * i))
+        self.assertEqual(t.epoch(), 0)
 
 
 if __name__ == "__main__":

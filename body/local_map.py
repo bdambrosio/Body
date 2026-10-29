@@ -229,6 +229,193 @@ def _median_filter_depth_mm(arr: np.ndarray, kernel: int) -> np.ndarray:
     return np.where(np.isnan(med), 0, med).astype(np.uint16)
 
 
+def _sensor_key(msg: dict[str, Any]) -> tuple[Any, Any]:
+    """Identity of a sensor frame: (seq, ts). Older producers have no seq."""
+    return (msg.get("seq"), msg.get("ts"))
+
+
+def _sensor_state(
+    msg: dict[str, Any] | None,
+    last_key: tuple[Any, Any] | None,
+    now_wall: float,
+    max_age_s: float,
+) -> str:
+    """``"stale"`` (absent / too old), ``"same"`` (fresh but already used) or ``"new"``."""
+    if msg is None:
+        return "stale"
+    try:
+        ts = float(msg.get("ts", 0.0))
+    except (TypeError, ValueError):
+        return "stale"
+    if max_age_s > 0.0 and not (now_wall - ts <= max_age_s):
+        return "stale"
+    return "same" if _sensor_key(msg) == last_key else "new"
+
+
+class OdomRing:
+    """Short history of ``body/odom`` poses for interpolating the pose at a sensor time.
+
+    Cleared when the odom frame resets (``session_id`` change or ``seq`` decrease).
+    """
+
+    def __init__(self, horizon_s: float = 2.0, max_extrapolate_s: float = 0.15) -> None:
+        self.horizon_s = float(horizon_s)
+        self.max_extrapolate_s = float(max_extrapolate_s)
+        self._buf: list[tuple[float, float, float, float, str]] = []
+        self._session: Any = None
+        self._seq: int | None = None
+
+    def add(self, msg: dict[str, Any]) -> None:
+        try:
+            ts = float(msg["ts"])
+            x = float(msg["x"])
+            y = float(msg["y"])
+            th = float(msg["theta"])
+        except (KeyError, TypeError, ValueError):
+            return
+        sid = msg.get("session_id")
+        seq = msg.get("seq")
+        reset = sid is not None and self._session is not None and sid != self._session
+        if isinstance(seq, int) and self._seq is not None and seq < self._seq and sid == self._session:
+            reset = True
+        if reset:
+            self._buf.clear()
+        self._session = sid
+        self._seq = seq if isinstance(seq, int) else None
+        if self._buf and ts <= self._buf[-1][0]:
+            if ts < self._buf[-1][0]:
+                return            # out of order
+            self._buf.pop()
+        self._buf.append((ts, x, y, th, str(msg.get("source", "commanded_vel_playback"))))
+        cutoff = ts - self.horizon_s
+        while len(self._buf) > 2 and self._buf[0][0] < cutoff:
+            self._buf.pop(0)
+
+    def latest(self) -> dict[str, Any] | None:
+        if not self._buf:
+            return None
+        ts, x, y, th, src = self._buf[-1]
+        return {"odom_ts": ts, "x": x, "y": y, "theta": th, "source": src}
+
+    def pose_at(self, t: float) -> dict[str, Any] | None:
+        """Pose interpolated at ``t``; ``interpolated`` is False when ``t`` was outside the
+        buffer (nearest end used, within ``max_extrapolate_s``) — None if too far outside."""
+        buf = self._buf
+        if not buf:
+            return None
+        if t <= buf[0][0] or t >= buf[-1][0]:
+            end = buf[0] if t <= buf[0][0] else buf[-1]
+            if abs(t - end[0]) > self.max_extrapolate_s:
+                return None
+            return {
+                "odom_ts": end[0], "x": end[1], "y": end[2], "theta": end[3],
+                "source": end[4], "interpolated": False,
+            }
+        lo, hi = 0, len(buf) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if buf[mid][0] <= t:
+                lo = mid
+            else:
+                hi = mid
+        a, b = buf[lo], buf[hi]
+        f = (t - a[0]) / (b[0] - a[0]) if b[0] > a[0] else 0.0
+        dth = math.atan2(math.sin(b[3] - a[3]), math.cos(b[3] - a[3]))
+        th = a[3] + f * dth
+        th = math.atan2(math.sin(th), math.cos(th))
+        return {
+            "odom_ts": t,
+            "x": a[1] + f * (b[1] - a[1]),
+            "y": a[2] + f * (b[2] - a[2]),
+            "theta": th,
+            "source": b[4],
+            "interpolated": True,
+        }
+
+
+class DriveableFilter:
+    """Temporal evidence filter for the driveable layer (body frame).
+
+    Streaks advance only on *new* sensor frames (``"new"``), hold on a re-used frame
+    (``"same"``) and reset on a stale/missing sensor (``"stale"``). Lidar clearing never
+    counts cells hit by lidar in the same frame, nor cells with a depth slab hit within the
+    last ``depth_memory_frames`` depth frames (low obstacles below the lidar plane). Clearing
+    needs at least as many frames as blocking so walls do not erode in motion.
+    """
+
+    def __init__(
+        self,
+        shape: tuple[int, int],
+        *,
+        lidar_min_hits: int = 1,
+        lidar_block_frames: int = 2,
+        depth_min_pixels: int = 2,
+        depth_block_frames: int = 2,
+        clear_frames: int = 1,
+        unobs_decay: int = 1,
+        depth_memory_frames: int = 3,
+    ) -> None:
+        self.lidar_min_hits = max(1, int(lidar_min_hits))
+        self.lidar_block_frames = max(1, int(lidar_block_frames))
+        self.depth_min_pixels = max(1, int(depth_min_pixels))
+        self.depth_block_frames = max(1, int(depth_block_frames))
+        self.clear_frames = max(int(clear_frames), self.lidar_block_frames, 1)
+        self.unobs_decay = max(0, int(unobs_decay))
+        self.depth_memory_frames = max(0, int(depth_memory_frames))
+        big = np.iinfo(np.int32).max // 2
+        self._big = big
+        self.clear_streak = np.zeros(shape, dtype=np.int32)
+        self.lidar_streak = np.zeros(shape, dtype=np.int32)
+        self.depth_streak = np.zeros(shape, dtype=np.int32)
+        self.depth_hit_age = np.full(shape, big, dtype=np.int32)
+
+    def update(
+        self,
+        *,
+        lidar_state: str,
+        depth_state: str,
+        lidar_slab_count: np.ndarray | None = None,
+        lidar_cleared: np.ndarray | None = None,
+        lidar_hit_cells: np.ndarray | None = None,
+        depth_slab_count: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Returns int8 grid: -1 unknown, 0 blocked, 1 driveable."""
+        if lidar_state == "new" and lidar_slab_count is not None:
+            raw = lidar_slab_count >= self.lidar_min_hits
+            self.lidar_streak = np.where(raw, self.lidar_streak + 1, 0).astype(np.int32)
+        elif lidar_state == "stale":
+            self.lidar_streak[:] = 0
+        if depth_state == "new" and depth_slab_count is not None:
+            raw_d = depth_slab_count >= self.depth_min_pixels
+            self.depth_streak = np.where(raw_d, self.depth_streak + 1, 0).astype(np.int32)
+            self.depth_hit_age = np.where(
+                raw_d, 0, np.minimum(self.depth_hit_age + 1, self._big)
+            ).astype(np.int32)
+        elif depth_state == "stale":
+            self.depth_streak[:] = 0
+            self.depth_hit_age[:] = self._big
+
+        instant_block = (self.depth_streak >= self.depth_block_frames) | (
+            self.lidar_streak >= self.lidar_block_frames
+        )
+        if lidar_state == "new" and lidar_cleared is not None:
+            cleared = lidar_cleared.copy()
+            if lidar_hit_cells is not None:
+                cleared &= ~lidar_hit_cells
+            protect = self.depth_hit_age < self.depth_memory_frames
+            inc = cleared & ~instant_block & ~protect
+            new_streak = np.maximum(0, self.clear_streak - self.unobs_decay)
+            new_streak[inc] = self.clear_streak[inc] + 1
+            new_streak[instant_block] = 0
+            self.clear_streak = new_streak.astype(np.int32)
+        elif lidar_state == "stale":
+            self.clear_streak[:] = 0
+        else:
+            self.clear_streak[instant_block] = 0
+        ok_mask = self.clear_streak >= self.clear_frames
+        return np.where(instant_block, _D_BLOCK, np.where(ok_mask, _D_OK, _D_NONE)).astype(np.int8)
+
+
 def main() -> None:
     body_cfg = zenoh_helpers.load_body_config()
     lm = body_cfg.get("local_map", {})
@@ -314,6 +501,12 @@ def main() -> None:
     # bounds the per-frame sample buffer size. Lidar is the sole source
     # of "clear" evidence — depth contributes only "blocked".
     lidar_max_clear_range_m = float(lm.get("lidar_max_clear_range_m", 6.0))
+    # Staleness gating: a sensor frame older than this (wall clock, vs its
+    # capture ts) contributes nothing; a frame already used re-renders but
+    # does not advance temporal streaks.
+    lidar_max_age_s = float(lm.get("lidar_max_age_s", 0.35))
+    depth_max_age_s = float(lm.get("depth_max_age_s", 0.35))
+    depth_memory_frames = int(lm.get("driveable_depth_memory_frames", 3))
     if not driveable_on or clearance_m <= 0.0:
         driveable_on = False
 
@@ -332,14 +525,29 @@ def main() -> None:
     floor_n, floor_d = _default_floor_plane(ground_z)
     next_floor_fit = 0.0
     last_floor_log = 0.0
-    clear_streak = np.zeros((nx, ny), dtype=np.int32)
-    lidar_streak = np.zeros((nx, ny), dtype=np.int32)
-    depth_slab_streak = np.zeros((nx, ny), dtype=np.int32)
+    dfilt = DriveableFilter(
+        (nx, ny),
+        lidar_min_hits=lidar_slab_min_hits,
+        lidar_block_frames=lidar_slab_block_frames,
+        depth_min_pixels=slab_min_pixels,
+        depth_block_frames=depth_slab_block_frames,
+        clear_frames=clear_frames_need,
+        unobs_decay=unobs_decay,
+        depth_memory_frames=depth_memory_frames,
+    )
+    if dfilt.clear_frames != clear_frames_need:
+        print(
+            f"[local_map] driveable_clear_frames raised {clear_frames_need} -> "
+            f"{dfilt.clear_frames} (must be >= lidar_slab_block_frames)",
+            flush=True,
+        )
+    last_lidar_key: tuple[Any, Any] | None = None
+    last_depth_key: tuple[Any, Any] | None = None
 
     lock = threading.Lock()
     last_lidar: dict[str, Any] | None = None
     last_depth: dict[str, Any] | None = None
-    last_odom: dict[str, Any] | None = None
+    odom_ring = OdomRing()
 
     session = zenoh_helpers.open_session(body_cfg)
     stop = threading.Event()
@@ -355,9 +563,8 @@ def main() -> None:
             last_depth = msg
 
     def on_odom(_k: str, msg: dict[str, Any]) -> None:
-        nonlocal last_odom
         with lock:
-            last_odom = msg
+            odom_ring.add(msg)
 
     zenoh_helpers.declare_subscriber_json(session, "body/lidar/scan", on_lidar)
     zenoh_helpers.declare_subscriber_json(session, "body/oakd/depth", on_depth)
@@ -376,13 +583,21 @@ def main() -> None:
         floor_count = np.zeros((nx, ny), dtype=np.int32) if driveable_on else None
         lidar_slab_count = np.zeros((nx, ny), dtype=np.int32)
         lidar_cleared = np.zeros((nx, ny), dtype=bool)
+        lidar_hit_cells = np.zeros((nx, ny), dtype=bool)
         lidar_ts: float | None = None
         depth_ts: float | None = None
 
         with lock:
             lmsg = last_lidar
             dmsg = last_depth
-            omsg = last_odom
+
+        now_wall = time.time()
+        lidar_state = _sensor_state(lmsg, last_lidar_key, now_wall, lidar_max_age_s)
+        depth_state = _sensor_state(dmsg, last_depth_key, now_wall, depth_max_age_s)
+        if lidar_state == "stale":
+            lmsg = None
+        if depth_state == "stale":
+            dmsg = None
 
         now = time.monotonic()
         if floor_fit_enabled and driveable_on and now >= next_floor_fit and dmsg is not None:
@@ -467,6 +682,7 @@ def main() -> None:
                     if np.any(inside_h):
                         ix_in = ix_h[inside_h]
                         iy_in = iy_h[inside_h]
+                        lidar_hit_cells[ix_in, iy_in] = True
                         np.maximum.at(z_acc, (ix_in, iy_in), lidar_z)
                         if driveable_on:
                             rs_in = rs_v[inside_h]
@@ -586,44 +802,17 @@ def main() -> None:
 
         driveable_rows: list[list[bool | None]] | None = None
         if driveable_on:
-            lidar_raw = lidar_slab_count >= lidar_slab_min_hits
-            lidar_streak = np.where(lidar_raw, lidar_streak + 1, 0)
-            lidar_blocked = lidar_streak >= lidar_slab_block_frames
-            depth_raw = (
-                slab_count >= slab_min_pixels
-                if slab_count is not None
-                else np.zeros((nx, ny), dtype=bool)
-            )
-            depth_slab_streak = np.where(depth_raw, depth_slab_streak + 1, 0)
-            slab_hit = depth_slab_streak >= depth_slab_block_frames
-            floor_seen = (
-                floor_count >= floor_seen_min_pixels
-                if floor_count is not None
-                else np.zeros((nx, ny), dtype=bool)
-            )
-            instant_block = slab_hit | lidar_blocked
-            # Clear authority belongs to lidar only — depth contributes
-            # blocked evidence (with 2-frame gate) but never "clear" on its
-            # own. Lidar ray-trace marks cells the ray swept through.
-            new_streak = clear_streak.copy()
-            new_streak[instant_block] = 0
-            inc = lidar_cleared & ~instant_block
-            new_streak[inc] = clear_streak[inc] + 1
-            # Cells the lidar did not sweep this frame decay so stale
-            # clears do not stick forever.
-            unobs = ~lidar_cleared & ~instant_block
-            new_streak[unobs] = np.maximum(0, clear_streak[unobs] - unobs_decay)
-            clear_streak = new_streak
-            ok_mask = clear_streak >= clear_frames_need
-            # Trichotomy is now driven by evidence layers directly:
-            # blocked iff depth/lidar slab; clear iff lidar accumulated
-            # enough clear frames; otherwise unknown. Depth-only-observed
-            # cells stay unknown until lidar verifies — they no longer
-            # masquerade as blocked just because they lack clear evidence.
-            d_now = np.where(
-                instant_block,
-                _D_BLOCK,
-                np.where(ok_mask, _D_OK, _D_NONE),
+            # Driveable trichotomy from evidence layers (DriveableFilter): blocked iff
+            # depth/lidar slab streak; clear iff lidar ray-trace accumulated enough
+            # new-frame clears (never on same-frame hit cells or recent depth slab
+            # hits); otherwise unknown. Depth contributes only blocked evidence.
+            d_now = dfilt.update(
+                lidar_state=lidar_state,
+                depth_state=depth_state,
+                lidar_slab_count=lidar_slab_count,
+                lidar_cleared=lidar_cleared,
+                lidar_hit_cells=lidar_hit_cells,
+                depth_slab_count=slab_count,
             )
             driveable_rows = []
             for ix in range(nx):
@@ -646,24 +835,37 @@ def main() -> None:
                 row.append(None if math.isnan(val) else round(val, 4))
             rows.append(row)
 
+        if lmsg is not None:
+            last_lidar_key = _sensor_key(lmsg)
+        if dmsg is not None:
+            last_depth_key = _sensor_key(dmsg)
+
         src: dict[str, Any] = {}
         if lidar_ts is not None:
             src["lidar_ts"] = lidar_ts
+            if lmsg is not None and lmsg.get("seq") is not None:
+                src["lidar_seq"] = lmsg.get("seq")
         if depth_ts is not None:
             src["depth_ts"] = depth_ts
+            if dmsg is not None and dmsg.get("seq") is not None:
+                src["depth_seq"] = dmsg.get("seq")
+        src["lidar_state"] = lidar_state
+        src["depth_state"] = depth_state
 
-        anchor_pose: dict[str, Any] | None = None
-        if omsg is not None:
-            try:
-                anchor_pose = {
-                    "odom_ts": float(omsg["ts"]),
-                    "x": float(omsg["x"]),
-                    "y": float(omsg["y"]),
-                    "theta": float(omsg["theta"]),
-                    "source": str(omsg.get("source", "commanded_vel_playback")),
-                }
-            except (KeyError, TypeError, ValueError):
+        # Anchor the grid at the time its geometry was sensed (lidar mid-sweep,
+        # else depth capture), not at the newest odom sample.
+        anchor_ts = lidar_ts if lidar_ts is not None else depth_ts
+        with lock:
+            if anchor_ts is not None:
+                anchor_pose = odom_ring.pose_at(anchor_ts)
+            else:
                 anchor_pose = None
+            if anchor_pose is None:
+                anchor_pose = odom_ring.latest()
+                if anchor_pose is not None:
+                    anchor_pose["interpolated"] = False
+        if anchor_pose is not None and anchor_ts is not None:
+            anchor_pose["anchor_ts"] = anchor_ts
 
         zenoh_helpers.publish_json(
             session,

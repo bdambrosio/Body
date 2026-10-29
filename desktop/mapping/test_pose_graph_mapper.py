@@ -132,6 +132,43 @@ class TestPoseGraphMapper(unittest.TestCase):
         self.assertGreater(len(wall_cols), 0)
         self.assertGreater(mapper.diagnostics()["node_count"], 4)
 
+    def _mapper(self, traj):
+        slam = SlamConfig(match_hz=100.0, min_submap_evidence_cells=10**9,
+                          graph_optimize_every_n_nodes=1000)
+        return PoseGraphMapper(slam_config=slam, fusion_config=FusionNoiseConfig(),
+                               ekf=_MockEkf(traj))  # type: ignore[arg-type]
+
+    def test_prior_composes_last_node_with_ekf_delta(self) -> None:
+        # S3: once the graph has corrected a node, the next prior must carry
+        # that correction forward (last node ⊕ EKF delta), not snap back to
+        # the absolute EKF pose.
+        traj = [(0.0, (0.0, 0.0, 0.0)), (1.0, (1.0, 0.0, 0.0))]
+        mapper = self._mapper(traj)
+        ranges, angles = _corridor_scan(0.0)
+        self.assertTrue(mapper.add_scan(0.0, ranges, angles))
+        node0 = mapper._nodes[0]
+        node0.x, node0.y, node0.theta = 0.0, 0.4, math.pi / 2   # graph correction
+        mapper._last_match_mono = 0.0
+        self.assertTrue(mapper.add_scan(1.0, ranges, angles))
+        n1 = mapper._nodes[1]
+        # Sparse submap → no match → node at the prior: 1 m along node0's
+        # (corrected) heading.
+        self.assertAlmostEqual(n1.x, 0.0, places=6)
+        self.assertAlmostEqual(n1.y, 1.4, places=6)
+        self.assertAlmostEqual(n1.theta, math.pi / 2, places=6)
+
+    def test_rate_slot_not_consumed_on_failed_lookup(self) -> None:
+        # S9: a scan past the EKF tail must not burn the rate slot.
+        class _Ekf(_MockEkf):
+            def pose_at(self, ts):
+                return None if ts > 5.0 else (0.0, 0.0, 0.0)
+        slam = SlamConfig(match_hz=0.5, min_submap_evidence_cells=10**9)
+        mapper = PoseGraphMapper(slam_config=slam, fusion_config=FusionNoiseConfig(),
+                                 ekf=_Ekf([]))  # type: ignore[arg-type]
+        ranges, angles = _corridor_scan(0.0)
+        self.assertFalse(mapper.add_scan(9.0, ranges, angles))   # lookup fails
+        self.assertTrue(mapper.add_scan(1.0, ranges, angles))    # slot still free
+
 
 if __name__ == "__main__":
     unittest.main()

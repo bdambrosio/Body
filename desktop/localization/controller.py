@@ -22,6 +22,7 @@ from desktop.reference_map.reference_map import ReferenceMap
 from desktop.world_map.particle_filter_pose import ParticleFilterConfig
 from desktop.world_map.pose_source import PoseSource
 from desktop.chassis.transport import open_session
+from desktop.utils.stream_epoch import epoch_fields
 from desktop.world_map.world_grid import encode_for_publish
 
 logger = logging.getLogger(__name__)
@@ -220,7 +221,8 @@ class LocalizationController:
         if triple is None:
             return
         ts, x, y, theta = triple
-        self.pose_source.update(ts, x, y, theta)
+        session_id, seq = epoch_fields(msg)
+        self.pose_source.update(ts, x, y, theta, session_id=session_id, seq=seq)
         with self._lock:
             self._arr_odom.append(_now())
             self._last_odom_ts = _now()

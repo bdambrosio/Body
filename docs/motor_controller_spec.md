@@ -127,7 +127,10 @@ Sole owner of MDD10A GPIO (PWM + DIR) and encoder GPIO. Translates velocity comm
 **Subscribes to:**
 - `body/cmd_vel` — twist commands (linear m/s, angular rad/s)
 - `body/cmd_direct` — direct wheel velocities (left m/s, right m/s)
-- `body/emergency_stop` — immediate halt
+- `body/emergency_stop` — immediate halt (latches)
+- `body/status` — watchdog `e_stop_active` (mirrored as a level)
+- `body/heartbeat` — tracked locally (monotonic) to gate `body/estop_rearm`
+- `body/estop_rearm` — explicit re-arm, `{"ts", "source"}` (§4.8)
 
 **Publishes to:**
 - `body/odom` — dead-reckoned pose + raw encoder ticks, at 50 Hz
@@ -231,16 +234,19 @@ lgpio.callback(h, 22, lgpio.BOTH_EDGES, right_encoder_callback)
 
 ### 4.7 Command Timeout
 
-Each `cmd_vel` or `cmd_direct` message carries a `timeout_ms` field (default 500ms). If no new command is received within this window, motor output is set to zero. This is independent of the watchdog process — it's a local safety measure.
+Each `cmd_vel` or `cmd_direct` message carries a `timeout_ms` field (default `motor.cmd_timeout_ms`, 500ms). If no new command is received within this window, motor output is set to zero. This is independent of the watchdog process — it's a local safety measure.
+
+**Arbitration (Pi receipt time, per topic).** Each callback stamps its command with the Pi's `time.monotonic()` at receipt; `cmd_vel` and `cmd_direct` are stored separately, each with its own `timeout_ms` clamped to `[50, motor.cmd_timeout_max_ms]` (default 1000). The active command is the most recently *received* one that has not expired; expired commands are discarded. The sender's `ts` is not used (desktop and Pi clocks may disagree), so a stale desktop `cmd_direct` can no longer mute Tier-3's `cmd_vel`, and a `cmd_vel` stream cannot keep an old `cmd_direct` alive.
+
+**Validation.** `linear`/`angular` (`cmd_vel`) and `left`/`right` (`cmd_direct`) must be present finite numbers, `timeout_ms` (optional) a finite number; anything else is ignored with a rate-limited log line — a malformed message can never crash the loop. Each control tick is wrapped in `try/except`: on an error PWM is zeroed, the PI loops reset and the error logged; after 250 consecutive failing ticks the process exits (the launcher respawns it; odom `session_id` changes).
 
 ### 4.8 Emergency Stop
 
 On receiving `body/emergency_stop`:
 - Immediately set both PWM channels to 0% duty
-- Set `e_stop_active = True`
-- Remain stopped until:
-  1. No `emergency_stop` has been received for `ESTOP_CLEAR_MS` (default 2000ms), AND
-  2. A new `cmd_vel` or `cmd_direct` is received (explicit re-engagement)
+- Latch `e_stop_active = True` (also active while `body/status.e_stop_active` is true)
+- Remain stopped until **re-armed**: a `body/estop_rearm` message arrives while the heartbeat is ok (a `body/heartbeat` within `watchdog.heartbeat_timeout_ms`, monotonic), or the watchdog's `status.e_stop_active` goes true → false (the watchdog clears only on the same re-arm rule). **Motion commands never clear an e-stop** — Tier-3's own `cmd_vel` stream would otherwise auto-resume.
+- `motor_state.e_stop_active` / `stall_detected` are published every tick for Tier-3 and the desktop.
 
 ### 4.9 Software Stall Detection
 
@@ -259,14 +265,13 @@ Not a substitute for current sensing, but prevents prolonged stalls from burning
 3. Open Zenoh session, subscribe to cmd topics
 4. Enter main loop
 
-**Shutdown (SIGTERM):**
-1. Set both PWM to 0%
-2. Close Zenoh session
-3. Release all GPIO
-4. Close lgpio handle
-5. Exit
+**Shutdown (SIGTERM / SIGINT / SIGHUP):**
+1. Set both PWM to 0% and disable the channels (first — before anything that can block)
+2. Release encoders / GPIO, close lgpio handle
+3. Close Zenoh session
+4. Exit
 
-Motors are always safe-off by default. If the process crashes, lgpio releases the pins and PWM output stops.
+Kernel sysfs PWM state **outlives the process** (SIGKILL, native crash): the launcher zeroes/disables the PWM channels whenever `motor_controller` exits or is found hung (`body/odom` stale > `launcher.liveness.motor_controller.timeout_ms`), and `body-launcher.service` runs `python -m body.lib.motor_gpio --zero-pwm` as `ExecStopPost` (see deploy/NETWORK.md "Motor failsafe").
 
 ### 4.11 Configuration Constants
 
@@ -326,7 +331,12 @@ No other dependencies. No ROS. No frameworks. One file.
 
 ## 6. What This Spec Does NOT Cover
 
-- Closed-loop velocity control is now implemented per wheel as a PI on commanded-vs-measured velocity (see `WheelPI` in `motor_controller.py`, config keys `motor.velocity_loop_enabled`, `motor.velocity_kp`, `motor.velocity_ki`, `motor.velocity_integ_limit`, `motor.min_drive_pwm`). Feed-forward remains `v_cmd / max_wheel_vel_ms`; the integrator absorbs the residual; `min_drive_pwm` snaps past static friction (value is **floor / tire / battery dependent** — often tuned in the **~0.15–0.25** duty range; validate with a slow in-place rotation or Sweep-360, not from theory alone; see `docs/motor_pwm_calibration_pi_change.md`). When the loop is disabled or encoders aren't live, the controller falls back to the original open-loop mapping. Further refinement (derivative term, per-side asymmetric gains, deceleration feed-forward) is still deferred.
+- Closed-loop velocity control is implemented per wheel as a PI on commanded-vs-measured velocity (`WheelPI` in `body/lib/wheel_control.py`, unit-tested in `body/lib/test_wheel_control.py`; config keys `motor.velocity_loop_enabled`, `velocity_kp`, `velocity_ki`, `velocity_integ_limit`, `velocity_integ_max_duty`, `min_drive_pwm`, `ff_kinetic_pwm`, `kinetic_threshold_ms`, `static_threshold_ms`, `regime_confirm_ticks`, `kick_ramp_ticks`, `kick_escalation_per_s`; per-wheel `min_drive_pwm_left/_right` and `ff_kinetic_pwm_left/_right` override the shared values):
+  - **Coulomb feed-forward**: `ff = sign(v)·(ff_kinetic_pwm + |v|·(1 − ff_kinetic_pwm)/max_wheel_vel_ms)` (with `ff_kinetic_pwm = 0` this is the legacy `v/max_v`).
+  - **Static kick with hysteresis**: while the wheel is in the static regime (speed along the command `< static_threshold_ms` to enter, `≥ kinetic_threshold_ms` to leave, each confirmed over `regime_confirm_ticks` ticks) the duty is floored at `min_drive_pwm`, ramped in over `kick_ramp_ticks`; if still stuck after the ramp the floor rises at `kick_escalation_per_s` (bounded by `velocity_integ_max_duty`). A single fast encoder tick no longer restarts the ramp.
+  - **Anti-windup**: integrator reset on a zero command and on a command sign change; no integration while the kick floor holds the output or while saturated; integral authority capped at `|ki·integ| ≤ velocity_integ_max_duty` (0.2).
+  - **Measured dt**: wheel velocity uses the measured interval between encoder drains, not the nominal period.
+  - `min_drive_pwm` / `ff_kinetic_pwm` are **floor / tyre / battery dependent**: measure per wheel with `scripts/motor_friction_ramp.py` (on blocks and on the floor), then confirm with a slow Sweep-360 (see `docs/motor_pwm_calibration_pi_change.md`). When the loop is disabled or encoders aren't live, the controller falls back to the open-loop mapping. Derivative term and deceleration feed-forward are still deferred.
 - Acceleration limiting / ramp-up. Currently jumps to commanded velocity instantly. Add if mechanical shock is a problem.
 - Pico-based encoder counting (upgrade path documented in Body spec).
 - Zenoh session configuration details (see Body spec §4).

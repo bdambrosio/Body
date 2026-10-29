@@ -11,6 +11,12 @@ Single-step semantics: while armed, ``should_hold`` stays True until a
 ``continue`` token arrives (one-shot). The producer clears it via
 ``consume_continue`` once it proceeds, so the next handoff re-holds.
 
+Arm lease (T14): an arm can expire. A gate built with ``arm_lease_s`` (or an
+arm message carrying ``lease_s``) disarms itself that long after the last
+``arm`` unless the inspector re-sends ``arm`` (it refreshes at ~1 Hz), so a
+closed or crashed inspector cannot leave a producer holding forever. Without
+either, an arm lasts until ``disarm`` (legacy).
+
 Only depends on the zenoh JSON helpers, so it is importable on both the
 desktop and the Pi. All state is mutated under a lock because the ctrl
 subscriber fires on a zenoh thread while producers call from their own loop.
@@ -18,6 +24,7 @@ subscriber fires on a zenoh thread while producers call from their own loop.
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Dict, Iterable, Optional
 
 from body.lib import zenoh_helpers
@@ -42,6 +49,8 @@ class HandoffGate:
         ctrl_key: str = CTRL_KEY,
         publish=zenoh_helpers.publish_json,
         subscribe: Optional[Any] = zenoh_helpers.declare_subscriber_json,
+        arm_lease_s: Optional[float] = None,
+        clock=time.monotonic,
     ) -> None:
         self._session = session
         self._publish = publish
@@ -51,6 +60,9 @@ class HandoffGate:
         self._armed: Dict[int, bool] = {t: False for t in self._tiers}
         self._continue: Dict[int, bool] = {t: False for t in self._tiers}
         self._seq: Dict[int, int] = {t: 0 for t in self._tiers}
+        self._lease_s = arm_lease_s if (arm_lease_s or 0) > 0 else None
+        self._clock = clock
+        self._expiry: Dict[int, Optional[float]] = {t: None for t in self._tiers}
         self._ctrl_sub = (
             subscribe(session, ctrl_key, self._on_ctrl)
             if subscribe is not None else None
@@ -68,9 +80,17 @@ class HandoffGate:
                 return
             if action == "arm":
                 self._armed[tier] = True
+                lease = self._lease_s
+                try:
+                    if msg.get("lease_s") is not None and float(msg["lease_s"]) > 0:
+                        lease = float(msg["lease_s"])
+                except (TypeError, ValueError):
+                    pass
+                self._expiry[tier] = (self._clock() + lease) if lease else None
             elif action == "disarm":
                 self._armed[tier] = False
                 self._continue[tier] = False
+                self._expiry[tier] = None
             elif action == "continue":
                 self._continue[tier] = True
 
@@ -88,14 +108,26 @@ class HandoffGate:
         self._publish(self._session, key, out)
 
     # ── gate queries (producer) ──────────────────────────────────────
+    def _armed_locked(self, tier: int) -> bool:
+        if not self._armed.get(tier, False):
+            return False
+        exp = self._expiry.get(tier)
+        if exp is not None and self._clock() > exp:
+            # Lease lapsed (inspector gone): disarm so the producer resumes.
+            self._armed[tier] = False
+            self._continue[tier] = False
+            self._expiry[tier] = None
+            return False
+        return True
+
     def is_armed(self, tier: int) -> bool:
         with self._lock:
-            return self._armed.get(tier, False)
+            return self._armed_locked(tier)
 
     def should_hold(self, tier: int) -> bool:
         """True when this tier is armed and no continue token is pending."""
         with self._lock:
-            return self._armed.get(tier, False) and not self._continue.get(tier, False)
+            return self._armed_locked(tier) and not self._continue.get(tier, False)
 
     def consume_continue(self, tier: int) -> bool:
         """Clear and return the one-shot continue token (call when proceeding)."""

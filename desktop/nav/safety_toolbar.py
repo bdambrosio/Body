@@ -1,8 +1,10 @@
 """Persistent safety-strip toolbar for the nav shell.
 
 Hosts the controls an operator must always have one click away:
-connection, ALL-STOP, Live-command toggle, and diagnostic pills
-(connection, heartbeat, e-stop). Teleop sliders and camera feeds live
+connection, ALL-STOP, e-stop Re-arm, Live-command toggle, and diagnostic
+pills (connection, heartbeat, e-stop). A latched e-stop on the Pi clears
+ONLY on an explicit Re-arm (body/estop_rearm) — motion commands no longer
+clear it. Teleop sliders and camera feeds live
 in toggleable docks so the map can dominate screen real estate during
 mission work.
 
@@ -140,12 +142,33 @@ class SafetyToolbar(QToolBar):
         )
         row.addWidget(self._stop_btn)
 
+        self._rearm_btn = QPushButton("Re-arm")
+        self._rearm_btn.setEnabled(False)
+        self._rearm_btn.setToolTip(
+            "Clear a latched e-stop on the Pi (publishes body/estop_rearm). "
+            "The Pi only accepts it while heartbeat is ok. Motion commands "
+            "do NOT clear an e-stop."
+        )
+        row.addWidget(self._rearm_btn)
+
+        # Latched-e-stop banner. The Pi watchdog latches e-stop at every boot
+        # (no heartbeat yet) and clears it only on an explicit Re-arm, so the
+        # operator re-arms once per session — make that impossible to miss.
+        self._estop_banner = QLabel("E-STOP LATCHED — press Re-arm")
+        self._estop_banner.setStyleSheet(
+            "background:#aa2222;color:white;font-weight:bold;"
+            "padding:2px 8px;border-radius:4px;"
+        )
+        self._estop_banner.setVisible(False)
+        row.addWidget(self._estop_banner)
+
         self.addWidget(host)
 
     def _wire(self) -> None:
         self._connect_btn.clicked.connect(self._on_connect_clicked)
         self._live_box.toggled.connect(self._on_live_toggled)
         self._stop_btn.clicked.connect(self._on_stop_clicked)
+        self._rearm_btn.clicked.connect(self._on_rearm_clicked)
 
     # ── Slots ────────────────────────────────────────────────────────
 
@@ -200,6 +223,13 @@ class SafetyToolbar(QToolBar):
                 self._on_stop_cb()
             except Exception:
                 logger.exception("ALL-STOP stop callback raised")
+
+    def _on_rearm_clicked(self) -> None:
+        try:
+            if not self.chassis.rearm_estop("nav_safety_toolbar"):
+                logger.warning("Re-arm: not connected")
+        except Exception:
+            logger.exception("Re-arm raised")
 
     def set_stop_callback(self, cb) -> None:
         """Register a callable run after ALL-STOP zeroes the chassis."""
@@ -261,3 +291,14 @@ class SafetyToolbar(QToolBar):
         elif isinstance(status, dict):
             estop_active = bool(status.get("e_stop_active", False))
         self._pill_estop.set_state(not estop_active)
+        latched = chassis_connected and estop_active
+        self._estop_banner.setVisible(latched)
+        # Drive controls are pointless while latched: block arming Live cmd
+        # (an already-armed Live stays uncheckable so it can be turned off).
+        if latched and not live:
+            self._live_box.setEnabled(False)
+        self._rearm_btn.setEnabled(chassis_connected)
+        self._rearm_btn.setStyleSheet(
+            "QPushButton{background:#c98a00;color:black;font-weight:bold;}"
+            if latched else ""
+        )

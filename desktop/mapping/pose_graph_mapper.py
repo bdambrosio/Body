@@ -20,6 +20,7 @@ from desktop.fusion.load_slam_config import (
 )
 from desktop.mapping.graph.pose_graph import (
     PoseGraphEdge,
+    compose_pose,
     odom_information,
     optimize_pose_graph,
     relative_pose,
@@ -41,6 +42,10 @@ class GraphNode:
     theta: float
     ranges: np.ndarray
     angles: np.ndarray
+    # Raw EKF pose at ``ts`` when the node was added. The next node's prior
+    # is this node's (optimized) pose composed with the EKF *delta* since
+    # then — never the absolute EKF pose (S3).
+    ekf_pose: Optional[PoseTuple] = None
 
 
 @dataclass
@@ -101,25 +106,39 @@ class PoseGraphMapper:
         ranges_m: np.ndarray,
         angles_rad: np.ndarray,
     ) -> bool:
-        """Rate-limited scan ingestion; returns True if a node was added."""
+        """Rate-limited scan ingestion; returns True if a node was added.
+
+        The rate slot is consumed only once the EKF pose lookup succeeds
+        (S9): a scan that lands just past the EKF tail is skipped without
+        burning the slot, so the next scan (≈100 ms later) can take it.
+
+        Prior = last node's (optimized) pose ⊕ EKF delta since that node
+        (S3): scan-match and loop-closure corrections carry forward, and a
+        rejected match leaves the node where dead-reckoning from the graph
+        puts it, not snapped back to the raw EKF frame."""
         now_mono = time.monotonic()
         hz = max(0.5, self.slam_config.match_hz)
         if now_mono - self._last_match_mono < 1.0 / hz:
             return False
-        self._last_match_mono = now_mono
 
         if not self.ekf.is_ready():
             return False
-        prior = self.ekf.pose_at(ts)
-        if prior is None:
+        ekf_now = self.ekf.pose_at(ts)
+        if ekf_now is None:
             return False
+        self._last_match_mono = now_mono
 
         scan_xy = lidar_scan_to_xy(ranges_m, angles_rad)
-        prior_pose = Pose2D(prior[0], prior[1], prior[2])
 
         with self._lock:
+            prior = ekf_now
+            if self._nodes and self._nodes[-1].ekf_pose is not None:
+                last = self._nodes[-1]
+                delta = relative_pose(last.ekf_pose, ekf_now)
+                prior = compose_pose((last.x, last.y, last.theta), delta)
+            prior_pose = Pose2D(prior[0], prior[1], prior[2])
             if not self._nodes:
-                self._add_node(ts, prior, ranges_m, angles_rad)
+                self._add_node(ts, prior, ranges_m, angles_rad, ekf_pose=ekf_now)
                 self._integrate_display_node(self._nodes[-1])
                 self._trajectory.append((ts, prior[0], prior[1], prior[2]))
                 return True
@@ -159,7 +178,8 @@ class PoseGraphMapper:
                 alpha_rot_rad=self.fusion_config.alpha_rot_per_rad,
                 match_response=max(0.5, self._last_match_improvement / 20.0),
             )
-            new_id = self._add_node(ts, corrected, ranges_m, angles_rad)
+            new_id = self._add_node(ts, corrected, ranges_m, angles_rad,
+                                    ekf_pose=ekf_now)
             self._edges.append(
                 PoseGraphEdge(
                     from_id=prev.node_id,
@@ -237,6 +257,8 @@ class PoseGraphMapper:
         pose: PoseTuple,
         ranges: np.ndarray,
         angles: np.ndarray,
+        *,
+        ekf_pose: Optional[PoseTuple] = None,
     ) -> int:
         node_id = len(self._nodes)
         self._nodes.append(
@@ -248,6 +270,7 @@ class PoseGraphMapper:
                 theta=pose[2],
                 ranges=ranges.copy(),
                 angles=angles.copy(),
+                ekf_pose=(tuple(ekf_pose) if ekf_pose is not None else None),
             ),
         )
         return node_id

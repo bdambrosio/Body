@@ -56,11 +56,52 @@ class TestLocalCostmap(unittest.TestCase):
         self.assertGreater(near, far)
         self.assertGreaterEqual(far, 0.0)
 
-    def test_denoise_drops_isolated(self):
+    def test_denoise_off_by_default_keeps_thin_obstacles(self):
+        # T1: a 1-cell post (chair leg, jamb edge) must stay an obstacle for
+        # the planner — the swept veto sees it on the raw grid.
         grid = _clear()
-        _block(grid, 0.5, 0.0)                # single isolated cell
+        _block(grid, 0.5, 0.0)
+        cm = build_local_costmap(grid, META, LocalCostmapConfig())
+        self.assertTrue(cm.lethal[_cell(0.5, 0.0)])
+
+    def test_denoise_only_far_isolated_cells(self):
+        grid = _clear()
+        _block(grid, 1.6, 0.0)                # isolated, far → dropped
+        _block(grid, 0.5, 0.0)                # isolated, near → kept
+        for x in (1.6, 1.68, 1.76):
+            _block(grid, x, 1.0)              # line: its ends are kept
         cm = build_local_costmap(grid, META, LocalCostmapConfig(denoise=True))
-        self.assertFalse(cm.lethal[_cell(0.5, 0.0)])             # speckle removed
+        self.assertFalse(cm.lethal[_cell(1.6, 0.0)])
+        self.assertTrue(cm.lethal[_cell(0.5, 0.0)])
+        self.assertTrue(cm.lethal[_cell(1.6, 1.0)])
+        self.assertTrue(cm.lethal[_cell(1.76, 1.0)])
+
+    def test_unknown_costs_at_least_the_halo(self):
+        # L2: an unknown cell in a wall's safety band costs the full halo,
+        # not the (lower) unknown_cost.
+        grid = _clear()
+        for y in np.arange(-1.0, 1.0, RES / 2):
+            _block(grid, 0.8, float(y))
+        ij = _cell(0.6, 0.0)                  # inside the halo band
+        clear_cost = build_local_costmap(grid, META, self.cfg).cost[ij]
+        grid[ij] = -1
+        unk_cost = build_local_costmap(grid, META, self.cfg).cost[ij]
+        self.assertGreaterEqual(unk_cost, clear_cost)
+        self.assertGreater(unk_cost, self.cfg.unknown_cost)
+
+    def test_quantization_pad_makes_diagonal_neighbours_lethal(self):
+        # T12: the diagonal neighbour (0.113 m) of a blocked cell is lethal
+        # with the res/√2 pad; without it only the cardinal ring is.
+        grid = _clear()
+        _block(grid, 0.5, 0.0)
+        i, j = _cell(0.5, 0.0)
+        padded = build_local_costmap(grid, META, self.cfg)
+        bare = build_local_costmap(grid, META, LocalCostmapConfig(
+            footprint_radius_m=0.11, quantization_pad=False))
+        self.assertTrue(padded.lethal[i + 1, j + 1])
+        self.assertTrue(padded.lethal[i + 2, j])          # 0.16 < 0.167
+        self.assertFalse(padded.lethal[i + 2, j + 1])     # 0.179
+        self.assertFalse(bare.lethal[i + 1, j + 1])
 
     def test_gap_sealing(self):
         # Two walls leaving a ~0.20 m gap → sealed by footprint 0.11 (lethal

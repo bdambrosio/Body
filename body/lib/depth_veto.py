@@ -10,6 +10,18 @@ streak so stereo speckles do not spam BLOCKED.
 
 Camera extrinsics match ``body.local_map`` (OpenCV cam → body via fixed axis
 fix + ZYX euler). Pure NumPy — unit-tested off-robot.
+
+Robustness (R2/R3/R7):
+  * the envelope follows the commanded (v, ω) ARC, not a straight box;
+  * low points (below ``structure_free_height_m``) count only where they form
+    vertical structure (a height span ≥ ``min_vertical_extent_m`` within one
+    ``structure_cell_m`` floor cell) — a pitched floor, braking nose-dip or a
+    ramp lifts the floor as a gently tilted plane with almost no span per
+    cell, while a real low obstacle has a face; ``floor_band_per_m`` can add
+    a range-scaled band on top;
+  * ``DepthVetoTracker`` advances the hit streak only on a NEW depth frame
+    (``seq``, else ``ts``) so one frame scored on two control ticks is not
+    "two frames".
 """
 from __future__ import annotations
 
@@ -49,6 +61,16 @@ class DepthVetoConfig:
     depth_yaw_rad: float = 0.0
     depth_pitch_rad: float = 0.14
     depth_roll_rad: float = 0.0
+    # Range-scaled floor band: band(x) = floor_band_m + floor_band_per_m · x
+    # (absorbs a pitch error of atan(floor_band_per_m)). 0 = flat band.
+    floor_band_per_m: float = 0.0
+    # Vertical-structure test for low points (see module doc). A point higher
+    # than structure_free_height_m always counts; a lower one only if its
+    # floor cell spans ≥ min_vertical_extent_m. min_vertical_extent_m ≤ 0
+    # disables the test (legacy: every point above the band counts).
+    min_vertical_extent_m: float = 0.03
+    structure_free_height_m: float = 0.10
+    structure_cell_m: float = 0.04
 
 
 def _rot_x(r: float) -> np.ndarray:
@@ -130,12 +152,39 @@ def _median_filter_depth_mm(arr: np.ndarray, kernel: int) -> np.ndarray:
     return np.where(np.isnan(med), 0, med).astype(np.uint16)
 
 
+def _arc_coords(
+    x: np.ndarray, y: np.ndarray, v_mps: Optional[float], omega_radps: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """(arc length along the commanded path, lateral offset from it) for body
+    points. Straight (x, |y|) when ω≈0 or no command is given."""
+    if v_mps is None or omega_radps is None or abs(v_mps) < 1e-6:
+        return x, np.abs(y)
+    curv = omega_radps / v_mps
+    if abs(curv) < 1e-3:
+        return x * (1.0 if v_mps > 0 else -1.0), np.abs(y)
+    r = 1.0 / curv                      # signed turn radius, centre at (0, r)
+    dy = y - r
+    lateral = np.abs(np.hypot(x, dy) - abs(r))
+    phi = np.arctan2(r * x, -r * dy) * (1.0 if r > 0 else -1.0)
+    if v_mps < 0:
+        phi = -phi
+    s = np.where(phi >= 0.0, phi * abs(r), -1.0)
+    return s, lateral
+
+
 def count_slab_hits(
     arr_mm: np.ndarray,
     msg: Dict[str, Any],
     cfg: DepthVetoConfig,
+    *,
+    v_mps: Optional[float] = None,
+    omega_radps: Optional[float] = None,
 ) -> int:
-    """Count body-frame depth points in the forward envelope obstacle slab."""
+    """Count body-frame depth points in the forward envelope obstacle slab.
+
+    With ``v_mps``/``omega_radps`` the envelope is the band of half-width
+    ``lateral_half_width_m`` around the commanded arc over arc length
+    [min_range_m, max_range_m]; without, the legacy straight box."""
     h, w = arr_mm.shape
     if h < 2 or w < 2:
         return 0
@@ -169,14 +218,42 @@ def count_slab_hits(
     y = pb[:, 1]
     z = pb[:, 2]
     height = z - cfg.ground_z_body_m
-    in_envelope = (
-        (x >= cfg.min_range_m)
-        & (x <= cfg.max_range_m)
-        & (np.abs(y) <= cfg.lateral_half_width_m)
-        & (height > cfg.floor_band_m)
-        & (height <= cfg.clearance_height_m)
+    s_arc, lateral = _arc_coords(x, y, v_mps, omega_radps)
+    in_corridor = (
+        (s_arc >= cfg.min_range_m)
+        & (s_arc <= cfg.max_range_m)
+        & (lateral <= cfg.lateral_half_width_m)
     )
-    return int(np.count_nonzero(in_envelope))
+    band = cfg.floor_band_m + cfg.floor_band_per_m * np.maximum(x, 0.0)
+    in_envelope = in_corridor & (height > band) & (height <= cfg.clearance_height_m)
+    if not np.any(in_envelope):
+        return 0
+    if cfg.min_vertical_extent_m <= 0.0:
+        return int(np.count_nonzero(in_envelope))
+
+    # Vertical-structure test for low points: per floor cell, the height span
+    # of every point in the corridor (floor returns included) must reach
+    # min_vertical_extent_m for a low point there to count.
+    low = in_envelope & (height <= cfg.structure_free_height_m)
+    hits = int(np.count_nonzero(in_envelope & ~low))
+    if np.any(low):
+        cs = max(1e-3, float(cfg.structure_cell_m))
+        sel = in_corridor & (height <= cfg.clearance_height_m)
+        ix = np.floor(x[sel] / cs).astype(np.int64)
+        iy = np.floor(y[sel] / cs).astype(np.int64)
+        ix0, iy0 = int(ix.min()), int(iy.min())
+        nxc = int(ix.max()) - ix0 + 1
+        nyc = int(iy.max()) - iy0 + 1
+        lin = (ix - ix0) * nyc + (iy - iy0)
+        hmax = np.full(nxc * nyc, -np.inf)
+        hmin = np.full(nxc * nyc, np.inf)
+        np.maximum.at(hmax, lin, height[sel])
+        np.minimum.at(hmin, lin, height[sel])
+        span = hmax - hmin
+        lx = np.floor(x[low] / cs).astype(np.int64) - ix0
+        ly = np.floor(y[low] / cs).astype(np.int64) - iy0
+        hits += int(np.count_nonzero(span[lx * nyc + ly] >= cfg.min_vertical_extent_m))
+    return hits
 
 
 def depth_frame_hits(
@@ -203,7 +280,7 @@ def depth_frame_hits(
     if decoded is None:
         return 0
     arr, _w, _h = decoded
-    return count_slab_hits(arr, depth_msg, cfg)
+    return count_slab_hits(arr, depth_msg, cfg, v_mps=v_mps, omega_radps=omega_radps)
 
 
 def depth_nearfield_blocked(
@@ -215,7 +292,9 @@ def depth_nearfield_blocked(
     cfg: DepthVetoConfig,
     streak: int,
 ) -> Tuple[bool, int]:
-    """Return (blocked, new_streak). ``streak`` is consecutive hit frames."""
+    """Return (blocked, new_streak). ``streak`` counts consecutive hit CALLS
+    (legacy, stateless) — the control loop uses ``DepthVetoTracker``, which
+    only advances on a new depth frame."""
     hits = depth_frame_hits(
         depth_msg,
         now_wall=now_wall,
@@ -229,3 +308,55 @@ def depth_nearfield_blocked(
         new_streak = 0
     blocked = new_streak >= max(1, cfg.hit_streak)
     return blocked, new_streak
+
+
+def depth_frame_key(depth_msg: Optional[Dict[str, Any]]) -> Optional[Any]:
+    """Identity of a depth frame: ``seq`` when the driver sends it, else the
+    capture ``ts``; None when neither is present."""
+    if not isinstance(depth_msg, dict):
+        return None
+    seq = depth_msg.get("seq")
+    if isinstance(seq, (int, float)) and not isinstance(seq, bool):
+        return ("seq", int(seq))
+    ts = depth_msg.get("ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return ("ts", float(ts))
+    return None
+
+
+class DepthVetoTracker:
+    """Per-goal debounce for the near-field veto: the streak advances (or
+    resets) only when a NEW depth frame is scored (R3). Re-scoring the same
+    frame on a later control tick — with that tick's (v, ω) — can still
+    block, but never counts as another frame. Frames with no identity (no
+    ``seq`` and no ``ts``) fall back to per-call counting."""
+
+    def __init__(self, cfg: DepthVetoConfig) -> None:
+        self.cfg = cfg
+        self.streak = 0
+        self._last_key: Optional[Any] = None
+
+    def reset(self) -> None:
+        self.streak = 0
+        self._last_key = None
+
+    def update(
+        self, depth_msg: Optional[Dict[str, Any]], *, now_wall: float,
+        v_mps: float, omega_radps: float,
+    ) -> bool:
+        cfg = self.cfg
+        if depth_msg is None:
+            self.reset()
+            return False
+        age = now_wall - float(depth_msg.get("ts", 0.0) or 0.0)
+        if age < 0.0 or age > cfg.stale_s:
+            self.reset()
+            return False
+        hits = depth_frame_hits(depth_msg, now_wall=now_wall, v_mps=v_mps,
+                                omega_radps=omega_radps, cfg=cfg)
+        hit = hits >= cfg.min_hits
+        key = depth_frame_key(depth_msg)
+        if key is None or key != self._last_key:
+            self.streak = self.streak + 1 if hit else 0
+            self._last_key = key
+        return hit and self.streak >= max(1, cfg.hit_streak)

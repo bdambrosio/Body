@@ -69,6 +69,10 @@ class PiDriveWindow(QMainWindow):
         connect_btn.clicked.connect(self._connect)
         stop_btn = QPushButton("STOP / Cancel")
         stop_btn.clicked.connect(self._stop)
+        # The Pi latches e-stop at every boot and clears it only on an explicit
+        # body/estop_rearm (motion commands no longer clear it).
+        rearm_btn = QPushButton("Re-arm e-stop")
+        rearm_btn.clicked.connect(lambda: self.controller.rearm_estop("pi_drive"))
 
         panel = QGroupBox("drive")
         pl = QVBoxLayout(panel)
@@ -81,6 +85,7 @@ class PiDriveWindow(QMainWindow):
         pl.addLayout(row)
         pl.addWidget(connect_btn)
         pl.addWidget(stop_btn)
+        pl.addWidget(rearm_btn)
         pl.addWidget(QLabel("click the map to set a goal"))
         pl.addSpacing(8)
         pl.addWidget(self._estop_lbl)
@@ -140,6 +145,7 @@ class PiDriveWindow(QMainWindow):
             drive, meta = rasterize_scan(
                 scan.get("ranges"), float(scan.get("angle_min", 0.0)),
                 float(scan.get("angle_increment", 0.0)), self._raster,
+                unknown_bins=scan.get("unknown_bins"),
             )
         status = self.drive.latest_status()
         goal_body: Optional[Tuple[float, float]] = None

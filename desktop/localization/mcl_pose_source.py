@@ -115,7 +115,13 @@ class MCLPoseSource(PoseSource):
             "scan_obs_skipped_sparse": 0,
             "scan_obs_skipped_malformed": 0,
             "resamples_fired": 0,
+            "odom_resets": 0,
+            "imu_obs_skipped_distrusted": 0,
+            "scan_prior_at_scan_ts": 0,
+            "scan_prior_fallback_now": 0,
         }
+        # EKF IMU re-bind epoch we last bound _yaw_offset against.
+        self._imu_rebind_epoch_seen = 0
         self._correction_total_m = 0.0
         self._correction_total_rad = 0.0
         self._correction_n_applied = 0
@@ -136,14 +142,35 @@ class MCLPoseSource(PoseSource):
         self._map = reference_map
         self._evidence = self._build_evidence(reference_map)
 
-    def update(self, ts: float, x: float, y: float, theta: float) -> None:
+    def update(
+        self, ts: float, x: float, y: float, theta: float, *,
+        session_id: Optional[str] = None, seq: Optional[int] = None,
+    ) -> None:
         self._counters["odom_seen"] += 1
         # Stamp desktop receive time (monotonic) on every odom, before any
         # early return, so odom_age_s() reflects true receipt regardless of
         # Pi clock or seeding/teleport branches below.
         self._last_odom_recv_mono = time.monotonic()
-        self._ekf.update_odom(ts, x, y, theta)
+        odom_reset = self._ekf.update_odom(
+            ts, x, y, theta, session_id=session_id, seq=seq)
         with self._lock:
+            if odom_reset and self._seeded and self._last_odom is not None:
+                # motor_controller restarted (X4): its odom frame is new. Do
+                # not predict across the jump — re-baseline: keep the
+                # posterior, re-derive the odom→world offset so to_world()
+                # stays continuous, and take this sample as the new reference.
+                _lt, lx, ly, lth = self._last_odom
+                wx, wy, wth = self.to_world(lx, ly, lth)
+                self._off_theta = _wrap(theta - wth)
+                c, s_ = math.cos(self._off_theta), math.sin(self._off_theta)
+                self._off_x = x - (c * wx - s_ * wy)
+                self._off_y = y - (s_ * wx + c * wy)
+                self._last_odom = (ts, x, y, theta)
+                self._last_ekf_pose = self._ekf.pose_at(ts)
+                self._counters["odom_resets"] += 1
+                self._record_pose(ts)
+                logger.warning("mcl_pose: odom stream reset — re-baselined")
+                return
             if not self._seeded:
                 if not self._ekf.is_ready():
                     return
@@ -187,6 +214,18 @@ class MCLPoseSource(PoseSource):
             self._mcl.predict(ds, edth)
 
             imu = self._imu_tracker.yaw_at(ts)
+            rebind_ep = self._ekf.imu_rebind_epoch()
+            if imu is not None and rebind_ep != self._imu_rebind_epoch_seen:
+                # The EKF re-bound its IMU yaw mapping (IMU stream reset or a
+                # frozen-IMU revival): re-anchor ours to the current posterior
+                # so the IMU constraint doesn't drag θ back to a stale frame.
+                self._imu_rebind_epoch_seen = rebind_ep
+                self._yaw_offset = _wrap(imu[0] - self._mcl.posterior_mean()[2])
+            if imu is not None and not self._ekf.imu_trusted():
+                # Frozen-IMU guard tripped (I2): don't pin the posterior to a
+                # flat yaw — scan matching + wheel prediction carry heading.
+                self._counters["imu_obs_skipped_distrusted"] += 1
+                imu = None
             if imu is not None:
                 hz = float(self._config.imu_obs_hz)
                 now_mono = time.monotonic()
@@ -262,6 +301,7 @@ class MCLPoseSource(PoseSource):
             ts, x, y, theta = self._last_odom
             imu = self._imu_tracker.yaw_at(ts)
             self._ekf.rebind_world_to_current()
+            self._imu_rebind_epoch_seen = self._ekf.imu_rebind_epoch()
             self._mcl.seed_at(0.0, 0.0, 0.0)
             self._off_x, self._off_y, self._off_theta = x, y, theta
             if imu is not None:
@@ -382,7 +422,21 @@ class MCLPoseSource(PoseSource):
         points_xy: np.ndarray,
         *,
         matcher: Optional[ScanMatcher] = None,
+        scan_ts: Optional[float] = None,
     ) -> bool:
+        """Match the scan around the pose AT THE SCAN'S TIME and apply the
+        result to the particles as a delta (S4).
+
+        The scan was captured ``scan_ts`` (Pi clock, same as the odom ts the
+        pose buffer is keyed on); by the time it is applied the posterior has
+        been predicted forward by later odom. Matching it around the current
+        posterior folds the scan→now motion (tens of ms, several degrees in
+        a turn) into the correction. Instead the search is centred on
+        ``pose_at(scan_ts)``, and the particles are scored by their offset
+        from the CURRENT mean — offset-from-current-mean ≈ offset-from-
+        scan-time-mean, since the motion since scan_ts was applied to all
+        particles alike. Falls back to the current posterior when the scan
+        ts is outside the pose buffer."""
         matcher = matcher or self._matcher
         evidence_count = int(self._evidence.sum())
         if evidence_count < self._config.min_evidence_cells:
@@ -390,8 +444,16 @@ class MCLPoseSource(PoseSource):
             return False
 
         with self._lock:
-            prior_tuple = self._mcl.posterior_mean()
+            now_tuple = self._mcl.posterior_mean()
+            scan_pose = (self._pose_buffer.pose_at(scan_ts)
+                         if scan_ts is not None else None)
+            if scan_pose is not None:
+                self._counters["scan_prior_at_scan_ts"] += 1
+            else:
+                self._counters["scan_prior_fallback_now"] += 1
+        prior_tuple = scan_pose if scan_pose is not None else now_tuple
         prior_pose = Pose2D(*prior_tuple)
+        now_pose = Pose2D(*now_tuple)
         n_eff_before = self._mcl.n_eff()
 
         t0 = time.monotonic()
@@ -412,7 +474,9 @@ class MCLPoseSource(PoseSource):
 
         with self._lock:
             if result.score_field is not None:
-                self._mcl.observe_scan_match_field(result.score_field, prior_pose)
+                # Reference = current mean (see docstring): particle offsets
+                # from it index the field computed around the scan-time pose.
+                self._mcl.observe_scan_match_field(result.score_field, now_pose)
             resampled = self._mcl.maybe_resample()
             if resampled:
                 self._counters["resamples_fired"] += 1
@@ -431,10 +495,12 @@ class MCLPoseSource(PoseSource):
             self._correction_n_applied += 1
             # Discrete only when the *posterior* (what drive consumers see)
             # actually jumped — the bounded reweight usually moves it far
-            # less than the raw match pose.
+            # less than the raw match pose. Measured against the posterior
+            # just before this observation (not the scan-time prior, which
+            # differs by the robot's own motion since scan_ts).
             post_shift_m = math.hypot(
-                posterior[0] - prior_pose.x, posterior[1] - prior_pose.y)
-            post_dtheta = abs(_wrap(posterior[2] - prior_pose.theta))
+                posterior[0] - now_pose.x, posterior[1] - now_pose.y)
+            post_dtheta = abs(_wrap(posterior[2] - now_pose.theta))
             if (post_shift_m > self._config.discrete_jump_xy_m
                     or post_dtheta > self._config.discrete_jump_theta_rad):
                 self._correction_discrete_seq += 1
@@ -742,7 +808,8 @@ class MCLPoseSource(PoseSource):
                 self._counters["scan_obs_skipped_malformed"] += 1
             return
 
-        self._apply_scan_match_observation(points)
+        self._apply_scan_match_observation(
+            points, scan_ts=scan_ts if msg.get("ts") else None)
 
 
 def _wrap(a: float) -> float:

@@ -36,7 +36,9 @@ This matches the navigation intent: lidar sees a **low, horizontal ring** (~10 c
 | `driveable_slab_min_pixels` | Minimum depth pixels in a cell whose plane-relative height lands in the obstacle slab before the depth slab streak can advance this frame. **1** = any speckle counts. Default **2**. |
 | `depth_slab_block_frames` | Consecutive frames that meet the depth slab pixel threshold before depth can declare a slab block for that cell (default **2**; mirrors lidar `lidar_slab_block_frames`). Set **1** for prior single-frame depth blocking. |
 | `driveable_floor_min_pixels` | Minimum depth pixels classified as floor (plane-relative height ≤ `driveable_floor_band_m`) in a cell before it counts as **observed** for the driveable clear-streak. Default **2**. |
-| `driveable_clear_frames` | Observed frames with no slab hit before a cell becomes `driveable` true. |
+| `driveable_clear_frames` | New lidar frames with a ray-trace clear and no slab hit before a cell becomes `driveable` true. Raised to at least `lidar_slab_block_frames` at startup. |
+| `driveable_depth_memory_frames` | Depth frames after a depth slab hit during which lidar may not clear that cell (default **3**). |
+| `lidar_max_age_s`, `depth_max_age_s` | Max age (s, wall clock vs the sensor's capture `ts`) before a sensor frame is ignored (default **0.35**). |
 | `driveable_unobs_decay_frames` | Per-tick decrement applied to the clear-streak counter of any cell **not** observed this frame. **0** disables decay (cells stay `_D_OK` forever until re-observed; old behavior). **1** (default) gives a memoryless half-life of roughly `driveable_clear_frames` publish ticks before a previously-clear cell drifts back to `null` (unknown). Speckle-induced false clears fade instead of sticking. |
 | `floor_fit_enabled` | Optional diagnostic RANSAC floor fit. Disabled by default; driveability uses the fixed horizontal floor plane. |
 | `floor_fit_interval_s` | Minimum time between diagnostic RANSAC floor fits on depth when `floor_fit_enabled` is true. |
@@ -56,8 +58,16 @@ Tune **`lidar_yaw_rad`** / **`depth_*`** to match your CAD mount; defaults assum
 - `max_height_m`: `list` length `nx`, each row length `ny`, entries `null` or **body-frame** \(z\) (m) of the highest sample (not plane-relative).
 - `driveable`: optional same shape; `true` / `false` / `null` if enabled.
 - `driveable_clearance_height_m`: optional scalar matching config slab top.
-- `sources`: optional `lidar_ts`, `depth_ts` of inputs used.
-- `anchor_pose`: optional `{odom_ts, x, y, theta, source}` captured from the latest `body/odom` sample at publish time. Lets consumers transform the grid into the odometry/world frame without interpolating `body/odom` to `ts`. Omitted until the first `body/odom` message is received. `source` mirrors `odom.source` (see [body_project_spec.md §5.3](body_project_spec.md)).
+- `ts`: publish time (wall clock). The geometry's sensing time is `anchor_pose.anchor_ts`.
+- `sources`: optional `lidar_ts`, `depth_ts` (capture times) and `lidar_seq`, `depth_seq` of the inputs used, plus `lidar_state` / `depth_state` ∈ `new` | `same` | `stale` (since 2026-10).
+- `anchor_pose`: optional `{odom_ts, x, y, theta, source, interpolated, anchor_ts}`. Since 2026-10 this is the odom pose **interpolated at the lidar scan's mid-sweep `ts`** (else the depth capture ts) from a ~2 s odom ring buffer, so the grid and its pose refer to the same instant; `odom_ts` = the time the pose is valid at. `interpolated: false` means the sensor time was outside the buffer (nearest pose within 0.15 s used, or the latest odom if none). The ring is cleared on an odom `session_id` change or `seq` decrease, so a pose is never blended across an odom reset. Omitted until the first `body/odom` message is received. `source` mirrors `odom.source` (see [body_project_spec.md §5.3](body_project_spec.md)).
+
+## Staleness and temporal gating (since 2026-10)
+
+- A lidar scan / depth frame whose `ts` is older than `lidar_max_age_s` / `depth_max_age_s` (default 0.35 s, wall clock) contributes **nothing**: its streaks reset and its cells fall back to unknown. (Older builds re-used the last message forever.)
+- A frame already used on a previous tick (`seq`/`ts` unchanged) is re-rendered into `max_height_m`, but **does not advance** any driveable streak; streaks advance once per new sensor frame, not per publish tick.
+- Lidar clearing never counts a cell that a lidar return hit in the same frame (grazing rays no longer erode walls), never counts a cell with a depth slab hit within the last `driveable_depth_memory_frames` (default 3) depth frames (low obstacles below the lidar plane are not cleared when they leave the depth FOV), and `driveable_clear_frames` is raised to at least `lidar_slab_block_frames` (clearing never faster than blocking).
+- `null` lidar bins (no echo, or listed in the scan's `unknown_bins`) clear nothing.
 
 ## Grid geometry stability
 

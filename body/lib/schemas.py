@@ -70,18 +70,26 @@ def drive_status(
     path_body_xy: list | None = None,
     plan_reason: str | None = None,
     build: str | None = None,
+    watermark: int | None = None,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
-    ``state`` is one of IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT.
-    ``ARRIVED`` and ``CANCELED`` are each published for one tick (CANCELED
-    under the revoked goal's cmd_id after cancel/stop), then IDLE.
-    ``goal_body_xy`` is the active goal transformed into the *live* body
-    frame, for the operator UI to draw. ``blocked_reason`` is set only when
-    state==BLOCKED/FAULT: no_path | boxed_in | swept_block | depth_block |
-    no_progress | deadline | no_scan | odom_stale | goal_out_of_map |
-    start_blocked | goal_unreachable. ``path_body_xy`` is the local A* path
-    (body frame, downsampled) when driving, for the operator UI.
+    ``state`` is one of IDLE | DRIVING | ARRIVED | BLOCKED | CANCELED | FAULT |
+    REJECTED. ``ARRIVED`` and ``CANCELED`` are each published for one tick
+    (CANCELED under the revoked goal's cmd_id after cancel/stop), then IDLE.
+    ``REJECTED`` is published once for a goto whose ``cmd_id`` is ≤ the
+    supersede ``watermark`` (carried in the message); it says nothing about
+    the active goal. ``goal_body_xy`` is the active goal transformed into the
+    *live* body frame, for the operator UI to draw. ``blocked_reason`` is set
+    only when state==BLOCKED/FAULT: BLOCKED — boxed_in | swept_block |
+    depth_block | no_progress | deadline | rotate_timeout | no_scan |
+    goal_out_of_map | start_blocked | start_out_of_map; FAULT — odom_stale |
+    odom_reset | e_stop | internal_error. ``mode`` while DRIVING: follow |
+    rotate | realign | held. ``plan_reason`` ok | snapped | frontier (also on
+    ARRIVED: snapped/frontier = reached the best reachable endpoint, with
+    ``dist_remaining_m`` the residual to the requested goal).
+    ``path_body_xy`` is the local A* path (body frame, downsampled) when
+    driving, for the operator UI.
     """
     msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
@@ -98,7 +106,9 @@ def drive_status(
     if mode is not None:
         msg["mode"] = mode
     if plan_reason is not None:
-        msg["plan_reason"] = plan_reason          # ok|frontier (A* reach vs best-effort)
+        msg["plan_reason"] = plan_reason          # ok|snapped|frontier (A* reach vs best-effort)
+    if watermark is not None:
+        msg["watermark"] = int(watermark)
     if path_body_xy:
         msg["path_body_xy"] = [[float(p[0]), float(p[1])] for p in path_body_xy]
     if build is not None:
@@ -115,22 +125,30 @@ def odom(
     vtheta: float = 0.0,
     left_ticks: int = 0,
     right_ticks: int = 0,
-    dt_ms: int = 20,
+    dt_ms: float = 20,
     source: str = "commanded_vel_playback",
+    session_id: str | None = None,
+    seq: int | None = None,
 ) -> dict[str, Any]:
     """body/odom — dead-reckoned pose + raw encoder ticks.
 
     ``source`` identifies the origin of the pose integration so consumers can decide how much to
     trust it as a prior. Defined values:
 
-    - ``"wheel_encoders"`` — integrated from real GPIO encoder ticks (best prior when available).
-    - ``"commanded_vel_playback"`` — integrated from the last commanded velocity (no encoders
-      configured or encoder read failed); usable as a coarse sanity check only.
+    - ``"wheel_encoders"`` — integrated from real GPIO encoder ticks (both wheels live).
+    - ``"none"`` — no usable pose integration (encoders off, or only one encoder): ``x``/``y``/
+      ``theta`` do not move; ``vx``/``vtheta`` are the commanded velocities. Do not use as a prior.
+    - ``"commanded_vel_playback"`` — legacy label (older Pi builds used it for the no-encoder case).
     - ``"stub"`` — synthetic zero-motion publisher (stub mode, no motion being commanded).
+
+    ``session_id`` (8 hex chars, random per motor_controller start) and ``seq`` (0-based, +1 per
+    publish) let consumers detect an odom-frame reset: a ``session_id`` change or a ``seq``
+    decrease means re-baseline, do not integrate the jump. ``dt_ms`` is the measured interval
+    since the previous publish. Both fields are optional for consumers (older Pi builds).
     """
     ts_val = now_ts() if ts is None else ts
     th = math.atan2(math.sin(theta), math.cos(theta))
-    return {
+    msg: dict[str, Any] = {
         "ts": ts_val,
         "x": x,
         "y": y,
@@ -142,6 +160,11 @@ def odom(
         "dt_ms": dt_ms,
         "source": source,
     }
+    if session_id is not None:
+        msg["session_id"] = str(session_id)
+    if seq is not None:
+        msg["seq"] = int(seq)
+    return msg
 
 
 def motor_state(
@@ -194,14 +217,24 @@ def lidar_scan_from_bins(
     range_max_m: float = 12.0,
     scan_time_ms: int = 100,
     ts: float | None = None,
+    ts_start: float | None = None,
+    ts_end: float | None = None,
+    seq: int | None = None,
+    unknown_bins: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Build ``body/lidar/scan`` from fixed angular bins (see docs/body_project_spec.md §5.5)."""
+    """Build ``body/lidar/scan`` from fixed angular bins (see docs/body_project_spec.md §5.5).
+
+    ``ts`` is the wall-clock time of the sweep's mid-point sample; ``ts_start``/``ts_end``
+    bracket the sweep; ``seq`` increments per published sweep. ``unknown_bins`` lists bin
+    indices with no information this sweep (self-masked, filtered, never sampled) — consumers
+    must treat them as unknown, never as a no-return (free) beam. All four are optional.
+    """
     n = len(ranges_m)
     angle_increment = (2.0 * math.pi) / max(1, n)
     msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
         "angle_min": 0.0,
-        "angle_max": 2.0 * math.pi,
+        "angle_max": angle_increment * max(0, n - 1),
         "angle_increment": angle_increment,
         "range_min": range_min_m,
         "range_max": range_max_m,
@@ -210,6 +243,14 @@ def lidar_scan_from_bins(
     }
     if intensities is not None:
         msg["intensities"] = intensities
+    if ts_start is not None:
+        msg["ts_start"] = float(ts_start)
+    if ts_end is not None:
+        msg["ts_end"] = float(ts_end)
+    if seq is not None:
+        msg["seq"] = int(seq)
+    if unknown_bins is not None:
+        msg["unknown_bins"] = [int(b) for b in unknown_bins]
     return msg
 
 
@@ -257,6 +298,8 @@ def imu_report(
     mag_quat_wxyz: tuple[float, float, float, float] | None = None,
     mag_accuracy_rad: float | None = None,
     mag_valid: bool | None = None,
+    session_id: str | None = None,
+    seq: int | None = None,
 ) -> dict[str, Any]:
     """Build body/imu JSON per docs/imu_integration_spec.md §2 (body frame).
 
@@ -264,6 +307,8 @@ def imu_report(
     ``fusion_accuracy_rad`` is the BNO085 per-report accuracy estimate (consumer σ).
     ``linear_accel_xyz`` is the gravity-removed accel when the driver enables that report.
     ``calibration_status`` (0–3) is the SH-2 system calibration level when available.
+    ``session_id`` changes whenever the fusion yaw origin may have changed (driver start or
+    sensor re-init); ``seq`` increments once per genuinely new orientation report.
     """
     msg: dict[str, Any] = {
         "ts": ts,
@@ -300,6 +345,10 @@ def imu_report(
         if mag_accuracy_rad is not None:
             mag_block["accuracy_rad"] = float(mag_accuracy_rad)
         msg["mag"] = mag_block
+    if session_id is not None:
+        msg["session_id"] = str(session_id)
+    if seq is not None:
+        msg["seq"] = int(seq)
     return msg
 
 
@@ -317,12 +366,14 @@ def oakd_depth_stream_frame(
     units: str = "mm",
     layout: str = "row_major",
     intrinsics: dict[str, float] | None = None,
+    seq: int | None = None,
 ) -> dict[str, Any]:
     """body/oakd/depth — streamed depth from StereoDepth (host-resized), raw uint16 row-major.
 
     If ``intrinsics`` is provided (``fx``, ``fy``, ``cx``, ``cy`` for the published ``width``×``height``
     depth image, post-rotation), include it so consumers can unproject without re-deriving from an
-    assumed HFOV.
+    assumed HFOV. ``ts`` is the frame's capture time (wall clock); ``seq`` increments once per new
+    device frame (consumers advance per-frame debounce only when it changes).
     """
     msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
@@ -337,6 +388,8 @@ def oakd_depth_stream_frame(
     }
     if intrinsics is not None:
         msg["intrinsics"] = intrinsics
+    if seq is not None:
+        msg["seq"] = int(seq)
     return msg
 
 
@@ -403,6 +456,15 @@ def emergency_stop(reason: str, source: str = "watchdog", ts: float | None = Non
     return {"ts": now_ts() if ts is None else ts, "reason": reason, "source": source}
 
 
+def estop_rearm(source: str, ts: float | None = None) -> dict[str, Any]:
+    """body/estop_rearm — explicit operator re-arm after an e-stop.
+
+    The watchdog and motor_controller clear their latched e-stop only on this
+    message while the heartbeat is ok; motion commands never clear it.
+    """
+    return {"ts": now_ts() if ts is None else ts, "source": str(source)}
+
+
 def local_map_2p5d(
     *,
     ts: float,
@@ -420,10 +482,11 @@ def local_map_2p5d(
 ) -> dict[str, Any]:
     """body/map/local_2p5d — egocentric max-height-above-ground grid (see docs/local_map_spec.md).
 
-    ``anchor_pose`` (optional) carries the latest ``body/odom`` pose cached at publish time so
-    consumers can fuse into a world frame without interpolating odom to ``ts``. Shape:
-    ``{odom_ts, x, y, theta, source}`` where ``source`` mirrors ``odom.source``. Omitted if no
-    odom has been received yet.
+    ``anchor_pose`` (optional) carries the ``body/odom`` pose interpolated at the sensing time of
+    the grid (lidar mid-sweep ts, else depth capture ts) so consumers can fuse into a world frame
+    without interpolating odom themselves. Shape: ``{odom_ts, x, y, theta, source, interpolated,
+    anchor_ts}`` where ``odom_ts`` is the time the pose is valid at and ``source`` mirrors
+    ``odom.source``. Omitted if no odom has been received yet.
     """
     msg: dict[str, Any] = {
         "ts": ts,

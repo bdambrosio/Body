@@ -1,8 +1,13 @@
 """BNO085 IMU driver: i2c → SH-2 fusion → Zenoh body/imu.
 
-Sole owner of the BNO085 i2c transaction. Reads accel, gyro, and the
-configured rotation quaternion from the SH-2 FIFO, publishes one fused
-report per cycle on ``body/imu`` at ``imu.publish_hz`` (default 100 Hz).
+Sole owner of the BNO085 i2c transaction. Enables accel, gyro and the
+configured rotation-vector report at ``imu.report_interval_ms`` (default
+10 ms), drains the SH-2 FIFO every ``imu.poll_interval_ms`` and publishes on
+``body/imu`` exactly once per *new* rotation report, stamped with that
+report's arrival time and carrying ``session_id`` + ``seq``. If no new report
+arrives for ``imu.stale_reinit_ms`` the driver stops publishing, re-inits the
+sensor under a new ``session_id`` and, after ``imu.max_reinit_attempts``,
+exits so the launcher restarts it.
 
 See docs/imu_driver_spec.md (producer spec) and docs/imu_integration_spec.md
 (consumer contract). Hardware pin allocation in the former §4.
@@ -11,6 +16,7 @@ See docs/imu_driver_spec.md (producer spec) and docs/imu_integration_spec.md
 from __future__ import annotations
 
 import queue
+import secrets
 import signal
 import sys
 import time
@@ -108,12 +114,33 @@ def _import_bno() -> tuple[Any, Any, Any, dict[str, int]]:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self._status_by_report: dict[int, int] = {}
             self._rv_accuracy_rad: float | None = None
+            # Freshness bookkeeping (see _process_report): per report id, the
+            # wall-clock time the report was parsed, a monotonically increasing
+            # count of reports received, and the last SH-2 sequence byte.
+            self._report_arrival: dict[int, float] = {}
+            self._report_count: dict[int, int] = {}
+            self._report_sh2_seq: dict[int, int] = {}
+            self._sh2_resets = 0
             super().__init__(*args, **kwargs)
 
         def _handle_packet(self, packet: Any) -> None:
+            # Channel 0 (SHTP advertisement) and 1 (executable: reset
+            # complete) carry no sensor reports. An unsolicited "reset
+            # complete" means the hub dropped every enabled report.
+            channel = getattr(getattr(packet, "header", None), "channel_number", None)
+            if channel is None:
+                channel = getattr(packet, "channel_number", None)
+            if channel in (0, 1):
+                try:
+                    data = packet.data
+                    if channel == 1 and len(data) >= 1 and int(data[0]) == 1:
+                        self._sh2_resets += 1
+                except Exception:
+                    pass
+                return
             try:
                 _separate_batch(packet, self._packet_slices)
-            except (KeyError, RuntimeError):
+            except (KeyError, RuntimeError, IndexError):
                 self._packet_slices.clear()
                 return
             while self._packet_slices:
@@ -128,6 +155,11 @@ def _import_bno() -> tuple[Any, Any, Any, dict[str, int]]:
                     raw = unpack_from("<h", bytes(report_bytes), 12)[0]
                     self._rv_accuracy_rad = float(raw) * _RV_ACCURACY_Q
             super()._process_report(report_id, report_bytes)
+            if report_id < 0xF0:
+                self._report_arrival[report_id] = time.time()
+                self._report_count[report_id] = self._report_count.get(report_id, 0) + 1
+                if len(report_bytes) >= 2:
+                    self._report_sh2_seq[report_id] = int(report_bytes[1])
 
     return board, busio, Bno085WithAccuracy, features
 
@@ -212,9 +244,52 @@ def _run_cal_action(bno: Any, action: str) -> None:
         )
 
 
-def _enable(bno: Any, feature_id: int, label: str) -> None:
-    try:
+_BNO_CHANNEL_CONTROL = 2
+
+
+def _enable_with_interval_legacy(bno: Any, feature_id: int, interval_us: int, label: str) -> None:
+    """Older adafruit_bno08x ``enable_feature`` has no ``report_interval`` kwarg (fixed
+    50 ms default). Build and send the Set Feature command ourselves when the private
+    helpers exist; otherwise fall back to the library default and say so."""
+    build = getattr(bno, "_get_feature_enable_report", None)
+    send = getattr(bno, "_send_packet", None)
+    process = getattr(bno, "_process_available_packets", None)
+    if build is None or send is None or process is None:
+        print(
+            f"imu_driver: adafruit_bno08x cannot set report_interval for {label}; using the "
+            "library default (~20 Hz). Upgrade adafruit-circuitpython-bno08x.",
+            file=sys.stderr,
+            flush=True,
+        )
         bno.enable_feature(feature_id)
+        return
+    try:
+        report = build(feature_id, report_interval=interval_us)
+    except TypeError:
+        report = build(feature_id, interval_us)
+    send(_BNO_CHANNEL_CONTROL, report)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            process(max_packets=10)
+        except TypeError:
+            process()
+        if feature_id in getattr(bno, "_readings", {}):
+            return
+    raise RuntimeError(f"feature {label} did not start reporting")
+
+
+def _enable(bno: Any, feature_id: int, label: str, interval_ms: float | None = None) -> None:
+    """Enable one SH-2 report, at ``interval_ms`` when given (library default otherwise)."""
+    try:
+        if interval_ms is None or interval_ms <= 0:
+            bno.enable_feature(feature_id)
+            return
+        interval_us = max(1000, int(round(float(interval_ms) * 1000.0)))
+        try:
+            bno.enable_feature(feature_id, report_interval=interval_us)
+        except TypeError:
+            _enable_with_interval_legacy(bno, feature_id, interval_us, label)
     except Exception as e:
         print(
             f"imu_driver: enable_feature({label}) failed: {type(e).__name__}: {e}",
@@ -222,6 +297,91 @@ def _enable(bno: Any, feature_id: int, label: str) -> None:
             flush=True,
         )
         raise
+
+
+def _new_session_id() -> str:
+    return secrets.token_hex(4)
+
+
+class ReportFreshness:
+    """Track whether the orientation report stream is delivering *new* reports.
+
+    ``poll(count, arrival_wall, now_wall)`` takes the per-report-id counter and
+    arrival time recorded by ``Bno085WithAccuracy._process_report`` and returns
+    ``(is_new, is_stale)``. ``is_new`` is True exactly once per new report;
+    ``is_stale`` is True once no new report has arrived for ``stale_s`` (or, before
+    the first report after (re)init, for ``first_report_timeout_s``).
+    """
+
+    def __init__(self, stale_s: float, first_report_timeout_s: float, now_wall: float) -> None:
+        self.stale_s = max(0.01, float(stale_s))
+        self.first_report_timeout_s = max(self.stale_s, float(first_report_timeout_s))
+        self.reset(now_wall)
+
+    def reset(self, now_wall: float) -> None:
+        self._armed_at = now_wall
+        self._last_count: int | None = None
+        self.last_arrival: float | None = None
+
+    def poll(self, count: int | None, arrival_wall: float | None, now_wall: float) -> tuple[bool, bool]:
+        new = False
+        if count is not None and arrival_wall is not None:
+            # Any change counts (a lower count means a new library object).
+            new = self._last_count is None or count != self._last_count
+            if new:
+                self._last_count = count
+                self.last_arrival = arrival_wall
+        if self.last_arrival is None:
+            stale = (now_wall - self._armed_at) > self.first_report_timeout_s
+        else:
+            stale = (now_wall - self.last_arrival) > self.stale_s
+        return new, stale
+
+
+class SettleGate:
+    """Boot-time settle: wait ``settle_time_s``, accuracy within threshold, and
+    ``still_reports`` consecutive fresh reports with |gyro| below ``still_gyro_radps``
+    (so a restart while moving does not lock in a biased yaw). The stillness
+    requirement is waived after ``max_wait_s`` (``forced`` is then True)."""
+
+    def __init__(
+        self,
+        settle_time_s: float,
+        accuracy_threshold_rad: float,
+        still_gyro_radps: float,
+        still_reports: int,
+        max_wait_s: float,
+        now_mono: float,
+    ) -> None:
+        self.settle_time_s = float(settle_time_s)
+        self.accuracy_threshold_rad = float(accuracy_threshold_rad)
+        self.still_gyro_radps = float(still_gyro_radps)
+        self.still_reports = max(0, int(still_reports))
+        self.max_wait_s = max(self.settle_time_s, float(max_wait_s))
+        self.reset(now_mono)
+
+    def reset(self, now_mono: float) -> None:
+        self.start_mono = now_mono
+        self.still_count = 0
+        self.settled = False
+        self.forced = False
+
+    def update(self, now_mono: float, accuracy_rad: float, gyro_norm_radps: float) -> bool:
+        if self.settled:
+            return True
+        if self.still_gyro_radps <= 0.0 or gyro_norm_radps <= self.still_gyro_radps:
+            self.still_count += 1
+        else:
+            self.still_count = 0
+        elapsed = now_mono - self.start_mono
+        if elapsed < self.settle_time_s or accuracy_rad > self.accuracy_threshold_rad:
+            return False
+        if self.still_count >= self.still_reports:
+            self.settled = True
+        elif elapsed >= self.max_wait_s:
+            self.settled = True
+            self.forced = True
+        return self.settled
 
 
 def main() -> None:
@@ -233,8 +393,6 @@ def main() -> None:
         sys.exit(1)
 
     address = int(imu_cfg.get("i2c_address", 0x4B))
-    publish_hz = float(imu_cfg.get("publish_hz", 100))
-    publish_period = 1.0 / max(1.0, publish_hz)
     fusion_mode = str(imu_cfg.get("fusion_mode", "rotation_vector"))
     fusion_fallback = str(imu_cfg.get("fusion_fallback", "game_rotation_vector"))
     mag_accuracy_fallback_rad = float(imu_cfg.get("mag_accuracy_fallback_rad", 0.087))
@@ -242,6 +400,9 @@ def main() -> None:
     calibration_threshold_rad = float(imu_cfg.get("calibration_stable_threshold_rad", 0.087))
     grv_accuracy_constant_rad = float(imu_cfg.get("game_rotation_vector_accuracy_rad", 0.175))
     settle_time_s = float(imu_cfg.get("settle_time_s", 2.0))
+    settle_still_gyro = float(imu_cfg.get("settle_still_gyro_rad_s", 0.05))
+    settle_still_reports = int(imu_cfg.get("settle_still_reports", 50))
+    settle_max_wait_s = float(imu_cfg.get("settle_max_wait_s", 10.0))
     linear_accel_enabled = bool(imu_cfg.get("linear_accel_enabled", False))
     mag_when_idle_enabled = bool(imu_cfg.get("mag_when_idle_enabled", False))
     mag_idle_pwm_threshold = float(imu_cfg.get("mag_idle_pwm_threshold", 0.02))
@@ -251,6 +412,15 @@ def main() -> None:
     )
     reset_gpio = int(imu_cfg.get("reset_gpio", 25))
     gpio_chip = int(imu_cfg.get("gpio_chip", 0))
+    # SH-2 report intervals (ms). The library default is 50 ms (~20 Hz).
+    rot_interval_ms = float(imu_cfg.get("report_interval_ms", 10.0))
+    gyro_interval_ms = float(imu_cfg.get("gyro_report_interval_ms", 10.0))
+    accel_interval_ms = float(imu_cfg.get("accel_report_interval_ms", 10.0))
+    mag_rv_interval_ms = float(imu_cfg.get("mag_report_interval_ms", 50.0))
+    poll_s = max(0.0005, float(imu_cfg.get("poll_interval_ms", 2.0)) / 1000.0)
+    stale_s = float(imu_cfg.get("stale_reinit_ms", 200.0)) / 1000.0
+    first_report_timeout_s = float(imu_cfg.get("first_report_timeout_s", 2.0))
+    max_reinit_attempts = max(1, int(imu_cfg.get("max_reinit_attempts", 3)))
 
     if fusion_mode not in ("rotation_vector", "game_rotation_vector"):
         print(
@@ -277,8 +447,26 @@ def main() -> None:
             flush=True,
         )
         sys.exit(1)
+
+    active_mode = fusion_mode
+
+    def _init_sensor() -> Any:
+        """Construct the SH-2 object and enable reports at the configured rates."""
+        dev = BNO08X_I2C(i2c, address=address)
+        _enable(dev, features["accel"], "accelerometer", accel_interval_ms)
+        _enable(dev, features["gyro"], "gyroscope", gyro_interval_ms)
+        _enable(dev, features[active_mode], active_mode, rot_interval_ms)
+        if mag_when_idle_enabled and active_mode == "game_rotation_vector":
+            _enable(
+                dev, features["rotation_vector"], "rotation_vector (mag-when-idle)",
+                mag_rv_interval_ms,
+            )
+        if linear_accel_enabled:
+            _enable(dev, features["linear_accel"], "linear_acceleration", accel_interval_ms)
+        return dev
+
     try:
-        bno = BNO08X_I2C(i2c, address=address)
+        bno = _init_sensor()
     except Exception as e:
         print(
             f"imu_driver: BNO085 init failed at 0x{address:02x}: {type(e).__name__}: {e}. "
@@ -289,19 +477,13 @@ def main() -> None:
         )
         sys.exit(1)
 
-    active_mode = fusion_mode
-    _enable(bno, features["accel"], "accelerometer")
-    _enable(bno, features["gyro"], "gyroscope")
-    _enable(bno, features[active_mode], active_mode)
-    if mag_when_idle_enabled and active_mode == "game_rotation_vector":
-        _enable(bno, features["rotation_vector"], "rotation_vector (mag-when-idle)")
-    if linear_accel_enabled:
-        _enable(bno, features["linear_accel"], "linear_acceleration")
-
+    session_id = _new_session_id()
     print(
         f"imu_driver: BNO085 ready at 0x{address:02x}, mode={active_mode}, "
-        f"publish_hz={publish_hz:.0f}, linear_accel={'on' if linear_accel_enabled else 'off'}, "
-        f"mag_when_idle={'on' if mag_when_idle_enabled else 'off'}.",
+        f"report_interval={rot_interval_ms:.1f}ms (gyro {gyro_interval_ms:.1f}, "
+        f"accel {accel_interval_ms:.1f}), stale_reinit={stale_s * 1000:.0f}ms, "
+        f"linear_accel={'on' if linear_accel_enabled else 'off'}, "
+        f"mag_when_idle={'on' if mag_when_idle_enabled else 'off'}, session={session_id}.",
         flush=True,
     )
 
@@ -349,16 +531,28 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    start_mono = time.monotonic()
-    settled = False
     publish_unsettled = False
     last_settle_log = 0.0
+    last_err_log = 0.0
     fallback_count = 0
     fallback_done = False
-    next_tick = time.monotonic()
     mag_idle_settle_s = max(0.0, mag_idle_settle_ms / 1000.0)
+    seq = 0
+    reinit_failures = 0
+    resets_baseline = int(getattr(bno, "_sh2_resets", 0))
+    fresh = ReportFreshness(stale_s, first_report_timeout_s, time.time())
+    settle = SettleGate(
+        settle_time_s,
+        calibration_threshold_rad,
+        settle_still_gyro,
+        settle_still_reports,
+        settle_max_wait_s,
+        time.monotonic(),
+    )
 
     def _motors_idle() -> bool:
+        if motor_ref["seen"] <= 0.0:
+            return False  # never heard from motor_controller: do not assume idle
         if (
             motor_ref["left_pwm"] > mag_idle_pwm_threshold
             or motor_ref["right_pwm"] > mag_idle_pwm_threshold
@@ -381,27 +575,105 @@ def main() -> None:
             except queue.Empty:
                 pass
 
+            count: int | None = None
+            arrival: float | None = None
+            sh2_resets = resets_baseline
+            mag_sample: tuple[tuple[float, float, float, float], float] | None = None
+            accel = gyro = quat = lin_accel = None
+            calib: int | None = None
+            accuracy_rad = grv_accuracy_constant_rad
             try:
+                # Every property access drains the SH-2 FIFO; the subclass stamps
+                # each report's arrival, so ``count``/``arrival`` identify new ones.
+                quat = _read_quat(bno, active_mode)
                 accel = bno.acceleration
                 gyro = bno.gyro
-                quat = _read_quat(bno, active_mode)
-                accuracy_rad = _read_accuracy_rad(
-                    bno, active_mode, grv_accuracy_constant_rad
-                )
+                accuracy_rad = _read_accuracy_rad(bno, active_mode, grv_accuracy_constant_rad)
                 lin_accel = bno.linear_acceleration if linear_accel_enabled else None
-                calib = _read_report_status(bno, features[active_mode])
+                rid = features[active_mode]
+                calib = _read_report_status(bno, rid)
+                count = getattr(bno, "_report_count", {}).get(rid)
+                arrival = getattr(bno, "_report_arrival", {}).get(rid)
+                sh2_resets = int(getattr(bno, "_sh2_resets", resets_baseline))
+                if mag_when_idle_enabled and active_mode == "game_rotation_vector":
+                    rv_id = features["rotation_vector"]
+                    rv_arrival = getattr(bno, "_report_arrival", {}).get(rv_id)
+                    if rv_arrival is not None and time.time() - rv_arrival < 0.25:
+                        rv_quat = _read_quat(bno, "rotation_vector")
+                        if rv_quat is not None:
+                            mag_sample = (
+                                rv_quat,
+                                _read_accuracy_rad(
+                                    bno, "rotation_vector", mag_accuracy_fallback_rad
+                                ),
+                            )
             except Exception as e:
+                now_m = time.monotonic()
+                if now_m - last_err_log > 1.0:
+                    print(
+                        f"imu_driver: i2c read error: {type(e).__name__}: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    last_err_log = now_m
+                count = None
+
+            now_wall = time.time()
+            now_mono = time.monotonic()
+            is_new, stale = fresh.poll(count, arrival, now_wall)
+            if sh2_resets > resets_baseline:
+                print("imu_driver: unsolicited SH-2 reset detected.", file=sys.stderr, flush=True)
+                stale = True
+
+            if stale:
+                # No new orientation report: publishing has already stopped (we
+                # only publish new reports). Re-initialise; give up after N tries
+                # so the launcher restarts the process.
+                age_ms = (
+                    (now_wall - fresh.last_arrival) * 1000.0
+                    if fresh.last_arrival is not None
+                    else float("nan")
+                )
+                reinit_failures += 1
+                if reinit_failures > max_reinit_attempts:
+                    print(
+                        f"imu_driver: {active_mode} still stale after {max_reinit_attempts} "
+                        "re-init attempts; exiting for launcher restart.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(1)
                 print(
-                    f"imu_driver: i2c read error: {type(e).__name__}: {e}",
+                    f"imu_driver: {active_mode} stale (last report {age_ms:.0f} ms ago); "
+                    f"re-initialising BNO085 (attempt {reinit_failures}/{max_reinit_attempts}).",
                     file=sys.stderr,
                     flush=True,
                 )
-                time.sleep(0.05)
-                next_tick = time.monotonic()
+                try:
+                    if reset_gpio >= 0:
+                        _pulse_reset(reset_gpio, gpio_chip)
+                    bno = _init_sensor()
+                except Exception as e:
+                    print(
+                        f"imu_driver: re-init failed: {type(e).__name__}: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(0.2)
+                # New yaw origin → new session; consumers re-baseline on the change.
+                session_id = _new_session_id()
+                seq = 0
+                resets_baseline = int(getattr(bno, "_sh2_resets", 0))
+                fresh.reset(time.time())
+                settle.reset(time.monotonic())
+                fallback_count = 0
+                print(f"imu_driver: new session {session_id}.", flush=True)
                 continue
 
-            now_mono = time.monotonic()
-            now_wall = time.time()
+            if not is_new:
+                time.sleep(poll_s)
+                continue
+            reinit_failures = 0
 
             if accel is None or gyro is None or quat is None:
                 if now_mono - last_settle_log > 1.0:
@@ -410,29 +682,33 @@ def main() -> None:
                         flush=True,
                     )
                     last_settle_log = now_mono
-                time.sleep(0.01)
-                next_tick = time.monotonic()
+                time.sleep(poll_s)
                 continue
 
-            if not settled:
-                elapsed = now_mono - start_mono
-                if elapsed >= settle_time_s and accuracy_rad <= calibration_threshold_rad:
-                    settled = True
+            gx, gy, gz = (float(gyro[0]), float(gyro[1]), float(gyro[2]))
+            if not settle.settled:
+                gyro_norm = (gx * gx + gy * gy + gz * gz) ** 0.5
+                if settle.update(now_mono, accuracy_rad, gyro_norm):
+                    elapsed = now_mono - settle.start_mono
                     print(
                         f"imu_driver: settled after {elapsed:.2f}s, "
-                        f"accuracy_rad={accuracy_rad:.4f}. Publishing body/imu.",
+                        f"accuracy_rad={accuracy_rad:.4f}"
+                        f"{' (stillness not reached; forced after max wait)' if settle.forced else ''}"
+                        ". Publishing body/imu.",
                         flush=True,
                     )
-                else:
-                    if now_mono - last_settle_log >= 1.0:
-                        print(
-                            f"imu_driver: calibrating, elapsed={elapsed:.1f}s, "
-                            f"accuracy_rad={accuracy_rad:.4f}, "
-                            f"threshold={calibration_threshold_rad:.4f} "
-                            "(hold the robot still).",
-                            flush=True,
-                        )
-                        last_settle_log = now_mono
+                elif now_mono - last_settle_log >= 1.0:
+                    elapsed = now_mono - settle.start_mono
+                    print(
+                        f"imu_driver: calibrating, elapsed={elapsed:.1f}s, "
+                        f"accuracy_rad={accuracy_rad:.4f}, "
+                        f"threshold={calibration_threshold_rad:.4f}, "
+                        f"still_reports={settle.still_count}/{settle.still_reports} "
+                        "(hold the robot still).",
+                        flush=True,
+                    )
+                    last_settle_log = now_mono
+            settled = settle.settled
 
             if (
                 settled
@@ -450,16 +726,25 @@ def main() -> None:
                         "game_rotation_vector for the remainder of this session.",
                         flush=True,
                     )
-                    _enable(bno, features["game_rotation_vector"], "game_rotation_vector")
+                    try:
+                        _enable(
+                            bno, features["game_rotation_vector"], "game_rotation_vector",
+                            rot_interval_ms,
+                        )
+                    except Exception:
+                        pass  # stale detection re-initialises if GRV never arrives
                     active_mode = "game_rotation_vector"
                     fallback_done = True
                     fallback_count = 0
+                    # Different quaternion origin → new session for consumers.
+                    session_id = _new_session_id()
+                    seq = 0
+                    fresh.reset(time.time())
             else:
                 fallback_count = 0
 
-            if settled or publish_unsettled:
+            if (settled or publish_unsettled) and arrival is not None:
                 ax, ay, az = (float(accel[0]), float(accel[1]), float(accel[2]))
-                gx, gy, gz = (float(gyro[0]), float(gyro[1]), float(gyro[2]))
                 i, j, k, real = quat
                 quat_wxyz = (real, i, j, k)
                 lin_tuple: tuple[float, float, float] | None = None
@@ -474,19 +759,12 @@ def main() -> None:
                 mag_valid: bool | None = None
                 if mag_when_idle_enabled and active_mode == "game_rotation_vector":
                     mag_valid = False
-                    if settled and _motors_idle():
-                        rv_quat = _read_quat(bno, "rotation_vector")
-                        if rv_quat is not None:
-                            i_rv, j_rv, k_rv, real_rv = rv_quat
-                            mag_quat_wxyz = (real_rv, i_rv, j_rv, k_rv)
-                            mag_accuracy = _read_accuracy_rad(
-                                bno,
-                                "rotation_vector",
-                                mag_accuracy_fallback_rad,
-                            )
-                            mag_valid = mag_accuracy <= mag_idle_max_accuracy_rad
+                    if settled and _motors_idle() and mag_sample is not None:
+                        (i_rv, j_rv, k_rv, real_rv), mag_accuracy = mag_sample
+                        mag_quat_wxyz = (real_rv, i_rv, j_rv, k_rv)
+                        mag_valid = mag_accuracy <= mag_idle_max_accuracy_rad
                 msg = schemas.imu_report(
-                    ts=now_wall,
+                    ts=arrival,
                     accel_xyz=(ax, ay, az),
                     gyro_xyz=(gx, gy, gz),
                     quat_wxyz=quat_wxyz,
@@ -497,15 +775,13 @@ def main() -> None:
                     mag_quat_wxyz=mag_quat_wxyz,
                     mag_accuracy_rad=mag_accuracy,
                     mag_valid=mag_valid,
+                    session_id=session_id,
+                    seq=seq,
                 )
                 zenoh_helpers.publish_json(session, "body/imu", msg)
+                seq += 1
 
-            next_tick += publish_period
-            sleep_for = next_tick - time.monotonic()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            else:
-                next_tick = time.monotonic()
+            time.sleep(poll_s)
     finally:
         try:
             session.close()

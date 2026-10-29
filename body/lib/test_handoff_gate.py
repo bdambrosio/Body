@@ -81,5 +81,43 @@ class TestHandoffGate(unittest.TestCase):
         self.assertFalse(g.is_armed(9))
 
 
+class TestArmLease(unittest.TestCase):
+    """T14: a closed inspector must not leave a producer holding forever."""
+
+    def _gate(self, bus, clock, lease=5.0):
+        return HandoffGate(object(), tiers=(3,), publish=bus.publish,
+                           subscribe=bus.subscribe, arm_lease_s=lease,
+                           clock=lambda: clock[0])
+
+    def test_arm_expires_without_refresh(self):
+        bus, clock = _FakeBus(), [100.0]
+        g = self._gate(bus, clock)
+        bus.send_ctrl(3, "arm")
+        self.assertTrue(g.should_hold(3))
+        clock[0] = 104.0
+        self.assertTrue(g.should_hold(3))
+        clock[0] = 105.5
+        self.assertFalse(g.should_hold(3))
+        self.assertFalse(g.is_armed(3))
+
+    def test_refresh_extends_lease(self):
+        bus, clock = _FakeBus(), [0.0]
+        g = self._gate(bus, clock)
+        for t in range(0, 20):
+            clock[0] = float(t)
+            bus.send_ctrl(3, "arm")                     # 1 Hz refresh
+            self.assertTrue(g.is_armed(3))
+
+    def test_message_lease_overrides_and_no_lease_is_legacy(self):
+        bus, clock = _FakeBus(), [0.0]
+        g = self._gate(bus, clock, lease=None)
+        bus.send_ctrl(3, "arm")
+        clock[0] = 1e6
+        self.assertTrue(g.is_armed(3))                  # legacy: no expiry
+        bus.ctrl_handler("drive/handoff/ctrl", {"tier": 3, "action": "arm", "lease_s": 2.0})
+        clock[0] = 1e6 + 2.5
+        self.assertFalse(g.is_armed(3))
+
+
 if __name__ == "__main__":
     unittest.main()

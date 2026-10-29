@@ -186,6 +186,10 @@ def _wait_estop_clear(
         st = status_ref.get("latest")
         if isinstance(st, dict) and st.get("heartbeat_ok") and not st.get("e_stop_active"):
             return True
+        # E-stop clears only on an explicit re-arm (heartbeat must be ok).
+        zenoh_helpers.publish_json(
+            session, "body/estop_rearm", schemas.estop_rearm("mag_motors_off_test")
+        )
         zenoh_helpers.publish_json(
             session,
             "body/cmd_direct",

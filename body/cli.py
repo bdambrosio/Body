@@ -36,11 +36,12 @@ def _cmd_oakd_capture(args: argparse.Namespace) -> int:
             result = msg
 
     zenoh_helpers.declare_subscriber_json(session, "body/oakd/rgb", on_rgb)
-    zenoh_helpers.publish_json(
+    if not zenoh_helpers.publish_json_when_matched(
         session,
         "body/oakd/config",
         schemas.oakd_config_capture_rgb(request_id),
-    )
+    ):
+        print("oakd capture: warning — no subscriber on body/oakd/config (is oakd_driver running?)", file=sys.stderr)
     deadline = time.time() + float(args.timeout)
     while time.time() < deadline and result is None:
         time.sleep(0.02)
@@ -79,10 +80,12 @@ def _cmd_imu_calibrate(args: argparse.Namespace) -> int:
     body_cfg = _body_cfg_with_router(getattr(args, "router", None))
     session = zenoh_helpers.open_session(body_cfg)
     try:
-        zenoh_helpers.publish_json(session, "body/imu/calibrate", {"action": action})
+        matched = zenoh_helpers.publish_json_when_matched(session, "body/imu/calibrate", {"action": action})
     finally:
         session.close()
     print(f"imu calibrate: sent {{'action': {action!r}}} on body/imu/calibrate")
+    if not matched:
+        print("imu calibrate: warning — no subscriber matched (is imu_driver running?)", file=sys.stderr)
     if action == "status":
         print(
             "imu calibrate: status is printed on the Pi imu_driver stdout "
@@ -90,6 +93,23 @@ def _cmd_imu_calibrate(args: argparse.Namespace) -> int:
             flush=True,
         )
     return 0
+
+
+def _cmd_estop_rearm(args: argparse.Namespace) -> int:
+    body_cfg = _body_cfg_with_router(getattr(args, "router", None))
+    session = zenoh_helpers.open_session(body_cfg)
+    try:
+        matched = zenoh_helpers.publish_json_when_matched(
+            session, "body/estop_rearm", schemas.estop_rearm("cli")
+        )
+    finally:
+        session.close()
+    print(
+        "estop rearm: sent on body/estop_rearm (clears only while the heartbeat is ok)"
+        + ("" if matched else " — warning: no subscriber matched"),
+        flush=True,
+    )
+    return 0 if matched else 1
 
 
 def main() -> None:
@@ -136,6 +156,19 @@ def main() -> None:
         help="Zenoh connect endpoint (default: config.json zenoh.connect_endpoints)",
     )
     cal_p.set_defaults(_handler=_cmd_imu_calibrate)
+
+    estop_p = sub.add_parser("estop", help="E-stop actions via Zenoh")
+    estop_sub = estop_p.add_subparsers(dest="estop_action", required=True)
+    rearm_p = estop_sub.add_parser(
+        "rearm",
+        help="Publish body/estop_rearm (watchdog + motor_controller clear a latched e-stop if heartbeat ok)",
+    )
+    rearm_p.add_argument(
+        "--router",
+        default=None,
+        help="Zenoh connect endpoint (default: config.json zenoh.connect_endpoints)",
+    )
+    rearm_p.set_defaults(_handler=_cmd_estop_rearm)
 
     args = parser.parse_args()
     handler = getattr(args, "_handler", None)

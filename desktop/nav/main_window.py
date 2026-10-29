@@ -551,8 +551,23 @@ class NavMainWindow(QMainWindow):
 
     def _on_hier_tick(self) -> None:
         # Fast, render-decoupled hierarchical-drive step (see _build_timer).
+        # Live-cmd / teleop armed while a drive is active → revoke the Tier-3
+        # goal and suspend (X3): Tier-3's 10 Hz cmd_vel interleaved with the
+        # operator's teleop stream fights it. Resume stays explicit.
+        with self.chassis.state.lock:
+            live = bool(self.chassis.state.live_command)
         if self._hier_drive is not None:
+            if live:
+                self._hier_drive.notify_teleop(True)
             self._hier_drive.tick(time.time())
+        elif live and not getattr(self, "_live_was_on", False) and self._drive_client is not None:
+            # No hier drive, but a Tier-3 goal from an earlier session may
+            # still be live on the Pi — revoke it once on the rising edge.
+            try:
+                self._drive_client.cancel()
+            except Exception:
+                logger.exception("cancel on teleop arm failed")
+        self._live_was_on = live
 
     def _on_redraw_tick(self) -> None:
         self._safety_toolbar.refresh()
@@ -1242,9 +1257,18 @@ class NavMainWindow(QMainWindow):
             return
         with self.chassis.state.lock:
             connected = self.chassis.state.connected
+            live = self.chassis.state.live_command
         if not connected:
             QMessageBox.warning(
                 self, "Hierarchical drive", "Chassis disconnected — connect first.",
+            )
+            return
+        if live:
+            # Teleop and Tier-3 would fight over cmd_vel; the drive suspends
+            # itself the moment Live is armed, so refuse to start with it on.
+            QMessageBox.warning(
+                self, "Hierarchical drive",
+                "Live cmd (teleop) is armed — turn it off before Go.",
             )
             return
         if self._drive_client.odom_pose() is None or self._drive_client.latest_scan() is None:

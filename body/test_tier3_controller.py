@@ -1,0 +1,348 @@
+"""Closed-loop tests for the Tier-3 controller (body/lib/tier3_controller.py).
+
+A tiny kinematic simulator ray-casts a synthetic world into a 360-beam scan,
+rasterizes it with the production scan_raster config, and integrates the
+controller's (v, ω). Scenarios are the reviewer reproductions of the
+"nav stalls / rotate-realign dither" findings (T1–T9, L2, T12, T13).
+"""
+import math
+import unittest
+from dataclasses import replace
+
+from body.lib import drive_config
+from body.lib import tier3_controller as tc
+from body.lib.drive_safety import (
+    explained_unknown_mask, seed_clear_disk, swept_path_blocked,
+    unknown_block_mask,
+)
+from body.lib.local_costmap import build_local_costmap
+from body.lib.local_drive_core import STATE_ARRIVED, STATE_BLOCKED, steer_to_body_point
+from body.lib.local_planner import lookahead_on_path, path_remaining_m, plan_local
+from body.lib.scan_raster import rasterize_scan
+from body.lib.tier3_controller import Tier3Controller, Tier3Goal
+from body.lib.zenoh_helpers import load_body_config
+
+N_BEAMS = 360
+W = 5.0
+
+_BODY_CFG = load_body_config()
+RASTER = drive_config.scan_raster_config(_BODY_CFG)
+T3 = drive_config.tier3_config(_BODY_CFG)
+T3 = replace(T3, depth=replace(T3.depth, enabled=False))
+
+
+def raycast(pose, segs):
+    x, y, th = pose
+    out = []
+    for k in range(N_BEAMS):
+        a = th + k * 2 * math.pi / N_BEAMS
+        dx, dy = math.cos(a), math.sin(a)
+        best = None
+        for (x1, y1, x2, y2) in segs:
+            ex, ey = x2 - x1, y2 - y1
+            den = dx * ey - dy * ex
+            if abs(den) < 1e-12:
+                continue
+            t = ((x1 - x) * ey - (y1 - y) * ex) / den
+            u = ((x1 - x) * dy - (y1 - y) * dx) / den
+            if t > 0.02 and 0 <= u <= 1 and (best is None or t < best):
+                best = t
+        out.append(best if best is not None and best < 12 else None)
+    return out
+
+
+def min_clearance(pose, segs):
+    x, y, _ = pose
+    m = 9.0
+    for (x1, y1, x2, y2) in segs:
+        ex, ey = x2 - x1, y2 - y1
+        L = ex * ex + ey * ey
+        t = max(0.0, min(1.0, ((x - x1) * ex + (y - y1) * ey) / L))
+        m = min(m, math.hypot(x1 + t * ex - x, y1 + t * ey - y))
+    return m
+
+
+def post(cx, cy, r):
+    return [(cx - r, cy - r, cx + r, cy - r), (cx + r, cy - r, cx + r, cy + r),
+            (cx + r, cy + r, cx - r, cy + r), (cx - r, cy + r, cx - r, cy - r)]
+
+
+class Sim:
+    """Kinematic unicycle + scan → controller loop at 10 Hz."""
+
+    def __init__(self, segs, goal, *, pose=(0.0, 0.0, 0.0), tol=0.12, cfg=T3,
+                 latency_ticks=0, final_heading=None, motor=lambda v, w: (v, w)):
+        self.segs = segs
+        self.pose = pose
+        self.poses = [pose]
+        self.latency = latency_ticks
+        self.motor = motor
+        self.ctrl = Tier3Controller(cfg)
+        self.ctrl.start_goal(Tier3Goal(1, goal[0], goal[1], tol,
+                                       final_heading=final_heading), 0.0, pose)
+        self.t = 0.0
+        self.results = []
+        self.primary_blocked = 0
+        self.min_clear = 9.0
+
+    def run(self, T=30.0):
+        dt = 0.1
+        r = None
+        while self.t < T:
+            ps = self.poses[max(0, len(self.poses) - 1 - self.latency)]
+            g, m = rasterize_scan(raycast(ps, self.segs), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+            r = self.ctrl.step(now_mono=self.t, now_wall=self.t, pose_now=self.pose,
+                               pose_scan=ps, grid=g, meta=m)
+            self.results.append(r)
+            self.min_clear = min(self.min_clear, min_clearance(self.pose, self.segs))
+            if r.done or r.terminal:
+                return r
+            v, w = self.motor(*(r.cmd or (0.0, 0.0)))
+            x, y, th = self.pose
+            self.pose = (x + v * math.cos(th) * dt, y + v * math.sin(th) * dt, th + w * dt)
+            self.poses.append(self.pose)
+            self.t += dt
+        return r
+
+    def reasons(self):
+        return [x.reason for x in self.results if x.reason]
+
+
+class _CountPrimary:
+    """Counts follow ticks whose FIRST (nominal) command the veto rejects."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __enter__(self):
+        self._orig = tc.swept_path_blocked
+        self._orig_step = Tier3Controller.step
+        outer = self
+
+        def sw(*a, **k):
+            r = outer._orig(*a, **k)
+            outer.calls[-1].append(r)
+            return r
+
+        def step(ctrl, **kw):
+            outer.calls.append([])
+            return outer._orig_step(ctrl, **kw)
+
+        tc.swept_path_blocked = sw
+        Tier3Controller.step = step
+        return self
+
+    def __exit__(self, *exc):
+        tc.swept_path_blocked = self._orig
+        Tier3Controller.step = self._orig_step
+
+    @property
+    def primary_blocked(self):
+        return sum(1 for c in self.calls if c and c[0])
+
+    @property
+    def follow_checks(self):
+        return sum(1 for c in self.calls if c)
+
+
+INVARIANT_WORLDS = {
+    "thin_post": post(0.7, 0.0, 0.02),
+    "post_offset": post(0.6, 0.15, 0.02),
+    "post_near": post(0.5, -0.1, 0.03),
+    "wall_end_left": [(0.6, 0.1, 0.6, W)],
+    "wall_end_right": [(0.5, -W, 0.5, -0.15)],
+    "door_jambs": [(0.8, -W, 0.8, -0.15), (0.8, 0.45, 0.8, W)],
+    "wall_follow_0.15": [(-W, 0.15, W, 0.15)],
+    "wall_follow_0.18": [(-W, 0.18, W, 0.18)],
+    "wall_follow_0.20": [(-W, 0.20, W, 0.20)],
+    "wall_follow_right_0.17": [(-W, -0.17, W, -0.17)],
+}
+
+
+class TestPlannerVetoInvariant(unittest.TestCase):
+    """Fix 3: the planner never sees fewer obstacles than the veto — an A*
+    path from plan_local, followed with the controller's nominal command,
+    passes swept_path_blocked on the same grid."""
+
+    def _grid(self, segs, pose=(0.0, 0.0, 0.0)):
+        g, m = rasterize_scan(raycast(pose, segs), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+        work = g.copy()
+        seed_clear_disk(work, m, (0.0, 0.0), T3.seed_clear_radius_m)
+        return work, m
+
+    def test_static_first_command_passes_veto(self):
+        foot = T3.foot
+        checked = 0
+        for name, segs in INVARIANT_WORLDS.items():
+            work, m = self._grid(segs)
+            ex = explained_unknown_mask(work, foot.unknown_explained_cells)
+            cm = build_local_costmap(work, m, T3.plan.costmap)
+            ub = unknown_block_mask(work, m, (0.0, 0.0), foot, ex)
+            cm.lethal |= ub
+            for goal in [(1.4, 0.0), (1.2, 0.3), (1.2, -0.3), (0.9, 0.1), (1.5, -0.1)]:
+                p = plan_local(work, m, goal, T3.plan, costmap=cm)
+                if not p.ok:
+                    continue
+                look = lookahead_on_path(p.path_body, T3.lookahead_m)
+                v, w, _d, _b, _rot = steer_to_body_point(look, T3.params, False)
+                if v <= 0:
+                    continue
+                checked += 1
+                blocked = swept_path_blocked(
+                    work, m, v_mps=v, omega_radps=w, config=foot,
+                    max_reach_m=path_remaining_m(p.path_body) + T3.stop_margin_m,
+                    explained_unknown=ex)
+                self.assertFalse(blocked, f"{name} goal={goal}: A* path vetoed")
+        self.assertGreater(checked, 3)
+
+    def test_closed_loop_nominal_command_never_vetoed(self):
+        for name, segs in INVARIANT_WORLDS.items():
+            for goal in [(1.4, 0.0), (1.2, 0.5), (1.2, -0.5)]:
+                with _CountPrimary() as cp:
+                    sim = Sim(segs, goal)
+                    sim.run(T=30.0)
+                self.assertEqual(cp.primary_blocked, 0,
+                                 f"{name} goal={goal}: nominal follow command vetoed "
+                                 f"{cp.primary_blocked}/{cp.follow_checks} ticks")
+                self.assertNotIn("swept_block", sim.reasons(), f"{name} goal={goal}")
+
+
+class TestReachesGoals(unittest.TestCase):
+    def _arrive(self, segs, goal, **kw):
+        sim = Sim(segs, goal, **kw)
+        r = sim.run(T=kw.pop("T", 30.0) if "T" in kw else 30.0)
+        self.assertEqual(r.state, STATE_ARRIVED,
+                         f"goal={goal}: {r.state} {r.reason} after {sim.t:.1f}s")
+        return sim, r
+
+    def test_subgoal_in_front_of_wall_arrives(self):
+        # T2/T8: Tier-2 places sub-goals 0.16–0.22 m in front of a wall. The
+        # veto used to stop the robot ~0.37 m short and dither to deadline.
+        for gap in (0.17, 0.22, 0.30):
+            sim, r = self._arrive([(1.0, -W, 1.0, W)], (1.0 - gap, 0.0))
+            self.assertLess(sim.t, 8.0)
+            self.assertGreater(sim.min_clear, 0.2)
+
+    def test_wall_following_close(self):
+        # T5: following a wall at 0.15–0.20 m used to be a permanent swept_block.
+        for off in (0.15, 0.20):
+            sim, _r = self._arrive([(-W, off, W, off)], (1.5, 0.0))
+            self.assertGreaterEqual(sim.min_clear, off - 0.01)
+
+    def test_thin_posts_are_avoided_not_blocked_on(self):
+        # T1: a 2–8 cm post was speckle-removed from the planner → A* drove
+        # straight at it and the raw-grid veto froze the robot.
+        for r_post in (0.01, 0.02, 0.04):
+            sim, _r = self._arrive(post(0.7, 0.0, r_post), (1.4, 0.0))
+            self.assertGreater(sim.min_clear, 0.15)
+
+    def test_doorways(self):
+        self._arrive([(0.8, -W, 0.8, -0.1), (0.8, 0.5, 0.8, W)], (1.6, 0.2))
+        self._arrive([(0.8, -W, 0.8, 0.05), (0.8, 0.55, 0.8, W)], (1.6, 0.3))
+
+    def test_goal_behind_robot_no_omega_flip(self):
+        # T4: a goal behind the robot flipped ω every tick.
+        sim, _r = self._arrive([(-W, 0.6, W, 0.6), (-W, -0.6, W, -0.6)], (-1.0, 0.02))
+        rot = [x.omega for x in sim.results if x.mode == "rotate"]
+        flips = sum(1 for a, b in zip(rot, rot[1:]) if a * b < 0)
+        self.assertLessEqual(flips, 1)
+
+    def test_goal_beyond_wall_arrives_at_best_endpoint(self):
+        # T8: reaching the best reachable cell is ARRIVED (plan_reason says
+        # it was a stand-in), not BLOCKED:boxed_in.
+        sim, r = self._arrive([(1.0, -W, 1.0, W)], (1.4, 0.0))
+        self.assertIn(r.plan_reason, ("frontier", "snapped"))
+        self.assertGreater(r.dist, 0.4)                 # residual is honest
+
+    def test_scan_latency_is_compensated(self):
+        # T10: scans 0.3 s old (pose_scan lags) must not break following.
+        self._arrive([(0.8, -W, 0.8, 0.05), (0.8, 0.55, 0.8, W)], (1.6, 0.3),
+                     latency_ticks=3)
+        self._arrive([(-W, 0.18, W, 0.18)], (1.5, 0.0), latency_ticks=3)
+
+
+class TestBoundedRotation(unittest.TestCase):
+    def test_rotate_timeout_when_robot_cannot_turn(self):
+        # A stalled / muted motor: commanded rotation never happens. The
+        # per-goal non-translating budget ends it as BLOCKED rotate_timeout
+        # well before the 30 s deadline.
+        sim = Sim([], (-1.0, 0.0), motor=lambda v, w: (0.0, 0.0))
+        r = sim.run(T=30.0)
+        self.assertEqual(r.state, STATE_BLOCKED)
+        self.assertEqual(r.reason, "rotate_timeout")
+        self.assertTrue(r.terminal)
+        self.assertLess(sim.t, T3.rotate_timeout_s + 1.0)
+
+    def test_terminal_block_goes_quiet_on_cmd_vel(self):
+        sim = Sim([], (-1.0, 0.0), motor=lambda v, w: (0.0, 0.0))
+        sim.run(T=30.0)
+        ctrl = sim.ctrl
+        cmds = []
+        for k in range(6):
+            r = ctrl.step(now_mono=sim.t + 0.1 * (k + 1), now_wall=0.0, pose_now=sim.pose,
+                          pose_scan=sim.pose, grid=None, meta=None)
+            self.assertEqual(r.reason, "rotate_timeout")
+            cmds.append(r.cmd)
+        # terminal_zero_ticks zeros in total (one already sent), then silence
+        self.assertEqual(cmds[-1], None)
+        self.assertIn((0.0, 0.0), cmds[:2])
+
+    def test_final_heading_bounded_by_budget(self):
+        # T13: the final-heading turn used to bypass every timer.
+        sim = Sim([], (0.5, 0.0), final_heading=math.pi / 2,
+                  motor=lambda v, w: (v, 0.0))       # wheels drive, never turn
+        r = sim.run(T=40.0)
+        self.assertEqual(r.state, STATE_BLOCKED)
+        self.assertIn(r.reason, ("rotate_timeout", "deadline"))
+
+    def test_final_heading_completes(self):
+        sim = Sim([], (0.5, 0.0), final_heading=math.pi / 2)
+        r = sim.run(T=20.0)
+        self.assertEqual(r.state, STATE_ARRIVED)
+        self.assertAlmostEqual(sim.pose[2], math.pi / 2, delta=0.1)
+
+    def test_rotation_does_not_reset_translation_clock(self):
+        # T3: realign/rotate ticks reset realign_since; only translation may.
+        ctrl = Tier3Controller(T3)
+        ctrl.start_goal(Tier3Goal(1, -1.0, 0.0, 0.12), 0.0, (0.0, 0.0, 0.0))
+        g, m = rasterize_scan(raycast((0, 0, 0), []), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+        th = 0.0
+        for k in range(5):
+            r = ctrl.step(now_mono=0.1 * k, now_wall=0.0, pose_now=(0, 0, th),
+                          pose_scan=(0, 0, th), grid=g, meta=m)
+            th += 0.06
+        self.assertEqual(r.mode, "rotate")
+        self.assertEqual(ctrl.last_translate_at, 0.0)
+        ctrl.step(now_mono=0.6, now_wall=0.0, pose_now=(0.06, 0.0, th),
+                  pose_scan=(0.06, 0.0, th), grid=g, meta=m)
+        self.assertAlmostEqual(ctrl.last_translate_at, 0.6)
+
+    def test_rotating_in_place_keeps_committed_path(self):
+        # T4 path hysteresis: while turning to line up, the path is frozen in
+        # odom (not re-planned on the re-quantized rotating grid).
+        sim = Sim(post(0.7, 0.0, 0.02), (0.8, 0.0))
+        r = sim.run(T=30.0)
+        self.assertEqual(r.state, STATE_ARRIVED)
+        rot = [x.omega for x in sim.results if x.mode == "rotate"]
+        flips = sum(1 for a, b in zip(rot, rot[1:]) if a * b < 0)
+        self.assertLessEqual(flips, 1)
+
+
+class TestFailures(unittest.TestCase):
+    def test_no_scan_is_blocked_not_driving(self):
+        ctrl = Tier3Controller(T3)
+        ctrl.start_goal(Tier3Goal(1, 1.0, 0.0, 0.12), 0.0, (0.0, 0.0, 0.0))
+        r = ctrl.step(now_mono=0.0, now_wall=0.0, pose_now=(0, 0, 0), pose_scan=None,
+                      grid=None, meta=None)
+        self.assertEqual((r.state, r.reason, r.cmd), (STATE_BLOCKED, "no_scan", (0.0, 0.0)))
+
+    def test_deadline_is_terminal(self):
+        cfg = replace(T3, goal_deadline_s=1.0)
+        sim = Sim([(1.0, -W, 1.0, W)], (3.0, 0.0), cfg=cfg, motor=lambda v, w: (0.0, 0.0))
+        r = sim.run(T=5.0)
+        self.assertEqual(r.reason, "deadline")
+        self.assertTrue(r.terminal)
+
+
+if __name__ == "__main__":
+    unittest.main()

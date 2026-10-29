@@ -15,9 +15,12 @@ Pure: no Qt, no zenoh. Collaborators are injected (``DriveClient`` satisfies
 bootstrap — swap it for an LPR-backed provider later without touching this).
 
 Frames: the sub-goal stays body-frame all the way into
-``send_goto_from_body`` (which re-anchors via live odom), so a constant
-PF↔odom yaw offset is harmless; only temporal skew matters, and it is
-self-correcting because we re-pick each leg from fresh pose + scan.
+``send_goto_from_body``. It is stamped with ``anchor_ts`` = the ts of the
+scan it was computed from, and Tier-3 anchors it into odom with its own odom
+ring buffer interpolated at that instant (time-consistent; X6) — so a
+constant PF↔odom yaw offset is harmless and the scan→send latency no longer
+rotates the goal during turns. Without a scan (blind projection) the goal
+falls back to the latest-odom anchoring.
 """
 from __future__ import annotations
 
@@ -63,8 +66,13 @@ class DriveIO(Protocol):
     def send_goto_from_body(
         self, bx: float, by: float, *,
         arrival_tol_m: Optional[float] = None, v_max: Optional[float] = None,
+        anchor_ts: Optional[float] = None,
     ) -> Optional[int]: ...
     def cancel(self) -> None: ...
+    # Optional (read defensively): True once the goto ``cmd_id`` exhausted its
+    # ack resends without any matching body/drive/status (lost on the link,
+    # or the Pi's Tier-3 is not running). ``DriveClient`` provides it.
+    # def ack_failed(self, cmd_id: int) -> bool: ...
 
 
 class HandoffSink(Protocol):
@@ -169,6 +177,17 @@ class HierConfig:
     # meaning whenever the host tick rate does (it already did once, 5→20 Hz).
     blocked_retry_interval_s: float = 0.5
     blocked_retry_window_s: float = 10.0
+    # Per-leg (one carrot / waypoint) deadline. Re-picks (sub-goal ARRIVED,
+    # drift, pose corrections, REJECTED) deliberately do NOT reset it — each
+    # re-pick is a new Tier-3 cmd_id that resets all of Tier-3's own per-goal
+    # bounds, so without a leg-level bound a re-pick loop never times out
+    # (X1). Only a waypoint advance or an operator resume starts a new leg.
+    # Expiry → BLOCKED("leg_timeout"), paused for the operator (no retries).
+    leg_deadline_s: float = 60.0
+    # REJECTED gotos (cmd_id below the Pi's watermark): the DriveClient re-seeds
+    # past the watermark, so a re-pick normally succeeds at once. More than
+    # this many consecutive rejections in a leg → BLOCKED("rejected").
+    max_consecutive_rejects: int = 3
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
@@ -178,6 +197,19 @@ class HierConfig:
 
 def _dist(a: Pose, wp_xy: Tuple[float, float]) -> float:
     return math.hypot(a[0] - wp_xy[0], a[1] - wp_xy[1])
+
+
+def _world_bearing(pose: Pose, wp_xy: Tuple[float, float]) -> float:
+    """World-frame bearing robot→waypoint (robot yaw NOT subtracted). Used for
+    the drift re-pick test: pure in-place rotation by Tier-3 leaves it
+    unchanged, so Tier-3's own rotate/realign is never mistaken for drift."""
+    return math.atan2(wp_xy[1] - pose[1], wp_xy[0] - pose[0])
+
+
+# Tier-3 status modes during which the robot is (re)orienting in place toward
+# the sub-goal. A drift re-pick here would supersede the goal and reset the
+# rotate hysteresis / realign bound on the Pi (X1).
+_TIER3_TURNING_MODES = ("rotate", "realign")
 
 
 class HierarchicalDrive:
@@ -221,6 +253,12 @@ class HierarchicalDrive:
         self._state = HierState.IDLE
         self._cmd_id: Optional[int] = None
         self._sent_bearing: Optional[float] = None
+        # World-frame bearing to the waypoint at send time (drift reference).
+        self._sent_world_bearing: Optional[float] = None
+        # Leg deadline: start of the current leg (None until the first select
+        # of the leg). Re-picks do not touch it.
+        self._leg_started_at: Optional[float] = None
+        self._consecutive_rejects = 0
         # Pose-correction count at the moment the live sub-goal was sent. If the
         # provider's count moves past this mid-leg, the world pose stepped under
         # us → re-pick from the corrected pose. -1 until the first goto.
@@ -249,6 +287,8 @@ class HierarchicalDrive:
         self._block_gave_up = False
         self._block_reason = None
         self._cmd_id = None
+        self._leg_started_at = None
+        self._consecutive_rejects = 0
         self._subgoal_body = None
         self._held_tier = None
         self._route_start = None
@@ -292,8 +332,27 @@ class HierarchicalDrive:
         self._block_started_at = None
         self._block_gave_up = False
         self._block_reason = None
+        self._leg_started_at = None          # operator resume = fresh leg budget
+        self._consecutive_rejects = 0
         self._to(HierState.ALIGNING)
         return True
+
+    # States in which the drive may have (or is about to issue) a live Tier-3
+    # goal — the ones an operator teleop takeover must interrupt.
+    _ACTIVE_STATES = (
+        HierState.ALIGNING, HierState.SELECT_SUBGOAL, HierState.DRIVING_SUBGOAL,
+        HierState.ADVANCE_WAYPOINT, HierState.BLOCKED,
+    )
+
+    def notify_teleop(self, active: bool) -> None:
+        """Host hook: the operator armed Live-cmd / teleop (desktop cmd_vel or
+        cmd_direct streaming). Tier-3 publishes its own cmd_vel at 10 Hz while
+        it holds a goal; interleaved with teleop the motors see alternating
+        commands (X3). Revoke the Tier-3 goal and hold SUSPENDED until the
+        operator explicitly resumes. Idempotent; ``active=False`` is a no-op
+        (resume stays an explicit operator action)."""
+        if active and self._state in self._ACTIVE_STATES:
+            self._enter_suspended("teleop")
 
     def is_suspended(self) -> bool:
         return self._state is HierState.SUSPENDED
@@ -314,6 +373,14 @@ class HierarchicalDrive:
         # progress — a sub-goal done or a waypoint advance), NOT by a
         # successful re-send. Otherwise a standstill that Tier-3 vetoes every
         # time would loop SELECT↔BLOCKED forever, re-issuing the same goto.
+        #
+        # Always revoke the Tier-3 goal on entry (X3): a BLOCKED Tier-3 keeps
+        # holding its goal and streaming cmd_vel, and resumes real motion on
+        # its own if the block clears (a depth ghost vanishes) — while the UI
+        # says BLOCKED/paused. Retries re-send a fresh goto anyway.
+        if self._state is not HierState.BLOCKED:
+            self._io.cancel()
+        self._subgoal_body = None
         self._block_reason = reason
         if self._block_started_at is None:
             self._block_started_at = self._tick_now
@@ -456,6 +523,11 @@ class HierarchicalDrive:
             return
         if self._route_start is None:
             self._route_start = (pose[0], pose[1])   # prev for the first vertex
+        if self._leg_started_at is None:
+            self._leg_started_at = self._tick_now
+        elif self._leg_expired():
+            self._enter_blocked("leg_timeout")
+            return
         self._waypoint = carrot
         wp_dist = _dist(pose, self._waypoint)
         if self._reached_waypoint(pose):
@@ -489,7 +561,6 @@ class HierarchicalDrive:
         # blind horizon projection; Tier-3 reports no_scan if it cannot plan.
         selected = self._select_subgoal_body(bearing, wp_dist)
         if selected is None:
-            self._io.cancel()
             self._enter_blocked("clear_run_failed")
             return
         (bx, by), src, free_dist, grid, meta = selected
@@ -512,21 +583,28 @@ class HierarchicalDrive:
         self._sink.consume_continue(2)
         self._held_tier = None
 
-        cid = self._io.send_goto_from_body(
-            bx, by,
-            arrival_tol_m=self._cfg.subgoal_arrival_tol_m,
-            v_max=self._cfg.sub_v_max,
-        )
+        # Time-consistent anchoring (X6): the sub-goal is in the body frame of
+        # the scan it was marched on, so stamp it with that scan's ts and let
+        # Tier-3 anchor it from its odom ring buffer at that instant. Blind
+        # projection has no scan → latest-odom anchoring (anchor_ts None).
+        kwargs: Dict[str, Any] = {
+            "arrival_tol_m": self._cfg.subgoal_arrival_tol_m,
+            "v_max": self._cfg.sub_v_max,
+        }
+        anchor_ts = (meta or {}).get("_scan_ts") if src == "clear" else None
+        if anchor_ts is not None:
+            kwargs["anchor_ts"] = anchor_ts
+        cid = self._io.send_goto_from_body(bx, by, **kwargs)
         if cid is None:
             # Send failed (no odom/connection). A previous goto may still be
             # live on the Pi (intermediate advances deliberately leave it
-            # running) — revoke it so BLOCKED in the UI matches an actually
-            # stopped robot.
-            self._io.cancel()
+            # running) — _enter_blocked revokes it so BLOCKED in the UI
+            # matches an actually stopped robot.
             self._enter_blocked("send_failed")
             return
         self._cmd_id = cid
         self._sent_bearing = bearing
+        self._sent_world_bearing = _world_bearing(pose, (cx, cy))
         self._sent_correction_seq = self._pose_correction_seq()
         self._subgoal_body = (bx, by)
         self._block_reason = None
@@ -549,6 +627,9 @@ class HierarchicalDrive:
         if self._held_tier is None:
             self._io.cancel()
         self._held_tier = tier
+        # Time parked at an inspector breakpoint is not leg time: restart the
+        # leg budget when the operator continues.
+        self._leg_started_at = None
         return True
 
     def _select_subgoal_body(
@@ -569,7 +650,8 @@ class HierarchicalDrive:
         if scan is not None and scan.get("ranges"):
             grid, meta = rasterize_scan(
                 scan.get("ranges"), float(scan.get("angle_min", 0.0)),
-                float(scan.get("angle_increment", 0.0)), self._raster)
+                float(scan.get("angle_increment", 0.0)), self._raster,
+                unknown_bins=scan.get("unknown_bins"))
             # March on Tier-3's footprint-inflated + goal-clearance lethal mask
             # (its exact costmap model), not the raw scan: a "clear" point here
             # is a goal Tier-3 accepts without snapping, and the 2-D inflation
@@ -584,6 +666,10 @@ class HierarchicalDrive:
             res = furthest_free_point(march_grid, meta, bearing, march_cfg,
                                       max_dist_m=wp_dist)
             if res.ok and res.body_xy is not None:
+                meta = dict(meta)
+                ts = scan.get("ts")
+                if isinstance(ts, (int, float)) and ts > 0:
+                    meta["_scan_ts"] = float(ts)
                 return res.body_xy, "clear", res.free_dist_m, grid, meta
             return None
         dist = min(wp_dist, t2.horizon_m)
@@ -608,9 +694,37 @@ class HierarchicalDrive:
                 self._to(HierState.ADVANCE_WAYPOINT)
                 return
 
+        if self._leg_expired():
+            self._enter_blocked("leg_timeout")
+            return
+
         st = self._io.latest_status()
-        if st is not None and int(st.get("cmd_id", 0)) == self._cmd_id:
+        tier3_mode = None
+        if st is not None and int(st.get("cmd_id", 0) or 0) == self._cmd_id:
             state = st.get("state")
+            tier3_mode = st.get("mode")
+            if tier3_mode == "held":
+                # Parked at the Pi-side HO-3 breakpoint: inspection time is
+                # not leg time.
+                self._leg_started_at = self._tick_now
+            if state == "REJECTED":
+                # Our cmd_id fell at/below the Pi's watermark (another client
+                # pushed it up, or local_drive restarted ahead of us). The
+                # DriveClient re-seeds past the watermark on this status, so a
+                # re-pick sends an accepted id. Resends of an accepted id are
+                # absorbed by Tier-3 without a REJECTED, so every REJECTED is
+                # real (watermark == our id means the goto itself was malformed).
+                wm = st.get("watermark")
+                self._consecutive_rejects += 1
+                if self._consecutive_rejects > self._cfg.max_consecutive_rejects:
+                    self._enter_blocked("rejected")
+                    return
+                logger.warning("hier: goto cmd=%s REJECTED (watermark=%s) — re-pick",
+                               self._cmd_id, wm)
+                self._to(HierState.SELECT_SUBGOAL)
+                return
+            else:
+                self._consecutive_rejects = 0
             # ARRIVED is published for a single Tier-3 tick before it drops
             # the goal and reverts to IDLE; at our slower poll we usually see
             # the IDLE. Both mean "this sub-goal is done" → re-pick the next
@@ -627,6 +741,12 @@ class HierarchicalDrive:
             if state == "CANCELED":
                 self._to(HierState.FAILED)
                 return
+        elif self._cmd_id is not None and self._ack_failed(self._cmd_id):
+            # The goto (and its resends) never produced a matching status:
+            # lost on the link or Tier-3 is not running. Don't wait forever
+            # in DRIVING_SUBGOAL on a robot that is sitting still (X5).
+            self._enter_blocked("no_ack")
+            return
 
         # World-pose correction (re-anchor snap / relocate the odom frame never
         # saw): the current sub-goal is anchored in odom and now points the wrong
@@ -639,13 +759,18 @@ class HierarchicalDrive:
             self._to(HierState.SELECT_SUBGOAL)
             return
 
-        # Mid-leg drift: re-pick if the bearing to the waypoint has moved on.
-        # The difference must be wrapped — both bearings live in (-π, π], so a
-        # tiny real drift across ±π (carrot near dead-astern) would otherwise
-        # read as ~2π and re-pick every tick.
-        if pose is not None and self._waypoint is not None and self._sent_bearing is not None:
-            b = bearing_to_waypoint(pose[0], pose[1], pose[2], self._waypoint[0], self._waypoint[1])
-            drift = abs(wrap_pi(b - self._sent_bearing))
+        # Mid-leg drift: re-pick if the WORLD-frame bearing to the waypoint has
+        # moved on (the robot translated off the line). World frame, not body:
+        # Tier-3 rotating in place toward the sub-goal changes the body-relative
+        # bearing but not the world one, and re-picking on it superseded the
+        # goal every ~20° of rotation, resetting Tier-3's rotate hysteresis and
+        # bounds (X1). Belt and braces: never drift-re-pick while Tier-3 says
+        # it is rotating/realigning. The difference must be wrapped — a tiny
+        # real drift across ±π would otherwise read as ~2π.
+        if (self._waypoint is not None and self._sent_world_bearing is not None
+                and tier3_mode not in _TIER3_TURNING_MODES):
+            b = _world_bearing(pose, self._waypoint)
+            drift = abs(wrap_pi(b - self._sent_world_bearing))
             if drift > self._cfg.repick_hysteresis_rad:
                 logger.info("hier: re-pick (bearing drift %.0f° > %.0f°)",
                             math.degrees(drift),
@@ -660,6 +785,8 @@ class HierarchicalDrive:
             self._lead_idx += 1
             self._block_started_at = None
             self._block_gave_up = False
+            self._leg_started_at = None
+            self._consecutive_rejects = 0
             self._to(HierState.SELECT_SUBGOAL)
             return
         # Remember the vertex we're leaving — it's the prev for the passed-test
@@ -671,6 +798,8 @@ class HierarchicalDrive:
         logger.info("hier: waypoint reached -> next=%s", next_idx)
         self._block_started_at = None              # fresh leg
         self._block_gave_up = False
+        self._leg_started_at = None
+        self._consecutive_rejects = 0
         if next_idx is None:
             self._io.cancel()
             self._subgoal_body = None
@@ -687,15 +816,41 @@ class HierarchicalDrive:
         if self._block_started_at is None:        # defensive: never unset here
             self._block_started_at = now
             self._block_last_retry = now
-        if now - self._block_started_at > self._cfg.blocked_retry_window_s:
+        # Leg deadline / repeated rejection are terminal for the leg: retrying
+        # would just re-trip them (and churn goto+cancel) — pause at once.
+        terminal = self._block_reason in ("leg_timeout", "rejected")
+        if terminal or now - self._block_started_at > self._cfg.blocked_retry_window_s:
             if not self._block_gave_up:
                 self._block_gave_up = True
+                # Re-send the revoke on give-up: the cancel on BLOCKED entry
+                # may have been lost, and a paused drive must not leave Tier-3
+                # holding (and possibly resuming) a goal (X3).
+                self._io.cancel()
                 logger.warning(
-                    "hier: blocked (%s) — retry window (%.1fs) exhausted, "
-                    "pausing for operator resume",
-                    self._block_reason, self._cfg.blocked_retry_window_s)
+                    "hier: blocked (%s) — %s, pausing for operator resume",
+                    self._block_reason,
+                    "terminal for this leg" if terminal else
+                    f"retry window ({self._cfg.blocked_retry_window_s:.1f}s) exhausted")
             return
         if now - self._block_last_retry >= self._cfg.blocked_retry_interval_s:
             self._block_last_retry = now
             self._to(HierState.SELECT_SUBGOAL)
 
+
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    def _leg_expired(self) -> bool:
+        return (self._leg_started_at is not None
+                and self._cfg.leg_deadline_s > 0
+                and self._tick_now - self._leg_started_at > self._cfg.leg_deadline_s)
+
+    def _ack_failed(self, cmd_id: int) -> bool:
+        """DriveIO's optional ack-failure signal, read defensively (test fakes
+        and older IO without it → never fails)."""
+        fn = getattr(self._io, "ack_failed", None)
+        if fn is None:
+            return False
+        try:
+            return bool(fn(cmd_id))
+        except Exception:
+            return False

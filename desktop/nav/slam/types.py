@@ -68,6 +68,11 @@ class ImuReading:
     mag_valid: bool = False
     mag_quat_wxyz: Optional[Tuple[float, float, float, float]] = None
     mag_accuracy_rad: Optional[float] = None
+    # Driver epoch (random per imu_driver start) and per-report sequence.
+    # Optional on the wire (older Pi): None when absent. A session change
+    # means the GRV yaw origin may have jumped → consumers re-baseline.
+    session_id: Optional[str] = None
+    seq: Optional[int] = None
 
     @classmethod
     def from_payload(cls, msg: dict) -> Optional["ImuReading"]:
@@ -117,12 +122,23 @@ class ImuReading:
                     except (TypeError, ValueError):
                         mag_acc = None
 
+            sid_raw = msg.get("session_id")
+            session_id = str(sid_raw) if sid_raw is not None else None
+            seq: Optional[int] = None
+            if msg.get("seq") is not None:
+                try:
+                    seq = int(msg["seq"])
+                except (TypeError, ValueError):
+                    seq = None
+
             return cls(
                 ts=ts, gyro_z=gz, quat_wxyz=quat,
                 fusion_mode=mode, accuracy_rad=acc,
                 mag_valid=mag_valid,
                 mag_quat_wxyz=mag_quat,
                 mag_accuracy_rad=mag_acc,
+                session_id=session_id,
+                seq=seq,
             )
         except Exception:
             return None

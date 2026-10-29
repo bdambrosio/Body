@@ -6,109 +6,60 @@ drives BCM pins per docs/motor_controller_spec.md (lgpio). Set ``max_wheel_vel_m
 
 from __future__ import annotations
 
-import math
+import secrets
 import signal
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
 from body.lib import diff_drive, motor_gpio, schemas, zenoh_helpers
+from body.lib.wheel_control import (
+    CommandArbiter,
+    CommandError,
+    EStopLatch,
+    WheelPI,
+    parse_cmd_direct,
+    parse_cmd_vel,
+)
 
 STALL_PWM_THRESHOLD = 0.1
 STALL_VELOCITY_EPS_MS = 0.01
+# Consecutive failing control ticks before the process exits (launcher respawns).
+TICK_ERROR_EXIT_COUNT = 250
 
-
-@dataclass
-class WheelPI:
-    """Per-wheel velocity PI with feed-forward and gated/ramped dead-zone kick.
-
-    ``ff = v_cmd / max_v`` (the prior open-loop mapping) is the starting duty; the
-    integrator absorbs the residual so commanded wheel velocity matches measured.
-
-    Dead-zone kick policy:
-      * The kick only fires while the wheel is in the static-friction regime
-        (``|v_meas| < kinetic_threshold_ms``). Once the wheel is actually moving,
-        kinetic friction is much lower than static, the PI's natural PWM is
-        sufficient, and we let the loop run free — otherwise the kick would
-        floor the PWM at ``min_drive_pwm`` and the loop can't decelerate (slow
-        commands oscillate, wheels overshoot).
-      * Within the static regime, the kick ramps from 0 to ``min_drive_pwm``
-        over ``kick_ramp_ticks`` consecutive ticks rather than slamming the
-        full value on tick 1. With ``kick_ramp_ticks=5`` at a 50 Hz loop, the
-        ramp takes ~100 ms — fast enough to break static friction quickly,
-        slow enough to avoid the torque step that was producing visible
-        startup wheelies + IMU shake.
-      * ``kick_tick_count`` resets to 0 whenever the wheel is moving or no
-        command is active, so the next stationary-start gets a fresh ramp.
-    """
-
-    kp: float
-    ki: float
-    integ_limit: float
-    min_drive_pwm: float
-    kinetic_threshold_ms: float = 0.02
-    kick_ramp_ticks: int = 5
-    integ: float = 0.0
-    kick_tick_count: int = 0
-
-    def reset(self) -> None:
-        self.integ = 0.0
-        self.kick_tick_count = 0
-
-    def step(
-        self, v_cmd: float, v_meas: float, dt: float, max_v: float
-    ) -> tuple[float, str]:
-        if max_v <= 0.0 or abs(v_cmd) < 1e-6:
-            self.integ = 0.0
-            self.kick_tick_count = 0
-            return 0.0, "fwd"
-        ff = v_cmd / max_v
-        err = v_cmd - v_meas
-        self.integ += err * dt
-        if self.integ > self.integ_limit:
-            self.integ = self.integ_limit
-        elif self.integ < -self.integ_limit:
-            self.integ = -self.integ_limit
-        pwm = ff + self.kp * err + self.ki * self.integ
-        if self.min_drive_pwm > 0.0:
-            if abs(v_meas) < self.kinetic_threshold_ms:
-                # Static-friction regime: ramp the PWM floor.
-                self.kick_tick_count += 1
-                t_frac = min(
-                    1.0,
-                    self.kick_tick_count / max(1, self.kick_ramp_ticks),
-                )
-                floor = self.min_drive_pwm * t_frac
-                if abs(pwm) < floor:
-                    pwm = math.copysign(floor, v_cmd)
-            else:
-                # Wheel is moving — kinetic regime, PI runs free.
-                self.kick_tick_count = 0
-        if pwm > 1.0:
-            pwm = 1.0
-        elif pwm < -1.0:
-            pwm = -1.0
-        return abs(pwm), "fwd" if pwm >= 0 else "rev"
+__all__ = ["WheelPI", "main"]
 
 
 @dataclass
 class MotionState:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    last_twist: dict[str, Any] | None = None
-    last_direct: dict[str, Any] | None = None
-    last_cmd_wall_s: float = 0.0
-    status_e_stop: bool = False
-    e_stop_latched: bool = False
-    awaiting_cmd_vel_after_clear: bool = False
+    arbiter: CommandArbiter = field(default_factory=CommandArbiter)
+    estop: EStopLatch = field(default_factory=EStopLatch)
+    last_hb_mono: float = 0.0
     stall_latched: bool = False
 
-def _command_is_all_stop(msg: dict[str, Any], *, direct: bool) -> bool:
-    """True if the message commands no motion (clears software stall latch)."""
-    if direct:
-        return abs(float(msg.get("left", 0.0))) < 1e-6 and abs(float(msg.get("right", 0.0))) < 1e-6
-    return abs(float(msg.get("linear", 0.0))) < 1e-6 and abs(float(msg.get("angular", 0.0))) < 1e-6
+
+class _RateLimitedLog:
+    def __init__(self, period_s: float = 1.0) -> None:
+        self.period_s = period_s
+        self._last: dict[str, float] = {}
+
+    def __call__(self, key: str, text: str) -> None:
+        now = time.monotonic()
+        if now - self._last.get(key, -1e9) >= self.period_s:
+            self._last[key] = now
+            print(text, flush=True)
+
+
+def _wheel_param(motor_cfg: dict[str, Any], key: str, side: str, default: float) -> float:
+    """Per-wheel override ``<key>_<side>`` falling back to ``<key>``."""
+    v = motor_cfg.get(f"{key}_{side}")
+    if v is None:
+        v = motor_cfg.get(key, default)
+    return float(v)
 
 
 def main() -> None:
@@ -128,19 +79,31 @@ def main() -> None:
     velocity_kp = float(motor_cfg.get("velocity_kp", 0.5))
     velocity_ki = float(motor_cfg.get("velocity_ki", 2.0))
     velocity_integ_limit = float(motor_cfg.get("velocity_integ_limit", 0.5))
-    min_drive_pwm = float(motor_cfg.get("min_drive_pwm", 0.0))
+    velocity_integ_max_duty = float(motor_cfg.get("velocity_integ_max_duty", 0.2))
     kinetic_threshold_ms = float(motor_cfg.get("kinetic_threshold_ms", 0.02))
+    static_threshold_ms = float(motor_cfg.get("static_threshold_ms", 0.5 * kinetic_threshold_ms))
+    regime_confirm_ticks = int(motor_cfg.get("regime_confirm_ticks", 2))
     kick_ramp_ticks = int(motor_cfg.get("kick_ramp_ticks", 5))
-    pi_left = WheelPI(
-        velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm,
-        kinetic_threshold_ms=kinetic_threshold_ms,
-        kick_ramp_ticks=kick_ramp_ticks,
-    )
-    pi_right = WheelPI(
-        velocity_kp, velocity_ki, velocity_integ_limit, min_drive_pwm,
-        kinetic_threshold_ms=kinetic_threshold_ms,
-        kick_ramp_ticks=kick_ramp_ticks,
-    )
+    kick_escalation_per_s = float(motor_cfg.get("kick_escalation_per_s", 0.0))
+    cmd_timeout_default_ms = float(motor_cfg.get("cmd_timeout_ms", 500))
+    cmd_timeout_max_ms = float(motor_cfg.get("cmd_timeout_max_ms", 1000))
+    hb_timeout_s = float(body_cfg.get("watchdog", {}).get("heartbeat_timeout_ms", 2000)) / 1000.0
+
+    def _make_pi(side: str) -> WheelPI:
+        return WheelPI(
+            velocity_kp, velocity_ki, velocity_integ_limit,
+            _wheel_param(motor_cfg, "min_drive_pwm", side, 0.0),
+            kinetic_threshold_ms=kinetic_threshold_ms,
+            kick_ramp_ticks=kick_ramp_ticks,
+            kinetic_pwm=_wheel_param(motor_cfg, "ff_kinetic_pwm", side, 0.0),
+            static_threshold_ms=static_threshold_ms,
+            regime_confirm_ticks=regime_confirm_ticks,
+            integ_max_duty=velocity_integ_max_duty,
+            kick_escalation_per_s=kick_escalation_per_s,
+        )
+
+    pi_left = _make_pi("left")
+    pi_right = _make_pi("right")
     if encoders_wanted and not gpio_enabled:
         print(
             "motor_controller: encoders_enabled requires gpio_enabled — encoder GPIO skipped.",
@@ -175,8 +138,8 @@ def main() -> None:
                 )
                 if not both_encoders_live:
                     print(
-                        "motor_controller: only one encoder enabled — odom.source stays "
-                        "'commanded_vel_playback' (see docs/encoder_integration_spec.md §6).",
+                        "motor_controller: only one encoder enabled — pose is NOT integrated, "
+                        "odom.source='none' (see docs/encoder_integration_spec.md §6).",
                         flush=True,
                     )
             else:
@@ -191,199 +154,240 @@ def main() -> None:
             flush=True,
         )
 
-    state = MotionState()
-    session = zenoh_helpers.open_session(body_cfg)
+    state = MotionState(arbiter=CommandArbiter(max_timeout_ms=cmd_timeout_max_ms))
+    log_rl = _RateLimitedLog(1.0)
     stop = threading.Event()
-    stall_begin_wall: float | None = None
-    left_ticks_total = 0
-    right_ticks_total = 0
+
+    def _zero_pwm() -> None:
+        if gpio_h is not None and gpio_pins is not None:
+            try:
+                motor_gpio.apply_outputs(gpio_h, gpio_pins, 0.0, 0.0, "fwd", "fwd")
+            except Exception:
+                motor_gpio.zero_outputs(gpio_pins)
+
+    def handle_stop_signal(_sig: int, _frame: Any) -> None:
+        stop.set()
+
+    # SIGHUP too: a launcher started from an SSH session must not leave PWM running.
+    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(_sig, handle_stop_signal)
+
+    try:
+        session = zenoh_helpers.open_session(body_cfg)
+    except Exception:
+        if gpio_h is not None and gpio_pins is not None:
+            motor_gpio.shutdown(gpio_h, gpio_pins)
+        raise
+
+    def _on_motion(kind: str, msg: dict[str, Any]) -> None:
+        try:
+            if kind == "twist":
+                a, b, timeout_ms = parse_cmd_vel(msg, cmd_timeout_default_ms)
+            else:
+                a, b, timeout_ms = parse_cmd_direct(msg, cmd_timeout_default_ms)
+        except CommandError as e:
+            topic = "body/cmd_vel" if kind == "twist" else "body/cmd_direct"
+            log_rl(f"bad_{kind}", f"motor_controller: ignoring malformed {topic}: {e}")
+            return
+        now_mono = time.monotonic()
+        with state.lock:
+            if state.stall_latched and abs(a) < 1e-6 and abs(b) < 1e-6:
+                state.stall_latched = False
+            state.arbiter.store(kind, a, b, timeout_ms, now_mono)
 
     def on_cmd_vel(_key: str, msg: dict[str, Any]) -> None:
-        with state.lock:
-            if state.stall_latched and _command_is_all_stop(msg, direct=False):
-                state.stall_latched = False
-            state.last_twist = msg
-            state.last_cmd_wall_s = time.time()
-            if state.awaiting_cmd_vel_after_clear:
-                state.e_stop_latched = False
-                state.awaiting_cmd_vel_after_clear = False
+        _on_motion("twist", msg)
 
     def on_cmd_direct(_key: str, msg: dict[str, Any]) -> None:
-        with state.lock:
-            if state.stall_latched and _command_is_all_stop(msg, direct=True):
-                state.stall_latched = False
-            state.last_direct = msg
-            state.last_cmd_wall_s = time.time()
-            if state.awaiting_cmd_vel_after_clear:
-                state.e_stop_latched = False
-                state.awaiting_cmd_vel_after_clear = False
+        _on_motion("direct", msg)
 
     def on_emergency_stop(_key: str, msg: dict[str, Any]) -> None:
         print(f"motor_controller: emergency_stop {msg}", flush=True)
         with state.lock:
-            state.e_stop_latched = True
-            state.awaiting_cmd_vel_after_clear = False
+            state.estop.on_emergency_stop()
 
     def on_status(_key: str, msg: dict[str, Any]) -> None:
-        e_active = bool(msg.get("e_stop_active", False))
         with state.lock:
-            state.status_e_stop = e_active
-            if e_active:
-                state.e_stop_latched = True
-                state.awaiting_cmd_vel_after_clear = False
-            else:
-                if state.e_stop_latched:
-                    state.awaiting_cmd_vel_after_clear = True
+            state.estop.on_status(bool(msg.get("e_stop_active", False)))
+
+    def on_heartbeat(_key: str, _msg: dict[str, Any]) -> None:
+        with state.lock:
+            state.last_hb_mono = time.monotonic()
+
+    def on_estop_rearm(_key: str, msg: dict[str, Any]) -> None:
+        with state.lock:
+            hb_ok = state.last_hb_mono > 0.0 and (time.monotonic() - state.last_hb_mono) < hb_timeout_s
+            was = state.estop.latched
+            cleared = state.estop.on_rearm(hb_ok)
+        if cleared:
+            print(f"motor_controller: e-stop re-armed by {msg.get('source', '?')}", flush=True)
+        elif was:
+            print("motor_controller: estop_rearm refused — heartbeat not ok", flush=True)
 
     zenoh_helpers.declare_subscriber_json(session, "body/cmd_vel", on_cmd_vel)
     zenoh_helpers.declare_subscriber_json(session, "body/cmd_direct", on_cmd_direct)
     zenoh_helpers.declare_subscriber_json(session, "body/emergency_stop", on_emergency_stop)
     zenoh_helpers.declare_subscriber_json(session, "body/status", on_status)
+    zenoh_helpers.declare_subscriber_json(session, "body/heartbeat", on_heartbeat)
+    zenoh_helpers.declare_subscriber_json(session, "body/estop_rearm", on_estop_rearm)
 
     pose = diff_drive.Pose(0.0, 0.0, 0.0)
+    session_id = secrets.token_hex(4)
+    odom_seq = 0
+    stall_begin_mono: float | None = None
+    left_ticks_total = 0
+    right_ticks_total = 0
+    last_drain_mono: float | None = None
+    last_pub_mono: float | None = None
+    consecutive_errors = 0
+    print(f"motor_controller: odom session_id={session_id}", flush=True)
 
-    def handle_sigterm(_sig: int, _frame: Any) -> None:
-        stop.set()
+    def tick() -> None:
+        nonlocal pose, odom_seq, stall_begin_mono, left_ticks_total, right_ticks_total
+        nonlocal last_drain_mono, last_pub_mono
 
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    signal.signal(signal.SIGINT, handle_sigterm)
+        delta_left_ticks = 0
+        delta_right_ticks = 0
+        if encoders is not None:
+            if encoders.get("left") is not None:
+                delta_left_ticks = int(encoders["left"].drain())
+            if encoders.get("right") is not None:
+                delta_right_ticks = int(encoders["right"].drain())
+        now_mono = time.monotonic()
+        # Measured interval between drains (velocity), not the nominal period.
+        dt = period if last_drain_mono is None else max(1e-4, now_mono - last_drain_mono)
+        last_drain_mono = now_mono
+
+        dl_m = diff_drive.ticks_to_delta_m(delta_left_ticks, wheel_radius_m, ticks_per_rev)
+        dr_m = diff_drive.ticks_to_delta_m(delta_right_ticks, wheel_radius_m, ticks_per_rev)
+        v_left_enc = dl_m / dt
+        v_right_enc = dr_m / dt
+
+        with state.lock:
+            active = state.arbiter.select(now_mono)
+            e_stop = state.estop.active
+            cmd_stale = active is None
+            cmd_timeout_active = not e_stop and cmd_stale
+
+            left_pwm = right_pwm = 0.0
+            left_dir = right_dir = "fwd"
+            vx_cmd = vtheta_cmd = 0.0
+            vl_cmd = vr_cmd = 0.0
+
+            if not e_stop and active is not None:
+                if active.kind == "direct":
+                    vl_cmd, vr_cmd = active.a, active.b
+                    vx_cmd = (vl_cmd + vr_cmd) / 2.0
+                    vtheta_cmd = (vr_cmd - vl_cmd) / wheel_base_m if wheel_base_m > 0 else 0.0
+                else:
+                    vl_cmd, vr_cmd = diff_drive.twist_to_wheel_velocities(active.a, active.b, wheel_base_m)
+                    vx_cmd, vtheta_cmd = active.a, active.b
+                if velocity_loop_enabled and both_encoders_live:
+                    left_pwm, left_dir = pi_left.step(vl_cmd, v_left_enc, dt, max_wheel_vel_ms)
+                    right_pwm, right_dir = pi_right.step(vr_cmd, v_right_enc, dt, max_wheel_vel_ms)
+                else:
+                    left_pwm, left_dir = diff_drive.pwm_from_velocity(vl_cmd, max_wheel_vel_ms)
+                    right_pwm, right_dir = diff_drive.pwm_from_velocity(vr_cmd, max_wheel_vel_ms)
+            else:
+                pi_left.reset()
+                pi_right.reset()
+
+            max_cmd_pwm = max(left_pwm, right_pwm)
+
+            if stall_detect_enabled and not state.stall_latched and not e_stop and active is not None:
+                if max_cmd_pwm > STALL_PWM_THRESHOLD and max(abs(v_left_enc), abs(v_right_enc)) < STALL_VELOCITY_EPS_MS:
+                    if stall_begin_mono is None:
+                        stall_begin_mono = now_mono
+                    elif (now_mono - stall_begin_mono) * 1000.0 >= float(stall_detect_ms):
+                        state.stall_latched = True
+                        stall_begin_mono = None
+                else:
+                    stall_begin_mono = None
+            else:
+                stall_begin_mono = None
+
+            stall_active = state.stall_latched
+            if stall_active:
+                left_pwm = right_pwm = 0.0
+                left_dir = right_dir = "fwd"
+                pi_left.reset()
+                pi_right.reset()
+
+        if gpio_h is not None and gpio_pins is not None:
+            motor_gpio.apply_outputs(gpio_h, gpio_pins, left_pwm, right_pwm, left_dir, right_dir)
+
+        left_ticks_total += delta_left_ticks
+        right_ticks_total += delta_right_ticks
+
+        if both_encoders_live:
+            # Always the measured wheel motion (coasting / pushed robot is real motion).
+            vx = (v_left_enc + v_right_enc) / 2.0
+            vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
+            pose = diff_drive.integrate_odometry(pose, dl_m, dr_m, wheel_base_m)
+            odom_source = "wheel_encoders"
+        else:
+            # No (or one) encoder: never integrate a one-sided pose. Report the
+            # commanded velocity only while a command is actually being executed.
+            moving = not (e_stop or cmd_stale or stall_active)
+            vx = vx_cmd if moving else 0.0
+            vtheta = vtheta_cmd if moving else 0.0
+            odom_source = "none"
+
+        pub_mono = time.monotonic()
+        dt_ms = period * 1000.0 if last_pub_mono is None else (pub_mono - last_pub_mono) * 1000.0
+        last_pub_mono = pub_mono
+        ts = schemas.now_ts()
+        zenoh_helpers.publish_json(
+            session,
+            "body/odom",
+            schemas.odom(
+                ts=ts,
+                x=pose.x,
+                y=pose.y,
+                theta=pose.theta,
+                vx=vx,
+                vtheta=vtheta,
+                left_ticks=left_ticks_total,
+                right_ticks=right_ticks_total,
+                dt_ms=round(dt_ms, 2),
+                source=odom_source,
+                session_id=session_id,
+                seq=odom_seq,
+            ),
+        )
+        odom_seq += 1
+        zenoh_helpers.publish_json(
+            session,
+            "body/motor_state",
+            schemas.motor_state(
+                ts=ts,
+                left_pwm=left_pwm,
+                right_pwm=right_pwm,
+                left_dir=left_dir,
+                right_dir=right_dir,
+                e_stop_active=e_stop,
+                cmd_timeout_active=cmd_timeout_active,
+                stall_detected=stall_active,
+            ),
+        )
 
     next_tick = time.monotonic()
     try:
         while not stop.is_set():
-            now_wall = time.time()
-            delta_left_ticks = 0
-            delta_right_ticks = 0
-            if encoders is not None:
-                if encoders.get("left") is not None:
-                    delta_left_ticks = int(encoders["left"].drain())
-                if encoders.get("right") is not None:
-                    delta_right_ticks = int(encoders["right"].drain())
-
-            with state.lock:
-                twist = state.last_twist
-                direct = state.last_direct
-                cmd_wall = state.last_cmd_wall_s
-                e_stop = state.e_stop_latched or state.status_e_stop
-                direct_ts = float(direct["ts"]) if direct else 0.0
-                use_direct = direct is not None and (twist is None or (twist is not None and direct_ts >= float(twist["ts"])))
-                active = direct if use_direct else twist
-                timeout_ms = int(active.get("timeout_ms", 500)) if active else 500
-                cmd_stale = active is None or (now_wall - cmd_wall) * 1000.0 > timeout_ms
-                cmd_timeout_active = not e_stop and cmd_stale
-
-                left_pwm = right_pwm = 0.0
-                left_dir = right_dir = "fwd"
-                vx_cmd = vtheta_cmd = 0.0
-                vl_cmd = vr_cmd = 0.0
-
-                dl_m = diff_drive.ticks_to_delta_m(delta_left_ticks, wheel_radius_m, ticks_per_rev)
-                dr_m = diff_drive.ticks_to_delta_m(delta_right_ticks, wheel_radius_m, ticks_per_rev)
-                v_left_enc = dl_m / period if period > 0 else 0.0
-                v_right_enc = dr_m / period if period > 0 else 0.0
-
-                if not e_stop and not cmd_stale and active is not None:
-                    if use_direct and direct is not None:
-                        vl_cmd = float(direct["left"])
-                        vr_cmd = float(direct["right"])
-                        vx_cmd = (vl_cmd + vr_cmd) / 2.0
-                        vtheta_cmd = (vr_cmd - vl_cmd) / wheel_base_m if wheel_base_m > 0 else 0.0
-                    elif twist is not None:
-                        lin = float(twist["linear"])
-                        ang = float(twist["angular"])
-                        vl_cmd, vr_cmd = diff_drive.twist_to_wheel_velocities(lin, ang, wheel_base_m)
-                        vx_cmd = lin
-                        vtheta_cmd = ang
-                    if velocity_loop_enabled and both_encoders_live:
-                        left_pwm, left_dir = pi_left.step(vl_cmd, v_left_enc, period, max_wheel_vel_ms)
-                        right_pwm, right_dir = pi_right.step(vr_cmd, v_right_enc, period, max_wheel_vel_ms)
-                    else:
-                        left_pwm, left_dir = diff_drive.pwm_from_velocity(vl_cmd, max_wheel_vel_ms)
-                        right_pwm, right_dir = diff_drive.pwm_from_velocity(vr_cmd, max_wheel_vel_ms)
-                else:
-                    pi_left.reset()
-                    pi_right.reset()
-
-                max_cmd_pwm = max(left_pwm, right_pwm)
-
-                if stall_detect_enabled and not state.stall_latched and not e_stop and not cmd_stale and active is not None:
-                    if max_cmd_pwm > STALL_PWM_THRESHOLD:
-                        if max(abs(v_left_enc), abs(v_right_enc)) < STALL_VELOCITY_EPS_MS:
-                            if stall_begin_wall is None:
-                                stall_begin_wall = now_wall
-                            elif (now_wall - stall_begin_wall) * 1000.0 >= float(stall_detect_ms):
-                                state.stall_latched = True
-                                stall_begin_wall = None
-                        else:
-                            stall_begin_wall = None
-                    else:
-                        stall_begin_wall = None
-                else:
-                    stall_begin_wall = None
-
-                stall_active = state.stall_latched
-                if stall_active:
-                    left_pwm = right_pwm = 0.0
-                    left_dir = right_dir = "fwd"
-                    pi_left.reset()
-                    pi_right.reset()
-
-                if both_encoders_live:
-                    vx = (v_left_enc + v_right_enc) / 2.0
-                    vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
-                elif dl_m != 0.0 or dr_m != 0.0:
-                    vx = (v_left_enc + v_right_enc) / 2.0
-                    vtheta = (v_right_enc - v_left_enc) / wheel_base_m if wheel_base_m > 0 else 0.0
-                else:
-                    vx = vx_cmd
-                    vtheta = vtheta_cmd
-
-                if e_stop or cmd_stale or stall_active:
-                    vx = 0.0
-                    vtheta = 0.0
-
-            if gpio_h is not None and gpio_pins is not None:
-                motor_gpio.apply_outputs(gpio_h, gpio_pins, left_pwm, right_pwm, left_dir, right_dir)
-
-            left_ticks_total += delta_left_ticks
-            right_ticks_total += delta_right_ticks
-
-            dt_ms = int(round(period * 1000))
-            pose = diff_drive.integrate_odometry(pose, dl_m, dr_m, wheel_base_m)
-            ts = schemas.now_ts()
-            odom_source = (
-                "wheel_encoders" if both_encoders_live else "commanded_vel_playback"
-            )
-            zenoh_helpers.publish_json(
-                session,
-                "body/odom",
-                schemas.odom(
-                    ts=ts,
-                    x=pose.x,
-                    y=pose.y,
-                    theta=pose.theta,
-                    vx=vx,
-                    vtheta=vtheta,
-                    left_ticks=left_ticks_total,
-                    right_ticks=right_ticks_total,
-                    dt_ms=dt_ms,
-                    source=odom_source,
-                ),
-            )
-            zenoh_helpers.publish_json(
-                session,
-                "body/motor_state",
-                schemas.motor_state(
-                    ts=ts,
-                    left_pwm=left_pwm,
-                    right_pwm=right_pwm,
-                    left_dir=left_dir,
-                    right_dir=right_dir,
-                    e_stop_active=e_stop,
-                    cmd_timeout_active=cmd_timeout_active,
-                    stall_detected=stall_active,
-                ),
-            )
+            try:
+                tick()
+                consecutive_errors = 0
+            except Exception:
+                # Never leave the motors driven on an unexpected error: zero PWM,
+                # reset the loops, log, keep ticking (exit if it keeps failing).
+                _zero_pwm()
+                pi_left.reset()
+                pi_right.reset()
+                consecutive_errors += 1
+                log_rl("tick_error", f"motor_controller: control tick failed (PWM zeroed):\n{traceback.format_exc()}")
+                if consecutive_errors >= TICK_ERROR_EXIT_COUNT:
+                    print("motor_controller: too many consecutive tick errors — exiting", flush=True)
+                    raise
 
             next_tick += period
             sleep_for = next_tick - time.monotonic()
@@ -392,11 +396,21 @@ def main() -> None:
             else:
                 next_tick = time.monotonic()
     finally:
-        session.close()
-        if encoders is not None:
-            motor_gpio.close_quadrature_encoders(encoders)
+        # PWM off FIRST — session.close() can block; the motors must not wait on it.
         if gpio_h is not None and gpio_pins is not None:
-            motor_gpio.shutdown(gpio_h, gpio_pins)
+            try:
+                motor_gpio.shutdown(gpio_h, gpio_pins)
+            except Exception:
+                motor_gpio.zero_outputs(gpio_pins)
+        if encoders is not None:
+            try:
+                motor_gpio.close_quadrature_encoders(encoders)
+            except Exception:
+                pass
+        try:
+            session.close()
+        except Exception:
+            pass
 
     sys.exit(0)
 
