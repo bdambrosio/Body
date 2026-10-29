@@ -154,7 +154,7 @@ Sole owner of the BNO085 i²c transaction. Reads SH-2 FIFO reports, assembles a 
 - Drive RST low for ≥ 10 µs, release, wait ≥ 100 ms for SH-2 boot.
 - Enable SH-2 reports with an explicit `report_interval` (the Adafruit library default is 50 ms ≈ 20 Hz, which is what the driver used to get):
   - Rotation Vector **or** Game Rotation Vector: `imu.report_interval_ms` (default 10 ms → 100 Hz)
-  - Accelerometer: `imu.accel_report_interval_ms` (10 ms); Gyroscope: `imu.gyro_report_interval_ms` (10 ms)
+  - Accelerometer: `imu.accel_report_interval_ms` (50 ms); Gyroscope: `imu.gyro_report_interval_ms` (50 ms) — only the rotation vector runs at 10 ms; three 100 Hz reports saturate the 100 kHz I2C bus (measured ~12 Hz unique output, 2026-10-28)
   - Rotation Vector for mag-when-idle (only if enabled): `imu.mag_report_interval_ms` (50 ms)
   - Linear Acceleration: optional, at the accel interval
   - Older `adafruit_bno08x` without the `report_interval` kwarg: the driver sends the SH-2 Set Feature command itself via the library's private helpers, or logs a warning and accepts the default.
@@ -186,7 +186,7 @@ If `rotation_vector` accuracy exceeds the threshold for ≥ N consecutive report
 
 The BNO085 auto-calibrates gyro bias at rest in the first ~1–2 s. During that window the SH-2 accuracy field is high. The driver:
 
-- Holds off publishing until `fusion.accuracy_rad` first drops below `imu.calibration_stable_threshold_rad` (default 0.087 rad ≈ 5°), **and** at least `imu.settle_time_s` (default 2.0) of wall time has elapsed since driver start (or re-init), **and** `imu.settle_still_reports` (default 50) consecutive fresh reports had |gyro| ≤ `imu.settle_still_gyro_rad_s` (0.05 rad/s). The stillness requirement is waived after `imu.settle_max_wait_s` (10 s) with a log line; the accuracy requirement never is. Note: in `game_rotation_vector` mode accuracy is the constant `game_rotation_vector_accuracy_rad`, so the accuracy gate is effectively time-only — stillness is the real gate.
+- Holds off publishing until `fusion.accuracy_rad` first drops below `imu.calibration_stable_threshold_rad` (default 0.087 rad ≈ 5°), **and** at least `imu.settle_time_s` (default 2.0) of wall time has elapsed since driver start (or re-init), **and** `imu.settle_still_reports` (default 50) consecutive fresh reports had |gyro| ≤ `imu.settle_still_gyro_rad_s` (0.1 rad/s; the BNO085 gyro carries a ~0.03–0.04 rad/s static bias before calibration, so 0.05 never settled). The stillness requirement is waived after `imu.settle_max_wait_s` (10 s) with a log line; the accuracy requirement never is. Note: in `game_rotation_vector` mode accuracy is the constant `game_rotation_vector_accuracy_rad`, so the accuracy gate is effectively time-only — stillness is the real gate.
 - While settling, the driver publishes a one-shot stdout line at 1 Hz showing current accuracy so operators know to keep the robot stationary.
 - Optionally (§9), publishes a `calibrating`/`ready` status signal — TBD whether this rides on `body/status` or a new `body/imu_status` topic. v1: print-only.
 
@@ -203,14 +203,14 @@ Suggested keys (implementer may trim on first pass):
   "interrupt_gpio": 17,
   "publish_hz": 100,                       // unused: rate = report rate
   "report_interval_ms": 10,
-  "gyro_report_interval_ms": 10,
-  "accel_report_interval_ms": 10,
+  "gyro_report_interval_ms": 50,
+  "accel_report_interval_ms": 50,
   "mag_report_interval_ms": 50,
   "poll_interval_ms": 2,
   "stale_reinit_ms": 200,
   "first_report_timeout_s": 2.0,
   "max_reinit_attempts": 3,
-  "settle_still_gyro_rad_s": 0.05,
+  "settle_still_gyro_rad_s": 0.1,
   "settle_still_reports": 50,
   "settle_max_wait_s": 10.0,
   "mag_when_idle_enabled": false,
