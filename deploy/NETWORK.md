@@ -10,7 +10,23 @@ How the Raspberry Pi's WiFi should be configured for stable zenoh communication 
   - SSID `GL-MT3000-bee` (2.4 GHz) — **use this for the Pi**
   - SSID `GL-MT3000-bee-5G` (5 GHz) — **avoid for the Pi**; less range through walls
 - Bot subnet is **192.168.8.0/24** with the router at **192.168.8.1**.
-- The Pi gets a DHCP lease somewhere in 192.168.8.x; the desktop is reachable at **192.168.8.60** in our setup.
+- The Pi is at **192.168.8.60** (`raspberrypi.lan`); Zenoh clients connect to `tcp/192.168.8.60:7447`. The desktop gets a DHCP lease (192.168.8.208 on 2026-10-28) and resolves as `bruce-TRX50-WS.lan` via the MT3000's DNS.
+
+## WiFi power save — turn it off on both ends
+
+With power save on, an adapter sleeps between beacons and holds frames until it wakes. Measured 2026-10-28 with good signal on both links (−48/−54 dBm): desktop↔Pi round trip averaged 170–240 ms with 550 ms peaks; with power save off on both, 9 ms average, 31 ms max. Teleop commands expire after 500 ms, so the defaults make driving stutter.
+
+```bash
+# Pi (one time; the second line persists across reboots)
+sudo iw dev wlan1 set power_save off
+sudo nmcli connection modify GL-MT3000-bee 802-11-wireless.powersave 2
+
+# Desktop (wlp68s0 here)
+sudo iw dev wlp68s0 set power_save off
+sudo nmcli connection modify GL-MT3000-bee 802-11-wireless.powersave 2
+
+iw dev wlan1 get power_save        # expect: Power save: off
+```
 
 ## Pi WiFi interfaces
 
@@ -84,7 +100,7 @@ nmcli device status
 
 ip addr show wlan1                # inet 192.168.8.XX/24
 ping -c 3 192.168.8.1             # gateway (MT3000)
-ping -c 3 192.168.8.60            # desktop
+ping -c 3 bruce-TRX50-WS.lan      # desktop
 
 sudo systemctl restart body-launcher
 sudo journalctl -u body-launcher -f --since="30 sec ago"
@@ -103,7 +119,7 @@ sudo apt install chrony                      # replaces systemd-timesyncd
 sudo cp ~/Body/deploy/chrony-body.conf /etc/chrony/conf.d/body.conf
 sudo systemctl enable --now chrony chrony-wait.service
 sudo systemctl daemon-reload                 # body-launcher.service is ordered After=time-sync.target
-chronyc sources -v; chronyc tracking         # expect the desktop (192.168.8.60) selected, offset < a few ms
+chronyc sources -v; chronyc tracking         # expect the desktop (bruce-TRX50-WS.lan) selected, offset < a few ms
 ```
 
 On the **desktop**, serve time to the bot subnet even without internet (chrony on the desktop):
