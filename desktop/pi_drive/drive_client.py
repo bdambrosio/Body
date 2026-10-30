@@ -105,6 +105,9 @@ class DriveClient:
         self._ack_thread.start()
         return True, None
 
+    def is_connected(self) -> bool:
+        return self._session is not None
+
     def shutdown(self) -> None:
         self._ack_stop.set()
         if self._ack_thread is not None and self._ack_thread.is_alive():

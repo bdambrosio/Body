@@ -605,6 +605,7 @@ class NavMainWindow(QMainWindow):
         self._liveness.tick()
         self._refresh_fuser_panel()
         self._refresh_chassis_panel()
+        self._open_drive_client_early()
         # Dock groups only consume ticks when visible. Each group owns
         # its own snapshot builder so nav doesn't have to know which
         # state fields either group reads.
@@ -1248,23 +1249,42 @@ class NavMainWindow(QMainWindow):
             logger.exception("could not prepare drive-trace dir")
             return None
 
-    def _ensure_drive_client(self) -> bool:
-        """Lazily open the DriveClient session (own zenoh session for
-        body/drive/goto + status + scan) on the first Go. Returns True once
-        a connected client is available; warns and returns False otherwise.
-        Closed in closeEvent."""
+    def _ensure_drive_client(self, quiet: bool = False) -> bool:
+        """Open the DriveClient session (own zenoh session for
+        body/drive/goto + status + odom + scan) if needed. Returns True once
+        a connected client is available; otherwise warns (unless ``quiet``)
+        and returns False. Closed in closeEvent."""
         if self._drive_client is None:
             self._drive_client = DriveClient(
                 self.chassis_config.router,
                 trace_path=self._new_drive_trace_path())
         ok, err = self._drive_client.connect()
         if not ok:
-            QMessageBox.warning(
-                self, "Hierarchical drive",
-                f"Drive client connect failed:\n{err}",
-            )
+            if quiet:
+                logger.warning("drive client connect failed: %s", err)
+            else:
+                QMessageBox.warning(
+                    self, "Hierarchical drive",
+                    f"Drive client connect failed:\n{err}",
+                )
             return False
         return True
+
+    def _open_drive_client_early(self) -> None:
+        """Subscribe to odom/scan as soon as the chassis connects, so the
+        first Go doesn't find them empty (opening on Go raced the first
+        message and refused with "No odom/scan"). Retries every 5 s."""
+        if self._drive_client is not None and self._drive_client.is_connected():
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_drive_client_retry_at", 0.0):
+            return
+        with self.chassis.state.lock:
+            connected = self.chassis.state.connected
+        if not connected:
+            return
+        self._drive_client_retry_at = now + 5.0
+        self._ensure_drive_client(quiet=True)
 
     def _ensure_handoff_gate(self) -> Optional[HandoffGate]:
         """Lazily open the handoff-inspector session + gate (HO-1/HO-2 records
@@ -1310,6 +1330,13 @@ class NavMainWindow(QMainWindow):
                 "Live cmd (teleop) is armed — turn it off before Go.",
             )
             return
+        # Backstop for a Go right after connect: give the first odom/scan
+        # (both stream continuously, ~20 Hz / ~7 Hz) up to 1 s to arrive.
+        deadline = time.monotonic() + 1.0
+        while (self._drive_client.odom_pose() is None
+               or self._drive_client.latest_scan() is None) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
         if self._drive_client.odom_pose() is None or self._drive_client.latest_scan() is None:
             QMessageBox.warning(
                 self, "Hierarchical drive",
