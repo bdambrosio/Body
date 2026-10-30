@@ -52,6 +52,22 @@ class TestSettleGate(unittest.TestCase):
         g = SettleGate(2.0, 0.087, 0.05, 1, 5.0, now_mono=0.0)
         self.assertFalse(g.update(100.0, 0.2, 0.0))
 
+    def test_quick_reset_settles_while_moving(self):
+        g = SettleGate(2.0, 0.18, 0.05, 50, 10.0, now_mono=0.0, quick_time_s=0.3)
+        g.update(2.0, 0.1, 0.0)
+        g.reset(20.0, quick=True)                          # mid-run re-init
+        self.assertFalse(g.update(20.1, 0.1, 0.6))         # before quick_time_s
+        self.assertTrue(g.update(20.35, 0.1, 0.6))         # rotating, still settles
+        self.assertFalse(g.forced)
+        self.assertTrue(g.update(20.4, 0.1, 0.6))
+
+    def test_quick_reset_keeps_accuracy_gate_and_plain_reset_is_full(self):
+        g = SettleGate(2.0, 0.087, 0.05, 3, 10.0, now_mono=0.0, quick_time_s=0.3)
+        g.reset(0.0, quick=True)
+        self.assertFalse(g.update(1.0, 0.2, 0.0))          # accuracy still gates
+        g.reset(10.0)                                      # boot-style reset
+        self.assertFalse(g.update(10.5, 0.1, 0.0))         # needs settle_time_s again
+
 
 class _FakeNew:
     def __init__(self):

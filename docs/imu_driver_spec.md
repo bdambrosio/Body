@@ -186,7 +186,7 @@ If `rotation_vector` accuracy exceeds the threshold for ≥ N consecutive report
 
 The BNO085 auto-calibrates gyro bias at rest in the first ~1–2 s. During that window the SH-2 accuracy field is high. The driver:
 
-- Holds off publishing until `fusion.accuracy_rad` first drops below `imu.calibration_stable_threshold_rad` (default 0.087 rad ≈ 5°), **and** at least `imu.settle_time_s` (default 2.0) of wall time has elapsed since driver start (or re-init), **and** `imu.settle_still_reports` (default 50) consecutive fresh reports had |gyro| ≤ `imu.settle_still_gyro_rad_s` (0.1 rad/s; the BNO085 gyro carries a ~0.03–0.04 rad/s static bias before calibration, so 0.05 never settled). The stillness requirement is waived after `imu.settle_max_wait_s` (10 s) with a log line; the accuracy requirement never is. Note: in `game_rotation_vector` mode accuracy is the constant `game_rotation_vector_accuracy_rad`, so the accuracy gate is effectively time-only — stillness is the real gate.
+- Holds off publishing until `fusion.accuracy_rad` first drops below `imu.calibration_stable_threshold_rad` (default 0.087 rad ≈ 5°), **and** at least `imu.settle_time_s` (default 2.0) of wall time has elapsed since driver start (or re-init), **and** `imu.settle_still_reports` (default 50) consecutive fresh reports had |gyro| ≤ `imu.settle_still_gyro_rad_s` (0.1 rad/s; the BNO085 gyro carries a ~0.03–0.04 rad/s static bias before calibration, so 0.05 never settled). The stillness requirement is waived after `imu.settle_max_wait_s` (10 s) with a log line; the accuracy requirement never is. **After a mid-run re-init** (§6.3 step 4) the gate is quick: only `imu.reinit_settle_time_s` (default 0.3 s) plus the accuracy requirement, no stillness — the robot is usually moving, consumers re-baseline on the new `session_id`, and waiting for stillness blanked heading for the full 10 s. Note: in `game_rotation_vector` mode accuracy is the constant `game_rotation_vector_accuracy_rad`, so the accuracy gate is effectively time-only — stillness is the real gate.
 - While settling, the driver publishes a one-shot stdout line at 1 Hz showing current accuracy so operators know to keep the robot stationary.
 - Optionally (§9), publishes a `calibrating`/`ready` status signal — TBD whether this rides on `body/status` or a new `body/imu_status` topic. v1: print-only.
 
@@ -213,6 +213,7 @@ Suggested keys (implementer may trim on first pass):
   "settle_still_gyro_rad_s": 0.1,
   "settle_still_reports": 50,
   "settle_max_wait_s": 10.0,
+  "reinit_settle_time_s": 0.3,
   "mag_when_idle_enabled": false,
   "fusion_mode": "rotation_vector",
   "fusion_fallback": "game_rotation_vector",

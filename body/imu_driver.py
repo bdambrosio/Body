@@ -342,7 +342,12 @@ class SettleGate:
     """Boot-time settle: wait ``settle_time_s``, accuracy within threshold, and
     ``still_reports`` consecutive fresh reports with |gyro| below ``still_gyro_radps``
     (so a restart while moving does not lock in a biased yaw). The stillness
-    requirement is waived after ``max_wait_s`` (``forced`` is then True)."""
+    requirement is waived after ``max_wait_s`` (``forced`` is then True).
+
+    ``reset(now, quick=True)`` is for a mid-run re-init: the robot is usually
+    moving and consumers re-baseline yaw on the new session, so waiting for
+    stillness only blanks heading for ``max_wait_s``. Quick mode settles after
+    ``quick_time_s`` with no stillness requirement."""
 
     def __init__(
         self,
@@ -352,19 +357,22 @@ class SettleGate:
         still_reports: int,
         max_wait_s: float,
         now_mono: float,
+        quick_time_s: float = 0.3,
     ) -> None:
         self.settle_time_s = float(settle_time_s)
         self.accuracy_threshold_rad = float(accuracy_threshold_rad)
         self.still_gyro_radps = float(still_gyro_radps)
         self.still_reports = max(0, int(still_reports))
         self.max_wait_s = max(self.settle_time_s, float(max_wait_s))
+        self.quick_time_s = max(0.0, float(quick_time_s))
         self.reset(now_mono)
 
-    def reset(self, now_mono: float) -> None:
+    def reset(self, now_mono: float, quick: bool = False) -> None:
         self.start_mono = now_mono
         self.still_count = 0
         self.settled = False
         self.forced = False
+        self.quick = bool(quick)
 
     def update(self, now_mono: float, accuracy_rad: float, gyro_norm_radps: float) -> bool:
         if self.settled:
@@ -374,9 +382,10 @@ class SettleGate:
         else:
             self.still_count = 0
         elapsed = now_mono - self.start_mono
-        if elapsed < self.settle_time_s or accuracy_rad > self.accuracy_threshold_rad:
+        min_time_s = self.quick_time_s if self.quick else self.settle_time_s
+        if elapsed < min_time_s or accuracy_rad > self.accuracy_threshold_rad:
             return False
-        if self.still_count >= self.still_reports:
+        if self.quick or self.still_count >= self.still_reports:
             self.settled = True
         elif elapsed >= self.max_wait_s:
             self.settled = True
@@ -403,6 +412,7 @@ def main() -> None:
     settle_still_gyro = float(imu_cfg.get("settle_still_gyro_rad_s", 0.05))
     settle_still_reports = int(imu_cfg.get("settle_still_reports", 50))
     settle_max_wait_s = float(imu_cfg.get("settle_max_wait_s", 10.0))
+    reinit_settle_time_s = float(imu_cfg.get("reinit_settle_time_s", 0.3))
     linear_accel_enabled = bool(imu_cfg.get("linear_accel_enabled", False))
     mag_when_idle_enabled = bool(imu_cfg.get("mag_when_idle_enabled", False))
     mag_idle_pwm_threshold = float(imu_cfg.get("mag_idle_pwm_threshold", 0.02))
@@ -548,6 +558,7 @@ def main() -> None:
         settle_still_reports,
         settle_max_wait_s,
         time.monotonic(),
+        quick_time_s=reinit_settle_time_s,
     )
 
     def _motors_idle() -> bool:
@@ -665,7 +676,7 @@ def main() -> None:
                 seq = 0
                 resets_baseline = int(getattr(bno, "_sh2_resets", 0))
                 fresh.reset(time.time())
-                settle.reset(time.monotonic())
+                settle.reset(time.monotonic(), quick=True)
                 fallback_count = 0
                 print(f"imu_driver: new session {session_id}.", flush=True)
                 continue
@@ -691,7 +702,8 @@ def main() -> None:
                 if settle.update(now_mono, accuracy_rad, gyro_norm):
                     elapsed = now_mono - settle.start_mono
                     print(
-                        f"imu_driver: settled after {elapsed:.2f}s, "
+                        f"imu_driver: settled after {elapsed:.2f}s"
+                        f"{' (re-init)' if settle.quick else ''}, "
                         f"accuracy_rad={accuracy_rad:.4f}"
                         f"{' (stillness not reached; forced after max wait)' if settle.forced else ''}"
                         ". Publishing body/imu.",
