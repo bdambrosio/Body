@@ -79,7 +79,7 @@
     "linear_accel_enabled": false,
     "reset_gpio": 25,
     "gpio_chip": 0,
-    "report_interval_ms": 10,
+    "report_interval_ms": 25,
     "gyro_report_interval_ms": 50,
     "accel_report_interval_ms": 50,
     "mag_report_interval_ms": 50,

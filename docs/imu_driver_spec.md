@@ -202,7 +202,7 @@ Suggested keys (implementer may trim on first pass):
   "reset_gpio": 25,
   "interrupt_gpio": 17,
   "publish_hz": 100,                       // unused: rate = report rate
-  "report_interval_ms": 10,
+  "report_interval_ms": 25,
   "gyro_report_interval_ms": 50,
   "accel_report_interval_ms": 50,
   "mag_report_interval_ms": 50,
