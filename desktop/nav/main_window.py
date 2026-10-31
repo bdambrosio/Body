@@ -748,10 +748,10 @@ class NavMainWindow(QMainWindow):
             self._refresh_hier_overlay(pose)
         # Tier-3 depth memory: shown whether or not a drive is running.
         try:
-            st = (self._drive_client.latest_status()
-                  if self._drive_client is not None else None)
+            drive_st = (self._drive_client.latest_status()
+                        if self._drive_client is not None else None)
             self._cameras.set_depth_memory(
-                st.get("depth_mem_body") if isinstance(st, dict) else None)
+                drive_st.get("depth_mem_body") if isinstance(drive_st, dict) else None)
         except Exception:
             logger.exception("depth-memory overlay failed; skipping")
 
