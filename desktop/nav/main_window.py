@@ -1296,7 +1296,7 @@ class NavMainWindow(QMainWindow):
             if self._prior_cache is None or self._prior_cache[0] != mkey:
                 rm = self.fuser.reference_map
                 prior = resample_prior(
-                    rm.driveable,
+                    rm.driveable_int8(),
                     {"resolution_m": rm.resolution_m, "origin_x_m": rm.origin_x_m,
                      "origin_y_m": rm.origin_y_m}, meta)
                 self._prior_cache = (mkey, prior)
