@@ -525,6 +525,89 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(len(io.sent), 3, io.sent)
         self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
 
+    # ── Review fixes (10-31 afternoon) ────────────────────────────────
+
+    def test_fan_goal_exempt_from_drift_repick(self):
+        # A fan hop moves the robot off the carrot bearing by design; the
+        # drift test must not abort it (re-sending the straight bearing that
+        # just failed). It runs to Tier-3 ARRIVED.
+        hd, io = self._fan_select(_clear_scan(), mem=self.BAG, wp=(2.0, 0.0))
+        self.assertEqual(len(io.sent), 1)
+        bx, by, _t, _v = io.sent[0]
+        self.assertGreater(abs(by), 0.3)                     # it IS a fan goal
+        po = hd._pose
+        # 40 % along the hop: bearing to the carrot has moved well past 20°.
+        po.pose = (0.4 * bx, 0.4 * by, 0.0)
+        io.set_status(cmd_id=1, state="DRIVING", mode="follow", ts=5.0)
+        for k in range(5):
+            hd.tick(1.0 + 0.1 * k)
+        self.assertEqual(len(io.sent), 1, io.sent)           # no drift re-pick
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        # Straight goals still drift-re-pick (unchanged behaviour).
+        hd2, io2, po2 = self._build(points=((2.0, 0.0),))
+        self._drive_to_sending(hd2)
+        po2.pose = (0.5, 0.6, 0.0)
+        io2.set_status(cmd_id=1, state="DRIVING", mode="follow", ts=5.0)
+        hd2.tick(1.0)
+        hd2.tick(1.1)
+        self.assertEqual(len(io2.sent), 2)
+
+    def test_snapped_arrival_without_motion_is_a_block(self):
+        # Tier-2 "clear" goal that Tier-3 knows is blocked → it ARRIVEs at a
+        # snapped endpoint where it stands. Counting that as progress re-picks
+        # the same goal from the same spot forever (10 Hz, no motion).
+        hd, io, po = self._build(points=((2.0, 0.0),))
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="IDLE", plan_reason="snapped", ts=2.0)
+        hd.tick(1.0)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "arrived_no_motion")
+        self.assertEqual(len(io.sent), 1)
+        # Same arrival after real motion → ordinary progress re-pick.
+        hd, io, po = self._build(points=((2.0, 0.0),))
+        self._drive_to_sending(hd)
+        po.pose = (0.3, 0.0, 0.0)
+        io.set_status(cmd_id=1, state="IDLE", plan_reason="snapped", ts=2.0)
+        hd.tick(1.0)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        self.assertEqual(len(io.sent), 2)
+        # A plain arrival (reached the goal) is never a block, moved or not.
+        hd, io, po = self._build(points=((2.0, 0.0),))
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="IDLE", ts=2.0)
+        hd.tick(1.0)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+
+    def test_retry_that_drives_resets_block_window(self):
+        # Block at t=0, retry at 0.5 s drives 1 m, second (unrelated) block at
+        # t=9.8 s: the window must not be "exhausted" by the first one.
+        hd, io, po = self._build(points=((3.0, 0.0),))
+        self._drive_to_sending(hd)
+        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="depth_block", ts=0.1)
+        hd.tick(0.0)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        hd.tick(0.6)                                          # retry goto (cmd 2)
+        self.assertEqual(len(io.sent), 2)
+        po.pose = (1.0, 0.0, 0.0)
+        io.set_status(cmd_id=2, state="DRIVING", mode="follow", ts=1.0)
+        hd.tick(1.0)
+        io.set_status(cmd_id=2, state="BLOCKED", blocked_reason="depth_block", ts=9.8)
+        hd.tick(9.8)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        hd.tick(10.4)                                         # still inside a fresh window
+        self.assertEqual(len(io.sent), 3, "window was charged for the first block")
+
+    def test_fan_ray_walks_back_to_a_point_that_gains_ground(self):
+        # Carrot close and off to the right; a left fan ray's far end loses
+        # ground but its near part gains: the ray must be used, not dropped.
+        wall = [(0.45, -5.0, 0.45, 5.0)]                     # straight blocked
+        hd, io = self._fan_select(self._seg_scan(wall), wp=(0.9, -0.25))
+        if io.sent:
+            bx, by, _t, _v = io.sent[0]
+            self.assertLess(math.hypot(0.9 - bx, -0.25 - by), math.hypot(0.9, 0.25))
+        else:
+            self.assertEqual(hd.block_reason(), "clear_run_failed")
+
     def test_select_clear_run_fail_blocks_not_blind(self):
         # When a live scan is present but the clear-run finds no usable point,
         # SELECT must BLOCKED (clear_run_failed) — never blind-project.

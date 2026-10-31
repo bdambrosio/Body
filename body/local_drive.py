@@ -30,6 +30,8 @@ cmd_vel producer.
 from __future__ import annotations
 
 import math
+
+import numpy as np
 import signal
 import sys
 import threading
@@ -42,6 +44,7 @@ from body.lib.buildinfo import git_sha
 from body.lib.depth_memory import rounded_xy
 from body.lib.handoff_gate import HandoffGate
 from body.lib.local_drive_core import (
+    STATE_IDLE,
     STATE_ARRIVED, STATE_FAULT, STATE_REJECTED, EStopMonitor, GotoArbiter,
     ImuYawCorrector, OdomRing, body_to_odom, quat_wxyz_to_yaw, wrap_pi,
 )
@@ -122,6 +125,7 @@ def main() -> None:
     last_imu: Optional[Dict[str, Any]] = None
     last_depth: Optional[Dict[str, Any]] = None
     mem_reset_reason: Optional[str] = None  # set by body/drive/depth_memory
+    last_done: Optional[tuple] = None       # (cmd_id, plan_reason) of the last ARRIVED
     odom_reset_pending = False
     imu_session: Optional[str] = None
     imu_seq: Optional[int] = None
@@ -265,7 +269,7 @@ def main() -> None:
 
     def tick(now_wall: float, now_mono: float) -> None:
         nonlocal tracked_cmd_id, was_active, odom_reset_pending, imu_rebaseline, mem_body
-        nonlocal mem_reset_reason
+        nonlocal mem_reset_reason, last_done
         with lock:
             rejects = arb.take_rejects()
             watermark = arb.watermark
@@ -314,7 +318,13 @@ def main() -> None:
             ctrl.observe_depth(depth, now_wall=now_wall, pose_now=raw_now,
                                pose_depth=pose_depth,
                                omega_radps=float(odom.get("vtheta", 0.0) or 0.0))
-            mem_body = rounded_xy(ctrl.memory.cells_body(raw_now), 64)
+            # Everything Tier-2 could march into (ahead/abeam, within its
+            # horizon + fan), not the 64 nearest: a truncated copy let it pick
+            # goals inside cells Tier-3 plans around (snapped from tick 1).
+            cells = ctrl.memory.cells_body(raw_now)
+            if len(cells):
+                cells = cells[(cells[:, 0] > -0.3) & (np.hypot(cells[:, 0], cells[:, 1]) < 2.0)]
+            mem_body = rounded_xy(cells, ctrl.memory.cfg.max_cells)
 
         if estop_on:
             if g is not None:
@@ -341,7 +351,12 @@ def main() -> None:
             tracked_cmd_id = None
             with lock:
                 state, cid, reason = arb.idle_status()
-            publish_status(state, cmd_id=cid, reason=reason)
+            # ARRIVED is one tick; the desktop usually sees the IDLE. Carry the
+            # arrival's plan_reason on it so a snapped/frontier (best-effort)
+            # endpoint is distinguishable from reaching the goal.
+            pr = (last_done[1] if state == STATE_IDLE and last_done is not None
+                  and last_done[0] == cid else None)
+            publish_status(state, cmd_id=cid, reason=reason, plan_reason=pr)
             return
 
         cmd_id = int(g.get("cmd_id", 0))
@@ -426,6 +441,7 @@ def main() -> None:
                       f"endpoint (residual {r.dist:.2f} m)", flush=True)
             with lock:
                 arb.finish(cmd_id)
+            last_done = (cmd_id, r.plan_reason) if r.state == STATE_ARRIVED else None
             ctrl.clear()
             tracked_cmd_id = None
 

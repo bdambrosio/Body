@@ -41,6 +41,11 @@ class LocalPlanConfig:
     # Snapped/frontier endpoints within this many cells of the closest
     # reachable distance are ties → cheapest path wins (stable endpoint).
     snap_tie_cells: float = 1.0
+    # Endpoint eligibility (see astar_toward detour_ratio): a best-effort
+    # endpoint stays on the robot's side of an obstacle instead of a long
+    # loop to a cell barely nearer on the far side.
+    frontier_detour_ratio: float = 3.0
+    frontier_detour_slack_cells: float = 4.0
 
 
 @dataclass
@@ -127,7 +132,8 @@ def plan_local(
         cost=cm.cost, lethal=lethal, start=(si, sj), goal=(gi, gj),
         cost_per_unit=cfg.cost_per_unit, h_weight=cfg.heuristic_weight,
         max_expansions=cfg.max_expansions, goal_ok=goal_ok,
-        tie_cells=cfg.snap_tie_cells)
+        tie_cells=cfg.snap_tie_cells, detour_ratio=cfg.frontier_detour_ratio,
+        detour_slack_cells=cfg.frontier_detour_slack_cells)
     elapsed = (time.monotonic() - t0) * 1000.0
     if cells is None or len(cells) <= 1:
         # Nothing reachable is nearer the goal than where we stand. If the

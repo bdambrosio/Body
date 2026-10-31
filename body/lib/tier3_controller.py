@@ -32,7 +32,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from body.lib.depth_memory import DepthMemoryConfig, DepthObstacleMemory, stamp_blocked
+from body.lib.depth_memory import (
+    DepthMemoryConfig, DepthObstacleMemory, plan_cells, stamp_blocked,
+)
 from body.lib.depth_veto import DepthVetoConfig, DepthVetoTracker
 from body.lib.drive_safety import (
     FootprintConfig, explained_unknown_mask, seed_clear_disk,
@@ -54,6 +56,12 @@ Pose = Tuple[float, float, float]
 
 # Endpoint kinds that are a best-effort stand-in for the requested goal.
 PARTIAL_ENDPOINTS = ("snapped", "frontier")
+# Consecutive goal-reaching plans before a snapped/frontier latch is cleared.
+LATCH_OK_TICKS = 3
+# A latched endpoint whose path exceeds this × the straight goal distance is
+# a detour: the fresh (shorter) plan wins. Same rule as the desktop's
+# detour re-pick (HierConfig.detour_ratio).
+LATCH_DETOUR_RATIO = 3.0
 
 
 @dataclass(frozen=True)
@@ -149,6 +157,7 @@ class Tier3Controller:
         self.prev_path_odom: Optional[List[Point2]] = None
         self.prev_reason: Optional[str] = None
         self.endpoint_odom: Optional[Point2] = None
+        self.goal_ok_ticks = 0                 # consecutive plans that reached the goal
         self.terminal: Optional[str] = None
         self.terminal_ticks = 0
         self.last_tick: Optional[float] = None
@@ -242,11 +251,11 @@ class Tier3Controller:
         if len(self.memory):
             # Remembered depth obstacles are hits for the planner AND the
             # swept veto: an arc into one is refused before the robot moves.
-            stamp_blocked(work, meta,
-                          self.memory.cells_body(pose_scan_raw or pose_scan),
-                          keep_clear_xy=(rel[0], rel[1]),
-                          keep_clear_radius_m=max(cfg.seed_clear_radius_m,
-                                                  cfg.memory.plan_exclude_radius_m))
+            cells = plan_cells(self.memory.cells_body(pose_scan_raw or pose_scan),
+                               rel, cfg.memory.plan_exclude_radius_m,
+                               cfg.memory.plan_exclude_half_angle_deg)
+            stamp_blocked(work, meta, cells, keep_clear_xy=(rel[0], rel[1]),
+                          keep_clear_radius_m=cfg.seed_clear_radius_m)
         explained = (explained_unknown_mask(work, foot.unknown_explained_cells)
                      if foot.block_on_unknown else None)
         cm = build_local_costmap(work, meta, cfg.plan.costmap)
@@ -429,7 +438,9 @@ class Tier3Controller:
         if not plan.ok:
             if plan.reason != "at_frontier":
                 self.endpoint_odom = None
+            self.goal_ok_ticks = 0
             return plan
+        self.goal_ok_ticks = self.goal_ok_ticks + 1 if plan.reason == "ok" else 0
         res_m = float(meta["resolution_m"])
         new_end = plan.goal_body_snapped or plan.path_body[-1]
         new_d = math.hypot(new_end[0] - goal_s[0], new_end[1] - goal_s[1])
@@ -449,14 +460,30 @@ class Tier3Controller:
             elif p2.reason == "at_frontier":
                 kept = replace(p2, reason="at_frontier")
             if kept is not None:
+                # The goal cell flickers lethal/non-lethal as the body-aligned
+                # grid re-quantizes (inflation edge): an "ok" plan clears the
+                # latch only after LATCH_OK_TICKS consecutive ok plans.
+                if plan.reason == "ok" and self.goal_ok_ticks < LATCH_OK_TICKS:
+                    return kept
                 # Switch only to an endpoint that is clearly closer to the
                 # goal AND not bought with a long detour (a far gap in a
-                # dotted wall is not worth 20 cm of goal distance locally).
+                # dotted wall is not worth 20 cm of goal distance locally) —
+                # or when the LATCHED path has become a real detour: longer
+                # than LATCH_DETOUR_RATIO × the straight distance to the goal
+                # and longer than the fresh path (one-sided, the old code kept
+                # a 6.6 m loop over a 0.6 m path, 10-31). Ratio to the goal
+                # distance, not to the fresh path: around a small post the
+                # two sides' paths differ by up to ~1 m and alternate as the
+                # grid re-quantizes — switching on that flips the rotation.
                 gain = old_d - new_d
                 len_new = path_remaining_m(plan.path_body, (rel[0], rel[1]))
                 len_old = (path_remaining_m(p2.path_body, (rel[0], rel[1]))
                            if p2.ok else 0.0)
-                if gain <= 1.0 * res_m or len_new > len_old + 2.0 * gain + 0.3:
+                d_goal = math.hypot(goal_s[0] - rel[0], goal_s[1] - rel[1])
+                old_is_detour = (len_old > LATCH_DETOUR_RATIO * max(d_goal, 0.2) + 0.3
+                                 and len_old > len_new + 0.3)
+                if not old_is_detour and (
+                        gain <= 1.0 * res_m or len_new > len_old + 2.0 * gain + 0.3):
                     return kept
         # The goal itself (reason ok) or a clearly better endpoint wins.
         self.endpoint_odom = None if plan.reason == "ok" else body_to_odom(new_end, pose_scan)

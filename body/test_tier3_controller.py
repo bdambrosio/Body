@@ -450,12 +450,76 @@ class TestDepthMemoryNoCreep(unittest.TestCase):
             return r
 
         r = first_moves(0.20)
-        self.assertEqual(r.state, "DRIVING", r)
-        self.assertGreater(r.v, 0.0)                       # translates at once
+        self.assertEqual(r.state, "DRIVING", r)            # not start_blocked
         self.assertEqual(r.plan_reason, "ok")
+        # Cells AHEAD stay (the camera can't see that close): the plan does
+        # not drive through them — it leaves backwards/around.
+        self.assertLess(r.path_body[1][0], 0.05, r.path_body[:3])
         pinned = first_moves(0.0)                           # old behaviour
-        self.assertFalse(pinned.state == "DRIVING" and pinned.v > 0
-                         and pinned.plan_reason == "ok", pinned)
+        self.assertFalse(pinned.state == "DRIVING" and pinned.plan_reason == "ok",
+                         pinned)
+
+    def test_behind_only_cells_do_not_slow_departure(self):
+        import numpy as np
+        from body.lib.depth_memory import DepthMemoryConfig
+        behind = np.array([[-0.14, 0.0], [-0.1, 0.1], [-0.1, -0.1], [0.0, 0.14], [0.0, -0.14]])
+        ctrl = Tier3Controller(replace(T3, memory=DepthMemoryConfig(enabled=True)))
+        ctrl.memory.cells_body = lambda pose: behind
+        ctrl.memory.__class__ = type("Pinned", (type(ctrl.memory),),
+                                     {"__len__": lambda self: len(behind)})
+        ctrl.start_goal(Tier3Goal(1, 1.0, 0.0, 0.12), 0.0, (0.0, 0.0, 0.0))
+        g, m = rasterize_scan(raycast((0.0, 0.0, 0.0), []), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+        r = ctrl.step(now_mono=0.0, now_wall=0.0, pose_now=(0.0, 0.0, 0.0),
+                      pose_scan=(0.0, 0.0, 0.0), grid=g, meta=m)
+        self.assertEqual((r.state, r.plan_reason), ("DRIVING", "ok"))
+        self.assertGreater(r.v, 0.0)
+
+
+class TestEndpointLatch(unittest.TestCase):
+    """_latch_endpoint: a latched snapped/frontier endpoint must not survive
+    once the path to it has become a long detour (10-31: a 6.6 m loop kept
+    over a 0.6 m near-side path for 6 s of rotating in place), and an "ok"
+    plan clears a latch only after LATCH_OK_TICKS consecutive ticks (the
+    goal cell flickers lethal/non-lethal at an inflation edge)."""
+
+    WALL_FAR_GAP = [(0.5, -W, 0.5, 1.0), (0.5, 1.8, 0.5, W)]
+
+    def _plan(self, ctrl, segs, goal):
+        from body.lib.local_costmap import build_local_costmap
+        from body.lib.drive_safety import seed_clear_disk
+        pose = (0.0, 0.0, 0.0)
+        g, m = rasterize_scan(raycast(pose, segs), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+        work = g.copy()
+        seed_clear_disk(work, m, (0.0, 0.0), T3.seed_clear_radius_m)
+        cm = build_local_costmap(work, m, T3.plan.costmap)
+        plan = plan_local(work, m, goal, T3.plan, costmap=cm, start_body=(0.0, 0.0))
+        return ctrl._latch_endpoint(plan, work, m, cm, goal, pose, pose), plan
+
+    def test_latched_loop_yields_to_short_near_side_path(self):
+        ctrl = Tier3Controller(T3)
+        ctrl.start_goal(Tier3Goal(1, 0.5, 0.0, 0.12), 0.0, (0.0, 0.0, 0.0))
+        # Goal ON the wall (snapped). Latch: a far-side point a little closer
+        # to it than the near-side snap, reachable only via the far gap.
+        ctrl.endpoint_odom = (0.7, 0.1)
+        chosen, fresh = self._plan(ctrl, self.WALL_FAR_GAP, (0.5, 0.0))
+        self.assertIn(fresh.reason, ("frontier", "snapped"))
+        self.assertLess(path_remaining_m(chosen.path_body), 1.0,
+                        "kept the loop over the near-side path")
+        self.assertLess(max(x for x, _y in chosen.path_body), 0.5)
+
+    def test_ok_plan_clears_latch_only_after_consecutive_ticks(self):
+        ctrl = Tier3Controller(T3)
+        ctrl.start_goal(Tier3Goal(1, 0.9, 0.0, 0.12), 0.0, (0.0, 0.0, 0.0))
+        ctrl.endpoint_odom = (0.4, 0.0)            # a near-side latch
+        reasons = []
+        for _ in range(tc.LATCH_OK_TICKS + 1):
+            chosen, fresh = self._plan(ctrl, [], (0.9, 0.0))   # open floor: ok
+            self.assertEqual(fresh.reason, "ok")
+            reasons.append(chosen.reason)
+        self.assertEqual(reasons[:tc.LATCH_OK_TICKS - 1],
+                         ["snapped"] * (tc.LATCH_OK_TICKS - 1))
+        self.assertEqual(reasons[-1], "ok")
+        self.assertIsNone(ctrl.endpoint_odom)
 
 
 if __name__ == "__main__":

@@ -242,6 +242,8 @@
       "ttl_s": 30.0,
       "keep_radius_m": 3.0,
       "plan_exclude_radius_m": 0.2,
+      "plan_exclude_half_angle_deg": 45.0,
+      "max_abs_omega_radps": 0.7,
       "max_range_m": 0.8
     },
     "depth_veto": {

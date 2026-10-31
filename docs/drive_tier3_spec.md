@@ -80,12 +80,12 @@ refused during e-stop — is reported as `FAULT:<reason>` under its `cmd_id`
 | `v_mps`, `omega_radps` | float | commanded velocity this tick |
 | `blocked_reason` | str? | BLOCKED: `boxed_in`\|`start_blocked`\|`goal_out_of_map`\|`swept_block`\|`depth_block`\|`no_progress`\|`deadline`\|`rotate_timeout`\|`no_scan`; FAULT: `odom_stale`\|`odom_reset`\|`e_stop`\|`internal_error` |
 | `mode` | str? | `follow`\|`rotate`\|`realign`\|`held`\|`plan` — `rotate`/`realign` = turning in place (the desktop must not re-pick on bearing drift then) |
-| `plan_reason` | str? | `ok`\|`snapped`\|`frontier`; on `ARRIVED`, `snapped`/`frontier` = reached the best reachable stand-in for an unreachable goal |
+| `plan_reason` | str? | `ok`\|`snapped`\|`frontier`; on `ARRIVED` (and the `IDLE` right after it, same `cmd_id`), `snapped`/`frontier` = reached the best reachable stand-in for an unreachable goal |
 | `path_body_xy` | list? | the A\* path being followed (display/inspector) |
 | `depth_hits`, `depth_seq` | int? | with `depth_block`: veto hit count and the depth frame's `seq` |
 | `depth_bbox_px` | [u0,v0,u1,v1,w,h]? | with `depth_block`: bounding box of the veto hits in that depth image (for the VLM) |
 | `depth_hit_body` | list? | with `depth_block`: body-frame [x,y] of the veto hits (≤ 32, nearest first) |
-| `depth_mem_body` | list? | any state: depth-memory cells (live body frame, ≤ 64, nearest first) that Tier-3 plans around; Tier-2 marches around them too |
+| `depth_mem_body` | list? | any state: depth-memory cells (live body frame; all cells with x > −0.3 m within 2 m, ≤ 400, nearest first) that Tier-3 plans around; Tier-2 marches around them too |
 | `build` | str? | Pi git sha — the desktop flags a stale deploy |
 
 ## cmd_vel ownership (arbitration)
@@ -178,11 +178,27 @@ is transport + lifecycle.
    reset — **not** on a new goal; out of view it is kept. Frames while
    |ω| > `max_abs_omega_radps` are skipped. `enabled: false` = old behaviour.
    Planning (Tier-3 and Tier-2) ignores cells within `plan_exclude_radius_m`
-   (0.2 m) of the robot — stale cells there (robot carried; camera near
-   blind zone) otherwise pin it (`start_blocked`). The desktop publishes
+   (0.2 m) of the robot that are beside or behind it (|bearing| >
+   `plan_exclude_half_angle_deg`, 45°) — stale cells there (robot carried;
+   camera near blind zone) otherwise pin it (`start_blocked`). Cells ahead
+   within the radius stay in the grid for both the planner and the swept
+   veto: the camera cannot see below ~0.18 m, so a remembered low obstacle
+   just ahead is the only thing besides lidar guarding the next 20 cm.
+   Memory frames are skipped above 0.7 rad/s (looser than the veto's 0.4:
+   each frame is placed with the odom pose at its capture time). The desktop publishes
    `body/drive/depth_memory` `{"action": "reset", "reason": …}` on Go,
    relocate / set-location and the "Clear depth memory" button; wheel odom
    cannot see the robot being picked up.
+
+Best-effort endpoints (snapped / frontier): A* ranks reachable cells by
+distance to the goal, but a cell whose path is longer than 3 × its
+straight-line distance from the robot + 4 cells is not eligible (a cell one
+cell nearer on the far side of a wall via a long loop; 10-31). Tier-3
+latches the first such endpoint in odom; a fresh plan replaces it only when
+clearly closer and not bought with a detour, or when the latched path has
+itself become a detour (> 3 × the goal distance and longer than the fresh
+path); an `ok` plan clears the latch after 3 consecutive ok ticks (the goal
+cell flickers at an inflation edge).
 
 Terminal conditions:
 

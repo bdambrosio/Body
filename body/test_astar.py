@@ -52,6 +52,23 @@ class TestAStarToward(unittest.TestCase):
         self.assertLess(cells[-1][1], 6)
         self.assertLess(_octile_d(cells[-1], goal), _octile_d((2, 2), goal))
 
+    def test_unreachable_goal_does_not_loop_to_far_side(self):
+        # 10-31: wall across the grid with the only gap far away; the goal
+        # sits just behind the wall. The Euclidean-nearest reachable cell is
+        # on the FAR side (one cell from the goal) via a long loop through the
+        # gap; the endpoint must stay on the robot's side instead.
+        cost, lethal = _grids(30)
+        lethal[:, 12:14] = True        # two-cell-thick wall; the goal is IN it
+        lethal[27:29, 12:14] = False   # gap at rows 27-28
+        start, goal = (3, 3), (3, 13)
+        cells, _n, msg = astar_toward(cost=cost, lethal=lethal, start=start, goal=goal)
+        self.assertEqual(msg, "frontier")
+        self.assertLess(cells[-1][1], 12, cells[-1])          # near side (2 cells off)
+        self.assertLess(len(cells), 15)                        # no loop
+        cells0, _n, _m = astar_toward(cost=cost, lethal=lethal, start=start,
+                                      goal=goal, detour_ratio=0.0)
+        self.assertGreater(cells0[-1][1], 13)                  # old: far side (1 cell off)
+
     def test_boxed_in_returns_start_only(self):
         cost, lethal = _grids()
         lethal[1:4, 1:4] = True

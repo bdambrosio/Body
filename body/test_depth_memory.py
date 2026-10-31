@@ -15,7 +15,7 @@ import numpy as np
 
 from body.lib.depth_memory import (
     DepthMemoryConfig, DepthObstacleMemory, memory_config_from_dict,
-    rounded_xy, stamp_blocked,
+    plan_cells, rounded_xy, stamp_blocked,
 )
 from body.lib.depth_veto import DepthVetoConfig, _cam_to_body_Rt
 
@@ -236,6 +236,20 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(n, 1)                 # near-robot and off-grid skipped
         self.assertEqual(grid[8, 5], 0)
         self.assertEqual(int(np.count_nonzero(grid == 0)), 1)
+
+    def test_plan_cells_excludes_only_beside_and_behind(self):
+        cells = np.array([[0.15, 0.0], [0.0, 0.15], [-0.15, 0.0], [0.15, 0.14], [0.5, 0.0]])
+        out = plan_cells(cells, (0.0, 0.0, 0.0), 0.2, 45.0)
+        kept = {tuple(p) for p in out.tolist()}
+        self.assertIn((0.15, 0.0), kept)       # ahead, within radius: kept
+        self.assertIn((0.5, 0.0), kept)        # beyond radius: kept
+        self.assertNotIn((0.0, 0.15), kept)    # abeam: dropped
+        self.assertNotIn((-0.15, 0.0), kept)   # behind: dropped
+        # Robot yawed 90°: "ahead" rotates with it.
+        out = plan_cells(cells, (0.0, 0.0, math.pi / 2), 0.2, 45.0)
+        kept = {tuple(p) for p in out.tolist()}
+        self.assertIn((0.0, 0.15), kept)
+        self.assertNotIn((0.15, 0.0), kept)
 
     def test_rounded_xy_nearest_first(self):
         pts = np.array([[1.0, 0.0], [0.2, 0.0], [0.5, 0.123456]])

@@ -30,8 +30,10 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Protocol, Tuple
 
+import numpy as np
+
 from body.lib import drive_config, schemas, zenoh_helpers
-from body.lib.depth_memory import memory_config_from_dict, stamp_blocked
+from body.lib.depth_memory import memory_config_from_dict, plan_cells, stamp_blocked
 from body.lib.local_costmap import build_local_costmap, dilate_bool
 from body.lib.local_drive_core import wrap_pi
 from body.lib.scan_raster import rasterize_scan
@@ -212,6 +214,18 @@ class HierConfig:
     detour_min_path_m: float = 0.8
     detour_ticks: int = 5
     detour_max_repicks: int = 2
+    # A retry that has really moved this far (world pose since its send) has
+    # got past what blocked it: the consecutive-block retry window restarts,
+    # so a second, unrelated block later in the same leg isn't charged for
+    # the first one's time ("window exhausted" after 1 m of driving).
+    retry_progress_m: float = 0.20
+    # Tier-3 ARRIVED/IDLE at a snapped/frontier endpoint (plan_reason, also
+    # carried on the IDLE after it) with the robot not having moved and the
+    # sub-goal not a tiny hop = a Tier-2 "clear" goal Tier-3 knows is
+    # blocked (e.g. depth memory). That is a block, not progress — a
+    # goto→ARRIVED loop otherwise runs at 10 Hz with no motion, invisible to
+    # the retry window, until leg_deadline_s.
+    arrived_min_motion_m: float = 0.05
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
@@ -294,10 +308,8 @@ class HierarchicalDrive:
         body_cfg = zenoh_helpers.load_body_config()
         self._raster = drive_config.scan_raster_config(body_cfg)
         # Same near-robot exclusion as Tier-3 when stamping its depth memory.
-        self._mem_exclude_m = max(
-            self._raster.robot_clear_radius_m,
-            memory_config_from_dict((body_cfg.get("local_drive") or {})
-                                    .get("depth_memory")).plan_exclude_radius_m)
+        self._mem_cfg = memory_config_from_dict(
+            (body_cfg.get("local_drive") or {}).get("depth_memory"))
         plan_cfg = drive_config.local_plan_config(body_cfg)
         self._costmap_cfg = plan_cfg.costmap
         self._goal_clearance_cells = plan_cfg.goal_clearance_cells
@@ -309,6 +321,9 @@ class HierarchicalDrive:
         self._detour_last_ts: Optional[float] = None
         self._detour_repicks = 0                    # per leg
         self._prefer_fan = False                    # next SELECT: fan before straight
+        self._sent_src: Optional[str] = None        # clear | fan | blind of the live goto
+        self._sent_pose_xy: Optional[Tuple[float, float]] = None   # world pose at send
+        self._sent_dist: float = 0.0                # |sub-goal| at send
         self._prev_waypoint_xy: Optional[Tuple[float, float]] = None  # last vertex left
         self._state = HierState.IDLE
         self._cmd_id: Optional[int] = None
@@ -727,6 +742,9 @@ class HierarchicalDrive:
         self._sent_bearing = bearing
         self._sent_world_bearing = _world_bearing(pose, (cx, cy))
         self._sent_correction_seq = self._pose_correction_seq()
+        self._sent_src = src
+        self._sent_pose_xy = (pose[0], pose[1])
+        self._sent_dist = math.hypot(bx, by)
         self._subgoal_body = (bx, by)
         self._block_reason = None
         logger.info(
@@ -782,8 +800,11 @@ class HierarchicalDrive:
             mem = self._depth_memory_body()
             if mem:
                 grid = grid.copy()
-                stamp_blocked(grid, meta, mem, keep_clear_xy=(0.0, 0.0),
-                              keep_clear_radius_m=self._mem_exclude_m)
+                cells = plan_cells(np.asarray(mem, dtype=float), (0.0, 0.0, 0.0),
+                                   self._mem_cfg.plan_exclude_radius_m,
+                                   self._mem_cfg.plan_exclude_half_angle_deg)
+                stamp_blocked(grid, meta, cells, keep_clear_xy=(0.0, 0.0),
+                              keep_clear_radius_m=self._raster.robot_clear_radius_m)
             # March on Tier-3's footprint-inflated + goal-clearance lethal mask
             # (its exact costmap model), not the raw scan: a "clear" point here
             # is a goal Tier-3 accepts without snapping, and the 2-D inflation
@@ -861,20 +882,20 @@ class HierarchicalDrive:
                 d = r.free_dist_m
                 step = float(march_cfg.step_m)
                 wx = wy = 0.0
+                d_wp = math.inf
                 while d >= cfg.fan_min_free_m:
                     bx, by = d * ca, d * sa
                     wx = pose[0] + c * bx - s * by
                     wy = pose[1] + s * bx + c * by
-                    if _dist_to_segment((wx, wy), prev, carrot) <= cfg.fan_corridor_m:
+                    d_wp = math.hypot(carrot[0] - wx, carrot[1] - wy)
+                    if (_dist_to_segment((wx, wy), prev, carrot) <= cfg.fan_corridor_m
+                            and d_wp < wp_dist - 0.02):
                         break
                     d -= step
                 if d < cfg.fan_min_free_m:
                     continue
                 if d < r.free_dist_m:
                     r = replace(r, body_xy=(d * ca, d * sa), free_dist_m=d)
-                d_wp = math.hypot(carrot[0] - wx, carrot[1] - wy)
-                if d_wp >= wp_dist - 0.02:
-                    continue
                 if best is None or d_wp < best[0]:
                     best = (d_wp, r, dev)
             if best is not None:
@@ -944,6 +965,15 @@ class HierarchicalDrive:
             # the IDLE. Both mean "this sub-goal is done" → re-pick the next
             # one toward the same waypoint.
             if state in ("ARRIVED", "IDLE"):
+                moved = self._moved_since_send(pose)
+                if (st.get("plan_reason") in ("snapped", "frontier")
+                        and moved < self._cfg.arrived_min_motion_m
+                        and self._sent_dist >= self._cfg.subgoal_arrival_tol_m + 0.1):
+                    logger.info("hier: %s without motion (sub-goal %.2f m away, "
+                                "moved %.2f m) — treating as a block", state,
+                                self._sent_dist, moved)
+                    self._enter_blocked("arrived_no_motion")
+                    return
                 self._block_started_at = None      # sub-goal progress
                 self._block_gave_up = False
                 self._detour_repicks = 0
@@ -951,6 +981,12 @@ class HierarchicalDrive:
                 logger.info("hier: re-pick (sub-goal %s)", state)
                 self._to(HierState.SELECT_SUBGOAL)
                 return
+            if (state == "DRIVING" and self._block_started_at is not None
+                    and self._moved_since_send(pose) >= self._cfg.retry_progress_m):
+                logger.info("hier: retry drove %.2f m — block window reset",
+                            self._moved_since_send(pose))
+                self._block_started_at = None
+                self._block_gave_up = False
             if state in ("BLOCKED", "FAULT"):
                 self._enter_blocked(st.get("blocked_reason") or state)
                 return
@@ -987,8 +1023,13 @@ class HierarchicalDrive:
         # bounds (X1). Belt and braces: never drift-re-pick while Tier-3 says
         # it is rotating/realigning. The difference must be wrapped — a tiny
         # real drift across ±π would otherwise read as ~2π.
+        # A fan sub-goal moves the robot off the bearing ON PURPOSE; the
+        # bearing to the carrot changes by design and a drift re-pick would
+        # abort the hop (and re-send the straight bearing that failed). Fan
+        # hops run to Tier-3 ARRIVED/IDLE.
         if (self._waypoint is not None and self._sent_world_bearing is not None
-                and tier3_mode not in _TIER3_TURNING_MODES):
+                and tier3_mode not in _TIER3_TURNING_MODES
+                and self._sent_src != "fan"):
             b = _world_bearing(pose, self._waypoint)
             drift = abs(wrap_pi(b - self._sent_world_bearing))
             if drift > self._cfg.repick_hysteresis_rad:
@@ -996,6 +1037,11 @@ class HierarchicalDrive:
                             math.degrees(drift),
                             math.degrees(self._cfg.repick_hysteresis_rad))
                 self._to(HierState.SELECT_SUBGOAL)
+
+    def _moved_since_send(self, pose: Pose) -> float:
+        if self._sent_pose_xy is None:
+            return 0.0
+        return math.hypot(pose[0] - self._sent_pose_xy[0], pose[1] - self._sent_pose_xy[1])
 
     def _detour_check(self, st: Dict[str, Any]) -> bool:
         """See ``HierConfig.detour_*``. True when a re-pick was triggered."""

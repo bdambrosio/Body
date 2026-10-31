@@ -57,15 +57,23 @@ class DepthMemoryConfig:
     ttl_s: float = 30.0           # forget this long after the last confirming frame
     keep_radius_m: float = 3.0    # forget cells farther than this from the robot
     clear_radius_m: float = 0.11  # the robot's own footprint can't hold an obstacle
-    # Planning ignores remembered cells this close to the robot (they stay
-    # remembered). Up close the lidar, the swept check and the depth veto
-    # guard; a stale cell there (robot carried, or sitting in the camera's
-    # near blind zone where it can never be seen free) otherwise pins the
-    # robot: start-in-lethal → snapped goal → rotate_timeout (10-31).
+    # Planning ignores remembered cells this close to the robot AND beside or
+    # behind it (|bearing| > plan_exclude_half_angle); they stay remembered.
+    # A stale cell there (robot carried; camera near blind zone, never seen
+    # free again) otherwise pins the robot: start-in-lethal → snapped goal →
+    # rotate_timeout (10-31). Cells AHEAD within the radius are kept: the
+    # camera cannot see below ~0.18 m, so a remembered low obstacle just in
+    # front is the only thing besides lidar guarding the next 20 cm — it
+    # must stay in the grid the swept veto checks.
     plan_exclude_radius_m: float = 0.20
+    plan_exclude_half_angle_deg: float = 45.0
     min_range_m: float = 0.08     # forward (body x) window that is scored
     max_range_m: float = 0.80
-    max_abs_omega_radps: float = 0.40
+    # Frames while turning faster than this are skipped. Looser than the
+    # veto's 0.40: each frame is placed with the odom pose at its capture ts,
+    # and rotate-in-place commands 0.6 rad/s — at 0.40 a 130° turn taught
+    # the memory nothing, then the robot drove off blind (10-31).
+    max_abs_omega_radps: float = 0.70
     stale_s: float = 0.5
     max_cells: int = 400
 
@@ -276,6 +284,23 @@ def stamp_blocked(grid: np.ndarray, meta: Dict[str, Any], pts_body: np.ndarray,
     ok = (ix >= 0) & (ix < grid.shape[0]) & (iy >= 0) & (iy < grid.shape[1])
     grid[ix[ok], iy[ok]] = 0
     return int(np.count_nonzero(ok))
+
+
+def plan_cells(cells: np.ndarray, robot: Tuple[float, float, float],
+               exclude_radius_m: float, half_angle_deg: float) -> np.ndarray:
+    """Cells to stamp into a planning grid: ``cells`` (N,2 in that grid's
+    frame) minus those within ``exclude_radius_m`` of ``robot`` (x, y, yaw in
+    the same frame) that are beside/behind it (|bearing| > half_angle)."""
+    if cells is None or len(cells) == 0 or exclude_radius_m <= 0:
+        return cells
+    p = np.asarray(cells, dtype=np.float64).reshape(-1, 2)
+    dx = p[:, 0] - robot[0]
+    dy = p[:, 1] - robot[1]
+    near = np.hypot(dx, dy) < exclude_radius_m
+    bearing = np.arctan2(dy, dx) - robot[2]
+    bearing = (bearing + math.pi) % (2 * math.pi) - math.pi
+    aside = np.abs(bearing) > math.radians(half_angle_deg)
+    return p[~(near & aside)]
 
 
 def rounded_xy(pts: Optional[np.ndarray], limit: int) -> Optional[List[List[float]]]:

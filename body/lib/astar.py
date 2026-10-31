@@ -113,6 +113,8 @@ def astar_toward(
     max_expansions: int = 50_000,
     goal_ok: Optional[np.ndarray] = None,
     tie_cells: float = 0.0,
+    detour_ratio: float = 3.0,
+    detour_slack_cells: float = 4.0,
 ) -> Tuple[Optional[List[Cell]], int, str]:
     """Like ``astar_8c``, but goal-unreachable is not failure: return the path
     to the **reachable** cell closest to ``goal``. This is what makes the
@@ -129,7 +131,15 @@ def astar_toward(
     be the endpoint (e.g. extra goal clearance); when no reachable cell
     satisfies it, the best reachable cell is used anyway. ``tie_cells`` > 0
     treats endpoints within that many cells of the best distance as ties and
-    picks the cheapest of them.
+    picks the cheapest of them. ``detour_ratio``: a cell whose geometric
+    path length exceeds ``detour_ratio`` × its straight-line (octile)
+    distance from the start + ``detour_slack_cells`` is a detour and is not
+    eligible as an endpoint — a cell one cell nearer the goal on the far
+    side of a wall, reachable only via a 75-cell loop, must not beat the
+    near side (10-31: a 6 m loop for a 0.5 m goal, spinning in place toward
+    it). A hard gate, not a penalty: ranking among eligible cells stays pure
+    distance, so the bend around a post (ratio < 2) does not shuffle the
+    endpoint as the grid re-quantizes. 0 disables.
 
     Returns (cells_path, n_expansions, msg) with msg:
       * "ok"       — reached the goal exactly,
@@ -141,6 +151,7 @@ def astar_toward(
     if start == goal and goal_accept:
         return [start], 0, "ok"
     g: Dict[Cell, float] = {start: 0.0}
+    plen: Dict[Cell, float] = {start: 0.0}      # geometric path length (cells)
     parents: Dict[Cell, Cell] = {}
     open_heap: List[Tuple[float, int, Cell]] = []
     counter = 0
@@ -150,7 +161,13 @@ def astar_toward(
     gi, gj = goal
 
     def _key(c: Cell) -> Tuple[float, float]:
-        return (math.hypot(c[0] - gi, c[1] - gj), g[c])
+        d = math.hypot(c[0] - gi, c[1] - gj)
+        # Geometric length, not g: g carries costmap cost, which would brand
+        # a straight approach along a wall as a detour.
+        if (detour_ratio > 0 and c != start
+                and plen[c] > detour_ratio * _octile(start, c) + detour_slack_cells):
+            d += 1e6                        # ineligible unless nothing else progresses
+        return (d, g[c])
 
     start_key = _key(start)
     best_cell: Cell = start
@@ -188,6 +205,7 @@ def astar_toward(
             if prev is not None and tentative >= prev:
                 continue
             g[(ni, nj)] = tentative
+            plen[(ni, nj)] = plen[cur] + base
             parents[(ni, nj)] = cur
             counter += 1
             heapq.heappush(
