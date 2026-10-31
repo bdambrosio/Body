@@ -28,7 +28,7 @@ from __future__ import annotations
 import base64
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -305,16 +305,35 @@ def slab_hits_detail(
 def _slab_hits_from_points(
     dp: Optional[DepthPoints], cfg: DepthVetoConfig, *,
     v_mps: Optional[float], omega_radps: Optional[float],
+    path_body: Optional[Sequence[Tuple[float, float]]] = None,
+    denoise: Any = None,
 ) -> SlabHits:
+    """``path_body`` (body-frame polyline from the robot, e.g. Tier-3's
+    planned path): the corridor follows IT instead of the instantaneous
+    commanded arc — while turning, the arc projected 0.8 m ahead swept
+    through things the path curved away from within 0.3 m (10-31: every
+    surviving would-block was a real object beside the path). ``denoise``
+    (DenoiseConfig) applies the blob gates to the points in the corridor."""
     if dp is None:
         return SlabHits()
-    s_arc, lateral = _arc_coords(dp.pts[:, 0], dp.pts[:, 1], v_mps, omega_radps)
+    if path_body is not None and len(path_body) >= 2:
+        s_arc, lateral = _path_coords(dp.pts[:, 0], dp.pts[:, 1], path_body)
+    else:
+        s_arc, lateral = _arc_coords(dp.pts[:, 0], dp.pts[:, 1], v_mps, omega_radps)
     in_corridor = (
         (s_arc >= cfg.min_range_m)
         & (s_arc <= cfg.max_range_m)
         & (lateral <= cfg.lateral_half_width_m)
     )
-    m = obstacle_mask(dp, in_corridor, cfg)
+    if denoise is not None and getattr(denoise, "enabled", False):
+        from body.lib.depth_denoise import denoised_hits   # lazy: it imports this module
+        n, idx, _blobs = denoised_hits(dp, in_corridor, cfg, denoise)
+        if n == 0 or idx is None:
+            return SlabHits()
+        m = np.zeros(len(dp.pts), dtype=bool)
+        m[idx] = True
+    else:
+        m = obstacle_mask(dp, in_corridor, cfg)
     n = int(np.count_nonzero(m))
     if n == 0:
         return SlabHits()
@@ -322,6 +341,33 @@ def _slab_hits_from_points(
     bbox = (int(uv[:, 0].min()), int(uv[:, 1].min()),
             int(uv[:, 0].max()), int(uv[:, 1].max()), dp.width, dp.height_px)
     return SlabHits(hits=n, bbox_px=bbox, hit_body=dp.pts[m, :2])
+
+
+def _path_coords(
+    x: np.ndarray, y: np.ndarray, path_body: Sequence[Tuple[float, float]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """(arc length along ``path_body`` at the nearest point, lateral distance
+    to it) for body points. The path starts at the robot; segments of zero
+    length are skipped."""
+    pts = [(float(a), float(b)) for a, b in path_body]
+    if len(pts) < 2:
+        return x, np.abs(y)
+    best_lat = np.full(x.shape, np.inf)
+    best_s = np.zeros(x.shape)
+    walked = 0.0
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        ex, ey = bx - ax, by - ay
+        L2 = ex * ex + ey * ey
+        if L2 < 1e-12:
+            continue
+        t = np.clip(((x - ax) * ex + (y - ay) * ey) / L2, 0.0, 1.0)
+        px, py = ax + t * ex, ay + t * ey
+        lat = np.hypot(x - px, y - py)
+        closer = lat < best_lat
+        best_lat = np.where(closer, lat, best_lat)
+        best_s = np.where(closer, walked + t * math.sqrt(L2), best_s)
+        walked += math.sqrt(L2)
+    return best_s, best_lat
 
 
 def count_slab_hits(
@@ -347,6 +393,8 @@ def depth_frame_detail(
     v_mps: float,
     omega_radps: float,
     cfg: DepthVetoConfig,
+    path_body: Optional[Sequence[Tuple[float, float]]] = None,
+    denoise: Any = None,
 ) -> SlabHits:
     """Hits this frame (with location), or empty when the veto should not
     fire (fail-open / gated)."""
@@ -362,7 +410,8 @@ def depth_frame_detail(
     if age < 0.0 or age > cfg.stale_s:
         return SlabHits()
     return _slab_hits_from_points(depth_points_for_msg(depth_msg, cfg), cfg,
-                                  v_mps=v_mps, omega_radps=omega_radps)
+                                  v_mps=v_mps, omega_radps=omega_radps,
+                                  path_body=path_body, denoise=denoise)
 
 
 def depth_frame_hits(
@@ -426,8 +475,9 @@ class DepthVetoTracker:
     block, but never counts as another frame. Frames with no identity (no
     ``seq`` and no ``ts``) fall back to per-call counting."""
 
-    def __init__(self, cfg: DepthVetoConfig) -> None:
+    def __init__(self, cfg: DepthVetoConfig, denoise: Any = None) -> None:
         self.cfg = cfg
+        self.denoise = denoise                # DenoiseConfig or None (raw pixel count)
         self.streak = 0
         self._last_key: Optional[Any] = None
         # Evidence for the last scored frame, reported with a depth_block so a
@@ -448,6 +498,7 @@ class DepthVetoTracker:
     def update(
         self, depth_msg: Optional[Dict[str, Any]], *, now_wall: float,
         v_mps: float, omega_radps: float,
+        path_body: Optional[Sequence[Tuple[float, float]]] = None,
     ) -> bool:
         cfg = self.cfg
         if depth_msg is None:
@@ -458,7 +509,8 @@ class DepthVetoTracker:
             self.reset()
             return False
         det = depth_frame_detail(depth_msg, now_wall=now_wall, v_mps=v_mps,
-                                 omega_radps=omega_radps, cfg=cfg)
+                                 omega_radps=omega_radps, cfg=cfg,
+                                 path_body=path_body, denoise=self.denoise)
         hits = det.hits
         hit = hits >= cfg.min_hits
         self.last_hits = int(hits)

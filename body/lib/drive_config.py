@@ -178,6 +178,15 @@ def footprint_config(body_cfg: Dict[str, Any]) -> FootprintConfig:
     )
 
 
+def denoise_config(body_cfg: Dict[str, Any]):
+    """``local_drive.depth_veto.denoise`` → DenoiseConfig (defaults on)."""
+    from body.lib.depth_denoise import DenoiseConfig
+    d = body_cfg.get("local_drive", {}).get("depth_veto", {}).get("denoise", {}) or {}
+    base = DenoiseConfig()
+    kw = {f: type(getattr(base, f))(d[f]) for f in base.__dataclass_fields__ if f in d}
+    return DenoiseConfig(**kw)
+
+
 def tier3_config(body_cfg: Dict[str, Any]):
     """Everything ``Tier3Controller`` needs, from the ``local_drive`` section
     (imported lazily: tier3_controller depends on this module's siblings)."""
@@ -193,6 +202,7 @@ def tier3_config(body_cfg: Dict[str, Any]):
         depth=depth_veto_config(body_cfg),
         memory=memory_config_from_dict(cfg.get("depth_memory")),
         depth_act=bool(cfg.get("depth_veto", {}).get("act", True)),
+        denoise=denoise_config(body_cfg),
         lookahead_m=float(cfg.get("local_planner", {}).get("lookahead_m", d.lookahead_m)),
         no_progress_timeout_s=float(cfg.get("no_progress_timeout_s", d.no_progress_timeout_s)),
         no_progress_eps_m=float(cfg.get("no_progress_eps_m", d.no_progress_eps_m)),

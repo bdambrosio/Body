@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from body.lib.depth_denoise import DenoiseConfig
 from body.lib.depth_memory import (
     DepthMemoryConfig, DepthObstacleMemory, plan_cells, stamp_blocked,
 )
@@ -78,6 +79,8 @@ class Tier3Config:
     # % of depth stops were floor glare / transitions); the reports feed an
     # offline denoiser until the false-positive rate is measured low.
     depth_act: bool = True
+    # Blob gates on the veto's evidence (body/lib/depth_denoise.py).
+    denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
     lookahead_m: float = 0.4
     no_progress_timeout_s: float = 4.0
     no_progress_eps_m: float = 0.03
@@ -143,7 +146,7 @@ class Tier3Controller:
         self.cfg = cfg
         self.gate = gate
         self.goal: Optional[Tier3Goal] = None
-        self._depth = DepthVetoTracker(cfg.depth)
+        self._depth = DepthVetoTracker(cfg.depth, denoise=cfg.denoise)
         # Survives goals on purpose: a retry is a new goal, and forgetting
         # what stopped the last one is what made the robot creep (10-31).
         self.memory = DepthObstacleMemory(cfg.memory, cfg.depth)
@@ -367,7 +370,8 @@ class Tier3Controller:
             else:
                 v, omega = pick
         depth_blocked = (not blocked) and self._depth.update(
-            depth, now_wall=now_wall, v_mps=v, omega_radps=omega)
+            depth, now_wall=now_wall, v_mps=v, omega_radps=omega,
+            path_body=path_now)
 
         if self.gate is not None:
             self._record(g, gb, plan_reason, path_now, look, v, omega,
