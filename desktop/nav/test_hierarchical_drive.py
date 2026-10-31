@@ -477,6 +477,54 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(io.sent, [])
         self.assertEqual(hd.block_reason(), "clear_run_failed")
 
+    # ── Detour re-pick (stale sub-goal) ───────────────────────────────
+
+    LOOP = [[0.0, 0.0], [0.3, 0.5], [0.3, 1.2], [-0.4, 1.4], [-0.9, 0.8],
+            [-0.6, 0.2], [-0.2, 0.3], [0.4, 0.3]]        # ~3.4 m for a 0.5 m goal
+
+    def _detour_run(self, n_ticks, *, same_ts=False, **cfg):
+        hd, io, _ = self._build(points=((3.0, 0.0),), **cfg)
+        self._drive_to_sending(hd)
+        self.assertEqual(len(io.sent), 1)
+        for k in range(n_ticks):
+            io.set_status(cmd_id=1, state="DRIVING", mode="rotate",
+                          ts=100.0 if same_ts else 100.0 + 0.1 * k,
+                          path_body_xy=self.LOOP, dist_remaining_m=0.5)
+            hd.tick(1.0 + 0.05 * k)
+        return hd, io
+
+    def test_detour_repicks_with_fan_first(self):
+        # 10-31: Tier-3 planned a 2 m loop (spinning in place) to a 0.5 m
+        # sub-goal picked before its depth memory filled in. Five consecutive
+        # detour ticks → re-pick, sides first.
+        hd, io = self._detour_run(5)
+        self.assertEqual(len(io.sent), 2, io.sent)
+        bx, by, _t, _v = io.sent[1]
+        self.assertAlmostEqual(abs(math.degrees(math.atan2(by, bx))), 15.0, delta=1.0)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+
+    def test_detour_needs_consecutive_distinct_ticks(self):
+        hd, io = self._detour_run(4)
+        self.assertEqual(len(io.sent), 1)                    # one short
+        hd, io = self._detour_run(10, same_ts=True)
+        self.assertEqual(len(io.sent), 1)                    # same tick re-read
+        hd, io = self._detour_run(5, detour_ratio=0.0)
+        self.assertEqual(len(io.sent), 1)                    # disabled
+
+    def test_detour_repicks_capped_per_leg(self):
+        hd, io, _ = self._build(points=((3.0, 0.0),))
+        self._drive_to_sending(hd)
+        t = 1.0
+        for cid in (1, 2, 3, 4):
+            for k in range(5):
+                io.set_status(cmd_id=cid, state="DRIVING", ts=t,
+                              path_body_xy=self.LOOP, dist_remaining_m=0.5)
+                hd.tick(t)
+                t += 0.1
+        # 2 re-picks allowed, then Tier-3 is left to drive its detour.
+        self.assertEqual(len(io.sent), 3, io.sent)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+
     def test_select_clear_run_fail_blocks_not_blind(self):
         # When a live scan is present but the clear-run finds no usable point,
         # SELECT must BLOCKED (clear_run_failed) — never blind-project.

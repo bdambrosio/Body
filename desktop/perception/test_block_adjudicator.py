@@ -26,9 +26,15 @@ class TestAdvisoryMapping(unittest.TestCase):
             {"blocked": True, "what": "person", "confidence": 0.9}, CFG)
         self.assertEqual((a.action, a.label, a.hold_s), ("hold", "person", CFG.hold_s))
 
-    def test_static_obstacle_pauses(self):
+    def test_static_obstacle_is_note_by_default(self):
+        # 10-31: with the depth memory a box is routable; pausing for the
+        # operator parked the patrol. Opt back in with pause_on_static.
         a = advisory_from_verdict(
             {"blocked": True, "what": "box", "confidence": 0.8}, CFG)
+        self.assertEqual((a.action, a.label), ("note", "box"))
+        a = advisory_from_verdict(
+            {"blocked": True, "what": "box", "confidence": 0.8},
+            AdjudicatorConfig(pause_on_static=True))
         self.assertEqual((a.action, a.label), ("pause", "box"))
 
     def test_low_confidence_is_note_only(self):
@@ -120,7 +126,7 @@ class TestBlockAdjudicator(unittest.TestCase):
         raise AssertionError("no verdict")
 
     def test_queries_once_per_run_and_pauses(self):
-        adj = self._adj()
+        adj = self._adj(pause_on_static=True)
         hd, io = self._blocked_drive()
         adj.poll(hd, io.latest_status(), (1.0, 2.0, 0.5))
         adj.poll(hd, io.latest_status(), (1.0, 2.0, 0.5))
@@ -152,7 +158,7 @@ class TestBlockAdjudicator(unittest.TestCase):
         self.assertEqual(lines[0]["verdict"], self.verdict)
 
     def test_log_only_mode_never_advises(self):
-        adj = self._adj(act=False)
+        adj = self._adj(act=False, pause_on_static=True)
         hd, io = self._blocked_drive()
         adj.poll(hd, io.latest_status(), None)
         self.ctl.answer()

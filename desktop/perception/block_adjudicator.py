@@ -6,8 +6,10 @@ hierarchical drive does next, on the 1–10 s scale of its retry window:
 
   * person / pet / door (things that move on their own) → ``hold``: no retry
     gotos for ``hold_s``, so the robot doesn't nudge into someone;
-  * a static obstacle in the path → ``pause``: stop churning
-    block→cancel→retry and wait for the operator;
+  * a static obstacle in the path → ``note`` (``pause`` only with
+    ``pause_on_static``): the planners route around it via Tier-3's depth
+    memory, so the retries continue — waiting for the operator is reserved
+    for the retry window running out;
   * floor transition, rug edge, shadow, nothing → ``note`` only: the robot
     keeps its normal retries, and the label tells the operator (and the log)
     that the veto may have been a false positive.
@@ -78,6 +80,12 @@ class AdjudicatorConfig:
     hold_s: float = 5.0
     min_conf_hold: float = 0.6
     min_conf_pause: float = 0.7
+    # A confident static verdict (box, chair, …) used to PAUSE the drive for
+    # the operator. Off by default since the depth memory + Tier-2 fan-out
+    # (10-31): a static obstacle is something the planners route around, and
+    # a patrol must not park itself waiting for a human (13:11 run: two such
+    # pauses, one of them the stall). The verdict is still logged and shown.
+    pause_on_static: bool = False
     max_age_s: float = 3.0        # skip frames older than this at query time
     max_tokens: int = 60
 
@@ -96,7 +104,7 @@ def advisory_from_verdict(verdict: Any, cfg: AdjudicatorConfig) -> Optional[Bloc
         return None
     if blocked and what in MOVING and conf >= cfg.min_conf_hold:
         return BlockAdvisory("hold", what, hold_s=cfg.hold_s)
-    if blocked and what in STATIC and conf >= cfg.min_conf_pause:
+    if blocked and what in STATIC and conf >= cfg.min_conf_pause and cfg.pause_on_static:
         return BlockAdvisory("pause", what)
     label = what if blocked else f"clear? ({what})"
     return BlockAdvisory("note", label)
