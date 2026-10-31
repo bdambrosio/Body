@@ -189,6 +189,17 @@ class HierConfig:
     # past the watermark, so a re-pick normally succeeds at once. More than
     # this many consecutive rejections in a leg → BLOCKED("rejected").
     max_consecutive_rejects: int = 3
+    # Tier-2 fan-out: when the straight clear-run toward the carrot fails (an
+    # obstacle — often one only Tier-3's depth memory knows — sits on the
+    # bearing), try bearings ±fan_step_deg … ±fan_max_deg and pick the one
+    # closest to the bearing that (a) is clear for ≥ fan_min_free_m on the
+    # same inflated mask, (b) lands within fan_corridor_m of the Tier-1 route
+    # segment (prev vertex → carrot) — no shortcuts through doorways/off the
+    # authored route — and (c) gets closer to the carrot. 0 disables.
+    fan_max_deg: float = 75.0
+    fan_step_deg: float = 15.0
+    fan_min_free_m: float = 0.35
+    fan_corridor_m: float = 0.75
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
@@ -217,6 +228,14 @@ ADVISORY_ACTIONS = ("hold", "pause", "note")
 
 def _dist(a: Pose, wp_xy: Tuple[float, float]) -> float:
     return math.hypot(a[0] - wp_xy[0], a[1] - wp_xy[1])
+
+
+def _dist_to_segment(p: Tuple[float, float], a: Tuple[float, float],
+                     b: Tuple[float, float]) -> float:
+    ex, ey = b[0] - a[0], b[1] - a[1]
+    L = ex * ex + ey * ey
+    t = 0.0 if L < 1e-12 else max(0.0, min(1.0, ((p[0] - a[0]) * ex + (p[1] - a[1]) * ey) / L))
+    return math.hypot(a[0] + t * ex - p[0], a[1] + t * ey - p[1])
 
 
 def _world_bearing(pose: Pose, wp_xy: Tuple[float, float]) -> float:
@@ -634,7 +653,8 @@ class HierarchicalDrive:
         # Tier-3's A* snap remains the authority. No usable clear point with a
         # live scan → BLOCKED (do not blind-project into obstacles). No scan →
         # blind horizon projection; Tier-3 reports no_scan if it cannot plan.
-        selected = self._select_subgoal_body(bearing, wp_dist)
+        selected = self._select_subgoal_body(bearing, wp_dist, pose=pose,
+                                             carrot=(cx, cy))
         if selected is None:
             self._enter_blocked("clear_run_failed")
             return
@@ -666,7 +686,7 @@ class HierarchicalDrive:
             "arrival_tol_m": self._cfg.subgoal_arrival_tol_m,
             "v_max": self._cfg.sub_v_max,
         }
-        anchor_ts = (meta or {}).get("_scan_ts") if src == "clear" else None
+        anchor_ts = (meta or {}).get("_scan_ts") if src in ("clear", "fan") else None
         if anchor_ts is not None:
             kwargs["anchor_ts"] = anchor_ts
         cid = self._io.send_goto_from_body(bx, by, **kwargs)
@@ -708,7 +728,8 @@ class HierarchicalDrive:
         return True
 
     def _select_subgoal_body(
-        self, bearing: float, wp_dist: float,
+        self, bearing: float, wp_dist: float, *,
+        pose: Optional[Pose] = None, carrot: Optional[Tuple[float, float]] = None,
     ) -> Optional[Tuple[Tuple[float, float], str, float, Optional[Any], Optional[Dict[str, Any]]]]:
         """Tier-2 sub-goal toward ``bearing``, capped at ``wp_dist``.
 
@@ -717,7 +738,8 @@ class HierarchicalDrive:
         when a scan is present but the clear-run finds no usable point (caller
         should BLOCKED). Blind horizon projection only when there is no
         rasterizable scan. Returns ``((bx, by), source, free_dist_m, grid,
-        meta)`` — source ``clear`` or ``blind``.
+        meta)`` — source ``clear``, ``fan`` (side bearing, see
+        ``HierConfig.fan_*``; needs ``pose`` + ``carrot``) or ``blind``.
         """
         t2 = self._cfg.tier2_cfg
         grid = meta = None
@@ -748,16 +770,85 @@ class HierarchicalDrive:
             march_cfg = replace(t2, backoff_m=0.5 * float(meta["resolution_m"]))
             res = furthest_free_point(march_grid, meta, bearing, march_cfg,
                                       max_dist_m=wp_dist)
-            if res.ok and res.body_xy is not None:
+            src = "clear"
+            straight_ok = res.ok and res.body_xy is not None
+            # Fan when the bearing is blocked outright, or only a short hop
+            # (< fan_min_free_m) short of an obstacle — inching up to it just
+            # to fail next tick wastes a cycle. A short straight hop is still
+            # the fallback when no side bearing qualifies.
+            short = (straight_ok and res.free_dist_m < self._cfg.fan_min_free_m
+                     and res.free_dist_m < wp_dist - 1e-6)
+            if not straight_ok or short:
+                fan = self._fan_subgoal(march_grid, meta, march_cfg, bearing,
+                                        wp_dist, pose, carrot)
+                if fan is not None:
+                    res, src = fan, "fan"
+            if res is not None and res.ok and res.body_xy is not None:
                 meta = dict(meta)
                 ts = scan.get("ts")
                 if isinstance(ts, (int, float)) and ts > 0:
                     meta["_scan_ts"] = float(ts)
-                return res.body_xy, "clear", res.free_dist_m, grid, meta
+                return res.body_xy, src, res.free_dist_m, grid, meta
             return None
         dist = min(wp_dist, t2.horizon_m)
         return ((dist * math.cos(bearing), dist * math.sin(bearing)),
                 "blind", dist, grid, meta)
+
+    def _fan_subgoal(self, march_grid, meta, march_cfg, bearing: float,
+                     wp_dist: float, pose: Optional[Pose],
+                     carrot: Optional[Tuple[float, float]]):
+        """Side-bearing clear-run when the straight one failed (see
+        ``HierConfig.fan_*``). Every candidate is a clear-run on the same
+        inflated mask (unknown = blocked), so the robot→sub-goal segment is
+        live-visible free space — it can't cross a wall. The route-corridor
+        and progress gates keep it from wandering off the authored route.
+        Smallest deviation wins; ties → closer to the carrot."""
+        cfg = self._cfg
+        if (pose is None or carrot is None or cfg.fan_max_deg <= 0
+                or cfg.fan_step_deg <= 0):
+            return None
+        prev = self._prev_vertex()
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        n = int(math.floor(cfg.fan_max_deg / cfg.fan_step_deg + 1e-9))
+        for k in range(1, n + 1):
+            best = None
+            for sign in (1.0, -1.0):
+                dev = sign * math.radians(k * cfg.fan_step_deg)
+                r = furthest_free_point(march_grid, meta, bearing + dev, march_cfg,
+                                        max_dist_m=wp_dist)
+                if not r.ok or r.body_xy is None or r.free_dist_m < cfg.fan_min_free_m:
+                    continue
+                # Pull the point back along its own (clear) ray until it is
+                # inside the route corridor: a sidestep, never a dive through
+                # an off-route doorway. Points on the clear ray are free on
+                # the inflated mask, so Tier-3 accepts them as-is.
+                ang = math.atan2(r.body_xy[1], r.body_xy[0])
+                ca, sa = math.cos(ang), math.sin(ang)
+                d = r.free_dist_m
+                step = float(march_cfg.step_m)
+                wx = wy = 0.0
+                while d >= cfg.fan_min_free_m:
+                    bx, by = d * ca, d * sa
+                    wx = pose[0] + c * bx - s * by
+                    wy = pose[1] + s * bx + c * by
+                    if _dist_to_segment((wx, wy), prev, carrot) <= cfg.fan_corridor_m:
+                        break
+                    d -= step
+                if d < cfg.fan_min_free_m:
+                    continue
+                if d < r.free_dist_m:
+                    r = replace(r, body_xy=(d * ca, d * sa), free_dist_m=d)
+                d_wp = math.hypot(carrot[0] - wx, carrot[1] - wy)
+                if d_wp >= wp_dist - 0.02:
+                    continue
+                if best is None or d_wp < best[0]:
+                    best = (d_wp, r, dev)
+            if best is not None:
+                logger.info("hier: fan-out %+.0f° (straight bearing blocked) "
+                            "free=%.2f d_wp=%.2f", math.degrees(best[2]),
+                            best[1].free_dist_m, best[0])
+                return best[1]
+        return None
 
     def _depth_memory_body(self) -> Optional[list]:
         """``depth_mem_body`` from the latest Tier-3 status, if any."""

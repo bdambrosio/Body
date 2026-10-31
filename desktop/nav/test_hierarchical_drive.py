@@ -362,7 +362,9 @@ class TestHierarchicalDrive(unittest.TestCase):
         io = FakeDriveIO(scan=scan)
         io.status = {"cmd_id": 0, "state": "IDLE",
                      "depth_mem_body": [[0.6, y / 100.0] for y in range(-8, 9, 4)]}
-        hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io)
+        # Fan off: this pins the stamping alone (the fan has its own tests).
+        hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,
+                               HierConfig(fan_max_deg=0.0))
         hd.start()
         hd.tick(0.0)
         hd.tick(0.0)
@@ -372,6 +374,108 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertGreater(bx, 0.2)                # …but still a forward sub-goal
         self.assertAlmostEqual(by, 0.0, places=2)
         # Without the memory the same scan marches to the 1.46 m horizon.
+
+    # ── Tier-2 fan-out (straight bearing blocked) ──────────────────────
+
+    @staticmethod
+    def _seg_scan(segs, pose=(0.0, 0.0, 0.0)):
+        """360-beam scan of line segments (world) from ``pose``; misses → 0.0
+        (no return → clear to the horizon)."""
+        x, y, th = pose
+        ranges = []
+        for k in range(N):
+            a = th + ANGLE_MIN + k * ANGLE_INC
+            dx, dy = math.cos(a), math.sin(a)
+            best = None
+            for (x1, y1, x2, y2) in segs:
+                ex, ey = x2 - x1, y2 - y1
+                den = dx * ey - dy * ex
+                if abs(den) < 1e-12:
+                    continue
+                t = ((x1 - x) * ey - (y1 - y) * ex) / den
+                u = ((x1 - x) * dy - (y1 - y) * dx) / den
+                if t > 0.02 and 0 <= u <= 1 and (best is None or t < best):
+                    best = t
+            ranges.append(best if best is not None and best < 12 else 0.0)
+        return {"ranges": ranges, "angle_min": ANGLE_MIN, "angle_increment": ANGLE_INC,
+                "ts": 1.0}
+
+    def _fan_select(self, scan, mem=None, wp=(2.0, 0.0), **cfg):
+        io = FakeDriveIO(scan=scan)
+        io.status = {"cmd_id": 0, "state": "IDLE",
+                     **({"depth_mem_body": mem} if mem else {})}
+        hd = HierarchicalDrive(_runner((wp,)), FakePose((0.0, 0.0, 0.0)), io,
+                               HierConfig(**cfg))
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        return hd, io
+
+    # The 10-31 bag: remembered by depth only, 0.5–0.8 m ahead, ~0.5 m wide.
+    BAG = [[x / 100.0, y / 100.0] for x in range(50, 81, 4) for y in range(-24, 25, 4)]
+
+    def test_fan_steps_around_depth_only_obstacle(self):
+        hd, io = self._fan_select(_clear_scan(), mem=self.BAG)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
+        bx, by, _t, _v = io.sent[0]
+        dev = math.degrees(math.atan2(by, bx))
+        self.assertGreaterEqual(abs(dev), 15.0 - 1e-6)
+        self.assertLessEqual(abs(dev), 75.0 + 1e-6)
+        self.assertGreaterEqual(math.hypot(bx, by), 0.35 - 1e-6)
+        self.assertLessEqual(abs(by), 0.75 + 1e-6)          # inside the route corridor
+        self.assertLess(math.hypot(2.0 - bx, by), 2.0)      # made progress
+
+    def test_fan_disabled_keeps_old_straight_hop(self):
+        # Without the fan: the short straight hop up to the obstacle (then a
+        # clear_run_failed once there) — the 10-31 stall.
+        hd, io = self._fan_select(_clear_scan(), mem=self.BAG, fan_max_deg=0.0)
+        self.assertEqual(len(io.sent), 1)
+        bx, by, _t, _v = io.sent[0]
+        self.assertLess(bx, 0.35)
+        self.assertAlmostEqual(by, 0.0, places=6)
+
+    def test_fan_never_goes_through_off_route_doorway(self):
+        # A wall across the route with the only opening 1.0–1.8 m to the
+        # left (the route itself runs into the wall). The fan may sidestep
+        # along the wall inside the corridor, but never picks a point through
+        # (or beyond) the wall.
+        wall = [(0.6, -5.0, 0.6, 1.0), (0.6, 1.8, 0.6, 5.0)]
+        hd, io = self._fan_select(self._seg_scan(wall))
+        for bx, by, _t, _v in io.sent:
+            self.assertLess(bx, 0.6, (bx, by))              # this side of the wall
+            self.assertLessEqual(abs(by), 0.75 + 1e-6)      # inside the corridor
+        if not io.sent:
+            self.assertEqual(hd.block_reason(), "clear_run_failed")
+
+    def test_fan_takes_in_corridor_gap(self):
+        # A wall close across the route with a gap just left of it (inside
+        # the corridor): the fan goes THROUGH the gap instead of blocking.
+        wall = [(0.45, -5.0, 0.45, 0.1), (0.45, 0.7, 0.45, 5.0)]
+        hd, io = self._fan_select(self._seg_scan(wall))
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
+        bx, by, _t, _v = io.sent[0]
+        self.assertGreater(bx, 0.45)                         # beyond the wall…
+        self.assertTrue(0.0 < by <= 0.75 + 1e-6, by)         # …via the in-corridor gap
+
+    def test_fan_prefers_smallest_deviation(self):
+        # The narrowest swing that clears the (footprint-inflated) obstacle
+        # wins: a narrow post needs less than the wide bag.
+        narrow = [[x / 100.0, y / 100.0] for x in range(50, 61, 4) for y in range(-4, 5, 4)]
+
+        def dev(mem):
+            _hd, io = self._fan_select(_clear_scan(), mem=mem)
+            bx, by, _t, _v = io.sent[0]
+            return abs(math.degrees(math.atan2(by, bx)))
+        self.assertAlmostEqual(dev(narrow), 30.0, delta=1.0)
+        self.assertGreater(dev(self.BAG), dev(narrow))
+
+    def test_fan_rejects_points_that_lose_ground(self):
+        # Fully boxed ahead and to both sides up to 75°: only backward-ish
+        # moves remain → no fan candidate, honest BLOCKED.
+        box = [(0.35, -0.6, 0.35, 0.6), (-0.3, 0.35, 0.35, 0.35), (-0.3, -0.35, 0.35, -0.35)]
+        hd, io = self._fan_select(self._seg_scan(box))
+        self.assertEqual(io.sent, [])
+        self.assertEqual(hd.block_reason(), "clear_run_failed")
 
     def test_select_clear_run_fail_blocks_not_blind(self):
         # When a live scan is present but the clear-run finds no usable point,
