@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, Optional
 
 import numpy as np
+from dataclasses import replace
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
@@ -38,6 +39,7 @@ from .hierarchical_drive import (
     HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
 )
 from . import patrol as patrol_mod
+from desktop.nav.route_planner import merge_prior, resample_prior
 from .patrol import PatrolRunner
 from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
@@ -335,6 +337,10 @@ class NavMainWindow(QMainWindow):
         self._astar_config = AStarConfig()
         self._last_plan: Optional[PlanResult] = None
         self._last_costmap = None  # cached for replanning when goal changes
+        self._last_snap = None
+        self._plan_cm = None       # planning costmap (prior + session), cached per snapshot
+        self._plan_cm_key = None
+        self._prior_cache = None   # (grid meta key, resampled reference prior)
         self._shared_view.set_goal_callback(self._on_goal_requested)
         self._shared_view.set_locate_callback(self._on_locate_requested)
         # Tracing: JSONL ring + edge-triggered emits (LivenessWatcher,
@@ -689,6 +695,7 @@ class NavMainWindow(QMainWindow):
 
     def _refresh_fuser_panel(self) -> None:
         snap = self.fuser.snapshot_for_ui()
+        self._last_snap = snap
         latest = self.fuser.pose_source.latest_pose()
         pose = latest[0] if latest is not None else None
         trail = self.fuser.pose_trail()
@@ -1271,6 +1278,42 @@ class NavMainWindow(QMainWindow):
             logger.exception("could not prepare drive-trace dir")
             return None
 
+    def _planning_costmap(self):
+        """The route planner's map: the reference map as a prior, overlaid
+        with everything this session's world grid has observed, unknown
+        routable at a cost (not lethal). Rebuilt only when the snapshot
+        changes."""
+        snap = self._last_snap
+        if snap is None:
+            return self._last_costmap
+        key = id(snap)
+        if self._plan_cm is not None and self._plan_cm_key == key:
+            return self._plan_cm
+        try:
+            meta = snap["meta"]
+            mkey = (int(meta["nx"]), int(meta["ny"]), float(meta["resolution_m"]),
+                    float(meta["origin_x_m"]), float(meta["origin_y_m"]))
+            if self._prior_cache is None or self._prior_cache[0] != mkey:
+                rm = self.fuser.reference_map
+                prior = resample_prior(
+                    rm.driveable,
+                    {"resolution_m": rm.resolution_m, "origin_x_m": rm.origin_x_m,
+                     "origin_y_m": rm.origin_y_m}, meta)
+                self._prior_cache = (mkey, prior)
+                logger.info("planning map: reference prior resampled (%d free, %d blocked cells)",
+                            int((prior == 1).sum()), int((prior == 0).sum()))
+            snap2 = dict(snap)
+            snap2["driveable"] = merge_prior(snap["driveable"], self._prior_cache[1])
+            latest = self.fuser.pose_source.latest_pose()
+            pose = latest[0] if latest is not None else None
+            cfg = replace(self._costmap_config, unknown_is_lethal=False)
+            cm = build_costmap(snap2, cfg, pose=pose)
+        except Exception:
+            logger.exception("planning costmap build failed; using the display costmap")
+            cm = self._last_costmap
+        self._plan_cm, self._plan_cm_key = cm, key
+        return cm
+
     def _reset_depth_memory(self, reason: str, *, quiet: bool = True) -> None:
         """Ask Tier-3 to forget its depth memory (Go, relocate, button). A
         relocate usually means the robot was moved by hand. Opens the drive
@@ -1395,7 +1438,7 @@ class NavMainWindow(QMainWindow):
         self._hier_drive = HierarchicalDrive(
             runner, provider, self._drive_client, HierConfig(),
             sink=self._ensure_handoff_gate(),
-            costmap_provider=lambda: self._last_costmap,
+            costmap_provider=self._planning_costmap,
         )
         self._shared_view.set_patrol_active_wp_index(0)
         # Fresh run: the robot may have been carried since the memory was

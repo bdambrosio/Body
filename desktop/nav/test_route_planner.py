@@ -148,6 +148,28 @@ class TestRoutePlanner(unittest.TestCase):
         self.assertGreaterEqual(
             min(math.hypot(x - 1.0, y) for x, y in plan.path_world), 0.15 - RES)
 
+    def test_reference_prior_fills_unobserved_session_cells(self):
+        from desktop.nav.route_planner import merge_prior, resample_prior
+        ref = np.ones((40, 40), np.int8)                 # 2 m × 2 m at 5 cm, all free
+        ref[20:22, :] = 0                                # a wall across y at x = 1.0
+        ref[20:22, 30:34] = 1                            # with a doorway
+        ref_meta = {"resolution_m": 0.05, "origin_x_m": 0.0, "origin_y_m": 0.0}
+        grid_meta = {"resolution_m": 0.1, "origin_x_m": -1.0, "origin_y_m": -1.0,
+                     "nx": 40, "ny": 40}
+        prior = resample_prior(ref, ref_meta, grid_meta)
+        self.assertEqual(prior.shape, (40, 40))
+        self.assertEqual(int(prior[5, 5]), -1)           # outside the reference map
+        self.assertEqual(int(prior[15, 15]), 1)          # (0.55, 0.55): free
+        self.assertEqual(int(prior[20, 15]), 0)          # (1.05, 0.55): wall
+        self.assertEqual(int(prior[20, 26]), 1)          # (1.05, 1.65): doorway
+        session = np.full((40, 40), -1, np.int8)
+        session[15, 15] = 0                              # session saw a box there
+        session[20, 15] = 1                              # and the wall gone here
+        merged = merge_prior(session, prior)
+        self.assertEqual(int(merged[15, 15]), 0)         # session wins
+        self.assertEqual(int(merged[20, 15]), 1)
+        self.assertEqual(int(merged[20, 16]), 0)         # prior elsewhere
+
     def test_bearing_fallback_without_costmap(self):
         io = FakeDriveIO(scan=_clear_scan())
         hd = HierarchicalDrive(_runner(((2.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,

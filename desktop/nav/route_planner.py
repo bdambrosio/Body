@@ -248,5 +248,39 @@ def _back_off(path_body: Sequence[Pt], d: float, back: float) -> Pt:
     return path_body[-1]
 
 
+# ── Planning map = reference-map prior + live session grid ───────────────
+
+def resample_prior(ref_driveable: np.ndarray, ref_meta: dict, grid_meta: dict) -> np.ndarray:
+    """``ref_driveable`` (int8 1/0/-1 on the reference map's grid) sampled
+    (nearest cell) onto the world grid described by ``grid_meta``
+    (resolution_m, origin_x_m, origin_y_m, nx, ny). Cells outside the
+    reference map are unknown (-1)."""
+    nx, ny = int(grid_meta["nx"]), int(grid_meta["ny"])
+    res = float(grid_meta["resolution_m"])
+    ox, oy = float(grid_meta["origin_x_m"]), float(grid_meta["origin_y_m"])
+    rres = float(ref_meta["resolution_m"])
+    rox, roy = float(ref_meta["origin_x_m"]), float(ref_meta["origin_y_m"])
+    xs = ox + (np.arange(nx) + 0.5) * res
+    ys = oy + (np.arange(ny) + 0.5) * res
+    ri = np.floor((xs - rox) / rres).astype(np.int64)
+    rj = np.floor((ys - roy) / rres).astype(np.int64)
+    out = np.full((nx, ny), -1, dtype=np.int8)
+    oki = (ri >= 0) & (ri < ref_driveable.shape[0])
+    okj = (rj >= 0) & (rj < ref_driveable.shape[1])
+    ii, jj = np.nonzero(oki)[0], np.nonzero(okj)[0]
+    if ii.size and jj.size:
+        out[np.ix_(ii, jj)] = ref_driveable[np.ix_(ri[ii], rj[jj])]
+    return out
+
+
+def merge_prior(session: np.ndarray, prior: np.ndarray) -> np.ndarray:
+    """Planning driveable layer: what this session has observed wins; the
+    reference-map prior fills what it has not seen yet. (The session grid
+    starts empty on every nav start — with unknown lethal to the planner,
+    the next room was a wall until the robot had looked at it: no_route
+    at waypoints 3 and 6, 10-31.)"""
+    return np.where(session != -1, session, prior).astype(np.int8)
+
+
 def path_length(path: Sequence[Pt]) -> float:
     return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:]))
