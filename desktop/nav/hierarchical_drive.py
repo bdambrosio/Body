@@ -28,7 +28,7 @@ import enum
 import logging
 import math
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -41,6 +41,9 @@ from body.lib.tier2_subgoal import (
     Tier2Config, bearing_to_waypoint, furthest_free_point,
 )
 from desktop.nav.patrol import PatrolRunner, passed_waypoint
+from desktop.nav.route_planner import (
+    RouteConfig, RoutePlan, path_to_body, plan_route, visible_subgoal_along_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -296,8 +299,21 @@ class HierarchicalDrive:
         cfg: Optional[HierConfig] = None,
         sink: Optional[HandoffSink] = None,
         lead_in: Optional[list] = None,
+        costmap_provider: Optional[Callable[[], Any]] = None,
+        route_cfg: Optional[RouteConfig] = None,
     ):
+        """``costmap_provider`` (nav redesign step 1): returns the live world
+        ``Costmap`` (or None). When given, each SELECT plans a global route
+        robot → (relaxed) carrot on it and hands Tier-3 the furthest
+        live-visible point along that path; the straight-bearing Tier-2
+        march (+ fan) is only the fallback when no costmap is available."""
         self._runner = runner
+        self._costmap_provider = costmap_provider
+        self._route_cfg = route_cfg or RouteConfig()
+        self._route: Optional[RoutePlan] = None          # last global plan
+        self._carrot_relaxed: Optional[Tuple[float, float]] = None
+        self._block_hits_world: List[Tuple[float, float]] = []   # recent depth-veto hits
+        self._block_hits_at: float = -1e9
         # One-time routed lead-in (start pose → first marker) the carrot follows
         # BEFORE the patrol loop, so the start isn't an un-routed beeline. Kept
         # OUT of the runner so lap/terminal accounting stays anchored on the
@@ -385,6 +401,9 @@ class HierarchicalDrive:
         self._route_start = None
         self._prev_waypoint_xy = None
         self._lead_idx = 1
+        self._route = None
+        self._carrot_relaxed = None
+        self._block_hits_world = []
         self._detour_ticks = 0
         self._detour_last_ts = None
         self._detour_repicks = 0
@@ -596,8 +615,13 @@ class HierarchicalDrive:
             return False
         prox = (self._cfg.waypoint_tol_m if self._carrot_terminal()
                 else self._cfg.pass_proximity_m)
-        return passed_waypoint((pose[0], pose[1]), self._prev_vertex(),
-                               self._waypoint, proximity_m=prox)
+        if passed_waypoint((pose[0], pose[1]), self._prev_vertex(),
+                           self._waypoint, proximity_m=prox):
+            return True
+        # A via-point relaxed by the route planner (its own cell is inside an
+        # obstacle's inflation): reaching the relaxed point IS reaching it.
+        rc = self._carrot_relaxed
+        return rc is not None and _dist(pose, rc) <= prox
 
     # ── Introspection (for the UI overlay / status label) ────────────
 
@@ -612,6 +636,11 @@ class HierarchicalDrive:
 
     def current_waypoint_world(self) -> Optional[Tuple[float, float]]:
         return self._waypoint
+
+    def current_route_world(self) -> Optional[list]:
+        """The last global path (world polyline) when the route planner is
+        in use, for the map preview."""
+        return list(self._route.path_world) if (self._route and self._route.ok) else None
 
     # ── Tick ─────────────────────────────────────────────────────────
 
@@ -679,6 +708,24 @@ class HierarchicalDrive:
         cx, cy = self._waypoint
         bearing = bearing_to_waypoint(pose[0], pose[1], pose[2], cx, cy)
 
+        # Nav redesign step 1: global route on the live world costmap. The
+        # carrot may be relaxed (moved to the nearest free cell) or skipped;
+        # the bearing handed down is the path's initial heading.
+        route = None
+        if self._costmap_provider is not None:
+            route = self._plan_global_route(pose, (cx, cy), wp_dist)
+            if route is False:
+                return                                  # advanced / blocked
+            if route is not None:
+                cx, cy = route.target_world
+                self._carrot_relaxed = route.target_world
+                wp_dist = _dist(pose, (cx, cy))
+                if wp_dist <= (self._cfg.waypoint_tol_m if self._carrot_terminal()
+                               else self._cfg.pass_proximity_m):
+                    self._to(HierState.ADVANCE_WAYPOINT)
+                    return
+                bearing = self._route_initial_bearing(route, pose, bearing)
+
         # HO-1 Tier-1 → Tier-2: the chosen world-frame carrot + bearing, plus the
         # FULL route (lead-in + dense markers) — Tier-2 tracks the whole route
         # vertex-by-vertex; this is just the current carrot.
@@ -702,8 +749,19 @@ class HierarchicalDrive:
         # live scan → BLOCKED (do not blind-project into obstacles). No scan →
         # blind horizon projection; Tier-3 reports no_scan if it cannot plan.
         prefer_fan, self._prefer_fan = self._prefer_fan, False
-        selected = self._select_subgoal_body(bearing, wp_dist, pose=pose,
-                                             carrot=(cx, cy), prefer_fan=prefer_fan)
+        if route is not None:
+            selected = self._select_along_route(route, pose)
+            if selected is None and not terminal and wp_dist <= self._cfg.blocked_carrot_skip_m:
+                logger.info("hier: carrot %.2f m away but the path to it is not "
+                            "live-clear — treating it as passed", wp_dist)
+                self._to(HierState.ADVANCE_WAYPOINT)
+                return
+            if selected is None:
+                self._enter_blocked("path_blocked_live")
+                return
+        else:
+            selected = self._select_subgoal_body(bearing, wp_dist, pose=pose,
+                                                 carrot=(cx, cy), prefer_fan=prefer_fan)
         if selected is None:
             if (not terminal and wp_dist <= self._cfg.blocked_carrot_skip_m
                     and self._io.latest_scan() is not None):
@@ -741,7 +799,7 @@ class HierarchicalDrive:
             "arrival_tol_m": self._cfg.subgoal_arrival_tol_m,
             "v_max": self._cfg.sub_v_max,
         }
-        anchor_ts = (meta or {}).get("_scan_ts") if src in ("clear", "fan") else None
+        anchor_ts = (meta or {}).get("_scan_ts") if src in ("clear", "fan", "route") else None
         if anchor_ts is not None:
             kwargs["anchor_ts"] = anchor_ts
         cid = self._io.send_goto_from_body(bx, by, **kwargs)
@@ -768,6 +826,128 @@ class HierarchicalDrive:
             " [lead-in]" if self._in_lead_in() else "",
             math.degrees(bearing), wp_dist, bx, by, src, free_dist)
         self._to(HierState.DRIVING_SUBGOAL)
+
+    # ── Global route (nav redesign step 1) ───────────────────────────
+
+    def _plan_global_route(self, pose: Pose, carrot: Tuple[float, float],
+                           wp_dist: float):
+        """Plan robot → carrot on the live costmap. Returns the RoutePlan,
+        None to fall back to the bearing march (no costmap), or False when
+        the state was changed here (carrot skipped / BLOCKED)."""
+        try:
+            cm = self._costmap_provider()
+        except Exception:
+            logger.exception("hier: costmap provider failed; bearing fallback")
+            cm = None
+        if cm is None:
+            return None
+        extra = self._extra_lethal_world(pose)
+        plan = plan_route(cm, (pose[0], pose[1]), carrot, self._route_cfg,
+                          extra_lethal_world=extra)
+        terminal = self._carrot_terminal()
+        if plan.ok:
+            self._route = plan
+            if plan.relaxed_m > 0.01:
+                logger.info("hier: via (%.2f,%.2f) relaxed %.2f m to (%.2f,%.2f)",
+                            carrot[0], carrot[1], plan.relaxed_m,
+                            plan.target_world[0], plan.target_world[1])
+            return plan
+        self._route = None
+        if plan.reason == "via_unreachable":
+            if terminal:
+                logger.warning("hier: terminal waypoint (%.2f,%.2f) has no free cell "
+                               "within %.2f m — blocked", carrot[0], carrot[1],
+                               self._route_cfg.via_radius_m)
+                self._enter_blocked("terminal_unreachable")
+                return False
+            logger.info("hier: via (%.2f,%.2f) has no free cell within %.2f m — skipped",
+                        carrot[0], carrot[1], self._route_cfg.via_radius_m)
+            self._to(HierState.ADVANCE_WAYPOINT)
+            return False
+        logger.info("hier: no global route to (%.2f,%.2f): %s", carrot[0], carrot[1],
+                    plan.reason)
+        self._enter_blocked("no_route")
+        return False
+
+    def _extra_lethal_world(self, pose: Pose) -> List[Tuple[float, float]]:
+        """Obstacles Tier-3 knows that the world map may not: its depth
+        memory (every status) and the hits of a recent depth_block."""
+        out: List[Tuple[float, float]] = []
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        mem = self._depth_memory_body() or []
+        for p in mem:
+            out.append((pose[0] + c * p[0] - s * p[1], pose[1] + s * p[0] + c * p[1]))
+        if self._tick_now - self._block_hits_at <= 20.0:
+            out.extend(self._block_hits_world)
+        return out
+
+    def _note_block_hits(self, st: Dict[str, Any], pose: Optional[Pose]) -> None:
+        hits = st.get("depth_hit_body") if isinstance(st, dict) else None
+        if not hits or pose is None:
+            return
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        self._block_hits_world = [
+            (pose[0] + c * p[0] - s * p[1], pose[1] + s * p[0] + c * p[1]) for p in hits]
+        self._block_hits_at = self._tick_now
+
+    @staticmethod
+    def _route_initial_bearing(route: RoutePlan, pose: Pose, default: float) -> float:
+        """Body-frame heading of the path's first ≥ 0.1 m."""
+        for x, y in route.path_world[1:]:
+            if math.hypot(x - pose[0], y - pose[1]) >= 0.1:
+                return wrap_pi(math.atan2(y - pose[1], x - pose[0]) - pose[2])
+        return default
+
+    def _select_along_route(self, route: RoutePlan, pose: Pose):
+        """Furthest live-visible point along the global path (same inflated
+        scan mask Tier-2 marched on). None when no scan or the first
+        min_subgoal_m of the path is not clear."""
+        live = self._live_march_grid()
+        if live is None:
+            # No scan: blind — the first horizon of the path (Tier-3 reports
+            # no_scan if it cannot plan).
+            pb = path_to_body(route.path_world, pose)
+            d = 0.0
+            for a, b in zip(pb, pb[1:]):
+                d += math.hypot(b[0] - a[0], b[1] - a[1])
+                if d >= self._route_cfg.horizon_m:
+                    return b, "blind", d, None, None
+            return pb[-1], "blind", d, None, None
+        march_grid, grid, meta = live
+        pb = path_to_body(route.path_world, pose)
+        hit = visible_subgoal_along_path(pb, march_grid, meta, self._route_cfg)
+        if hit is None:
+            return None
+        (bx, by), free = hit
+        return (bx, by), "route", free, grid, meta
+
+    def _live_march_grid(self):
+        """(march_grid, grid, meta) from the latest scan: Tier-3's footprint-
+        inflated lethal mask with the depth memory stamped, or None."""
+        scan = self._io.latest_scan()
+        if scan is None or not scan.get("ranges"):
+            return None
+        grid, meta = rasterize_scan(
+            scan.get("ranges"), float(scan.get("angle_min", 0.0)),
+            float(scan.get("angle_increment", 0.0)), self._raster,
+            unknown_bins=scan.get("unknown_bins"))
+        mem = self._depth_memory_body()
+        if mem:
+            grid = grid.copy()
+            cells = plan_cells(np.asarray(mem, dtype=float), (0.0, 0.0, 0.0),
+                               self._mem_cfg.plan_exclude_radius_m,
+                               self._mem_cfg.plan_exclude_half_angle_deg)
+            stamp_blocked(grid, meta, cells, keep_clear_xy=(0.0, 0.0),
+                          keep_clear_radius_m=self._raster.robot_clear_radius_m)
+        cm = build_local_costmap(grid, meta, self._costmap_cfg)
+        blocked = dilate_bool(cm.lethal, iters=self._goal_clearance_cells)
+        march_grid = grid.copy()
+        march_grid[blocked] = 0
+        meta = dict(meta)
+        ts = scan.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            meta["_scan_ts"] = float(ts)
+        return march_grid, grid, meta
 
     def _hold(self, tier: int) -> bool:
         """If ``tier``'s breakpoint is armed and unstepped, hold here. On the
@@ -1002,6 +1182,7 @@ class HierarchicalDrive:
                 self._block_started_at = None
                 self._block_gave_up = False
             if state in ("BLOCKED", "FAULT"):
+                self._note_block_hits(st, pose)
                 self._enter_blocked(st.get("blocked_reason") or state)
                 return
             if state == "CANCELED":
@@ -1091,6 +1272,7 @@ class HierarchicalDrive:
         if self._in_lead_in():
             self._prev_waypoint_xy = tuple(self._lead_in[self._lead_idx])
             self._lead_idx += 1
+            self._carrot_relaxed = None
             self._block_started_at = None
             self._block_gave_up = False
             self._leg_started_at = None
@@ -1103,6 +1285,7 @@ class HierarchicalDrive:
         left = self._runner.current_target()
         if left is not None:
             self._prev_waypoint_xy = (left.x_m, left.y_m)
+        self._carrot_relaxed = None
         next_idx, _lap_done = self._runner.on_arrived()
         logger.info("hier: waypoint reached -> next=%s", next_idx)
         self._block_started_at = None              # fresh leg
