@@ -190,6 +190,52 @@ class TestRoutePlanner(unittest.TestCase):
         self.assertFalse(plan2.ok)
         self.assertEqual(plan2.reason, "no_route")
 
+    def test_via_radius_and_must_visit(self):
+        from desktop.nav.patrol import Patrol, PatrolRunner, Waypoint
+        cm = _world([(1.9, -0.1, 2.1, 0.1)])        # blob on the marker
+        # Tight radius: nothing free within 0.1 m of the marker (the blob's
+        # inflation reaches 0.11 + ...) → unreachable → skipped (intermediate).
+        plan = plan_route(cm, (0.0, 0.0), (2.0, 0.0), RouteConfig(), via_radius_m=0.1)
+        self.assertEqual((plan.ok, plan.reason), (False, "via_unreachable"))
+        # Default radius relaxes it.
+        self.assertTrue(plan_route(cm, (0.0, 0.0), (2.0, 0.0), RouteConfig()).ok)
+        # must_visit: never relaxed; and in the drive it BLOCKS rather than skips.
+        plan = plan_route(cm, (0.0, 0.0), (2.0, 0.0), RouteConfig(), must_visit=True)
+        self.assertEqual((plan.ok, plan.reason), (False, "via_unreachable"))
+        patrol = Patrol(name="t", session_id="s", authored_utc="", loop=False, laps=1,
+                        waypoints=[Waypoint(2.0, 0.0, must_visit=True), Waypoint(0.0, 2.0)])
+        io = FakeDriveIO(scan=_clear_scan())
+        hd = HierarchicalDrive(PatrolRunner(patrol), FakePose((0.0, 0.0, 0.0)), io,
+                               HierConfig(), costmap_provider=lambda: cm)
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "terminal_unreachable")
+        # Round trip of the new fields.
+        d = Waypoint(1.0, 2.0, radius_m=0.3, must_visit=True).to_dict()
+        w = Waypoint.from_dict(d)
+        self.assertEqual((w.radius_m, w.must_visit), (0.3, True))
+        self.assertEqual(Waypoint.from_dict({"x_m": 0, "y_m": 0}).radius_m, None)
+
+    def test_blocked_intermediate_via_is_skipped_before_a_pause(self):
+        # Window exhausted at an intermediate via → skip it (ADVANCE) once,
+        # not an operator pause; the terminal still pauses.
+        cm = _world()
+        hd, io, po = _drive(cm, ((2.0, 0.0), (2.0, 2.0)))
+        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="swept_block", ts=0.5)
+        hd.tick(0.5)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        for k in range(1, 24):                       # 11.5 s of retries, all re-blocked
+            t = 0.5 + 0.5 * k
+            io.set_status(cmd_id=len(io.sent), state="BLOCKED", blocked_reason="swept_block", ts=t)
+            hd.tick(t)
+            if hd.current_waypoint_world() == (2.0, 2.0):
+                break
+        self.assertEqual(hd.current_waypoint_world(), (2.0, 2.0), "via not skipped")
+        self.assertFalse(hd.can_resume() and hd.state() is HierState.BLOCKED
+                         and hd.block_reason() == "swept_block" and hd._block_gave_up)
+
     def test_bearing_fallback_without_costmap(self):
         io = FakeDriveIO(scan=_clear_scan())
         hd = HierarchicalDrive(_runner(((2.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,

@@ -79,22 +79,38 @@ class Waypoint:
     # Optional pause after arrival. Schema slot only — hierarchical drive
     # ignores it.
     hold_s: float = 0.0
+    # Via-point radius (nav redesign step 2): the route planner may move
+    # this marker to the nearest free cell within radius_m when its own cell
+    # is blocked, and skips it when no free cell is that close. None = the
+    # planner default (RouteConfig.via_radius_m, 0.5 m).
+    radius_m: Optional[float] = None
+    # A marker that must be reached as placed: never relaxed, never skipped
+    # — the drive blocks (and pauses) if it cannot be reached.
+    must_visit: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "x_m": float(self.x_m),
             "y_m": float(self.y_m),
             "face_next": bool(self.face_next),
             "hold_s": float(self.hold_s),
         }
+        if self.radius_m is not None:
+            d["radius_m"] = float(self.radius_m)
+        if self.must_visit:
+            d["must_visit"] = True
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Waypoint":
+        r = d.get("radius_m")
         return cls(
             x_m=float(d["x_m"]),
             y_m=float(d["y_m"]),
             face_next=bool(d.get("face_next", True)),
             hold_s=float(d.get("hold_s", 0.0)),
+            radius_m=(float(r) if r is not None else None),
+            must_visit=bool(d.get("must_visit", False)),
         )
 
 

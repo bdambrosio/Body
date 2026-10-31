@@ -658,28 +658,33 @@ class MCLPoseSource(PoseSource):
         if evidence_count < self._config.min_evidence_cells:
             return {"success": False, "reason": "sparse_map"}
 
-        # Small xy window around the click, full yaw sweep at a fine step.
+        # Small xy window around the click. Heading: the current (IMU-fused)
+        # heading is usually roughly right even when position is lost, and
+        # corridors are self-similar under 180 deg flips (10-31: a full sweep
+        # picked the wrong heading and the robot drove into furniture). So:
+        # sweep +-90 deg around the current heading first and take the full
+        # circle only when it is clearly better.
         prior_pose = Pose2D(x, y, prior_tuple[2])
-        matcher = ScanMatcher(
-            ScanMatcherConfig(
-                xy_half_m=self._config.relocate_at_xy_half_m,
-                xy_step_m=0.02,
-                theta_half_rad=math.pi,
-                theta_step_rad=math.radians(2.0),
-                min_improvement=0.0,
-            ),
-        )
+
+        def _search(theta_half: float):
+            m = ScanMatcher(ScanMatcherConfig(
+                xy_half_m=self._config.relocate_at_xy_half_m, xy_step_m=0.02,
+                theta_half_rad=theta_half, theta_step_rad=math.radians(2.0),
+                min_improvement=0.0))
+            return m.search(points, prior_pose, self._evidence, self._map.origin_x_m,
+                            self._map.origin_y_m, self._map.resolution_m,
+                            return_field=False)
+
         t0 = time.monotonic()
         try:
-            result = matcher.search(
-                points,
-                prior_pose,
-                self._evidence,
-                self._map.origin_x_m,
-                self._map.origin_y_m,
-                self._map.resolution_m,
-                return_field=False,
-            )
+            near = _search(math.pi / 2)
+            full = _search(math.pi)
+            result = near
+            if full.improvement > 1.25 * max(near.improvement, 0.0) + 5.0:
+                logger.warning("mcl_pose.relocate_at: heading flipped — full sweep "
+                               "improv=%.1f vs near-heading %.1f", full.improvement,
+                               near.improvement)
+                result = full
         except Exception:
             logger.exception("mcl_pose.relocate_at: scan_match crashed")
             return {"success": False, "reason": "scan_match_error"}

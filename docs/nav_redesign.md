@@ -64,13 +64,28 @@ pose-lost stay the only true special cases.
 | # | Step | Pi change | Status |
 |---|------|-----------|--------|
 | 1 | Global planner on the live world costmap each leg; via-points relaxed/skipped; Tier-3 gets the furthest live-visible point along the path (`desktop/nav/route_planner.py`). Depth-veto hits and Tier-3's depth memory are stamped into the plan. The one-shot `expand_patrol` at Go is retired. | none | **done 10-31** |
-| 2 | Via-point radius / priority in the patrol format and editor; terminal tolerance separate. | none | next |
+| 1b | Planning map = reference-map prior + session grid, unknown routable at a cost; frontier fallback when a via is sealed off; path vs goal masks; footprint 0.11; `plan-fail-*.npz` dumps. | none | **done 10-31** |
+| 2 | Via-point `radius_m` / `must_visit` in the patrol format (`Waypoint`), honoured by the planner (relax within radius, skip, or block for must-visit). Editor UI for them: pending (edit the JSON for now). | none | **format done 10-31**; editor pending |
 | 3 | Path streaming to Tier-3 (`goto` kind `path`: a polyline, refreshed at 2–5 Hz) — no per-sub-goal stop-and-go. | yes | |
-| 4 | Depth memory becomes a world-map source (confidence + decay); Tier-3 keeps a short safety memory only. The 64/400-cell status copy goes away. | yes | |
-| 5 | Route-progress watchdog + escalation ladder replace the retry window and the operator pause. | none | |
+| 4 | Depth evidence becomes a world-map source (confidence + decay) once the veto's false-positive rate is measured low (blob gates + path corridor shipped 10-31, observe-only; `scripts/depth_denoise_score.py`). The Pi depth memory is retired. | yes | gates done; map source pending |
+| 5 | Route-progress watchdog + escalation ladder replace the retry window and the operator pause. First rung shipped 10-31: an intermediate via that stays blocked for the window is skipped before any pause; terminal / must-visit still pause. Remaining: progress-based stall timer, back-up primitive, retire the 10 s window. | none | partial |
 
 Each step is testable in the existing sims and leaves the robot drivable.
-Steps 1–2 alone would have prevented four of the six 10-31 stalls.
+Result so far (15:05–15:13 on step 1 + observe-only depth): three clean
+laps, one resume per lap for the fixed `leg_timeout`.
+
+## Depth veto (observe-only) — what the logged frames showed
+
+28 would-block frames in one session (none a contact): the raw rule (≥ 8
+pixels in the commanded-arc corridor) fires on 17 offline; the blob gates
+(connected floor blob ≥ 6 cm longest dimension, ≥ 6 cm high somewhere, ≥
+0.25 m away) remove every small one and keep 9 that are 13–36 cm wide and
+20–24 cm tall — real objects *beside* the path that the arc projected
+0.8 m ahead swept through while turning. Hence the second fix: the veto
+scores along Tier-3's planned path with the footprint half-width, max
+range 0.45 m. `act` stays off until the next sessions' would-block rate is
+measured. A persistence gate (same odom cells across ≥ 3 frames with ≥
+10 cm of motion) is the remaining idea, for the glare class.
 
 ## Step 1 contract (as built)
 

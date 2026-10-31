@@ -129,6 +129,8 @@ def relax_via(costmap: Any, via: Pt, radius_m: float, *,
         return None
     if not lethal[i, j]:
         return via
+    if radius_m <= 0:
+        return None
     radius = max(1, int(math.ceil(radius_m / res)))
     rel = _nearest_non_lethal(lethal, i, j, radius=radius)
     if rel is None:
@@ -140,18 +142,22 @@ def relax_via(costmap: Any, via: Pt, radius_m: float, *,
 
 
 def plan_route(costmap: Any, pose_xy: Pt, via: Pt, cfg: RouteConfig, *,
-               extra_lethal_world: Sequence[Pt] = ()) -> RoutePlan:
-    """Global path robot → (relaxed) via on the live costmap."""
+               extra_lethal_world: Sequence[Pt] = (),
+               via_radius_m: Optional[float] = None,
+               must_visit: bool = False) -> RoutePlan:
+    """Global path robot → (relaxed) via on the live costmap. ``via_radius_m``
+    overrides the config default for this via; ``must_visit`` plans to the
+    marker exactly (no relaxation, no frontier)."""
     if costmap is None:
         return RoutePlan(False, "no_costmap", [], None)
     cm = stamp_lethal_world(costmap, extra_lethal_world)
-    target = relax_via(cm, via, cfg.via_radius_m,
-                       min_clearance_cells=cfg.astar.min_clearance_cells)
+    radius = 0.0 if must_visit else (cfg.via_radius_m if via_radius_m is None else via_radius_m)
+    target = relax_via(cm, via, radius, min_clearance_cells=cfg.astar.min_clearance_cells)
     if target is None:
         return RoutePlan(False, "via_unreachable", [], None)
     res = plan_path(cm, pose_xy, target, cfg.astar)
     reason = "ok"
-    if not res.ok and res.msg == "no path":
+    if not res.ok and res.msg == "no path" and not must_visit:
         fr = frontier_target(cm, pose_xy, target, cfg)
         if fr is not None:
             res = plan_path(cm, pose_xy, fr, cfg.astar)

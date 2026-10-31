@@ -358,6 +358,7 @@ class HierarchicalDrive:
         self._held_tier: Optional[int] = None    # which handoff we're paused at
         self._route_start: Optional[Tuple[float, float]] = None   # prev for vertex 0
         self._detour_ticks = 0                      # consecutive detour status ticks
+        self._block_skipped_via = False             # one via skip per leg
         self._detour_last_ts: Optional[float] = None
         self._detour_repicks = 0                    # per leg
         self._prefer_fan = False                    # next SELECT: fan before straight
@@ -421,6 +422,7 @@ class HierarchicalDrive:
         self._route = None
         self._carrot_relaxed = None
         self._block_hits_world = []
+        self._block_skipped_via = False
         self._detour_ticks = 0
         self._detour_last_ts = None
         self._detour_repicks = 0
@@ -860,9 +862,13 @@ class HierarchicalDrive:
         if cm is None:
             return None
         extra = self._extra_lethal_world(pose)
+        wp = None if self._in_lead_in() else self._runner.current_target()
+        must_visit = bool(getattr(wp, "must_visit", False))
         plan = plan_route(cm, (pose[0], pose[1]), carrot, self._route_cfg,
-                          extra_lethal_world=extra)
-        terminal = self._carrot_terminal()
+                          extra_lethal_world=extra,
+                          via_radius_m=getattr(wp, "radius_m", None),
+                          must_visit=must_visit)
+        terminal = self._carrot_terminal() or must_visit
         if plan.ok:
             self._route = plan
             if self._leg_started_at is not None and self._tick_now - self._leg_started_at < 1.0:
@@ -879,9 +885,10 @@ class HierarchicalDrive:
         self._route = None
         if plan.reason == "via_unreachable":
             if terminal:
-                logger.warning("hier: terminal waypoint (%.2f,%.2f) has no free cell "
-                               "within %.2f m — blocked", carrot[0], carrot[1],
-                               self._route_cfg.via_radius_m)
+                logger.warning("hier: %s waypoint (%.2f,%.2f) has no free cell "
+                               "within its radius — blocked",
+                               "must-visit" if must_visit else "terminal",
+                               carrot[0], carrot[1])
                 self._enter_blocked("terminal_unreachable")
                 return False
             logger.info("hier: via (%.2f,%.2f) has no free cell within %.2f m — skipped",
@@ -1338,6 +1345,7 @@ class HierarchicalDrive:
             self._leg_started_at = None
             self._consecutive_rejects = 0
             self._detour_repicks = 0
+            self._block_skipped_via = False
             self._to(HierState.SELECT_SUBGOAL)
             return
         # Remember the vertex we're leaving — it's the prev for the passed-test
@@ -1353,6 +1361,7 @@ class HierarchicalDrive:
         self._leg_started_at = None
         self._consecutive_rejects = 0
         self._detour_repicks = 0
+        self._block_skipped_via = False
         if next_idx is None:
             self._io.cancel()
             self._subgoal_body = None
@@ -1375,6 +1384,22 @@ class HierarchicalDrive:
         if self._block_gave_up:
             return                 # paused (window spent, or a pause advisory)
         if terminal or now - self._block_started_at > self._cfg.blocked_retry_window_s:
+            # Escalation before a pause (redesign step 5, first rung): an
+            # intermediate via that cannot be reached within the window is
+            # skipped — it is a route hint. The terminal (or a must-visit
+            # marker, or a leg_timeout/rejected) still pauses for the operator.
+            wp = None if self._in_lead_in() else self._runner.current_target()
+            if (not terminal and not self._carrot_terminal()
+                    and not getattr(wp, "must_visit", False)
+                    and not self._block_skipped_via):
+                self._block_skipped_via = True
+                logger.warning("hier: blocked (%s) for %.0fs at via %s — skipping it",
+                               self._block_reason, now - self._block_started_at,
+                               self._waypoint)
+                self._block_started_at = None
+                self._block_gave_up = False
+                self._to(HierState.ADVANCE_WAYPOINT)
+                return
             if not self._block_gave_up:
                 self._block_gave_up = True
                 # Re-send the revoke on give-up: the cancel on BLOCKED entry
