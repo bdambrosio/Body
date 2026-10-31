@@ -34,7 +34,7 @@ import numpy as np
 
 from body.lib import drive_config, schemas, zenoh_helpers
 from body.lib.depth_memory import memory_config_from_dict, plan_cells, stamp_blocked
-from body.lib.local_costmap import build_local_costmap, dilate_bool
+from body.lib.local_costmap import build_local_costmap, dilate_bool, dilate_disk
 from body.lib.local_drive_core import wrap_pi
 from body.lib.scan_raster import rasterize_scan
 from body.lib.tier2_subgoal import (
@@ -913,17 +913,21 @@ class HierarchicalDrive:
                 if d >= self._route_cfg.horizon_m:
                     return b, "blind", d, None, None
             return pb[-1], "blind", d, None, None
-        march_grid, grid, meta = live
+        march_grid, path_grid, grid, meta = live
         pb = path_to_body(route.path_world, pose)
-        hit = visible_subgoal_along_path(pb, march_grid, meta, self._route_cfg)
+        hit = visible_subgoal_along_path(
+            pb, march_grid, meta, self._route_cfg, path_grid=path_grid,
+            robot_clear_radius_m=self._raster.robot_clear_radius_m)
         if hit is None:
             return None
         (bx, by), free = hit
         return (bx, by), "route", free, grid, meta
 
     def _live_march_grid(self):
-        """(march_grid, grid, meta) from the latest scan: Tier-3's footprint-
-        inflated lethal mask with the depth memory stamped, or None."""
+        """(goal_grid, path_grid, grid, meta) from the latest scan, depth
+        memory stamped: goal_grid = Tier-3's full lethal (+ goal clearance)
+        mask — where a goal is accepted as-is; path_grid = footprint-only
+        inflation — where the body physically fits. None without a scan."""
         scan = self._io.latest_scan()
         if scan is None or not scan.get("ranges"):
             return None
@@ -943,11 +947,15 @@ class HierarchicalDrive:
         blocked = dilate_bool(cm.lethal, iters=self._goal_clearance_cells)
         march_grid = grid.copy()
         march_grid[blocked] = 0
+        res = float(meta["resolution_m"])
+        core = dilate_disk(grid == 0, self._costmap_cfg.footprint_radius_m / res) | (grid == 0)
+        path_grid = grid.copy()
+        path_grid[core] = 0
         meta = dict(meta)
         ts = scan.get("ts")
         if isinstance(ts, (int, float)) and ts > 0:
             meta["_scan_ts"] = float(ts)
-        return march_grid, grid, meta
+        return march_grid, path_grid, grid, meta
 
     def _hold(self, tier: int) -> bool:
         """If ``tier``'s breakpoint is armed and unstepped, hold here. On the

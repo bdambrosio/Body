@@ -120,6 +120,34 @@ class TestRoutePlanner(unittest.TestCase):
         bx, by, _t, _v = io.sent[1]
         self.assertGreater(abs(by), 0.12, "retry still aims through the depth hits")
 
+    def test_leaving_from_right_in_front_of_an_obstacle(self):
+        # 10-31 14:30: the robot stopped 0.2 m from the bag (depth block),
+        # the next via is off to the side. Inside the full inflation every
+        # forward sample fails; the path only has to be physically passable
+        # (footprint) and its END acceptable to Tier-3.
+        cm = _world([(0.15, -0.25, 0.4, 0.25)])      # bag 0.2 m ahead, 0.5 m wide
+        wall = TestHierarchicalDrive._seg_scan(
+            [(0.2, -0.25, 0.2, 0.25), (0.2, 0.25, 0.4, 0.25), (0.2, -0.25, 0.4, -0.25)])
+        hd, io, _ = _drive(cm, ((0.4, 1.5),), scan=wall)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
+        bx, by, _t, _v = io.sent[0]
+        self.assertGreater(by, 0.2)                  # leaves sideways, toward the via
+        self.assertGreaterEqual(math.hypot(bx, by), 0.2)
+
+    def test_stamped_hits_are_inflated_like_mapped_obstacles(self):
+        cm = _world()
+        from desktop.nav.route_planner import stamp_lethal_world
+        cm2 = stamp_lethal_world(cm, [(1.0, 0.0)])
+        i, j = int((1.0 + HALF) / RES), int((0.0 + HALF) / RES)
+        self.assertTrue(cm2.lethal[i, j])
+        self.assertTrue(cm2.lethal[i, j + 2])        # 10 cm away: inside the footprint
+        self.assertFalse(cm2.lethal[i, j + 6])       # 30 cm away: free
+        plan = plan_route(cm, (0.0, 0.0), (2.0, 0.0), RouteConfig(),
+                          extra_lethal_world=[(1.0, 0.0)])
+        self.assertTrue(plan.ok)
+        self.assertGreaterEqual(
+            min(math.hypot(x - 1.0, y) for x, y in plan.path_world), 0.15 - RES)
+
     def test_bearing_fallback_without_costmap(self):
         io = FakeDriveIO(scan=_clear_scan())
         hd = HierarchicalDrive(_runner(((2.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,

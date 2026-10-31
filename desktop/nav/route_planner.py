@@ -79,22 +79,31 @@ def _cell_to_world(ij: Tuple[int, int], meta: dict) -> Pt:
 
 def stamp_lethal_world(costmap: Any, points_world: Iterable[Pt]) -> Any:
     """A shallow copy of ``costmap`` whose lethal mask also holds
-    ``points_world`` (e.g. Tier-3 depth hits the map doesn't carry yet).
-    Returns the original object when there is nothing to stamp."""
+    ``points_world`` (e.g. Tier-3 depth hits the map doesn't carry yet),
+    inflated by the costmap's footprint radius exactly like a mapped
+    blocked cell — so the global path keeps the same clearance from them
+    that the live scan check demands (a bare cell let the path hug a
+    remembered obstacle the live check then rejected: path_blocked_live
+    every retry, 10-31). Returns the original object when nothing stamps."""
     pts = [p for p in points_world]
     if not pts:
         return costmap
-    lethal = costmap.lethal.copy()
-    nx, ny = lethal.shape
+    stamp = np.zeros(costmap.lethal.shape, dtype=bool)
+    nx, ny = stamp.shape
     n = 0
     for p in pts:
         i, j = _world_to_cell(p, costmap.meta)
         if 0 <= i < nx and 0 <= j < ny:
-            lethal[i, j] = True
+            stamp[i, j] = True
             n += 1
     if n == 0:
         return costmap
-    return replace(costmap, lethal=lethal)
+    res = float(costmap.meta["resolution_m"])
+    fp = float(getattr(getattr(costmap, "config", None), "footprint_radius_m", 0.15))
+    iters = int(math.ceil(fp / res))
+    if iters > 0:
+        stamp = _dilate_bool(stamp, iters=iters)
+    return replace(costmap, lethal=costmap.lethal | stamp)
 
 
 def relax_via(costmap: Any, via: Pt, radius_m: float, *,
@@ -154,25 +163,42 @@ def path_to_body(path_world: Sequence[Pt], pose: Pose) -> List[Pt]:
 
 
 def visible_subgoal_along_path(
-    path_body: Sequence[Pt], march_grid: np.ndarray, meta: dict, cfg: RouteConfig,
-    *, max_dist_m: Optional[float] = None,
+    path_body: Sequence[Pt], goal_grid: np.ndarray, meta: dict, cfg: RouteConfig,
+    *, path_grid: Optional[np.ndarray] = None, max_dist_m: Optional[float] = None,
+    robot_clear_radius_m: float = 0.0,
 ) -> Optional[Tuple[Pt, float]]:
-    """Furthest point along ``path_body`` (from the robot at the origin) that
-    the live ``march_grid`` (int8: 1 clear, else not) shows clear, up to
-    ``horizon_m`` of path length (and ``max_dist_m`` if given). Returns
-    ((bx, by), path_dist) or None when the first ``min_subgoal_m`` are not
-    clear. Off-grid counts as open (Tier-2 convention)."""
+    """Furthest point along ``path_body`` (from the robot at the origin) the
+    live scan shows drivable, up to ``horizon_m`` of path length (and
+    ``max_dist_m`` if given).
+
+    Two masks (int8: 1 clear, else not): the path is walked on ``path_grid``
+    (footprint-only inflation — physically passable; Tier-3's swept veto is
+    the real gate), the chosen END point must be clear on ``goal_grid``
+    (Tier-3's full lethal + goal clearance, so it accepts the goal without
+    snapping). One mask for both made a robot standing 0.2 m from an
+    obstacle unable to leave along any path (10-31). Samples within
+    ``robot_clear_radius_m`` of the robot are never obstructions (it is
+    already there). Returns ((bx, by), path_dist) or None when no sample
+    ≥ ``min_subgoal_m`` qualifies. Off-grid counts as open."""
     if len(path_body) < 2:
         return None
+    if path_grid is None:
+        path_grid = goal_grid
     res = float(meta["resolution_m"])
     ox, oy = float(meta["origin_x_m"]), float(meta["origin_y_m"])
-    nx, ny = march_grid.shape
+    nx, ny = goal_grid.shape
     limit = cfg.horizon_m if max_dist_m is None else min(cfg.horizon_m, max_dist_m)
     step = cfg.march_step_m
-    last_clear: Optional[Pt] = None
-    last_d = 0.0
+
+    def cell(px: float, py: float):
+        i = int(math.floor((px - ox) / res))
+        j = int(math.floor((py - oy) / res))
+        return (i, j) if (0 <= i < nx and 0 <= j < ny) else None
+
+    samples: List[Tuple[Pt, float]] = []       # path-clear samples in order
+    obstructed = False
     walked = 0.0
-    reached_end = False
+    done = False
     for (ax, ay), (bx, by) in zip(path_body, path_body[1:]):
         seg = math.hypot(bx - ax, by - ay)
         if seg < 1e-9:
@@ -183,27 +209,30 @@ def visible_subgoal_along_path(
             px, py = ax + t * (bx - ax), ay + t * (by - ay)
             d = walked + t * seg
             if d > limit:
+                done = True
                 break
-            i = int(math.floor((px - ox) / res))
-            j = int(math.floor((py - oy) / res))
-            if 0 <= i < nx and 0 <= j < ny and int(march_grid[i, j]) != 1:
-                # Back off from the obstruction along the path; too short a
-                # clear stretch is no sub-goal at all.
-                d_ok = last_d - cfg.backoff_m
-                if last_clear is None or d_ok < cfg.min_subgoal_m:
-                    return None
-                return _back_off(path_body, last_d, cfg.backoff_m), d_ok
-            last_clear, last_d = (px, py), d
+            c = cell(px, py)
+            near_robot = math.hypot(px, py) <= robot_clear_radius_m
+            if c is not None and not near_robot and int(path_grid[c]) != 1:
+                obstructed = True
+                done = True
+                break
+            samples.append(((px, py), d))
         walked += seg
-        if walked > limit:
+        if done:
             break
-    else:
-        reached_end = True
-    if last_clear is None or last_d < cfg.min_subgoal_m:
+    if not samples:
         return None
-    if reached_end:
-        return last_clear, last_d          # the (relaxed) via itself: no backoff
-    return last_clear, last_d
+    # Pull back from an obstruction, then take the furthest sample Tier-3
+    # would accept as a goal.
+    d_cap = samples[-1][1] - (cfg.backoff_m if obstructed else 0.0)
+    for (px, py), d in reversed(samples):
+        if d > d_cap or d < cfg.min_subgoal_m:
+            continue
+        c = cell(px, py)
+        if c is None or int(goal_grid[c]) == 1:
+            return (px, py), d
+    return None
 
 
 def _back_off(path_body: Sequence[Pt], d: float, back: float) -> Pt:
