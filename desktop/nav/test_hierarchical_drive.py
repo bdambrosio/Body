@@ -608,6 +608,34 @@ class TestHierarchicalDrive(unittest.TestCase):
         else:
             self.assertEqual(hd.block_reason(), "clear_run_failed")
 
+    def test_blocked_intermediate_carrot_within_reach_is_passed(self):
+        # 10-31 hallway: waypoint against a cabinet base. Carrot 0.3 m ahead,
+        # remembered cells between the robot and it: no clear run ≥ 0.2 m,
+        # no fan hop that gains on it. An intermediate vertex that close is
+        # passed, not fought; the next carrot gets a normal goto.
+        wall = [[0.22 + x / 100.0, y / 100.0] for x in range(0, 13, 4) for y in range(-30, 31, 4)]
+        io = FakeDriveIO(scan=_clear_scan())
+        io.status = {"cmd_id": 0, "state": "IDLE", "depth_mem_body": wall}
+        hd = HierarchicalDrive(_runner(((0.3, 0.0), (0.3, 2.0))), FakePose((0.0, 0.0, 0.0)), io)
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        hd.tick(0.0)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
+        self.assertEqual(hd.current_waypoint_world(), (0.3, 2.0))
+        self.assertEqual(len(io.sent), 1)
+        bx, by, _t, _v = io.sent[0]
+        self.assertGreater(by, 0.2)                           # heading for the next vertex
+        # The TERMINAL waypoint is never skipped: honest block.
+        io2 = FakeDriveIO(scan=_clear_scan())
+        io2.status = {"cmd_id": 0, "state": "IDLE", "depth_mem_body": wall}
+        hd2 = HierarchicalDrive(_runner(((0.3, 0.0),)), FakePose((0.0, 0.0, 0.0)), io2)
+        hd2.start()
+        hd2.tick(0.0)
+        hd2.tick(0.0)
+        self.assertEqual(hd2.state(), HierState.BLOCKED)
+        self.assertEqual(hd2.block_reason(), "clear_run_failed")
+
     def test_select_clear_run_fail_blocks_not_blind(self):
         # When a live scan is present but the clear-run finds no usable point,
         # SELECT must BLOCKED (clear_run_failed) — never blind-project.

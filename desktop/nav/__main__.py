@@ -134,6 +134,18 @@ def main(argv=None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger(__name__)
+    # Also keep every nav log line on disk next to the drive traces: the
+    # hier/fan/re-pick lines are what explain a stall after the fact.
+    try:
+        log_dir = os.path.expanduser("~/body-logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"nav-{int(time.time())}.log")
+        fh = logging.FileHandler(log_path)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
+        log.info("nav log file: %s", log_path)
+    except OSError as e:
+        log.warning("nav log file not opened: %s", e)
     router = resolve_router(args.router)
     map_path = os.path.expanduser(args.map_path)
     log.info("nav starting router=%s map=%s", router, map_path)

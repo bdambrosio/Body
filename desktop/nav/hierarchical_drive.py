@@ -226,6 +226,14 @@ class HierConfig:
     # goto→ARRIVED loop otherwise runs at 10 Hz with no motion, invisible to
     # the retry window, until leg_deadline_s.
     arrived_min_motion_m: float = 0.05
+    # An intermediate carrot this close that Tier-2 cannot reach (no clear
+    # run ≥ min_subgoal_m toward it, no fan candidate that gains on it) is
+    # treated as passed: it is a route vertex, not a destination, and it is
+    # sitting inside an obstacle's inflation (10-31: waypoint 3 against a
+    # cabinet base; the robot parked 10–20 cm short of it, retrying
+    # clear_run_failed until the window ran out). The terminal waypoint is
+    # never skipped. Must exceed pass_proximity_m to matter.
+    blocked_carrot_skip_m: float = 0.40
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
@@ -697,6 +705,12 @@ class HierarchicalDrive:
         selected = self._select_subgoal_body(bearing, wp_dist, pose=pose,
                                              carrot=(cx, cy), prefer_fan=prefer_fan)
         if selected is None:
+            if (not terminal and wp_dist <= self._cfg.blocked_carrot_skip_m
+                    and self._io.latest_scan() is not None):
+                logger.info("hier: carrot %.2f m away but no clear run to it — "
+                            "treating it as passed", wp_dist)
+                self._to(HierState.ADVANCE_WAYPOINT)
+                return
             self._enter_blocked("clear_run_failed")
             return
         (bx, by), src, free_dist, grid, meta = selected
