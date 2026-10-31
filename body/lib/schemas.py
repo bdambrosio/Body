@@ -76,6 +76,7 @@ def drive_status(
     depth_bbox_px: list | tuple | None = None,
     depth_hit_body: list | None = None,
     depth_mem_body: list | None = None,
+    depth_would_block: bool = False,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
@@ -132,6 +133,8 @@ def drive_status(
         msg["depth_hit_body"] = [[float(p[0]), float(p[1])] for p in depth_hit_body]
     if depth_mem_body:
         msg["depth_mem_body"] = [[float(p[0]), float(p[1])] for p in depth_mem_body]
+    if depth_would_block:
+        msg["depth_would_block"] = True      # observe-only veto fired (local_drive.depth_veto.act=false)
     if build is not None:
         msg["build"] = build
     return msg

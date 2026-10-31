@@ -465,6 +465,11 @@ def main() -> None:
     depth_median_kernel = int(lm.get("depth_median_kernel", 3))
 
     driveable_on = bool(lm.get("driveable_enabled", True))
+    # Depth slab hits as BLOCKED evidence in the driveable layer. Off since
+    # 10-31: ~92 % of the day's depth stops were floor glare / transitions /
+    # nothing (VLM-judged); the phantoms reached the world map through this
+    # path and sealed corridors. Depth still feeds the height grid.
+    driveable_depth_on = bool(lm.get("driveable_depth_enabled", True))
     clearance_m = float(lm.get("driveable_clearance_height_m", 0.35))
     floor_band_m = float(lm.get("driveable_floor_band_m", 0.04))
     clear_frames_need = max(1, int(lm.get("driveable_clear_frames", 4)))
@@ -594,6 +599,8 @@ def main() -> None:
         now_wall = time.time()
         lidar_state = _sensor_state(lmsg, last_lidar_key, now_wall, lidar_max_age_s)
         depth_state = _sensor_state(dmsg, last_depth_key, now_wall, depth_max_age_s)
+        if not driveable_depth_on:
+            depth_state = "stale"            # the filter sees no depth evidence
         if lidar_state == "stale":
             lmsg = None
         if depth_state == "stale":
@@ -812,7 +819,7 @@ def main() -> None:
                 lidar_slab_count=lidar_slab_count,
                 lidar_cleared=lidar_cleared,
                 lidar_hit_cells=lidar_hit_cells,
-                depth_slab_count=slab_count,
+                depth_slab_count=slab_count if driveable_depth_on else None,
             )
             driveable_rows = []
             for ix in range(nx):

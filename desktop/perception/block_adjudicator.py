@@ -137,12 +137,17 @@ class BlockAdjudicator:
                  query_fn: Optional[Callable[[bytes], Any]] = None,
                  emit: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
                  log_dir: Optional[str] = None,
+                 depth_fn: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
                  clock: Callable[[], float] = time.time):
         self.cfg = cfg or AdjudicatorConfig()
         self._worker = worker
         self._query_fn = query_fn or self._default_query
         self._emit = emit
         self._log_dir = log_dir
+        # Optional: the latest decoded depth frame ({"depth": uint16 (h,w),
+        # "ts": ...}); saved next to the JPEG at every depth_block so a
+        # denoiser can be tuned offline on what the veto actually fired on.
+        self._depth_fn = depth_fn
         self._clock = clock
         self._pose: Optional[Pose] = None           # refreshed by poll()
         self._grabber = FrameGrabber(controller, lambda: self._pose, clock=clock)
@@ -185,6 +190,7 @@ class BlockAdjudicator:
         self._asked = key
         q = _Query(drive_id=key[0], run=key[1], reason=reason,
                    status=dict(status or {}), asked_ts=self._clock())
+        self._save_depth(q)
         rid = self._grabber.grab(lambda f: self._on_frame(q, f),
                                  on_fail=lambda r, e: self._on_capture_fail(q, r, e))
         if rid is None:
@@ -251,6 +257,26 @@ class BlockAdjudicator:
         return vs.chat_json([{"role": "user", "content": PROMPT}], SCHEMA,
                             images=[jpeg], max_tokens=self.cfg.max_tokens,
                             name="depth_block")
+
+    def _save_depth(self, q: _Query) -> None:
+        if self._log_dir is None or self._depth_fn is None:
+            return
+        try:
+            d = self._depth_fn()
+            if not d or d.get("depth") is None:
+                return
+            import numpy as _np
+            os.makedirs(self._log_dir, exist_ok=True)
+            st = q.status
+            _np.savez_compressed(
+                os.path.join(self._log_dir, f"run{q.run:04d}_depth.npz"),
+                depth=_np.asarray(d["depth"]), depth_ts=float(d.get("ts") or 0.0),
+                asked_ts=float(q.asked_ts), depth_hits=int(st.get("depth_hits") or 0),
+                depth_bbox_px=_np.asarray(st.get("depth_bbox_px") or [], dtype=float),
+                depth_hit_body=_np.asarray(st.get("depth_hit_body") or [], dtype=float).reshape(-1, 2),
+                reason=_np.array(q.reason))
+        except Exception:
+            logger.exception("block adjudicator: could not save depth frame")
 
     def _save_jpeg(self, q: _Query, res: VlmResult) -> Optional[str]:
         if self._log_dir is None or res.frame is None:

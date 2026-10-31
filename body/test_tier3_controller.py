@@ -357,7 +357,7 @@ class TestDepthMemoryNoCreep(unittest.TestCase):
     def _run(self, mem_on, retries=8, T=40.0):
         from body.lib.depth_memory import DepthMemoryConfig
         from body.test_depth_memory import depth_msg, render_depth
-        cfg = replace(T3, depth=replace(T3.depth, enabled=True),
+        cfg = replace(T3, depth=replace(T3.depth, enabled=True), depth_act=True,
                       memory=DepthMemoryConfig(enabled=mem_on))
         ctrl = Tier3Controller(cfg)
         pose, t, seq, cmd = (0.0, 0.0, 0.0), 0.0, 0, 1
@@ -473,6 +473,30 @@ class TestDepthMemoryNoCreep(unittest.TestCase):
                       pose_scan=(0.0, 0.0, 0.0), grid=g, meta=m)
         self.assertEqual((r.state, r.plan_reason), ("DRIVING", "ok"))
         self.assertGreater(r.v, 0.0)
+
+
+class TestObserveOnlyVeto(unittest.TestCase):
+    def test_observe_only_reports_but_does_not_block(self):
+        """depth_act=False: the veto scores the frame, the status says
+        depth_would_block with the hit evidence, and the robot keeps driving."""
+        from body.test_depth_memory import depth_msg, render_depth
+        cfg = replace(T3, depth=replace(T3.depth, enabled=True), depth_act=False)
+        ctrl = Tier3Controller(cfg)
+        panel = (0.40, -0.2, 0.44, 0.2, 0.3)
+        ctrl.start_goal(Tier3Goal(1, 1.0, 0.0, 0.12), 0.0, (0.0, 0.0, 0.0))
+        g, m = rasterize_scan(raycast((0.0, 0.0, 0.0), []), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+        seen = False
+        for k in range(4):
+            dm = depth_msg(render_depth((0.0, 0.0, 0.0), [panel], cfg.depth), ts=0.1 * k, seq=k)
+            r = ctrl.step(now_mono=0.1 * k, now_wall=0.1 * k, pose_now=(0.0, 0.0, 0.0),
+                          pose_scan=(0.0, 0.0, 0.0), grid=g, meta=m, depth=dm)
+            self.assertNotEqual(r.reason, "depth_block")
+            if r.depth_would_block:
+                seen = True
+                self.assertGreater(r.depth_hits, 0)
+                self.assertIsNotNone(r.depth_bbox_px)
+                self.assertGreater(r.v, 0.0)
+        self.assertTrue(seen, "veto never scored the panel")
 
 
 class TestEndpointLatch(unittest.TestCase):

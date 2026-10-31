@@ -192,6 +192,7 @@ def tier3_config(body_cfg: Dict[str, Any]):
         foot=footprint_config(body_cfg),
         depth=depth_veto_config(body_cfg),
         memory=memory_config_from_dict(cfg.get("depth_memory")),
+        depth_act=bool(cfg.get("depth_veto", {}).get("act", True)),
         lookahead_m=float(cfg.get("local_planner", {}).get("lookahead_m", d.lookahead_m)),
         no_progress_timeout_s=float(cfg.get("no_progress_timeout_s", d.no_progress_timeout_s)),
         no_progress_eps_m=float(cfg.get("no_progress_eps_m", d.no_progress_eps_m)),

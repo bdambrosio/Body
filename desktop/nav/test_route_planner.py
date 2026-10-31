@@ -106,7 +106,7 @@ class TestRoutePlanner(unittest.TestCase):
 
     def test_depth_block_hits_are_stamped_into_the_next_plan(self):
         cm = _world()
-        hd, io, po = _drive(cm, ((2.0, 0.0),))
+        hd, io, po = _drive(cm, ((2.0, 0.0),), stamp_block_hits=True)
         straight = io.sent[0]
         self.assertLess(abs(straight[1]), 0.05)        # straight (± half a cell)
         hits = [[0.6 + k * 0.04, y] for k in range(4) for y in (-0.08, -0.04, 0.0, 0.04, 0.08)]

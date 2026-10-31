@@ -73,6 +73,11 @@ class Tier3Config:
     # Odom-frame memory of depth obstacles, stamped into the planning grid
     # (body/lib/depth_memory.py). Uses ``depth``'s camera model / ROI.
     memory: DepthMemoryConfig = field(default_factory=lambda: DepthMemoryConfig(enabled=False))
+    # Observe-only veto: score every frame and report depth_would_block /
+    # hits / bbox in the status, but never BLOCK on it. Off since 10-31 (~92
+    # % of depth stops were floor glare / transitions); the reports feed an
+    # offline denoiser until the false-positive rate is measured low.
+    depth_act: bool = True
     lookahead_m: float = 0.4
     no_progress_timeout_s: float = 4.0
     no_progress_eps_m: float = 0.03
@@ -125,6 +130,7 @@ class TickResult:
     depth_seq: Optional[int] = None        # … and the depth frame's seq
     depth_bbox_px: Optional[Tuple[int, int, int, int, int, int]] = None  # u0,v0,u1,v1,w,h
     depth_hit_body: Optional[Any] = None   # (N, 2) body x, y of the veto hits
+    depth_would_block: bool = False        # veto fired but depth_act is off (observe-only)
 
 
 class Tier3Controller:
@@ -367,13 +373,19 @@ class Tier3Controller:
             self._record(g, gb, plan_reason, path_now, look, v, omega,
                          blocked or depth_blocked, work, meta)
 
+        depth_report: Dict[str, Any] = {}
         if depth_blocked:
-            self.prog_at = now_mono
-            return res(STATE_BLOCKED, (0.0, 0.0), reason="depth_block", mode="follow",
-                       depth_hits=self._depth.last_hits,
-                       depth_seq=self._depth.last_seq,
-                       depth_bbox_px=self._depth.last_bbox_px,
-                       depth_hit_body=self._depth.last_hit_body)
+            if cfg.depth_act:
+                self.prog_at = now_mono
+                return res(STATE_BLOCKED, (0.0, 0.0), reason="depth_block", mode="follow",
+                           depth_hits=self._depth.last_hits,
+                           depth_seq=self._depth.last_seq,
+                           depth_bbox_px=self._depth.last_bbox_px,
+                           depth_hit_body=self._depth.last_hit_body)
+            depth_report = dict(depth_would_block=True, depth_hits=self._depth.last_hits,
+                                depth_seq=self._depth.last_seq,
+                                depth_bbox_px=self._depth.last_bbox_px,
+                                depth_hit_body=self._depth.last_hit_body)
 
         if blocked:
             look_bearing = math.atan2(look[1], look[0])
@@ -422,6 +434,7 @@ class Tier3Controller:
             return res(STATE_BLOCKED, (0.0, 0.0), reason="no_progress")
 
         return res(STATE_DRIVING, (v, omega), v=v, omega=omega, mode="follow",
+                   **depth_report,
                    path_body=path_now, plan_reason=plan_reason)
 
     # ── helpers ──────────────────────────────────────────────────────

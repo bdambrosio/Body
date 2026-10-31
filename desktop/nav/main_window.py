@@ -40,6 +40,7 @@ from .hierarchical_drive import (
 )
 from . import patrol as patrol_mod
 from desktop.nav.route_planner import merge_prior, resample_prior
+from desktop.perception.depth_stop_logger import DepthStopLogger
 from .patrol import PatrolRunner
 from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
@@ -129,8 +130,11 @@ class NavMainWindow(QMainWindow):
                 cfg=AdjudicatorConfig(act=(vlm_advisor == "act")),
                 emit=lambda c, e, d: self._tracer.emit(c, e, d),
                 log_dir=default_log_dir(),
+                depth_fn=self._latest_depth_frame,
             )
             logger.info("vlm advisor: %s", vlm_advisor)
+        # Observe-only depth veto: record what it would have stopped on.
+        self._depth_stop_logger = DepthStopLogger(default_log_dir())
 
         self._build_toolbars()
         self._build_ui()
@@ -768,6 +772,10 @@ class NavMainWindow(QMainWindow):
         try:
             drive_st = (self._drive_client.latest_status()
                         if self._drive_client is not None else None)
+            if drive_st is not None:
+                self._depth_stop_logger.observe(
+                    drive_st, depth=self._latest_depth_frame(),
+                    rgb=self._latest_rgb(), pose=pose)
             self._cameras.set_depth_memory(
                 drive_st.get("depth_mem_body") if isinstance(drive_st, dict) else None)
         except Exception:
@@ -1313,6 +1321,20 @@ class NavMainWindow(QMainWindow):
             cm = self._last_costmap
         self._plan_cm, self._plan_cm_key = cm, key
         return cm
+
+    def _latest_rgb(self) -> Optional[dict]:
+        st = self.chassis.state
+        with st.lock:
+            return ({"jpeg": st.rgb_jpeg, "ts": st.rgb_ts} if st.rgb_jpeg else None)
+
+    def _latest_depth_frame(self) -> Optional[dict]:
+        """The chassis' latest decoded depth frame, for the block logger."""
+        st = self.chassis.state
+        with st.lock:
+            if st.depth_image is None:
+                return None
+            return {"depth": st.depth_image.copy(), "ts": st.depth_ts,
+                    "format": st.depth_format}
 
     def _reset_depth_memory(self, reason: str, *, quiet: bool = True) -> None:
         """Ask Tier-3 to forget its depth memory (Go, relocate, button). A

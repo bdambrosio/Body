@@ -230,7 +230,7 @@ def main() -> None:
                        dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
                        path_body=None, plan_reason=None, watermark=None,
                        depth_hits=None, depth_seq=None, depth_bbox_px=None,
-                       depth_hit_body=None) -> None:
+                       depth_hit_body=None, depth_would_block=False) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
@@ -242,6 +242,7 @@ def main() -> None:
                 depth_bbox_px=depth_bbox_px,
                 depth_hit_body=rounded_xy(depth_hit_body, 32),
                 depth_mem_body=mem_body,
+                depth_would_block=depth_would_block,
             ),
         )
 
@@ -434,7 +435,8 @@ def main() -> None:
                        v=r.v, omega=r.omega, reason=r.reason, mode=r.mode,
                        path_body=r.path_body, plan_reason=r.plan_reason,
                        depth_hits=r.depth_hits, depth_seq=r.depth_seq,
-                       depth_bbox_px=r.depth_bbox_px, depth_hit_body=r.depth_hit_body)
+                       depth_bbox_px=r.depth_bbox_px, depth_hit_body=r.depth_hit_body,
+                       depth_would_block=r.depth_would_block)
         if r.done:
             if r.state == STATE_ARRIVED and r.plan_reason:
                 print(f"local_drive: goal {cmd_id} ARRIVED at {r.plan_reason} "
@@ -447,7 +449,7 @@ def main() -> None:
 
     print(
         f"local_drive: up; control_hz={control_hz} v_max={t3_cfg.params.v_max} "
-        f"depth_veto={'on' if t3_cfg.depth.enabled else 'off'} "
+        f"depth_veto={('on' if t3_cfg.depth_act else 'observe') if t3_cfg.depth.enabled else 'off'} "
         f"depth_memory={'on' if t3_cfg.memory.enabled else 'off'}",
         flush=True,
     )

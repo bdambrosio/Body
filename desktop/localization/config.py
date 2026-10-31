@@ -55,9 +55,11 @@ class LocalizationConfig:
 
     map_stale_s: float = 2.0
     ui_redraw_hz: float = 5.0
-    # Tier-1 (global-planner) lethal radius. DELIBERATELY larger than the
-    # robot's true footprint (config.json local_planner.footprint_radius_m =
-    # 0.11): global routes get extra clearance; Tier-3 handles reality.
-    footprint_radius_m: float = 0.15
+    # Global-planner lethal radius = the robot's true half-width (220 mm
+    # wide; config.json local_planner.footprint_radius_m = 0.11), the same
+    # as Tier-3's. Safety lives in the halo COST, not in lethal: with 0.15
+    # + the planner's 1-cell clearance every gap under 0.40 m was a wall
+    # and each speckle pixel a 0.4 m disc (10-31).
+    footprint_radius_m: float = 0.11
 
     topics: Topics = field(default_factory=Topics)

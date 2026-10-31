@@ -245,6 +245,9 @@ class HierConfig:
     # re-approach what just stopped you). Tier-3 still plans around its own
     # memory locally. Redesign step 4 moves persistence into the world map.
     plan_with_depth_memory: bool = False
+    # Stamp a depth_block's own hits into the global plan for 20 s. Off
+    # with the veto (10-31): the hits were phantoms 92 % of the time.
+    stamp_block_hits: bool = False
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
@@ -914,7 +917,7 @@ class HierarchicalDrive:
         mem = self._depth_memory_body() or []
         for p in mem:
             out.append((pose[0] + c * p[0] - s * p[1], pose[1] + s * p[0] + c * p[1]))
-        if self._tick_now - self._block_hits_at <= 20.0:
+        if self._cfg.stamp_block_hits and self._tick_now - self._block_hits_at <= 20.0:
             out.extend(self._block_hits_world)
         return out
 
