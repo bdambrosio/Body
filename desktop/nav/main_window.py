@@ -746,6 +746,14 @@ class NavMainWindow(QMainWindow):
         # Here we only refresh the overlay at the render rate.
         if self._hier_drive is not None:
             self._refresh_hier_overlay(pose)
+        # Tier-3 depth memory: shown whether or not a drive is running.
+        try:
+            st = (self._drive_client.latest_status()
+                  if self._drive_client is not None else None)
+            self._cameras.set_depth_memory(
+                st.get("depth_mem_body") if isinstance(st, dict) else None)
+        except Exception:
+            logger.exception("depth-memory overlay failed; skipping")
 
         # All status labels below use width-stable formats: every
         # numeric field has a fixed min-width via `:>N.Mf` / `:>Nd` so

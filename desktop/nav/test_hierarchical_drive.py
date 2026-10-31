@@ -352,6 +352,27 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertAlmostEqual(bx, 1.46, places=2)
         self.assertAlmostEqual(by, 0.0, places=2)
 
+    def test_select_marches_around_tier3_depth_memory(self):
+        # Tier-3's depth memory (depth_mem_body in its status) is an obstacle
+        # for the Tier-2 clear-run too: a remembered door edge 0.6 m ahead
+        # shortens the march instead of being picked straight through.
+        n = 360
+        scan = {"ranges": [10.0] * n, "angle_min": -math.pi,
+                "angle_increment": 2.0 * math.pi / n, "ts": 1.0}
+        io = FakeDriveIO(scan=scan)
+        io.status = {"cmd_id": 0, "state": "IDLE",
+                     "depth_mem_body": [[0.6, y / 100.0] for y in range(-8, 9, 4)]}
+        hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io)
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        self.assertEqual(len(io.sent), 1)
+        bx, by, _tol, _v = io.sent[0]
+        self.assertLess(bx, 0.6 - 0.11)            # short of the edge + footprint
+        self.assertGreater(bx, 0.2)                # …but still a forward sub-goal
+        self.assertAlmostEqual(by, 0.0, places=2)
+        # Without the memory the same scan marches to the 1.46 m horizon.
+
     def test_select_clear_run_fail_blocks_not_blind(self):
         # When a live scan is present but the clear-run finds no usable point,
         # SELECT must BLOCKED (clear_run_failed) — never blind-project.

@@ -232,6 +232,17 @@
       "clear_buffer_cells": 2.0,
       "robot_clear_radius_m": 0.11
     },
+    "depth_memory": {
+      "enabled": true,
+      "cell_m": 0.04,
+      "min_pts": 3,
+      "confirm_frames": 2,
+      "clear_frames": 2,
+      "floor_min_pts": 4,
+      "ttl_s": 30.0,
+      "keep_radius_m": 3.0,
+      "max_range_m": 0.8
+    },
     "depth_veto": {
       "enabled": true,
       "stale_s": 0.5,

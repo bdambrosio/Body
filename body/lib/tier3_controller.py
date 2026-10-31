@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from body.lib.depth_memory import DepthMemoryConfig, DepthObstacleMemory, stamp_blocked
 from body.lib.depth_veto import DepthVetoConfig, DepthVetoTracker
 from body.lib.drive_safety import (
     FootprintConfig, explained_unknown_mask, seed_clear_disk,
@@ -61,6 +62,9 @@ class Tier3Config:
     plan: LocalPlanConfig = field(default_factory=LocalPlanConfig)
     foot: FootprintConfig = field(default_factory=FootprintConfig)
     depth: DepthVetoConfig = field(default_factory=lambda: DepthVetoConfig(enabled=False))
+    # Odom-frame memory of depth obstacles, stamped into the planning grid
+    # (body/lib/depth_memory.py). Uses ``depth``'s camera model / ROI.
+    memory: DepthMemoryConfig = field(default_factory=lambda: DepthMemoryConfig(enabled=False))
     lookahead_m: float = 0.4
     no_progress_timeout_s: float = 4.0
     no_progress_eps_m: float = 0.03
@@ -111,6 +115,8 @@ class TickResult:
     terminal: bool = False
     depth_hits: Optional[int] = None       # depth_block evidence (slab hit count)
     depth_seq: Optional[int] = None        # … and the depth frame's seq
+    depth_bbox_px: Optional[Tuple[int, int, int, int, int, int]] = None  # u0,v0,u1,v1,w,h
+    depth_hit_body: Optional[Any] = None   # (N, 2) body x, y of the veto hits
 
 
 class Tier3Controller:
@@ -124,6 +130,9 @@ class Tier3Controller:
         self.gate = gate
         self.goal: Optional[Tier3Goal] = None
         self._depth = DepthVetoTracker(cfg.depth)
+        # Survives goals on purpose: a retry is a new goal, and forgetting
+        # what stopped the last one is what made the robot creep (10-31).
+        self.memory = DepthObstacleMemory(cfg.memory, cfg.depth)
         self._reset_state(0.0, (0.0, 0.0, 0.0))
 
     # ── lifecycle ────────────────────────────────────────────────────
@@ -152,12 +161,23 @@ class Tier3Controller:
     def clear(self) -> None:
         self.goal = None
 
+    def observe_depth(self, depth: Optional[Dict[str, Any]], *, now_wall: float,
+                      pose_now: Pose, pose_depth: Optional[Pose],
+                      omega_radps: float) -> bool:
+        """Feed the depth memory. Call every control tick, with or without a
+        goal, with raw wheel-odom poses (the memory's frame)."""
+        return self.memory.update(depth, now_wall=now_wall, pose_now=pose_now,
+                                  pose_depth=pose_depth, omega_radps=omega_radps)
+
     # ── one control tick ─────────────────────────────────────────────
     def step(
         self, *, now_mono: float, now_wall: float, pose_now: Pose,
         pose_scan: Optional[Pose], grid: Optional[np.ndarray],
         meta: Optional[Dict[str, Any]], depth: Optional[Dict[str, Any]] = None,
+        pose_scan_raw: Optional[Pose] = None,
     ) -> TickResult:
+        """``pose_scan_raw``: raw wheel-odom pose at the scan ts (the depth
+        memory's frame); defaults to ``pose_scan``."""
         g = self.goal
         if g is None:
             raise RuntimeError("Tier3Controller.step without a goal")
@@ -219,6 +239,13 @@ class Tier3Controller:
         work = np.array(grid, dtype=np.int8, copy=True)
         seed_clear_disk(work, meta, (0.0, 0.0), cfg.seed_clear_radius_m)
         seed_clear_disk(work, meta, (rel[0], rel[1]), cfg.seed_clear_radius_m)
+        if len(self.memory):
+            # Remembered depth obstacles are hits for the planner AND the
+            # swept veto: an arc into one is refused before the robot moves.
+            stamp_blocked(work, meta,
+                          self.memory.cells_body(pose_scan_raw or pose_scan),
+                          keep_clear_xy=(rel[0], rel[1]),
+                          keep_clear_radius_m=cfg.seed_clear_radius_m)
         explained = (explained_unknown_mask(work, foot.unknown_explained_cells)
                      if foot.block_on_unknown else None)
         cm = build_local_costmap(work, meta, cfg.plan.costmap)
@@ -334,7 +361,9 @@ class Tier3Controller:
             self.prog_at = now_mono
             return res(STATE_BLOCKED, (0.0, 0.0), reason="depth_block", mode="follow",
                        depth_hits=self._depth.last_hits,
-                       depth_seq=self._depth.last_seq)
+                       depth_seq=self._depth.last_seq,
+                       depth_bbox_px=self._depth.last_bbox_px,
+                       depth_hit_body=self._depth.last_hit_body)
 
         if blocked:
             look_bearing = math.atan2(look[1], look[0])

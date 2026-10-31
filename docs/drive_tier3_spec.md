@@ -82,6 +82,10 @@ refused during e-stop — is reported as `FAULT:<reason>` under its `cmd_id`
 | `mode` | str? | `follow`\|`rotate`\|`realign`\|`held`\|`plan` — `rotate`/`realign` = turning in place (the desktop must not re-pick on bearing drift then) |
 | `plan_reason` | str? | `ok`\|`snapped`\|`frontier`; on `ARRIVED`, `snapped`/`frontier` = reached the best reachable stand-in for an unreachable goal |
 | `path_body_xy` | list? | the A\* path being followed (display/inspector) |
+| `depth_hits`, `depth_seq` | int? | with `depth_block`: veto hit count and the depth frame's `seq` |
+| `depth_bbox_px` | [u0,v0,u1,v1,w,h]? | with `depth_block`: bounding box of the veto hits in that depth image (for the VLM) |
+| `depth_hit_body` | list? | with `depth_block`: body-frame [x,y] of the veto hits (≤ 32, nearest first) |
+| `depth_mem_body` | list? | any state: depth-memory cells (live body frame, ≤ 64, nearest first) that Tier-3 plans around; Tier-2 marches around them too |
 | `build` | str? | Pi git sha — the desktop flags a stale deploy |
 
 ## cmd_vel ownership (arbitration)
@@ -158,6 +162,21 @@ is transport + lifecycle.
    only on a new depth frame (`seq`, else `ts`). Fail-open when depth is
    missing/stale/rotating fast; lidar still owns planning. This is **not**
    consumption of `body/map/local_2p5d`.
+6. **Depth obstacle memory** (`body/lib/depth_memory.py`, config
+   `local_drive.depth_memory`): the veto alone keeps no record, so a retry
+   (a new goal) re-approached what stopped the last one — ≥ 2 depth frames
+   of motion, veto, retry, ~2 cm closer each cycle (2026-10-31). Every
+   tick, goal or not, new depth frames (same points / floor band /
+   structure test as the veto, forward window `min_range_m`..`max_range_m`)
+   update an odom-frame cell memory (`cell_m`). A cell is remembered after
+   ≥ `min_pts` obstacle points on `confirm_frames` consecutive new frames
+   and stamped into the planning grid as a hit, so A\* routes around it and
+   the swept veto refuses an arc into it **before** moving. It is forgotten
+   when seen as floor (≥ `floor_min_pts` floor points, no obstacle points)
+   on `clear_frames` consecutive frames, `ttl_s` after its last confirming
+   frame, beyond `keep_radius_m`, under the robot's footprint, or on an odom
+   reset — **not** on a new goal; out of view it is kept. Frames while
+   |ω| > `max_abs_omega_radps` are skipped. `enabled: false` = old behaviour.
 
 Terminal conditions:
 

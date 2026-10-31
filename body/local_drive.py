@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional
 
 from body.lib import drive_config, schemas, zenoh_helpers
 from body.lib.buildinfo import git_sha
+from body.lib.depth_memory import rounded_xy
 from body.lib.handoff_gate import HandoffGate
 from body.lib.local_drive_core import (
     STATE_ARRIVED, STATE_FAULT, STATE_REJECTED, EStopMonitor, GotoArbiter,
@@ -213,7 +214,8 @@ def main() -> None:
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
                        dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
                        path_body=None, plan_reason=None, watermark=None,
-                       depth_hits=None, depth_seq=None) -> None:
+                       depth_hits=None, depth_seq=None, depth_bbox_px=None,
+                       depth_hit_body=None) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
@@ -222,10 +224,14 @@ def main() -> None:
                 blocked_reason=reason, mode=mode, path_body_xy=path_body,
                 plan_reason=plan_reason, build=build, watermark=watermark,
                 depth_hits=depth_hits, depth_seq=depth_seq,
+                depth_bbox_px=depth_bbox_px,
+                depth_hit_body=rounded_xy(depth_hit_body, 32),
+                depth_mem_body=mem_body,
             ),
         )
 
     # Main-loop-only state.
+    mem_body = None                         # depth memory, live body frame, per tick
     tracked_cmd_id: Optional[int] = None
     was_active = False                      # commanded motion last tick
     imu_guard = cfg.get("imu_guard", {})
@@ -247,7 +253,7 @@ def main() -> None:
             print(f"local_drive: goal {cid} dropped ({reason})", flush=True)
 
     def tick(now_wall: float, now_mono: float) -> None:
-        nonlocal tracked_cmd_id, was_active, odom_reset_pending, imu_rebaseline
+        nonlocal tracked_cmd_id, was_active, odom_reset_pending, imu_rebaseline, mem_body
         with lock:
             rejects = arb.take_rejects()
             watermark = arb.watermark
@@ -272,9 +278,24 @@ def main() -> None:
         if reset:
             print("local_drive: odom frame reset (motor_controller restart)", flush=True)
             yaw_corr.reset()
+            ctrl.memory.reset()
             if g is not None:
                 drop_goal("odom_reset")
                 g = None
+
+        # Depth memory learns (and forgets) every tick, goal or not, in the raw
+        # wheel-odom frame — a retry is a new goal and must still see it.
+        mem_body = None
+        if _odom_usable(odom, now_wall, odom_stale_s):
+            raw_now = (float(odom["x"]), float(odom["y"]), float(odom["theta"]))
+            pose_depth = None
+            if depth is not None:
+                with lock:
+                    pose_depth = ring.pose_at(float(depth.get("ts", 0.0) or 0.0))
+            ctrl.observe_depth(depth, now_wall=now_wall, pose_now=raw_now,
+                               pose_depth=pose_depth,
+                               omega_radps=float(odom.get("vtheta", 0.0) or 0.0))
+            mem_body = rounded_xy(ctrl.memory.cells_body(raw_now), 64)
 
         if estop_on:
             if g is not None:
@@ -357,7 +378,7 @@ def main() -> None:
         div = wrap_pi(theta - odom_theta)
         pose_now = (float(odom["x"]), float(odom["y"]), theta)
 
-        grid = meta = pose_scan = None
+        grid = meta = pose_scan = pose_scan_raw = None
         if scan is not None and (now_wall - float(scan.get("ts", 0.0))) <= scan_stale_s:
             grid, meta = _rasterize(scan, raster)
             # Plan in the scan's own body frame: the pose at its (mid-sweep)
@@ -366,16 +387,20 @@ def main() -> None:
                 p_scan = ring.pose_at(float(scan.get("ts", 0.0)))
             pose_scan = (pose_now if p_scan is None
                          else (p_scan[0], p_scan[1], wrap_pi(p_scan[2] + div)))
+            pose_scan_raw = ((pose_now[0], pose_now[1], odom_theta) if p_scan is None
+                             else tuple(p_scan[:3]))
 
         r = ctrl.step(now_mono=now_mono, now_wall=now_wall, pose_now=pose_now,
-                      pose_scan=pose_scan, grid=grid, meta=meta, depth=depth)
+                      pose_scan=pose_scan, grid=grid, meta=meta, depth=depth,
+                      pose_scan_raw=pose_scan_raw)
         if r.cmd is not None:
             publish_cmd(r.cmd[0], r.cmd[1])
             was_active = abs(r.cmd[0]) > 0 or abs(r.cmd[1]) > 0
         publish_status(r.state, cmd_id=cmd_id, goal_body=r.goal_body, dist=r.dist,
                        v=r.v, omega=r.omega, reason=r.reason, mode=r.mode,
                        path_body=r.path_body, plan_reason=r.plan_reason,
-                       depth_hits=r.depth_hits, depth_seq=r.depth_seq)
+                       depth_hits=r.depth_hits, depth_seq=r.depth_seq,
+                       depth_bbox_px=r.depth_bbox_px, depth_hit_body=r.depth_hit_body)
         if r.done:
             if r.state == STATE_ARRIVED and r.plan_reason:
                 print(f"local_drive: goal {cmd_id} ARRIVED at {r.plan_reason} "
@@ -387,7 +412,8 @@ def main() -> None:
 
     print(
         f"local_drive: up; control_hz={control_hz} v_max={t3_cfg.params.v_max} "
-        f"depth_veto={'on' if t3_cfg.depth.enabled else 'off'}",
+        f"depth_veto={'on' if t3_cfg.depth.enabled else 'off'} "
+        f"depth_memory={'on' if t3_cfg.memory.enabled else 'off'}",
         flush=True,
     )
     next_tick = time.monotonic()

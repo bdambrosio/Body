@@ -344,5 +344,86 @@ class TestFailures(unittest.TestCase):
         self.assertTrue(r.terminal)
 
 
+
+class TestDepthMemoryNoCreep(unittest.TestCase):
+    """2026-10-31 door edge: an obstacle only the depth camera sees. With no
+    memory, every retry (a new goal) drives ≥ 2 depth frames into it before
+    the veto stops it — creeping ~2 cm closer per cycle. With the memory it
+    is planned around like a lidar hit and the veto never has to fire."""
+
+    PANEL = (0.60, -0.05, 0.64, 0.80, 2.0)    # open door: edge on the forward axis
+    GOAL = (1.4, 0.0)
+
+    def _run(self, mem_on, retries=8, T=40.0):
+        from body.lib.depth_memory import DepthMemoryConfig
+        from body.test_depth_memory import depth_msg, render_depth
+        cfg = replace(T3, depth=replace(T3.depth, enabled=True),
+                      memory=DepthMemoryConfig(enabled=mem_on))
+        ctrl = Tier3Controller(cfg)
+        pose, t, seq, cmd = (0.0, 0.0, 0.0), 0.0, 0, 1
+        x0, y0, x1, y1, _ = self.PANEL
+
+        def dist(p):
+            return math.hypot(max(x0 - p[0], 0.0, p[0] - x1), max(y0 - p[1], 0.0, p[1] - y1))
+
+        blocks, dmin, retry_at = [], 9.0, 0.0
+        ctrl.start_goal(Tier3Goal(cmd, *self.GOAL, 0.12), t, pose)
+        while t < T:
+            seq += 1
+            dm = depth_msg(render_depth(pose, [self.PANEL], cfg.depth), ts=t, seq=seq)
+            ctrl.observe_depth(dm, now_wall=t, pose_now=pose, pose_depth=pose, omega_radps=0.0)
+            if ctrl.goal is None:                       # hier retry cadence
+                if t < retry_at:
+                    t += 0.1
+                    continue
+                cmd += 1
+                ctrl.start_goal(Tier3Goal(cmd, *self.GOAL, 0.12), t, pose)
+            g, m = rasterize_scan(raycast(pose, []), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+            r = ctrl.step(now_mono=t, now_wall=t, pose_now=pose, pose_scan=pose,
+                          grid=g, meta=m, depth=dm)
+            if r.done and r.state == STATE_ARRIVED:
+                return "ARRIVED", blocks, dmin
+            if r.state == STATE_BLOCKED:
+                blocks.append((r.reason, dist(pose)))
+                ctrl.clear()
+                retry_at = t + 0.5
+                if len(blocks) > retries:
+                    return "GAVEUP", blocks, dmin
+            v, w = r.cmd or (0.0, 0.0)
+            x, y, th = pose
+            pose = (x + v * math.cos(th) * 0.1, y + v * math.sin(th) * 0.1, th + w * 0.1)
+            dmin = min(dmin, dist(pose))
+            t += 0.1
+        return "TIMEOUT", blocks, dmin
+
+    def test_without_memory_reproduces_creep(self):
+        state, blocks, _ = self._run(False)
+        self.assertEqual(state, "GAVEUP")
+        self.assertTrue(all(b[0] == "depth_block" for b in blocks), blocks)
+        d = [b[1] for b in blocks]
+        self.assertLess(d[-1], d[0] - 0.1, d)          # crept > 10 cm closer
+
+    def test_with_memory_plans_around_without_blocking(self):
+        state, blocks, dmin = self._run(True)
+        self.assertEqual(state, "ARRIVED", blocks)
+        self.assertEqual([b for b in blocks if b[0] == "depth_block"], [])
+        self.assertGreater(dmin, T3.plan.costmap.footprint_radius_m)
+
+    def test_memory_survives_new_goal(self):
+        from body.lib.depth_memory import DepthMemoryConfig
+        from body.test_depth_memory import depth_msg, render_depth
+        cfg = replace(T3, memory=DepthMemoryConfig(enabled=True))
+        ctrl = Tier3Controller(cfg)
+        for k in (1, 2):
+            dm = depth_msg(render_depth((0, 0, 0), [self.PANEL], cfg.depth), ts=k * 0.1, seq=k)
+            ctrl.observe_depth(dm, now_wall=k * 0.1, pose_now=(0, 0, 0),
+                               pose_depth=(0, 0, 0), omega_radps=0.0)
+        n = len(ctrl.memory)
+        self.assertGreater(n, 0)
+        ctrl.start_goal(Tier3Goal(7, 1.0, 0.0, 0.12), 0.3, (0, 0, 0))
+        ctrl.clear()
+        self.assertEqual(len(ctrl.memory), n)
+
+
 if __name__ == "__main__":
     unittest.main()

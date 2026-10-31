@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Protocol, Tuple
 
 from body.lib import drive_config, schemas, zenoh_helpers
+from body.lib.depth_memory import stamp_blocked
 from body.lib.local_costmap import build_local_costmap, dilate_bool
 from body.lib.local_drive_core import wrap_pi
 from body.lib.scan_raster import rasterize_scan
@@ -726,6 +727,14 @@ class HierarchicalDrive:
                 scan.get("ranges"), float(scan.get("angle_min", 0.0)),
                 float(scan.get("angle_increment", 0.0)), self._raster,
                 unknown_bins=scan.get("unknown_bins"))
+            # Tier-3's depth memory (obstacles only the depth camera saw, in
+            # the live body frame): march around them too, so the sub-goal
+            # isn't picked straight through what stopped the last goal.
+            mem = self._depth_memory_body()
+            if mem:
+                grid = grid.copy()
+                stamp_blocked(grid, meta, mem, keep_clear_xy=(0.0, 0.0),
+                              keep_clear_radius_m=self._raster.robot_clear_radius_m)
             # March on Tier-3's footprint-inflated + goal-clearance lethal mask
             # (its exact costmap model), not the raw scan: a "clear" point here
             # is a goal Tier-3 accepts without snapping, and the 2-D inflation
@@ -749,6 +758,12 @@ class HierarchicalDrive:
         dist = min(wp_dist, t2.horizon_m)
         return ((dist * math.cos(bearing), dist * math.sin(bearing)),
                 "blind", dist, grid, meta)
+
+    def _depth_memory_body(self) -> Optional[list]:
+        """``depth_mem_body`` from the latest Tier-3 status, if any."""
+        st = self._io.latest_status()
+        mem = st.get("depth_mem_body") if isinstance(st, dict) else None
+        return mem if isinstance(mem, list) and mem else None
 
     def _tick_driving(self) -> None:
         pose = self._pose.world_pose()

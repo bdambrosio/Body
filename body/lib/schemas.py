@@ -73,6 +73,9 @@ def drive_status(
     watermark: int | None = None,
     depth_hits: int | None = None,
     depth_seq: int | None = None,
+    depth_bbox_px: list | tuple | None = None,
+    depth_hit_body: list | None = None,
+    depth_mem_body: list | None = None,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
@@ -93,7 +96,11 @@ def drive_status(
     ``path_body_xy`` is the local A* path (body frame, downsampled) when
     driving, for the operator UI. ``depth_hits`` / ``depth_seq`` accompany a
     ``depth_block``: the near-field slab hit count and the ``body/oakd/depth``
-    frame seq that tripped the veto.
+    frame seq that tripped the veto, ``depth_bbox_px`` [u0, v0, u1, v1, w, h]
+    the hits' bounding box in that depth image and ``depth_hit_body``
+    [[x, y], …] (≤ 32, nearest first) where they were in the body frame.
+    ``depth_mem_body`` [[x, y], …] (any state, ≤ 64, live body frame) are the
+    cells Tier-3's depth memory currently plans around.
     """
     msg: dict[str, Any] = {
         "ts": now_ts() if ts is None else ts,
@@ -119,6 +126,12 @@ def drive_status(
         msg["depth_hits"] = int(depth_hits)
     if depth_seq is not None:
         msg["depth_seq"] = int(depth_seq)
+    if depth_bbox_px is not None:
+        msg["depth_bbox_px"] = [int(v) for v in depth_bbox_px]
+    if depth_hit_body:
+        msg["depth_hit_body"] = [[float(p[0]), float(p[1])] for p in depth_hit_body]
+    if depth_mem_body:
+        msg["depth_mem_body"] = [[float(p[0]), float(p[1])] for p in depth_mem_body]
     if build is not None:
         msg["build"] = build
     return msg

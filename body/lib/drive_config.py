@@ -181,6 +181,7 @@ def footprint_config(body_cfg: Dict[str, Any]) -> FootprintConfig:
 def tier3_config(body_cfg: Dict[str, Any]):
     """Everything ``Tier3Controller`` needs, from the ``local_drive`` section
     (imported lazily: tier3_controller depends on this module's siblings)."""
+    from body.lib.depth_memory import memory_config_from_dict
     from body.lib.tier3_controller import Tier3Config
     cfg = body_cfg.get("local_drive", {})
     d = Tier3Config()
@@ -190,6 +191,7 @@ def tier3_config(body_cfg: Dict[str, Any]):
         plan=plan,
         foot=footprint_config(body_cfg),
         depth=depth_veto_config(body_cfg),
+        memory=memory_config_from_dict(cfg.get("depth_memory")),
         lookahead_m=float(cfg.get("local_planner", {}).get("lookahead_m", d.lookahead_m)),
         no_progress_timeout_s=float(cfg.get("no_progress_timeout_s", d.no_progress_timeout_s)),
         no_progress_eps_m=float(cfg.get("no_progress_eps_m", d.no_progress_eps_m)),

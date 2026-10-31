@@ -172,6 +172,158 @@ def _arc_coords(
     return s, lateral
 
 
+@dataclass
+class DepthPoints:
+    """Valid depth pixels of one frame (inside the ROI) in the body frame."""
+    pts: np.ndarray        # (N, 3) body-frame x fwd, y left, z up (m)
+    uv: np.ndarray         # (N, 2) int pixel (u, v) in the full depth image
+    height: np.ndarray     # (N,) z above ``ground_z_body_m``
+    width: int
+    height_px: int
+
+
+def depth_points_body(
+    arr_mm: np.ndarray, msg: Dict[str, Any], cfg: DepthVetoConfig,
+) -> Optional[DepthPoints]:
+    """ROI + median filter + intrinsics + cam→body for one depth frame. None
+    when the frame or ROI is empty. Shared by the veto and the depth memory
+    so both see exactly the same points."""
+    h, w = arr_mm.shape
+    if h < 2 or w < 2:
+        return None
+    kernel = int(cfg.depth_median_kernel)
+    work = _median_filter_depth_mm(arr_mm, kernel) if kernel > 1 else arr_mm
+    hfov = math.radians(cfg.depth_hfov_deg)
+    vfov = math.radians(cfg.depth_vfov_deg)
+    fx, fy, cx, cy = _intrinsics(msg, w, h, hfov, vfov)
+    r_bc, t_bc = _cam_to_body_Rt(cfg)
+
+    u0 = int(np.clip(min(cfg.roi_u0, cfg.roi_u1) * w, 0, max(0, w - 1)))
+    u1 = int(np.clip(max(cfg.roi_u0, cfg.roi_u1) * w, 0, w))
+    v0 = int(np.clip(min(cfg.roi_v0, cfg.roi_v1) * h, 0, max(0, h - 1)))
+    v1 = int(np.clip(max(cfg.roi_v0, cfg.roi_v1) * h, 0, h))
+    if u1 <= u0 or v1 <= v0:
+        return None
+
+    sl = work[v0:v1, u0:u1]
+    vv_r, uu_r = np.nonzero(sl > 0)
+    if vv_r.size == 0:
+        return None
+    vv = vv_r + v0
+    uu = uu_r + u0
+    z_c = work[vv, uu].astype(np.float64) / 1000.0
+    xc = (uu.astype(np.float64) - cx) * z_c / fx
+    yc = (vv.astype(np.float64) - cy) * z_c / fy
+    pc = np.stack([xc, yc, z_c], axis=1)
+    pb = pc @ r_bc.T + t_bc
+    return DepthPoints(pts=pb, uv=np.stack([uu, vv], axis=1), height=pb[:, 2] - cfg.ground_z_body_m,
+                       width=int(w), height_px=int(h))
+
+
+def obstacle_mask(dp: DepthPoints, region: np.ndarray, cfg: DepthVetoConfig) -> np.ndarray:
+    """Obstacle points inside ``region`` (bool over dp's points): above the
+    floor band, under the clearance height, and — for low points — standing
+    on a floor cell with real vertical extent (see module doc). The span is
+    measured over every point of ``region`` (floor returns included)."""
+    x = dp.pts[:, 0]
+    y = dp.pts[:, 1]
+    height = dp.height
+    band = cfg.floor_band_m + cfg.floor_band_per_m * np.maximum(x, 0.0)
+    in_envelope = region & (height > band) & (height <= cfg.clearance_height_m)
+    if not np.any(in_envelope) or cfg.min_vertical_extent_m <= 0.0:
+        return in_envelope
+    low = in_envelope & (height <= cfg.structure_free_height_m)
+    out = in_envelope & ~low
+    if np.any(low):
+        cs = max(1e-3, float(cfg.structure_cell_m))
+        sel = region & (height <= cfg.clearance_height_m)
+        ix = np.floor(x[sel] / cs).astype(np.int64)
+        iy = np.floor(y[sel] / cs).astype(np.int64)
+        ix0, iy0 = int(ix.min()), int(iy.min())
+        nxc = int(ix.max()) - ix0 + 1
+        nyc = int(iy.max()) - iy0 + 1
+        lin = (ix - ix0) * nyc + (iy - iy0)
+        hmax = np.full(nxc * nyc, -np.inf)
+        hmin = np.full(nxc * nyc, np.inf)
+        np.maximum.at(hmax, lin, height[sel])
+        np.minimum.at(hmin, lin, height[sel])
+        span = hmax - hmin
+        low_idx = np.nonzero(low)[0]
+        lx = np.floor(x[low_idx] / cs).astype(np.int64) - ix0
+        ly = np.floor(y[low_idx] / cs).astype(np.int64) - iy0
+        ok = span[lx * nyc + ly] >= cfg.min_vertical_extent_m
+        out[low_idx[ok]] = True
+    return out
+
+
+_POINTS_CACHE: Dict[str, Any] = {"key": None, "val": None}
+
+
+def depth_points_for_msg(
+    depth_msg: Dict[str, Any], cfg: DepthVetoConfig,
+) -> Optional[DepthPoints]:
+    """Decode + ``depth_points_body`` for a depth message, cached for the
+    last frame (by ``seq``/``ts`` and config). The veto (every control tick)
+    and the depth memory share one median filter per frame — it dominates
+    the cost (~4 ms on the desktop)."""
+    fk = depth_frame_key(depth_msg)
+    data = depth_msg.get("data")
+    # The data hash guards against two different frames sharing a key (no
+    # seq + same ts); hashing ~20 kB of base64 is microseconds.
+    key = None if fk is None or not isinstance(data, str) else (fk, hash(data), cfg)
+    if key is not None and _POINTS_CACHE["key"] == key:
+        return _POINTS_CACHE["val"]
+    decoded = decode_depth_mm(depth_msg)
+    val = None if decoded is None else depth_points_body(decoded[0], depth_msg, cfg)
+    if key is not None:
+        _POINTS_CACHE["key"] = key
+        _POINTS_CACHE["val"] = val
+    return val
+
+
+@dataclass
+class SlabHits:
+    """Veto evidence for one frame: count, and where (for the status / VLM)."""
+    hits: int = 0
+    bbox_px: Optional[Tuple[int, int, int, int, int, int]] = None  # u0,v0,u1,v1,w,h
+    hit_body: Optional[np.ndarray] = None                          # (N, 2) body x, y
+
+
+def slab_hits_detail(
+    arr_mm: np.ndarray,
+    msg: Dict[str, Any],
+    cfg: DepthVetoConfig,
+    *,
+    v_mps: Optional[float] = None,
+    omega_radps: Optional[float] = None,
+) -> SlabHits:
+    """``count_slab_hits`` plus the pixel bbox and body x/y of the hits."""
+    return _slab_hits_from_points(depth_points_body(arr_mm, msg, cfg), cfg,
+                                  v_mps=v_mps, omega_radps=omega_radps)
+
+
+def _slab_hits_from_points(
+    dp: Optional[DepthPoints], cfg: DepthVetoConfig, *,
+    v_mps: Optional[float], omega_radps: Optional[float],
+) -> SlabHits:
+    if dp is None:
+        return SlabHits()
+    s_arc, lateral = _arc_coords(dp.pts[:, 0], dp.pts[:, 1], v_mps, omega_radps)
+    in_corridor = (
+        (s_arc >= cfg.min_range_m)
+        & (s_arc <= cfg.max_range_m)
+        & (lateral <= cfg.lateral_half_width_m)
+    )
+    m = obstacle_mask(dp, in_corridor, cfg)
+    n = int(np.count_nonzero(m))
+    if n == 0:
+        return SlabHits()
+    uv = dp.uv[m]
+    bbox = (int(uv[:, 0].min()), int(uv[:, 1].min()),
+            int(uv[:, 0].max()), int(uv[:, 1].max()), dp.width, dp.height_px)
+    return SlabHits(hits=n, bbox_px=bbox, hit_body=dp.pts[m, :2])
+
+
 def count_slab_hits(
     arr_mm: np.ndarray,
     msg: Dict[str, Any],
@@ -185,75 +337,32 @@ def count_slab_hits(
     With ``v_mps``/``omega_radps`` the envelope is the band of half-width
     ``lateral_half_width_m`` around the commanded arc over arc length
     [min_range_m, max_range_m]; without, the legacy straight box."""
-    h, w = arr_mm.shape
-    if h < 2 or w < 2:
-        return 0
-    kernel = int(cfg.depth_median_kernel)
-    work = _median_filter_depth_mm(arr_mm, kernel) if kernel > 1 else arr_mm
-    hfov = math.radians(cfg.depth_hfov_deg)
-    vfov = math.radians(cfg.depth_vfov_deg)
-    fx, fy, cx, cy = _intrinsics(msg, w, h, hfov, vfov)
-    r_bc, t_bc = _cam_to_body_Rt(cfg)
+    return slab_hits_detail(arr_mm, msg, cfg, v_mps=v_mps, omega_radps=omega_radps).hits
 
-    u0 = int(np.clip(min(cfg.roi_u0, cfg.roi_u1) * w, 0, max(0, w - 1)))
-    u1 = int(np.clip(max(cfg.roi_u0, cfg.roi_u1) * w, 0, w))
-    v0 = int(np.clip(min(cfg.roi_v0, cfg.roi_v1) * h, 0, max(0, h - 1)))
-    v1 = int(np.clip(max(cfg.roi_v0, cfg.roi_v1) * h, 0, h))
-    if u1 <= u0 or v1 <= v0:
-        return 0
 
-    sl = work[v0:v1, u0:u1]
-    vv_r, uu_r = np.nonzero(sl > 0)
-    if vv_r.size == 0:
-        return 0
-    vv = vv_r + v0
-    uu = uu_r + u0
-    z_c = work[vv, uu].astype(np.float64) / 1000.0
-    xc = (uu.astype(np.float64) - cx) * z_c / fx
-    yc = (vv.astype(np.float64) - cy) * z_c / fy
-    pc = np.stack([xc, yc, z_c], axis=1)
-    pb = pc @ r_bc.T + t_bc
-
-    x = pb[:, 0]
-    y = pb[:, 1]
-    z = pb[:, 2]
-    height = z - cfg.ground_z_body_m
-    s_arc, lateral = _arc_coords(x, y, v_mps, omega_radps)
-    in_corridor = (
-        (s_arc >= cfg.min_range_m)
-        & (s_arc <= cfg.max_range_m)
-        & (lateral <= cfg.lateral_half_width_m)
-    )
-    band = cfg.floor_band_m + cfg.floor_band_per_m * np.maximum(x, 0.0)
-    in_envelope = in_corridor & (height > band) & (height <= cfg.clearance_height_m)
-    if not np.any(in_envelope):
-        return 0
-    if cfg.min_vertical_extent_m <= 0.0:
-        return int(np.count_nonzero(in_envelope))
-
-    # Vertical-structure test for low points: per floor cell, the height span
-    # of every point in the corridor (floor returns included) must reach
-    # min_vertical_extent_m for a low point there to count.
-    low = in_envelope & (height <= cfg.structure_free_height_m)
-    hits = int(np.count_nonzero(in_envelope & ~low))
-    if np.any(low):
-        cs = max(1e-3, float(cfg.structure_cell_m))
-        sel = in_corridor & (height <= cfg.clearance_height_m)
-        ix = np.floor(x[sel] / cs).astype(np.int64)
-        iy = np.floor(y[sel] / cs).astype(np.int64)
-        ix0, iy0 = int(ix.min()), int(iy.min())
-        nxc = int(ix.max()) - ix0 + 1
-        nyc = int(iy.max()) - iy0 + 1
-        lin = (ix - ix0) * nyc + (iy - iy0)
-        hmax = np.full(nxc * nyc, -np.inf)
-        hmin = np.full(nxc * nyc, np.inf)
-        np.maximum.at(hmax, lin, height[sel])
-        np.minimum.at(hmin, lin, height[sel])
-        span = hmax - hmin
-        lx = np.floor(x[low] / cs).astype(np.int64) - ix0
-        ly = np.floor(y[low] / cs).astype(np.int64) - iy0
-        hits += int(np.count_nonzero(span[lx * nyc + ly] >= cfg.min_vertical_extent_m))
-    return hits
+def depth_frame_detail(
+    depth_msg: Optional[Dict[str, Any]],
+    *,
+    now_wall: float,
+    v_mps: float,
+    omega_radps: float,
+    cfg: DepthVetoConfig,
+) -> SlabHits:
+    """Hits this frame (with location), or empty when the veto should not
+    fire (fail-open / gated)."""
+    if not cfg.enabled:
+        return SlabHits()
+    if abs(v_mps) < 1e-3:
+        return SlabHits()  # pure rotation — same policy as swept veto
+    if abs(omega_radps) > cfg.max_abs_omega_radps:
+        return SlabHits()
+    if depth_msg is None:
+        return SlabHits()
+    age = now_wall - float(depth_msg.get("ts", 0.0))
+    if age < 0.0 or age > cfg.stale_s:
+        return SlabHits()
+    return _slab_hits_from_points(depth_points_for_msg(depth_msg, cfg), cfg,
+                                  v_mps=v_mps, omega_radps=omega_radps)
 
 
 def depth_frame_hits(
@@ -265,22 +374,8 @@ def depth_frame_hits(
     cfg: DepthVetoConfig,
 ) -> int:
     """Hits this frame, or 0 when the veto should not fire (fail-open / gated)."""
-    if not cfg.enabled:
-        return 0
-    if abs(v_mps) < 1e-3:
-        return 0  # pure rotation — same policy as swept veto
-    if abs(omega_radps) > cfg.max_abs_omega_radps:
-        return 0
-    if depth_msg is None:
-        return 0
-    age = now_wall - float(depth_msg.get("ts", 0.0))
-    if age < 0.0 or age > cfg.stale_s:
-        return 0
-    decoded = decode_depth_mm(depth_msg)
-    if decoded is None:
-        return 0
-    arr, _w, _h = decoded
-    return count_slab_hits(arr, depth_msg, cfg, v_mps=v_mps, omega_radps=omega_radps)
+    return depth_frame_detail(depth_msg, now_wall=now_wall, v_mps=v_mps,
+                              omega_radps=omega_radps, cfg=cfg).hits
 
 
 def depth_nearfield_blocked(
@@ -339,12 +434,16 @@ class DepthVetoTracker:
         # desktop observer can tie the veto to a depth frame and camera image.
         self.last_hits = 0
         self.last_seq: Optional[int] = None
+        self.last_bbox_px: Optional[Tuple[int, int, int, int, int, int]] = None
+        self.last_hit_body: Optional[np.ndarray] = None
 
     def reset(self) -> None:
         self.streak = 0
         self._last_key = None
         self.last_hits = 0
         self.last_seq = None
+        self.last_bbox_px = None
+        self.last_hit_body = None
 
     def update(
         self, depth_msg: Optional[Dict[str, Any]], *, now_wall: float,
@@ -358,10 +457,13 @@ class DepthVetoTracker:
         if age < 0.0 or age > cfg.stale_s:
             self.reset()
             return False
-        hits = depth_frame_hits(depth_msg, now_wall=now_wall, v_mps=v_mps,
-                                omega_radps=omega_radps, cfg=cfg)
+        det = depth_frame_detail(depth_msg, now_wall=now_wall, v_mps=v_mps,
+                                 omega_radps=omega_radps, cfg=cfg)
+        hits = det.hits
         hit = hits >= cfg.min_hits
         self.last_hits = int(hits)
+        self.last_bbox_px = det.bbox_px
+        self.last_hit_body = det.hit_body
         seq = depth_msg.get("seq")
         self.last_seq = (int(seq) if isinstance(seq, (int, float))
                          and not isinstance(seq, bool) else None)

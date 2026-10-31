@@ -55,6 +55,9 @@ class LidarFeedView(QWidget):
         # and the live Tier-2 sub-goal, each (x_fwd, y_left) or None.
         self._wp_body: Optional[Tuple[float, float]] = None
         self._sub_body: Optional[Tuple[float, float]] = None
+        # Tier-3 depth memory cells (body frame [[x, y], ...]) — obstacles
+        # only the depth camera saw, which the planners treat as hits.
+        self._depth_mem: Optional[list] = None
         self.setMinimumSize(160, 80)
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
@@ -75,6 +78,12 @@ class LidarFeedView(QWidget):
         self._wp_body = wp_body
         self._sub_body = sub_body
         self.update()
+
+    def set_depth_memory(self, cells_body: Optional[list]) -> None:
+        """Tier-3 depth-memory cells (status ``depth_mem_body``) or None."""
+        if cells_body != self._depth_mem:
+            self._depth_mem = cells_body
+            self.update()
 
     def paintEvent(self, event) -> None:  # noqa: D401
         p = QPainter(self)
@@ -131,6 +140,19 @@ class LidarFeedView(QWidget):
                     sx = cx - y_b * scale
                     sy = cy - x_b * scale
                     p.drawEllipse(QPointF(sx, sy), 1.5, 1.5)
+
+            # Depth-memory cells: magenta squares (≥ 3 px so 4 cm shows).
+            if self._depth_mem:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(230, 60, 220))
+                half = max(1.5, 0.02 * scale)
+                for pt in self._depth_mem:
+                    try:
+                        x_b, y_b = float(pt[0]), float(pt[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    p.drawRect(QRectF(cx - y_b * scale - half, cy - x_b * scale - half,
+                                      2 * half, 2 * half))
 
             # Robot triangle (forward = up).
             p.setPen(Qt.PenStyle.NoPen)
@@ -329,6 +351,9 @@ class CameraFeedsDock(QDockWidget):
 
     def set_lidar_overlay(self, wp_body, sub_body) -> None:
         self.lidar_view.set_overlay(wp_body, sub_body)
+
+    def set_depth_memory(self, cells_body) -> None:
+        self.lidar_view.set_depth_memory(cells_body)
 
     def render_depth(self, snap: dict) -> None:
         img = snap["depth_image"]
@@ -539,6 +564,10 @@ class CameraPanels:
     def set_lidar_overlay(self, wp_body, sub_body) -> None:
         """Body-frame next-waypoint + sub-goal markers on the lidar plot."""
         self._feeds_dock.set_lidar_overlay(wp_body, sub_body)
+
+    def set_depth_memory(self, cells_body) -> None:
+        """Tier-3 depth-memory cells on the lidar plot (None clears)."""
+        self._feeds_dock.set_depth_memory(cells_body)
 
     def _on_request_rgb(self) -> None:
         req = self.chassis.request_rgb()
