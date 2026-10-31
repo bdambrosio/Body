@@ -245,6 +245,18 @@ class NavMainWindow(QMainWindow):
         self._resume_act.triggered.connect(self._on_resume_hier)
         self._map_toolbar.addAction(self._resume_act)
 
+        clear_mem_act = QAction("Clear depth memory", self)
+        clear_mem_act.setToolTip(
+            "Make Tier-3 forget the obstacles it remembers from the depth "
+            "camera (magenta on the lidar plot). Done automatically on Go and "
+            "re-localize; use it after carrying the robot or if stale cells "
+            "pin it in place. Whatever is still in view is re-learned in "
+            "~0.2 s."
+        )
+        clear_mem_act.triggered.connect(
+            lambda: self._reset_depth_memory("ui_button", quiet=False))
+        self._map_toolbar.addAction(clear_mem_act)
+
         self._patrol_edit_act = QAction("Patrol edit", self)
         self._patrol_edit_act.setCheckable(True)
         self._patrol_edit_act.setChecked(False)
@@ -909,6 +921,7 @@ class NavMainWindow(QMainWindow):
         """MCL relocate (global scan-match) + patrol/goal frame shift."""
         self.chassis.set_cmd_vel(0.0, 0.0)
         result = dict(self.fuser.request_relocate(reason=reason))
+        self._reset_depth_memory(reason)
         if result.get("success"):
             result["shift_count"] = self._apply_relocate_to_patrol(result)
             # Fresh fix — drop stale low-quality samples so the health
@@ -1036,6 +1049,7 @@ class NavMainWindow(QMainWindow):
         self.chassis.set_cmd_vel(0.0, 0.0)
 
         result = dict(self.fuser.request_relocate_at(x_w, y_w, reason="ui_locate"))
+        self._reset_depth_memory("ui_locate")
         if result.get("success"):
             result["shift_count"] = self._apply_relocate_to_patrol(result)
             shift = int(result.get("shift_count", 0))
@@ -1088,6 +1102,7 @@ class NavMainWindow(QMainWindow):
         # Seat the PF pose at the recognized spot (relocate_at recovers yaw on
         # the locally-healed patch); re-seed an active checkpoint localizer.
         self.fuser.request_relocate_at(m.pose[0], m.pose[1], reason="ui_relocate_cp")
+        self._reset_depth_memory("ui_relocate_cp")
         if self._cp_localizer is not None:
             odom = self._cp_odom()
             if odom is not None:
@@ -1257,6 +1272,19 @@ class NavMainWindow(QMainWindow):
             logger.exception("could not prepare drive-trace dir")
             return None
 
+    def _reset_depth_memory(self, reason: str, *, quiet: bool = True) -> None:
+        """Ask Tier-3 to forget its depth memory (Go, relocate, button). A
+        relocate usually means the robot was moved by hand. Opens the drive
+        client if needed; best-effort when not connected."""
+        try:
+            if not self._ensure_drive_client(quiet=quiet):
+                return
+            if self._drive_client.reset_depth_memory(reason):
+                logger.info("depth memory reset sent (%s)", reason)
+                self._cameras.set_depth_memory(None)
+        except Exception:
+            logger.exception("depth memory reset failed (%s)", reason)
+
     def _ensure_drive_client(self, quiet: bool = False) -> bool:
         """Open the DriveClient session (own zenoh session for
         body/drive/goto + status + odom + scan) if needed. Returns True once
@@ -1392,6 +1420,9 @@ class NavMainWindow(QMainWindow):
             sink=self._ensure_handoff_gate(), lead_in=lead_in,
         )
         self._shared_view.set_patrol_active_wp_index(0)
+        # Fresh run: the robot may have been carried since the memory was
+        # built (wheel odom can't see that). Whatever is in view comes back.
+        self._reset_depth_memory("go")
         self._hier_drive.start()
 
     # ── Pose provider (PF posterior, or checkpoint re-anchor) ────────

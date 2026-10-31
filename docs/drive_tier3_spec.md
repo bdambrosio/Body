@@ -177,6 +177,12 @@ is transport + lifecycle.
    frame, beyond `keep_radius_m`, under the robot's footprint, or on an odom
    reset — **not** on a new goal; out of view it is kept. Frames while
    |ω| > `max_abs_omega_radps` are skipped. `enabled: false` = old behaviour.
+   Planning (Tier-3 and Tier-2) ignores cells within `plan_exclude_radius_m`
+   (0.2 m) of the robot — stale cells there (robot carried; camera near
+   blind zone) otherwise pin it (`start_blocked`). The desktop publishes
+   `body/drive/depth_memory` `{"action": "reset", "reason": …}` on Go,
+   relocate / set-location and the "Clear depth memory" button; wheel odom
+   cannot see the robot being picked up.
 
 Terminal conditions:
 

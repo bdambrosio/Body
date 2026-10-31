@@ -20,6 +20,7 @@ BLOCK_TOPICS: frozenset[str] = frozenset(
         "body/cmd_vel",
         "body/cmd_direct",
         "body/drive/goto",
+        "body/drive/depth_memory",
         "body/estop_rearm",
         "body/heartbeat",
     }

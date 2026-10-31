@@ -241,6 +241,7 @@
       "floor_min_pts": 4,
       "ttl_s": 30.0,
       "keep_radius_m": 3.0,
+      "plan_exclude_radius_m": 0.2,
       "max_range_m": 0.8
     },
     "depth_veto": {

@@ -20,6 +20,10 @@ refuses an arc into it *before* moving. Policy:
   * Clear, backstops: ``ttl_s`` after the last confirming frame; farther than
     ``keep_radius_m`` from the robot; under the robot's own footprint; and
     ``reset()`` on an odom-frame reset.
+  * Planning skips cells within ``plan_exclude_radius_m`` of the robot.
+  * The desktop resets it (``body/drive/depth_memory`` {"action": "reset"})
+    on Go / relocate / a UI button: wheel odom can't see the robot being
+    carried, so old cells would land around it wherever it is put down.
   * Out of view → kept (that is the point: going around a door edge takes it
     out of the camera's view). NOT cleared by a new goal.
   * Frames taken while |ω| > ``max_abs_omega_radps`` are skipped (smear).
@@ -53,6 +57,12 @@ class DepthMemoryConfig:
     ttl_s: float = 30.0           # forget this long after the last confirming frame
     keep_radius_m: float = 3.0    # forget cells farther than this from the robot
     clear_radius_m: float = 0.11  # the robot's own footprint can't hold an obstacle
+    # Planning ignores remembered cells this close to the robot (they stay
+    # remembered). Up close the lidar, the swept check and the depth veto
+    # guard; a stale cell there (robot carried, or sitting in the camera's
+    # near blind zone where it can never be seen free) otherwise pins the
+    # robot: start-in-lethal → snapped goal → rotate_timeout (10-31).
+    plan_exclude_radius_m: float = 0.20
     min_range_m: float = 0.08     # forward (body x) window that is scored
     max_range_m: float = 0.80
     max_abs_omega_radps: float = 0.40

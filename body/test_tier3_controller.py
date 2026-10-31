@@ -425,5 +425,38 @@ class TestDepthMemoryNoCreep(unittest.TestCase):
         self.assertEqual(len(ctrl.memory), n)
 
 
+    def test_stale_ring_next_to_robot_does_not_pin_it(self):
+        """10-31: robot carried by hand → old cells land 0.14 m around it (just
+        outside the footprint, in the camera's near blind zone, so never seen
+        free). Planning must ignore cells that close, or the robot starts in
+        lethal space and spins to rotate_timeout."""
+        import numpy as np
+        from body.lib.depth_memory import DepthMemoryConfig
+        ring = np.array([[0.14 * math.cos(a), 0.14 * math.sin(a)]
+                         for a in np.linspace(0, 2 * math.pi, 24, endpoint=False)])
+
+        def first_moves(exclude):
+            cfg = replace(T3, memory=DepthMemoryConfig(enabled=True,
+                                                        plan_exclude_radius_m=exclude))
+            ctrl = Tier3Controller(cfg)
+            ctrl.memory.cells_body = lambda pose: ring
+            ctrl.memory.__class__ = type("Pinned", (type(ctrl.memory),),
+                                         {"__len__": lambda self: len(ring)})
+            ctrl.start_goal(Tier3Goal(1, 1.0, 0.0, 0.12), 0.0, (0.0, 0.0, 0.0))
+            g, m = rasterize_scan(raycast((0.0, 0.0, 0.0), []), 0.0,
+                                  2 * math.pi / N_BEAMS, RASTER)
+            r = ctrl.step(now_mono=0.0, now_wall=0.0, pose_now=(0.0, 0.0, 0.0),
+                          pose_scan=(0.0, 0.0, 0.0), grid=g, meta=m)
+            return r
+
+        r = first_moves(0.20)
+        self.assertEqual(r.state, "DRIVING", r)
+        self.assertGreater(r.v, 0.0)                       # translates at once
+        self.assertEqual(r.plan_reason, "ok")
+        pinned = first_moves(0.0)                           # old behaviour
+        self.assertFalse(pinned.state == "DRIVING" and pinned.v > 0
+                         and pinned.plan_reason == "ok", pinned)
+
+
 if __name__ == "__main__":
     unittest.main()

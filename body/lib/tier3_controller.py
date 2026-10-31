@@ -245,7 +245,8 @@ class Tier3Controller:
             stamp_blocked(work, meta,
                           self.memory.cells_body(pose_scan_raw or pose_scan),
                           keep_clear_xy=(rel[0], rel[1]),
-                          keep_clear_radius_m=cfg.seed_clear_radius_m)
+                          keep_clear_radius_m=max(cfg.seed_clear_radius_m,
+                                                  cfg.memory.plan_exclude_radius_m))
         explained = (explained_unknown_mask(work, foot.unknown_explained_cells)
                      if foot.block_on_unknown else None)
         cm = build_local_costmap(work, meta, cfg.plan.costmap)

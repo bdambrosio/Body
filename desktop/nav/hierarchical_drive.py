@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Protocol, Tuple
 
 from body.lib import drive_config, schemas, zenoh_helpers
-from body.lib.depth_memory import stamp_blocked
+from body.lib.depth_memory import memory_config_from_dict, stamp_blocked
 from body.lib.local_costmap import build_local_costmap, dilate_bool
 from body.lib.local_drive_core import wrap_pi
 from body.lib.scan_raster import rasterize_scan
@@ -281,6 +281,11 @@ class HierarchicalDrive:
         # same lethal; parallel dataclass defaults would drift silently.
         body_cfg = zenoh_helpers.load_body_config()
         self._raster = drive_config.scan_raster_config(body_cfg)
+        # Same near-robot exclusion as Tier-3 when stamping its depth memory.
+        self._mem_exclude_m = max(
+            self._raster.robot_clear_radius_m,
+            memory_config_from_dict((body_cfg.get("local_drive") or {})
+                                    .get("depth_memory")).plan_exclude_radius_m)
         plan_cfg = drive_config.local_plan_config(body_cfg)
         self._costmap_cfg = plan_cfg.costmap
         self._goal_clearance_cells = plan_cfg.goal_clearance_cells
@@ -756,7 +761,7 @@ class HierarchicalDrive:
             if mem:
                 grid = grid.copy()
                 stamp_blocked(grid, meta, mem, keep_clear_xy=(0.0, 0.0),
-                              keep_clear_radius_m=self._raster.robot_clear_radius_m)
+                              keep_clear_radius_m=self._mem_exclude_m)
             # March on Tier-3's footprint-inflated + goal-clearance lethal mask
             # (its exact costmap model), not the raw scan: a "clear" point here
             # is a goal Tier-3 accepts without snapping, and the 2-D inflation

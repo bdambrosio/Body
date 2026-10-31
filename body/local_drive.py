@@ -121,6 +121,7 @@ def main() -> None:
     last_scan: Optional[Dict[str, Any]] = None
     last_imu: Optional[Dict[str, Any]] = None
     last_depth: Optional[Dict[str, Any]] = None
+    mem_reset_reason: Optional[str] = None  # set by body/drive/depth_memory
     odom_reset_pending = False
     imu_session: Optional[str] = None
     imu_seq: Optional[int] = None
@@ -173,6 +174,15 @@ def main() -> None:
             print(f"local_drive: goto cmd_id={msg.get('cmd_id')!r} {outcome} "
                   f"(frame={msg.get('frame')!r})", flush=True)
 
+    def on_depth_memory(_k: str, msg: Dict[str, Any]) -> None:
+        # Desktop: forget everything (Go / relocate / robot carried / button).
+        # Wheel odom can't see the robot being picked up, so remembered cells
+        # would land around it wherever it is put down.
+        nonlocal mem_reset_reason
+        if isinstance(msg, dict) and msg.get("action") == "reset":
+            with lock:
+                mem_reset_reason = str(msg.get("reason") or "desktop")
+
     def on_estop(_k: str, msg: Dict[str, Any]) -> None:
         with lock:
             estop.on_event(msg)
@@ -190,6 +200,7 @@ def main() -> None:
     zenoh_helpers.declare_subscriber_json(session, "body/imu", on_imu)
     zenoh_helpers.declare_subscriber_json(session, "body/oakd/depth", on_depth)
     zenoh_helpers.declare_subscriber_json(session, "body/drive/goto", on_goto)
+    zenoh_helpers.declare_subscriber_json(session, "body/drive/depth_memory", on_depth_memory)
     zenoh_helpers.declare_subscriber_json(session, "body/emergency_stop", on_estop)
     zenoh_helpers.declare_subscriber_json(session, "body/status", on_status)
     zenoh_helpers.declare_subscriber_json(session, "body/motor_state", on_motor_state)
@@ -254,6 +265,7 @@ def main() -> None:
 
     def tick(now_wall: float, now_mono: float) -> None:
         nonlocal tracked_cmd_id, was_active, odom_reset_pending, imu_rebaseline, mem_body
+        nonlocal mem_reset_reason
         with lock:
             rejects = arb.take_rejects()
             watermark = arb.watermark
@@ -266,6 +278,8 @@ def main() -> None:
             odom_reset_pending = False
             rebase = imu_rebaseline
             imu_rebaseline = False
+            mem_reset = mem_reset_reason
+            mem_reset_reason = None
             imu_seq_fresh = imu_seq is None or (now_wall - imu_seq_at) <= imu_stale_s
             estop_on = estop.active()
             estop_desc = estop.describe()
@@ -282,6 +296,11 @@ def main() -> None:
             if g is not None:
                 drop_goal("odom_reset")
                 g = None
+
+        if mem_reset is not None:
+            print(f"local_drive: depth memory reset ({mem_reset}, "
+                  f"{len(ctrl.memory)} cells dropped)", flush=True)
+            ctrl.memory.reset()
 
         # Depth memory learns (and forgets) every tick, goal or not, in the raw
         # wheel-odom frame — a retry is a new goal and must still see it.

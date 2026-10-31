@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 GOTO_TOPIC = "body/drive/goto"
+DEPTH_MEMORY_TOPIC = "body/drive/depth_memory"
 
 
 class DriveClient:
@@ -318,6 +319,26 @@ class DriveClient:
             msg["v_max"] = v_max
         self._publish_tracked(cid, msg)
         return cid
+
+    def reset_depth_memory(self, reason: str) -> bool:
+        """Tell Tier-3 to forget its depth memory (idempotent). Sent twice,
+        ~0.2 s apart, so one lost put on the WiFi link doesn't leave stale
+        cells around a robot that was just carried or relocated."""
+        if self._session is None:
+            return False
+        payload = json.dumps({"ts": time.time(), "action": "reset", "reason": reason})
+        session = self._session
+        control_put(session, DEPTH_MEMORY_TOPIC, payload)
+
+        def _again() -> None:
+            try:
+                control_put(session, DEPTH_MEMORY_TOPIC, payload)
+            except Exception:                   # session closed meanwhile
+                pass
+        t = threading.Timer(0.2, _again)
+        t.daemon = True
+        t.start()
+        return True
 
     def cancel(self) -> None:
         if self._session is None:
