@@ -107,14 +107,16 @@ def main() -> int:
     coef, inl = _fit_plane_ransac(p, rng=np.random.default_rng(0))
     a, b, c = (float(v) for v in coef)
     res = p[inl, 0] * a + p[inl, 1] * b + c - p[inl, 2]
-    pitch_err = math.atan(a)          # floor rising with range → camera pitched down LESS than config
+    # Sign convention (verified 10-31 by reprojecting saved frames): a floor
+    # that FALLS with range (a < 0) means the configured pitch is too large.
+    pitch_err = math.atan(a)
     roll_err = math.atan(b)
     print(f"floor plane: z = {a:+.4f} x {b:+.4f} y {c:+.4f}   inliers {inl.sum()}/{len(p)} "
           f"rms {float(np.sqrt(np.mean(res**2)))*1000:.1f} mm")
     print(f"residual: pitch {math.degrees(pitch_err):+.1f} deg  roll {math.degrees(roll_err):+.1f} deg  "
           f"height {c*1000:+.0f} mm")
     print("suggested config:")
-    print(f"  local_map.depth_pitch_rad: {vc.depth_pitch_rad - pitch_err:.3f}   (now {vc.depth_pitch_rad:.3f})")
+    print(f"  local_map.depth_pitch_rad: {vc.depth_pitch_rad + pitch_err:.3f}   (now {vc.depth_pitch_rad:.3f})")
     print(f"  local_map.depth_roll_rad:  {vc.depth_roll_rad - roll_err:.3f}   (now {vc.depth_roll_rad:.3f})")
     print(f"  oakd.depth_camera_height_above_ground_m: {vc.depth_z_body_m - c:.3f}   (now {vc.depth_z_body_m:.3f})")
     # What the current config does to the floor across the veto / memory range.
