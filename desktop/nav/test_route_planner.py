@@ -12,9 +12,8 @@ from desktop.nav.hierarchical_drive import HierConfig, HierState, HierarchicalDr
 from desktop.nav.route_planner import (
     RouteConfig, path_to_body, plan_route, relax_via, visible_subgoal_along_path,
 )
-from desktop.nav.test_hierarchical_drive import (
-    FakeDriveIO, FakePose, TestHierarchicalDrive, _clear_scan, _runner,
-)
+import desktop.nav.test_hierarchical_drive as thd
+from desktop.nav.test_hierarchical_drive import FakeDriveIO, FakePose, _clear_scan, _runner
 from desktop.world_map.costmap import build_costmap
 
 RES = 0.05
@@ -93,14 +92,14 @@ class TestRoutePlanner(unittest.TestCase):
 
     def test_live_scan_obstacle_shortens_subgoal_along_path(self):
         cm = _world()                                # map says all clear
-        wall = TestHierarchicalDrive._seg_scan([(0.6, -5.0, 0.6, 5.0)])
+        wall = thd.TestHierarchicalDrive._seg_scan([(0.6, -5.0, 0.6, 5.0)])
         hd, io, _ = _drive(cm, ((2.0, 0.0),), scan=wall)
         self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
         bx, by, _t, _v = io.sent[0]
         self.assertLess(bx, 0.6 - 0.11)              # stops short of the live wall
         self.assertGreaterEqual(bx, 0.2)
         # Wall right in front: nothing drivable along the path → honest block.
-        near = TestHierarchicalDrive._seg_scan([(0.3, -5.0, 0.3, 5.0)])
+        near = thd.TestHierarchicalDrive._seg_scan([(0.3, -5.0, 0.3, 5.0)])
         hd2, io2, _ = _drive(cm, ((2.0, 0.0),), scan=near)
         self.assertEqual(hd2.state(), HierState.BLOCKED)
         self.assertEqual(hd2.block_reason(), "path_blocked_live")
@@ -126,7 +125,7 @@ class TestRoutePlanner(unittest.TestCase):
         # forward sample fails; the path only has to be physically passable
         # (footprint) and its END acceptable to Tier-3.
         cm = _world([(0.15, -0.25, 0.4, 0.25)])      # bag 0.2 m ahead, 0.5 m wide
-        wall = TestHierarchicalDrive._seg_scan(
+        wall = thd.TestHierarchicalDrive._seg_scan(
             [(0.2, -0.25, 0.2, 0.25), (0.2, 0.25, 0.4, 0.25), (0.2, -0.25, 0.4, -0.25)])
         hd, io, _ = _drive(cm, ((0.4, 1.5),), scan=wall)
         self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())

@@ -364,7 +364,7 @@ class TestHierarchicalDrive(unittest.TestCase):
                      "depth_mem_body": [[0.6, y / 100.0] for y in range(-8, 9, 4)]}
         # Fan off: this pins the stamping alone (the fan has its own tests).
         hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,
-                               HierConfig(fan_max_deg=0.0))
+                               HierConfig(fan_max_deg=0.0, plan_with_depth_memory=True))
         hd.start()
         hd.tick(0.0)
         hd.tick(0.0)
@@ -404,6 +404,7 @@ class TestHierarchicalDrive(unittest.TestCase):
         io = FakeDriveIO(scan=scan)
         io.status = {"cmd_id": 0, "state": "IDLE",
                      **({"depth_mem_body": mem} if mem else {})}
+        cfg.setdefault("plan_with_depth_memory", True)   # these test the mechanism
         hd = HierarchicalDrive(_runner((wp,)), FakePose((0.0, 0.0, 0.0)), io,
                                HierConfig(**cfg))
         hd.start()
@@ -616,7 +617,8 @@ class TestHierarchicalDrive(unittest.TestCase):
         wall = [[0.22 + x / 100.0, y / 100.0] for x in range(0, 13, 4) for y in range(-30, 31, 4)]
         io = FakeDriveIO(scan=_clear_scan())
         io.status = {"cmd_id": 0, "state": "IDLE", "depth_mem_body": wall}
-        hd = HierarchicalDrive(_runner(((0.3, 0.0), (0.3, 2.0))), FakePose((0.0, 0.0, 0.0)), io)
+        hd = HierarchicalDrive(_runner(((0.3, 0.0), (0.3, 2.0))), FakePose((0.0, 0.0, 0.0)), io,
+                               HierConfig(plan_with_depth_memory=True))
         hd.start()
         hd.tick(0.0)
         hd.tick(0.0)

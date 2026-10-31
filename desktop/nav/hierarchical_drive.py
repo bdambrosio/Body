@@ -237,6 +237,14 @@ class HierConfig:
     # clear_run_failed until the window ran out). The terminal waypoint is
     # never skipped. Must exceed pass_proximity_m to matter.
     blocked_carrot_skip_m: float = 0.40
+    # Use Tier-3's depth memory (status depth_mem_body) in the desktop's
+    # planning (global route stamp + live path check). Off since 10-31: the
+    # remembered cells, inflated, sealed corridors on the session map and
+    # were the trigger in most stalls; the 20 s stamp of an actual
+    # depth_block's hits keeps the one behaviour that mattered (do not
+    # re-approach what just stopped you). Tier-3 still plans around its own
+    # memory locally. Redesign step 4 moves persistence into the world map.
+    plan_with_depth_memory: bool = False
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
@@ -1108,7 +1116,10 @@ class HierarchicalDrive:
         return None
 
     def _depth_memory_body(self) -> Optional[list]:
-        """``depth_mem_body`` from the latest Tier-3 status, if any."""
+        """``depth_mem_body`` from the latest Tier-3 status, if any (and the
+        desktop is configured to plan with it)."""
+        if not self._cfg.plan_with_depth_memory:
+            return None
         st = self._io.latest_status()
         mem = st.get("depth_mem_body") if isinstance(st, dict) else None
         return mem if isinstance(mem, list) and mem else None
