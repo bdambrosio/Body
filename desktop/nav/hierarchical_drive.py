@@ -855,7 +855,11 @@ class HierarchicalDrive:
         terminal = self._carrot_terminal()
         if plan.ok:
             self._route = plan
-            if plan.relaxed_m > 0.01:
+            if plan.reason == "frontier":
+                logger.info("hier: via (%.2f,%.2f) sealed off — heading for the reachable "
+                            "point nearest it (%.2f,%.2f), %.2f m short", carrot[0], carrot[1],
+                            plan.target_world[0], plan.target_world[1], plan.relaxed_m)
+            elif plan.relaxed_m > 0.01:
                 logger.info("hier: via (%.2f,%.2f) relaxed %.2f m to (%.2f,%.2f)",
                             carrot[0], carrot[1], plan.relaxed_m,
                             plan.target_world[0], plan.target_world[1])
@@ -874,8 +878,33 @@ class HierarchicalDrive:
             return False
         logger.info("hier: no global route to (%.2f,%.2f): %s", carrot[0], carrot[1],
                     plan.reason)
+        self._dump_planning_map(cm, pose, carrot, extra, plan.reason)
         self._enter_blocked("no_route")
         return False
+
+    _dump_last_at = -1e9
+
+    def _dump_planning_map(self, cm, pose, carrot, extra, reason) -> None:
+        """Save the planning costmap + pose + via on a failed plan (at most
+        one per 5 s) to ~/body-logs/plan-fail-<ts>.npz, so a no_route can
+        be reproduced offline instead of inferred from the trace."""
+        import os
+        import time as _time
+        if self._tick_now - self._dump_last_at < 5.0:
+            return
+        self._dump_last_at = self._tick_now
+        try:
+            d = os.path.expanduser("~/body-logs")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"plan-fail-{int(_time.time())}.npz")
+            np.savez_compressed(
+                path, lethal=cm.lethal, cost=np.asarray(cm.cost, dtype=np.float32),
+                unknown=cm.unknown, meta=np.array([cm.meta], dtype=object),
+                pose=np.array(pose, dtype=float), via=np.array(carrot, dtype=float),
+                extra=np.array(extra, dtype=float).reshape(-1, 2), reason=np.array(reason))
+            logger.info("hier: planning map dumped to %s", path)
+        except Exception:
+            logger.exception("hier: planning map dump failed")
 
     def _extra_lethal_world(self, pose: Pose) -> List[Tuple[float, float]]:
         """Obstacles Tier-3 knows that the world map may not: its depth

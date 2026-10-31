@@ -30,6 +30,8 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from collections import deque
+
 from desktop.nav.planner import AStarConfig, _dilate_bool, _nearest_non_lethal, plan_path
 
 Pt = Tuple[float, float]
@@ -52,6 +54,13 @@ class RouteConfig:
     # Pull the visible sub-goal back from the first non-clear cell.
     backoff_m: float = 0.04
     astar: AStarConfig = field(default_factory=AStarConfig)
+    # Best-effort when the via is sealed off (a marker on a bag; a doorway
+    # closed by a chair): plan to the reachable cell nearest the via, if it
+    # gains at least this much on it. The Pi's local A* has had this
+    # ("frontier") from the start; the desktop planner only knew path /
+    # no path, and "no path" meant a 10 s pause.
+    frontier_min_gain_m: float = 0.15
+    frontier_search_m: float = 4.0
 
 
 @dataclass
@@ -141,6 +150,14 @@ def plan_route(costmap: Any, pose_xy: Pt, via: Pt, cfg: RouteConfig, *,
     if target is None:
         return RoutePlan(False, "via_unreachable", [], None)
     res = plan_path(cm, pose_xy, target, cfg.astar)
+    reason = "ok"
+    if not res.ok and res.msg == "no path":
+        fr = frontier_target(cm, pose_xy, target, cfg)
+        if fr is not None:
+            res = plan_path(cm, pose_xy, fr, cfg.astar)
+            if res.ok:
+                reason = "frontier"
+                target = fr
     if not res.ok:
         return RoutePlan(False, "no_route" if res.msg == "no path" else res.msg, [], target)
     path = list(res.waypoints_world)
@@ -148,9 +165,48 @@ def plan_route(costmap: Any, pose_xy: Pt, via: Pt, cfg: RouteConfig, *,
     # the exact robot position so the body-frame march starts at (0, 0).
     if not path or math.hypot(path[0][0] - pose_xy[0], path[0][1] - pose_xy[1]) > 1e-6:
         path = [pose_xy] + path
-    return RoutePlan(True, "ok", path, target,
+    return RoutePlan(True, reason, path, target,
                      relaxed_m=math.hypot(target[0] - via[0], target[1] - via[1]),
                      distance_m=res.distance_m, elapsed_ms=res.elapsed_ms)
+
+
+def frontier_target(costmap: Any, pose_xy: Pt, via: Pt, cfg: RouteConfig) -> Optional[Pt]:
+    """The cell reachable from the robot (8-connected over the
+    clearance-dilated non-lethal mask, within ``frontier_search_m``) that is
+    nearest the via, when it gains ≥ ``frontier_min_gain_m`` on the robot's
+    own distance to the via. None otherwise."""
+    meta = costmap.meta
+    res = float(meta["resolution_m"])
+    lethal = (_dilate_bool(costmap.lethal, iters=int(cfg.astar.min_clearance_cells))
+              if cfg.astar.min_clearance_cells > 0 else costmap.lethal)
+    nx, ny = lethal.shape
+    si, sj = _world_to_cell(pose_xy, meta)
+    if not (0 <= si < nx and 0 <= sj < ny):
+        return None
+    if lethal[si, sj]:
+        rel = _nearest_non_lethal(lethal, si, sj, radius=8)
+        if rel is None:
+            return None
+        si, sj = rel
+    gi, gj = _world_to_cell(via, meta)
+    rmax = int(cfg.frontier_search_m / res)
+    seen = np.zeros_like(lethal)
+    seen[si, sj] = True
+    q = deque([(si, sj)])
+    best, best_d = None, math.hypot(si - gi, sj - gj) - cfg.frontier_min_gain_m / res
+    while q:
+        i, j = q.popleft()
+        d = math.hypot(i - gi, j - gj)
+        if d < best_d:
+            best, best_d = (i, j), d
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                ni, nj = i + di, j + dj
+                if (di or dj) and 0 <= ni < nx and 0 <= nj < ny and not seen[ni, nj] \
+                        and not lethal[ni, nj] and abs(ni - si) <= rmax and abs(nj - sj) <= rmax:
+                    seen[ni, nj] = True
+                    q.append((ni, nj))
+    return None if best is None else _cell_to_world(best, meta)
 
 
 def path_to_body(path_world: Sequence[Pt], pose: Pose) -> List[Pt]:

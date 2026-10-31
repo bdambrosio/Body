@@ -169,6 +169,27 @@ class TestRoutePlanner(unittest.TestCase):
         self.assertEqual(int(merged[20, 15]), 1)
         self.assertEqual(int(merged[20, 16]), 0)         # prior elsewhere
 
+    def test_sealed_via_gets_a_frontier_path(self):
+        # Marker inside a closed pocket (a bag on it, walls around): the
+        # via's own cell may be free but unreachable. Plan to the reachable
+        # cell nearest it instead of "no route".
+        pocket = [(1.5, -0.6, 2.5, -0.5), (1.5, 0.5, 2.5, 0.6),
+                  (2.4, -0.6, 2.5, 0.6), (1.5, -0.6, 1.6, 0.6)]      # closed box
+        cm = _world(pocket)
+        plan = plan_route(cm, (0.0, 0.0), (2.0, 0.0), RouteConfig())
+        self.assertTrue(plan.ok, plan.reason)
+        self.assertEqual(plan.reason, "frontier")
+        self.assertLess(plan.target_world[0], 1.5)                  # outside the box
+        self.assertLess(math.hypot(plan.target_world[0] - 2.0, plan.target_world[1]), 1.0)
+        hd, io, _ = _drive(cm, ((2.0, 0.0), (0.0, 2.0)))
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
+        # Robot wholly enclosed: no progress possible → honest no_route.
+        ring = [(-0.4, -0.4, 0.4, -0.3), (-0.4, 0.3, 0.4, 0.4),
+                (0.3, -0.4, 0.4, 0.4), (-0.4, -0.4, -0.3, 0.4)]
+        plan2 = plan_route(_world(ring), (0.0, 0.0), (2.0, 0.0), RouteConfig())
+        self.assertFalse(plan2.ok)
+        self.assertEqual(plan2.reason, "no_route")
+
     def test_bearing_fallback_without_costmap(self):
         io = FakeDriveIO(scan=_clear_scan())
         hd = HierarchicalDrive(_runner(((2.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,
