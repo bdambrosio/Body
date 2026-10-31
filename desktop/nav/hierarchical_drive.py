@@ -190,6 +190,11 @@ class HierConfig:
     # (X1). Only a waypoint advance or an operator resume starts a new leg.
     # Expiry → BLOCKED("leg_timeout"), paused for the operator (no retries).
     leg_deadline_s: float = 60.0
+    # With the route planner a leg is marker-to-marker (9 m on long_loop,
+    # 52 s at v_max before any turn): the deadline is leg_deadline_s plus
+    # the planned route length at this crawl speed (10-31: leg_timeout on
+    # the first clean lap's return leg). 0 disables the distance term.
+    leg_deadline_mps: float = 0.10
     # REJECTED gotos (cmd_id below the Pi's watermark): the DriveClient re-seeds
     # past the watermark, so a re-pick normally succeeds at once. More than
     # this many consecutive rejections in a leg → BLOCKED("rejected").
@@ -368,6 +373,7 @@ class HierarchicalDrive:
         # Leg deadline: start of the current leg (None until the first select
         # of the leg). Re-picks do not touch it.
         self._leg_started_at: Optional[float] = None
+        self._leg_deadline_s: float = 0.0           # this leg's budget (set at leg start)
         self._consecutive_rejects = 0
         # Pose-correction count at the moment the live sub-goal was sent. If the
         # provider's count moves past this mid-leg, the world pose stepped under
@@ -705,13 +711,14 @@ class HierarchicalDrive:
             return
         if self._route_start is None:
             self._route_start = (pose[0], pose[1])   # prev for the first vertex
+        self._waypoint = carrot
+        wp_dist = _dist(pose, self._waypoint)
         if self._leg_started_at is None:
             self._leg_started_at = self._tick_now
+            self._start_leg_budget(wp_dist)
         elif self._leg_expired():
             self._enter_blocked("leg_timeout")
             return
-        self._waypoint = carrot
-        wp_dist = _dist(pose, self._waypoint)
         if self._reached_waypoint(pose):
             self._to(HierState.ADVANCE_WAYPOINT)
             return
@@ -858,6 +865,8 @@ class HierarchicalDrive:
         terminal = self._carrot_terminal()
         if plan.ok:
             self._route = plan
+            if self._leg_started_at is not None and self._tick_now - self._leg_started_at < 1.0:
+                self._start_leg_budget(max(wp_dist, plan.distance_m))   # the real route length
             if plan.reason == "frontier":
                 logger.info("hier: via (%.2f,%.2f) sealed off — heading for the reachable "
                             "point nearest it (%.2f,%.2f), %.2f m short", carrot[0], carrot[1],
@@ -1390,7 +1399,12 @@ class HierarchicalDrive:
     def _leg_expired(self) -> bool:
         return (self._leg_started_at is not None
                 and self._cfg.leg_deadline_s > 0
-                and self._tick_now - self._leg_started_at > self._cfg.leg_deadline_s)
+                and self._tick_now - self._leg_started_at > self._leg_deadline_s)
+
+    def _start_leg_budget(self, dist_m: float) -> None:
+        cfg = self._cfg
+        extra = dist_m / cfg.leg_deadline_mps if cfg.leg_deadline_mps > 0 else 0.0
+        self._leg_deadline_s = cfg.leg_deadline_s + extra
 
     def _ack_failed(self, cmd_id: int) -> bool:
         """DriveIO's optional ack-failure signal, read defensively (test fakes

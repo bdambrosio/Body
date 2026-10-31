@@ -778,7 +778,8 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(len(io.sent), 2)     # now it re-picks
 
     def test_leg_deadline_not_reset_by_repicks(self):
-        hd, io, po = self._build(points=((5.0, 0.0),), leg_deadline_s=10.0)
+        hd, io, po = self._build(points=((5.0, 0.0),), leg_deadline_s=10.0,
+                                 leg_deadline_mps=0.0)       # flat budget for this test
         hd.start()
         hd.tick(0.0)
         hd.tick(0.0)                                  # leg starts t=0, goto #1
