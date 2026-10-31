@@ -631,7 +631,8 @@ class TestHierarchicalDrive(unittest.TestCase):
         # The TERMINAL waypoint is never skipped: honest block.
         io2 = FakeDriveIO(scan=_clear_scan())
         io2.status = {"cmd_id": 0, "state": "IDLE", "depth_mem_body": wall}
-        hd2 = HierarchicalDrive(_runner(((0.3, 0.0),)), FakePose((0.0, 0.0, 0.0)), io2)
+        hd2 = HierarchicalDrive(_runner(((0.3, 0.0),)), FakePose((0.0, 0.0, 0.0)), io2,
+                                HierConfig(plan_with_depth_memory=True))
         hd2.start()
         hd2.tick(0.0)
         hd2.tick(0.0)
