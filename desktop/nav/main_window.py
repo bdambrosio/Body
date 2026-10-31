@@ -1109,6 +1109,18 @@ class NavMainWindow(QMainWindow):
             m = matcher.relocalize(
                 ar[0], ar[1], yaw_hint=yaw, prior_xy=prior_xy,
                 xy_half_m=0.6, theta_half_rad=math.radians(60.0))
+            if m is None:
+                # The believed pose may be the thing that is wrong (10-31:
+                # heading off by far more than 60 deg after an IMU glitch +
+                # a hand drive; the local search could not see cp_008 and
+                # the operator had to Set location). Cold-start: every
+                # checkpoint, full circle of heading, no prior demotion. The
+                # ambiguity guard still rejects look-alike corridors.
+                m = matcher.relocalize(ar[0], ar[1], yaw_hint=None, prior_xy=None,
+                                       xy_half_m=0.6, theta_half_rad=math.pi)
+                if m is not None:
+                    logger.info("relocate: local checkpoint search failed; cold-start "
+                                "recognized %s", getattr(m, "checkpoint_id", m))
         finally:
             QApplication.restoreOverrideCursor()
         if m is None:
