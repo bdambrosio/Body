@@ -30,7 +30,7 @@ from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
 from desktop.localization.config import LocalizationConfig
 from desktop.localization.controller import LocalizationController
-from desktop.localization.pose_verify import PoseVerifier
+from desktop.localization.pose_verify import PoseVerifier, Verdict
 from desktop.nav.recovery import LinkEStopGuard, RecoveryHooks, RecoverySupervisor
 from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
@@ -43,6 +43,9 @@ from .hierarchical_drive import (
 from . import patrol as patrol_mod
 from desktop.nav.route_planner import merge_prior, resample_prior
 from desktop.perception.depth_stop_logger import DepthStopLogger
+from desktop.perception.frames import FrameGrabber, SnapshotRing
+from desktop.perception.image_check import check_frames
+from desktop.nav.recovery_log import RecoveryLogger, default_recovery_dir
 from .patrol import PatrolRunner
 from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
@@ -137,6 +140,11 @@ class NavMainWindow(QMainWindow):
             logger.info("vlm advisor: %s", vlm_advisor)
         # Observe-only depth veto: record what it would have stopped on.
         self._depth_stop_logger = DepthStopLogger(default_log_dir())
+        # Self-recovery: last few pose-tagged frames (camera fallback of the
+        # post-fault pose check) + diagnostic dumps of every recovery event.
+        self._snapshot_ring = SnapshotRing(
+            FrameGrabber(self.chassis, PFPoseProvider(self.fuser).world_pose))
+        self._recovery_log = RecoveryLogger(default_recovery_dir())
 
         self._build_toolbars()
         self._build_ui()
@@ -604,7 +612,10 @@ class NavMainWindow(QMainWindow):
         if self._hier_drive is not None:
             if live:
                 self._hier_drive.notify_teleop(True)
-            self._hier_drive.tick(time.time())
+            now = time.time()
+            self._hier_drive.tick(now)
+            self._snapshot_ring.tick(now, active=self._hier_drive.state() not in (
+                HierState.IDLE, HierState.ARRIVED, HierState.FAILED))
             if self._block_adj is not None:
                 self._block_adj.poll(
                     self._hier_drive,
@@ -1507,9 +1518,24 @@ class NavMainWindow(QMainWindow):
         checkpoint re-localize if wrong -> resume, backing off but never
         giving up."""
         ps = self.fuser.pose_source
+        fault = {"frame": None, "t": 0.0}
+
+        def image_check() -> Verdict:
+            pre = fault["frame"]
+            post = self._snapshot_ring.latest(after=fault["t"])
+            if pre is None or post is None:
+                return Verdict("unknown", "no before/after frames", "image")
+            return check_frames(pre.jpeg, pre.pose, post.jpeg, post.pose)
+
+        def on_begin(now: float) -> None:
+            guard.on_fault_start(now, estop_active=self._estop_active())
+            fault["frame"] = self._snapshot_ring.latest()
+            fault["t"] = now
+
         verifier = PoseVerifier(
             ps.match_summary,
             lambda: self._pose_health.median_quality(time.time()),
+            image_check=image_check,
         )
         guard = LinkEStopGuard()
         return RecoverySupervisor(RecoveryHooks(
@@ -1517,9 +1543,20 @@ class NavMainWindow(QMainWindow):
             relocalize=self._auto_relocalize,
             estop_latched=self._estop_active,
             rearm=lambda: self._auto_rearm(guard),
-            on_begin=lambda now: guard.on_fault_start(
-                now, estop_active=self._estop_active()),
+            on_begin=on_begin,
+            on_event=self._on_recovery_event,
         ))
+
+    def _on_recovery_event(self, tag: str, detail: str) -> None:
+        hd = self._hier_drive
+        latest = self.fuser.pose_source.latest_pose()
+        self._recovery_log.event(
+            tag, detail,
+            frames=self._snapshot_ring.frames(),
+            scan=self._drive_client.latest_scan() if self._drive_client else None,
+            pose=tuple(latest[0]) if latest is not None else None,
+            status=hd.recovery_status() if hd is not None else None,
+        )
 
     def _estop_active(self) -> bool:
         """Pi e-stop latched (motor_controller's view, else the watchdog's) —

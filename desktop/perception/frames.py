@@ -85,3 +85,55 @@ class FrameGrabber:
 
         return self._ctl.request_rgb_tagged(
             _reply, max_width=max_width, jpeg_quality=jpeg_quality)
+
+
+class SnapshotRing:
+    """The last few pose-tagged frames, kept while a drive is active.
+
+    ``tick(now, active)`` requests one frame every ``period_s`` (non-blocking;
+    replies land on the Zenoh thread). Used by the recovery supervisor: the
+    camera fallback of the post-fault pose check compares the last frame from
+    before the fault with a fresh one, and diagnostic dumps save the ring.
+    The 2 Hz operator preview carries no pose, so it is not reused.
+    """
+
+    def __init__(self, grabber: "FrameGrabber", *, size: int = 3,
+                 period_s: float = 1.0, max_width: int = 320,
+                 jpeg_quality: int = 70) -> None:
+        import threading
+        from collections import deque
+        self._grabber = grabber
+        self._period = float(period_s)
+        self._max_width = max_width
+        self._q = jpeg_quality
+        self._frames: "deque[PosedFrame]" = deque(maxlen=size)
+        self._lock = threading.Lock()
+        self._last_req = -1e9
+
+    def tick(self, now: float, active: bool) -> None:
+        if not active or now - self._last_req < self._period:
+            return
+        self._last_req = now
+        try:
+            self._grabber.grab(self._add, max_width=self._max_width,
+                               jpeg_quality=self._q)
+        except Exception:
+            logger.exception("snapshot ring: grab failed")
+
+    def _add(self, frame: PosedFrame) -> None:
+        if frame.pose is None:
+            return
+        with self._lock:
+            self._frames.append(frame)
+
+    def frames(self) -> list:
+        with self._lock:
+            return list(self._frames)
+
+    def latest(self, *, after: float = -1e18) -> Optional[PosedFrame]:
+        """Newest frame that arrived after ``after`` (desktop wall clock)."""
+        with self._lock:
+            for f in reversed(self._frames):
+                if f.recv_ts > after:
+                    return f
+        return None
