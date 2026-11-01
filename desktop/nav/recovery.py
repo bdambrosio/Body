@@ -82,13 +82,17 @@ class RecoverySupervisor:
 
     # ── lifecycle ────────────────────────────────────────────────────
 
-    def begin(self, now: float, reason: str) -> None:
-        """A fault started (the drive just suspended)."""
-        self._fault_times.append(now)
+    def begin(self, now: float, reason: str, *, link_fault: bool = True) -> None:
+        """A fault started (the drive just suspended), or — ``link_fault=False``
+        — a blocked leg wants its pose checked (no flap accounting, and the
+        link is already up, so the stability wait is the shortest one)."""
+        if link_fault:
+            self._fault_times.append(now)
         while self._fault_times and now - self._fault_times[0] > self._cfg.flap_window_s:
             self._fault_times.popleft()
         k = min(len(self._fault_times), len(self._cfg.stable_link_s)) - 1
-        self._stable_req = self._cfg.stable_link_s[max(0, k)]
+        self._stable_req = (self._cfg.stable_link_s[max(0, k)] if link_fault
+                            else self._cfg.stable_link_s[0])
         self._reason = reason
         self._stable_since = None
         self._reloc_fails = 0

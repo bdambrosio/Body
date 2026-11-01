@@ -1154,6 +1154,112 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertFalse(sup2.active())
         self.assertEqual(hd2.state(), HierState.IDLE)
 
+    # ── Blocked-leg escalation ladder (with a supervisor) ───────────
+
+    def _blocked_with_recovery(self, verdicts=None, **cfg):
+        from desktop.localization.pose_verify import OK, Verdict
+        from desktop.nav.recovery import RecoveryHooks, RecoverySupervisor
+        from desktop.nav.test_recovery import FakeVerifier
+        cfg.setdefault("blocked_retry_interval_s", 0.5)
+        cfg.setdefault("blocked_retry_window_s", 2.0)
+        hd, io, po = self._build(points=((5.0, 0.0),), **cfg)
+        sup = RecoverySupervisor(RecoveryHooks(
+            verifier=FakeVerifier(verdicts or [Verdict(OK, "fine")])))
+        hd.set_recovery(sup)
+        self._drive_to_sending(hd)
+        return hd, io, po
+
+    def _block_until_give_up(self, hd, io, t):
+        """Keep every goto BLOCKED until the retry window is spent."""
+        while t < 200.0:
+            if io.sent:
+                io.set_status(cmd_id=io._cid, state="BLOCKED",
+                              blocked_reason="swept_block")
+            hd.tick(t)
+            if hd.recovery_status() is not None:
+                return t
+            t += 0.1
+        self.fail("never escalated")
+
+    def test_spent_window_climbs_the_ladder_instead_of_pausing(self):
+        hd, io, po = self._blocked_with_recovery()
+        t = self._block_until_give_up(hd, io, 1.0)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        self.assertTrue(hd.recovery_status()["phase"].startswith("blocked:verify"))
+        # Pose check: link already up → 2 s stable → verify ok → unstick goto.
+        sent = len(io.sent)
+        while len(io.sent) == sent and t < 20.0:
+            t += 0.1
+            hd.tick(t)
+        self.assertEqual(len(io.sent), sent + 1)
+        bx, by = io.sent[-1][0], io.sent[-1][1]
+        self.assertLess(bx, 0.0)                       # backs away from the carrot
+        self.assertTrue(hd.recovery_status()["phase"].startswith("blocked:unstick"))
+        # Unstick done → re-plan: a fresh goto toward the waypoint.
+        io.set_status(cmd_id=io._cid, state="ARRIVED")
+        hd.tick(t + 0.1)
+        hd.tick(t + 0.2)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        self.assertGreater(io.sent[-1][0], 0.0)
+        # Blocks again → the ladder moves on to a wait, no gotos meanwhile.
+        t = self._block_until_give_up(hd, io, t + 0.3)
+        st = hd.recovery_status()
+        self.assertTrue(st["phase"].startswith("blocked:wait"), st)
+        sent = len(io.sent)
+        for _ in range(100):                           # 10 s of a 15 s wait
+            t += 0.1
+            hd.tick(t)
+        self.assertEqual(len(io.sent), sent)
+        self.assertEqual(hd.state(), HierState.BLOCKED)
+        # After the wait it starts over with a pose check (never gives up).
+        for _ in range(60):
+            t += 0.1
+            hd.tick(t)
+        self.assertIn("verify", hd.recovery_status()["phase"])
+
+    def test_progress_ends_the_ladder(self):
+        hd, io, po = self._blocked_with_recovery()
+        t = self._block_until_give_up(hd, io, 1.0)
+        while hd.recovery_status() and "unstick" not in hd.recovery_status()["phase"]:
+            t += 0.1
+            hd.tick(t)
+        io.set_status(cmd_id=io._cid, state="ARRIVED")
+        hd.tick(t + 0.1)
+        hd.tick(t + 0.2)                               # re-plan → driving
+        io.set_status(cmd_id=io._cid, state="ARRIVED") # real sub-goal progress
+        hd.tick(t + 0.3)
+        self.assertIsNone(hd.recovery_status())
+
+    def test_rejected_goes_straight_to_replan(self):
+        hd, io, po = self._blocked_with_recovery(max_consecutive_rejects=1)
+        t = 1.0
+        for _ in range(4):
+            io.set_status(cmd_id=io._cid, state="REJECTED")
+            hd.tick(t)
+            t += 0.1
+        # leg re-planned with a fresh budget rather than paused
+        self.assertIn(hd.state(), (HierState.DRIVING_SUBGOAL, HierState.SELECT_SUBGOAL))
+
+    def test_advisory_pause_becomes_a_wait(self):
+        hd, io, po = self._blocked_with_recovery(blocked_retry_window_s=10.0)
+        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="depth_block")
+        hd.tick(1.0)
+        self.assertTrue(hd.apply_block_advisory(
+            hd.block_run(), BlockAdvisory("pause", "chair")))
+        st = hd.recovery_status()
+        self.assertTrue(st["phase"].startswith("blocked:wait"))
+        self.assertGreaterEqual(st["next_try_in_s"], 59.0)   # longer first wait
+
+    def test_stop_and_resume_clear_the_ladder(self):
+        hd, io, po = self._blocked_with_recovery()
+        self._block_until_give_up(hd, io, 1.0)
+        self.assertTrue(hd.request_resume())
+        self.assertIsNone(hd.recovery_status())
+        hd2, io2, po2 = self._blocked_with_recovery()
+        self._block_until_give_up(hd2, io2, 1.0)
+        hd2.stop()
+        self.assertIsNone(hd2.recovery_status())
+
     def test_select_pose_loss_suspends(self):
         # Pose lost when a sub-goal completes (the re-pick step) must suspend
         # rather than send a goto from a stale pose. With the same-tick handoff

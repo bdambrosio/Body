@@ -202,6 +202,14 @@ class HierConfig:
     # past the watermark, so a re-pick normally succeeds at once. More than
     # this many consecutive rejections in a leg → BLOCKED("rejected").
     max_consecutive_rejects: int = 3
+    # Escalation ladder (needs a RecoverySupervisor; without one a spent
+    # retry window pauses for the operator as before). Instead of pausing:
+    # pose check (re-localize if wrong) -> back off to a clear spot -> re-plan
+    # with a fresh leg budget -> wait (these, capped at the last) -> repeat.
+    escalation_waits_s: Tuple[float, ...] = (15.0, 30.0, 60.0, 120.0, 300.0)
+    unstick_min_m: float = 0.30
+    unstick_max_m: float = 0.50
+    unstick_timeout_s: float = 15.0
     # Tier-2 fan-out: when the straight clear-run toward the carrot fails (an
     # obstacle — often one only Tier-3's depth memory knows — sits on the
     # bearing), try bearings ±fan_step_deg … ±fan_max_deg and pick the one
@@ -406,6 +414,13 @@ class HierarchicalDrive:
         self._recovery: Optional[Any] = None
         self._auto_resumes = 0
         self._suspend_link_back = False
+        # Blocked-leg escalation (see HierConfig.escalation_waits_s).
+        self._esc_rung: Optional[str] = None     # verify|unstick|replan|wait
+        self._esc_wait_idx = 0
+        self._esc_until = 0.0
+        self._esc_cmd: Optional[int] = None
+        self._esc_sent_at = 0.0
+        self._esc_count = 0
 
     # ── Control ──────────────────────────────────────────────────────
 
@@ -417,6 +432,7 @@ class HierarchicalDrive:
     def start(self) -> None:
         if self._recovery is not None:
             self._recovery.cancel()
+        self._esc_clear(full=True)
         self._block_started_at = None
         self._block_gave_up = False
         self._block_reason = None
@@ -446,6 +462,7 @@ class HierarchicalDrive:
     def stop(self) -> None:
         if self._recovery is not None:
             self._recovery.cancel()
+        self._esc_clear(full=True)
         self._io.cancel()
         self._subgoal_body = None
         self._held_tier = None
@@ -458,7 +475,17 @@ class HierarchicalDrive:
 
     def recovery_status(self) -> Optional[Dict[str, Any]]:
         r = self._recovery
-        if r is None or not r.active():
+        if r is None:
+            return None
+        if self._esc_rung is not None and self._block_gave_up:
+            st = dict(r.status(self._tick_now)) if r.active() else {}
+            st["phase"] = f"blocked:{self._esc_rung}" + (
+                f"/{st['phase']}" if st.get("phase") else "")
+            if self._esc_rung == "wait":
+                st["next_try_in_s"] = max(0.0, self._esc_until - self._tick_now)
+            st["escalations"] = self._esc_count
+            return st
+        if not r.active():
             return None
         return r.status(self._tick_now)
 
@@ -511,6 +538,7 @@ class HierarchicalDrive:
         logger.info("hier: operator resume from %s", self._state.value)
         if self._recovery is not None:
             self._recovery.cancel()
+        self._esc_clear(full=False)
         self._resume_resets()
         self._to(HierState.ALIGNING)
         return True
@@ -603,8 +631,16 @@ class HierarchicalDrive:
         elif adv.action == "pause" and not self._block_gave_up:
             self._block_gave_up = True
             self._io.cancel()
-            logger.warning("hier: blocked (%s) — advisory says %s, pausing for "
-                           "operator resume", self._block_reason, adv.label)
+            if self._recovery is not None:
+                # Caution-only: a static obstacle means wait longer before the
+                # next attempt — never motion, never forever.
+                logger.warning("hier: blocked (%s) — advisory says %s, waiting",
+                               self._block_reason, adv.label)
+                self._esc_wait_idx = max(self._esc_wait_idx, 2)
+                self._esc_enter("wait", self._tick_now)
+            else:
+                logger.warning("hier: blocked (%s) — advisory says %s, pausing for "
+                               "operator resume", self._block_reason, adv.label)
         return True
 
     def block_advisory(self) -> Optional[BlockAdvisory]:
@@ -1104,32 +1140,7 @@ class HierarchicalDrive:
         grid = meta = None
         scan = self._io.latest_scan()
         if scan is not None and scan.get("ranges"):
-            grid, meta = rasterize_scan(
-                scan.get("ranges"), float(scan.get("angle_min", 0.0)),
-                float(scan.get("angle_increment", 0.0)), self._raster,
-                unknown_bins=scan.get("unknown_bins"))
-            # Tier-3's depth memory (obstacles only the depth camera saw, in
-            # the live body frame): march around them too, so the sub-goal
-            # isn't picked straight through what stopped the last goal.
-            mem = self._depth_memory_body()
-            if mem:
-                grid = grid.copy()
-                cells = plan_cells(np.asarray(mem, dtype=float), (0.0, 0.0, 0.0),
-                                   self._mem_cfg.plan_exclude_radius_m,
-                                   self._mem_cfg.plan_exclude_half_angle_deg)
-                stamp_blocked(grid, meta, cells, keep_clear_xy=(0.0, 0.0),
-                              keep_clear_radius_m=self._raster.robot_clear_radius_m)
-            # March on Tier-3's footprint-inflated + goal-clearance lethal mask
-            # (its exact costmap model), not the raw scan: a "clear" point here
-            # is a goal Tier-3 accepts without snapping, and the 2-D inflation
-            # catches walls lateral to the ray a single ray-march would miss.
-            cm = build_local_costmap(grid, meta, self._costmap_cfg)
-            blocked = dilate_bool(cm.lethal, iters=self._goal_clearance_cells)
-            march_grid = grid.copy()
-            march_grid[blocked] = 0
-            # Inflation already provides the clearance — only a half-cell backoff
-            # to land cleanly inside the free region (not 0.15 m on top of it).
-            march_cfg = replace(t2, backoff_m=0.5 * float(meta["resolution_m"]))
+            grid, meta, march_grid, march_cfg = self._build_march(scan, t2)
             res = furthest_free_point(march_grid, meta, bearing, march_cfg,
                                       max_dist_m=wp_dist)
             src = "clear"
@@ -1293,6 +1304,7 @@ class HierarchicalDrive:
                     return
                 self._block_started_at = None      # sub-goal progress
                 self._block_gave_up = False
+                self._esc_clear(full=False)
                 self._detour_repicks = 0
                 self._detour_ticks = 0
                 logger.info("hier: re-pick (sub-goal %s)", state)
@@ -1304,6 +1316,7 @@ class HierarchicalDrive:
                             self._moved_since_send(pose))
                 self._block_started_at = None
                 self._block_gave_up = False
+                self._esc_clear(full=False)
             if state in ("BLOCKED", "FAULT"):
                 self._note_block_hits(st, pose)
                 self._enter_blocked(st.get("blocked_reason") or state)
@@ -1398,6 +1411,7 @@ class HierarchicalDrive:
             self._carrot_relaxed = None
             self._block_started_at = None
             self._block_gave_up = False
+            self._esc_clear(full=True)
             self._leg_started_at = None
             self._consecutive_rejects = 0
             self._detour_repicks = 0
@@ -1414,6 +1428,7 @@ class HierarchicalDrive:
         logger.info("hier: waypoint reached -> next=%s", next_idx)
         self._block_started_at = None              # fresh leg
         self._block_gave_up = False
+        self._esc_clear(full=True)
         self._leg_started_at = None
         self._consecutive_rejects = 0
         self._detour_repicks = 0
@@ -1424,6 +1439,150 @@ class HierarchicalDrive:
             self._to(HierState.ARRIVED)
         else:
             self._to(HierState.SELECT_SUBGOAL)
+
+    # ── Blocked-leg escalation ladder (redesign step 5) ──────────────
+
+    _ESC_NEXT = {"verify": "unstick", "unstick": "replan", "replan": "wait",
+                 "wait": "verify"}
+
+    def _esc_clear(self, *, full: bool) -> None:
+        """Real progress ends the ladder; a waypoint advance (``full``) also
+        forgets how long the last waits were."""
+        if self._esc_rung is not None and self._recovery is not None:
+            self._recovery.cancel()
+        self._esc_rung = None
+        self._esc_cmd = None
+        if full:
+            self._esc_wait_idx = 0
+
+    def _escalate(self, now: float) -> None:
+        """The current attempt gave up: climb to the next rung. A first give-
+        up starts at the pose check (a wrong pose looks like a block: 11-01),
+        except repeated REJECTED gotos, which go straight to a fresh leg."""
+        if self._esc_rung is None:
+            first = "replan" if self._block_reason == "rejected" else "verify"
+            self._esc_enter(first, now)
+        else:
+            self._esc_enter(self._ESC_NEXT[self._esc_rung], now)
+
+    def _esc_enter(self, rung: str, now: float) -> None:
+        self._esc_rung = rung
+        self._esc_count += 1
+        self._block_gave_up = True
+        if rung == "verify":
+            logger.warning("hier: escalation %d — checking the pose", self._esc_count)
+            self._recovery.begin(now, f"blocked ({self._block_reason})", link_fault=False)
+        elif rung == "unstick":
+            self._esc_cmd = None
+            target = self._unstick_target()
+            if target is None:
+                logger.warning("hier: escalation %d — no clear spot to back off "
+                               "to, re-planning", self._esc_count)
+                self._esc_enter("replan", now)
+                return
+            cid = self._io.send_goto_from_body(
+                target[0], target[1], arrival_tol_m=self._cfg.subgoal_arrival_tol_m)
+            if cid is None:
+                self._esc_enter("replan", now)
+                return
+            self._esc_cmd = cid
+            self._esc_sent_at = now
+            logger.warning("hier: escalation %d — backing off to body (%+.2f, %+.2f)",
+                           self._esc_count, target[0], target[1])
+        elif rung == "replan":
+            logger.warning("hier: escalation %d — re-planning with a fresh leg "
+                           "budget", self._esc_count)
+            self._block_started_at = None
+            self._block_gave_up = False
+            self._leg_started_at = None
+            self._consecutive_rejects = 0
+            self._prefer_fan = True
+            self._io.cancel()
+            self._to(HierState.SELECT_SUBGOAL)
+        elif rung == "wait":
+            waits = self._cfg.escalation_waits_s
+            w = waits[min(self._esc_wait_idx, len(waits) - 1)]
+            self._esc_wait_idx += 1
+            self._esc_until = now + w
+            logger.warning("hier: escalation %d — waiting %.0fs before trying again",
+                           self._esc_count, w)
+
+    def _tick_escalation(self, now: float) -> None:
+        rung = self._esc_rung
+        pose = self._pose.world_pose()
+        if rung != "verify" and pose is None:
+            self._esc_clear(full=False)
+            self._enter_suspended("pose_lost")
+            return
+        if rung == "verify":
+            if self._recovery.step(now, link_ok=pose is not None,
+                                   goal_live=False) == RESUME:
+                logger.info("hier: escalation pose check: %s", self._recovery.resume_detail)
+                self._esc_enter("unstick", now)
+        elif rung == "unstick":
+            st = self._io.latest_status()
+            done = now - self._esc_sent_at > self._cfg.unstick_timeout_s
+            if st is not None and int(st.get("cmd_id", 0) or 0) == self._esc_cmd:
+                done = done or st.get("state") in (
+                    "ARRIVED", "IDLE", "BLOCKED", "FAULT", "CANCELED", "REJECTED")
+            if done:
+                self._io.cancel()
+                self._esc_enter("replan", now)
+        elif rung == "wait":
+            if now >= self._esc_until:
+                self._esc_enter("verify", now)
+
+    def _unstick_target(self) -> Optional[Tuple[float, float]]:
+        """A clear body-frame point 0.3–0.5 m away, as directly away from the
+        carrot as the live scan allows (Tier-3's own inflated mask)."""
+        scan = self._io.latest_scan()
+        pose = self._pose.world_pose()
+        carrot = self._carrot_xy()
+        if not scan or not scan.get("ranges") or pose is None:
+            return None
+        ahead = 0.0
+        if carrot is not None:
+            ahead = wrap_pi(_world_bearing(pose, carrot) - pose[2])
+        _g, meta, march_grid, march_cfg = self._build_march(scan, self._cfg.tier2_cfg)
+        for dev in (180.0, 150.0, -150.0, 120.0, -120.0, 90.0, -90.0):
+            b = wrap_pi(ahead + math.radians(dev))
+            r = furthest_free_point(march_grid, meta, b, march_cfg,
+                                    max_dist_m=self._cfg.unstick_max_m)
+            if r.ok and r.body_xy is not None and r.free_dist_m >= self._cfg.unstick_min_m:
+                return (float(r.body_xy[0]), float(r.body_xy[1]))
+        return None
+
+    def _build_march(self, scan: Dict[str, Any], t2: Tier2Config):
+        """Body-frame scan raster (+ Tier-3 depth memory) and the march grid on
+        Tier-3's footprint-inflated + goal-clearance lethal mask. Returns
+        ``(grid, meta, march_grid, march_cfg)``."""
+        grid, meta = rasterize_scan(
+            scan.get("ranges"), float(scan.get("angle_min", 0.0)),
+            float(scan.get("angle_increment", 0.0)), self._raster,
+            unknown_bins=scan.get("unknown_bins"))
+        # Tier-3's depth memory (obstacles only the depth camera saw, in
+        # the live body frame): march around them too, so the sub-goal
+        # isn't picked straight through what stopped the last goal.
+        mem = self._depth_memory_body()
+        if mem:
+            grid = grid.copy()
+            cells = plan_cells(np.asarray(mem, dtype=float), (0.0, 0.0, 0.0),
+                               self._mem_cfg.plan_exclude_radius_m,
+                               self._mem_cfg.plan_exclude_half_angle_deg)
+            stamp_blocked(grid, meta, cells, keep_clear_xy=(0.0, 0.0),
+                          keep_clear_radius_m=self._raster.robot_clear_radius_m)
+        # March on Tier-3's footprint-inflated + goal-clearance lethal mask
+        # (its exact costmap model), not the raw scan: a "clear" point here
+        # is a goal Tier-3 accepts without snapping, and the 2-D inflation
+        # catches walls lateral to the ray a single ray-march would miss.
+        cm = build_local_costmap(grid, meta, self._costmap_cfg)
+        blocked = dilate_bool(cm.lethal, iters=self._goal_clearance_cells)
+        march_grid = grid.copy()
+        march_grid[blocked] = 0
+        # Inflation already provides the clearance — only a half-cell backoff
+        # to land cleanly inside the free region (not 0.15 m on top of it).
+        march_cfg = replace(t2, backoff_m=0.5 * float(meta["resolution_m"]))
+        return grid, meta, march_grid, march_cfg
 
     def _tick_blocked(self, now: float) -> None:
         # Retry selection (the scan may clear, or Tier-3's A* finds a way) at
@@ -1438,6 +1597,8 @@ class HierarchicalDrive:
         # would just re-trip them (and churn goto+cancel) — pause at once.
         terminal = self._block_reason in ("leg_timeout", "rejected")
         if self._block_gave_up:
+            if self._esc_rung is not None:
+                self._tick_escalation(now)
             return                 # paused (window spent, or a pause advisory)
         if terminal or now - self._block_started_at > self._cfg.blocked_retry_window_s:
             # Escalation before a pause (redesign step 5, first rung): an
@@ -1462,11 +1623,15 @@ class HierarchicalDrive:
                 # may have been lost, and a paused drive must not leave Tier-3
                 # holding (and possibly resuming) a goal (X3).
                 self._io.cancel()
-                logger.warning(
-                    "hier: blocked (%s) — %s, pausing for operator resume",
-                    self._block_reason,
-                    "terminal for this leg" if terminal else
-                    f"retry window ({self._cfg.blocked_retry_window_s:.1f}s) exhausted")
+                why = ("terminal for this leg" if terminal else
+                       f"retry window ({self._cfg.blocked_retry_window_s:.1f}s) exhausted")
+                if self._recovery is not None:
+                    logger.warning("hier: blocked (%s) — %s, escalating",
+                                   self._block_reason, why)
+                    self._escalate(now)
+                else:
+                    logger.warning("hier: blocked (%s) — %s, pausing for operator "
+                                   "resume", self._block_reason, why)
             return
         if self._advisory_run == self._block_run and now < self._advisory_hold_until:
             return
