@@ -405,6 +405,7 @@ class HierarchicalDrive:
         # Optional self-recovery for pose_lost suspends (None = operator only).
         self._recovery: Optional[Any] = None
         self._auto_resumes = 0
+        self._suspend_link_back = False
 
     # ── Control ──────────────────────────────────────────────────────
 
@@ -474,6 +475,7 @@ class HierarchicalDrive:
         self._block_reason = reason
         self._to(HierState.SUSPENDED)
         if auto:
+            self._suspend_link_back = False
             self._recovery.begin(self._tick_now, reason)
         elif self._recovery is not None:
             self._recovery.cancel()
@@ -482,8 +484,13 @@ class HierarchicalDrive:
         r = self._recovery
         if r is None or self._block_reason != "pose_lost" or not r.active():
             return
-        if r.step(now, link_ok=self._pose.world_pose() is not None,
-                  goal_live=False) == RESUME:
+        link_ok = self._pose.world_pose() is not None
+        if link_ok and not self._suspend_link_back:
+            # The cancel sent on entry rode the same failing link — repeat it
+            # once the link is back so Tier-3 can't still hold the old goal.
+            self._io.cancel()
+        self._suspend_link_back = link_ok
+        if r.step(now, link_ok=link_ok, goal_live=False) == RESUME:
             self._auto_resumes += 1
             logger.info("hier: auto-resume from SUSPENDED (pose_lost) — %s",
                         r.resume_detail)

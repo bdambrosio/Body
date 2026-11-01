@@ -1109,8 +1109,13 @@ class TestHierarchicalDrive(unittest.TestCase):
         po.pose = None
         self.assertEqual(hd.tick(10.0), HierState.SUSPENDED)
         self.assertIsNotNone(hd.recovery_status())
+        cancels = io.cancels
         po.pose = (0.5, 0.0, 0.0)
         sent = len(io.sent)
+        hd.tick(10.05)
+        self.assertEqual(io.cancels, cancels + 1)     # re-sent once on link back
+        hd.tick(10.08)
+        self.assertEqual(io.cancels, cancels + 1)
         t = 10.1
         while t < 11.9:                               # < 2 s stable: hold
             self.assertEqual(hd.tick(t), HierState.SUSPENDED)

@@ -4,7 +4,9 @@ Hosts the controls an operator must always have one click away:
 connection, ALL-STOP, e-stop Re-arm, Live-command toggle, and diagnostic
 pills (connection, heartbeat, e-stop). A latched e-stop on the Pi clears
 ONLY on an explicit Re-arm (body/estop_rearm) — motion commands no longer
-clear it. Teleop sliders and camera feeds live
+clear it. Exception: during a drive's self-recovery the nav window re-arms a
+latch the link fault caused (watchdog heartbeat_timeout) on its own
+(desktop/nav/recovery.py LinkEStopGuard). Teleop sliders and camera feeds live
 in toggleable docks so the map can dominate screen real estate during
 mission work.
 

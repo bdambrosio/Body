@@ -485,7 +485,14 @@ class StubController:
         """Publish ``body/estop_rearm`` — the ONLY way to clear a latched
         e-stop (watchdog and motor_controller latch). Motion commands no
         longer clear it (E1). The Pi additionally requires heartbeat to be
-        ok at the moment of re-arm. Returns True if published."""
+        ok at the moment of re-arm. Returns True if published.
+
+        Callers: the operator's Re-arm button, and (2026-11-01, a deliberate
+        relaxation of spec §5.10) the nav recovery supervisor with source
+        ``auto_recovery`` — only for a latch the link fault itself caused
+        (the watchdog's heartbeat_timeout; see desktop/nav/recovery.py
+        LinkEStopGuard), only once the link has been healthy 2 s, and only
+        while no drive goal is live."""
         if self._session is None:
             return False
         payload = _estop_rearm_payload(source)

@@ -152,3 +152,43 @@ class TestRecoverySupervisor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLinkEStopGuard(unittest.TestCase):
+    def _g(self, active_at_start=False):
+        from desktop.nav.recovery import LinkEStopGuard
+        g = LinkEStopGuard()
+        g.on_fault_start(100.0, estop_active=active_at_start)
+        return g
+
+    def test_heartbeat_timeout_during_fault_may_rearm(self):
+        g = self._g()
+        self.assertTrue(g.may_rearm(
+            estop_active=True,
+            emergency={"reason": "heartbeat_timeout", "source": "watchdog"},
+            emergency_ts=101.0))
+
+    def test_lost_emergency_message_still_link_caused(self):
+        self.assertTrue(self._g().may_rearm(
+            estop_active=True, emergency=None, emergency_ts=0.0))
+        # An emergency from long before the fault doesn't count against it.
+        self.assertTrue(self._g().may_rearm(
+            estop_active=True, emergency={"reason": "operator"}, emergency_ts=10.0))
+
+    def test_operator_or_other_estop_never(self):
+        g = self._g()
+        self.assertFalse(g.may_rearm(
+            estop_active=True, emergency={"reason": "operator", "source": "desktop"},
+            emergency_ts=101.0))
+        self.assertFalse(g.may_rearm(
+            estop_active=True,
+            emergency={"reason": "heartbeat_timeout", "source": "desktop"},
+            emergency_ts=101.0))
+
+    def test_already_latched_at_fault_start_never(self):
+        self.assertFalse(self._g(active_at_start=True).may_rearm(
+            estop_active=True, emergency=None, emergency_ts=0.0))
+
+    def test_not_latched_nothing_to_do(self):
+        self.assertFalse(self._g().may_rearm(
+            estop_active=False, emergency=None, emergency_ts=0.0))

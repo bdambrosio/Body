@@ -47,10 +47,13 @@ class RecoveryHooks:
     """What the supervisor may do. All optional except ``verifier``."""
     verifier: object                                   # PoseVerifier-like
     relocalize: Optional[Callable[[], tuple]] = None   # -> (ok: bool, detail: str)
-    # Pi e-stop latched by a link fault (heartbeat_timeout)?
+    # Any Pi e-stop latched? (No resume while it is.)
     estop_latched: Optional[Callable[[], bool]] = None
-    # Clear it (only called when link healthy + no live goal). -> bool
+    # Try to clear it: called only when the link is healthy and no goal is
+    # live; the hook itself refuses non-link e-stops (LinkEStopGuard). -> bool
     rearm: Optional[Callable[[], bool]] = None
+    # Called from begin() so the hook side can note the fault start.
+    on_begin: Optional[Callable[[float], None]] = None
     # Called on each phase change with (tag, detail) — diagnostic dumps.
     on_event: Optional[Callable[[str, str], None]] = None
 
@@ -96,6 +99,11 @@ class RecoverySupervisor:
             self._h.verifier.mark_fault()
         except Exception:
             logger.exception("recovery: verifier.mark_fault failed")
+        if self._h.on_begin is not None:
+            try:
+                self._h.on_begin(now)
+            except Exception:
+                logger.exception("recovery: on_begin failed")
         self._set_phase("wait_link", f"{reason}; need link stable {self._stable_req:.0f}s")
 
     def cancel(self) -> None:
@@ -232,10 +240,13 @@ class RecoverySupervisor:
         except Exception:
             logger.exception("recovery: rearm failed")
             sent = False
-        logger.warning("recovery: link healthy %.0fs — auto re-arm of the link "
-                       "e-stop %s", now - self._stable_since,
-                       "sent" if sent else "NOT sent")
-        self._emit("rearm", "sent" if sent else "failed")
+        if sent:
+            logger.warning("recovery: link healthy %.0fs — auto re-arm of the "
+                           "link e-stop sent", now - self._stable_since)
+        else:
+            logger.warning("recovery: e-stop latched and not ours to clear "
+                           "(not a link fault) — waiting for the operator's Re-arm")
+        self._emit("rearm", "sent" if sent else "refused")
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -256,4 +267,38 @@ class RecoverySupervisor:
             logger.exception("recovery: on_event failed")
 
 
-__all__ = ["RecoverySupervisor", "RecoveryHooks", "RecoveryConfig", "WAIT", "RESUME"]
+class LinkEStopGuard:
+    """Decides whether a latched Pi e-stop was caused by the link fault and
+    so may be re-armed automatically (spec §5.10 deliberately relaxed for
+    this one case; the Pi still refuses a re-arm while the heartbeat is bad).
+
+    May re-arm only when the e-stop was NOT latched when the fault began and
+    either the latest emergency message is the watchdog's
+    ``heartbeat_timeout`` (received during this fault) or no emergency
+    message arrived at all (the watchdog's own message lost in the same
+    drop). An operator / desktop e-stop, a boot latch, or any other reason
+    stays operator-only.
+    """
+
+    AUTO_REASONS = ("heartbeat_timeout",)
+
+    def __init__(self) -> None:
+        self._fault_start: Optional[float] = None
+        self._active_at_start = True
+
+    def on_fault_start(self, now: float, *, estop_active: bool) -> None:
+        self._fault_start = now
+        self._active_at_start = bool(estop_active)
+
+    def may_rearm(self, *, estop_active: bool, emergency: Optional[dict],
+                  emergency_ts: float) -> bool:
+        if not estop_active or self._fault_start is None or self._active_at_start:
+            return False
+        if emergency is not None and emergency_ts >= self._fault_start - 1.0:
+            return (str(emergency.get("reason")) in self.AUTO_REASONS
+                    and str(emergency.get("source", "watchdog")) == "watchdog")
+        return True     # latched during this fault, no other reason seen
+
+
+__all__ = ["RecoverySupervisor", "RecoveryHooks", "RecoveryConfig", "LinkEStopGuard",
+           "WAIT", "RESUME"]

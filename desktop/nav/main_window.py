@@ -31,7 +31,7 @@ from desktop.chassis.controller import StubController
 from desktop.localization.config import LocalizationConfig
 from desktop.localization.controller import LocalizationController
 from desktop.localization.pose_verify import PoseVerifier
-from desktop.nav.recovery import RecoveryHooks, RecoverySupervisor
+from desktop.nav.recovery import LinkEStopGuard, RecoveryHooks, RecoverySupervisor
 from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
@@ -1511,10 +1511,39 @@ class NavMainWindow(QMainWindow):
             ps.match_summary,
             lambda: self._pose_health.median_quality(time.time()),
         )
+        guard = LinkEStopGuard()
         return RecoverySupervisor(RecoveryHooks(
             verifier=verifier,
             relocalize=self._auto_relocalize,
+            estop_latched=self._estop_active,
+            rearm=lambda: self._auto_rearm(guard),
+            on_begin=lambda now: guard.on_fault_start(
+                now, estop_active=self._estop_active()),
         ))
+
+    def _estop_active(self) -> bool:
+        """Pi e-stop latched (motor_controller's view, else the watchdog's) —
+        same source as the safety toolbar's pill."""
+        s = self.chassis.state
+        with s.lock:
+            motor, status = s.motor_state, s.status
+        if isinstance(motor, dict):
+            return bool(motor.get("e_stop_active", False))
+        if isinstance(status, dict):
+            return bool(status.get("e_stop_active", False))
+        return False
+
+    def _auto_rearm(self, guard: LinkEStopGuard) -> bool:
+        """Recovery's re-arm: only an e-stop the link fault caused (the
+        watchdog's heartbeat_timeout). Operator / boot / other latches stay
+        for the Re-arm button."""
+        s = self.chassis.state
+        with s.lock:
+            emergency, emergency_ts = s.emergency_stop, s.emergency_ts
+        if not guard.may_rearm(estop_active=self._estop_active(),
+                               emergency=emergency, emergency_ts=emergency_ts):
+            return False
+        return bool(self.chassis.rearm_estop("auto_recovery"))
 
     def _auto_relocalize(self) -> tuple:
         """Recovery's re-localize: checkpoint recognition only (it seats the
