@@ -7,8 +7,9 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from desktop.fusion.ekf_pose_tracker import EkfPoseTracker
 from desktop.fusion.load_slam_config import load_slam_config, scan_matcher_config_from_slam
 from desktop.localization.mcl_localizer import MCLConfig, MCLLocalizer
 from desktop.localization.pose_buffer import PoseBuffer
+from desktop.localization.scan_rotation import estimate_rotation, judge
 from desktop.nav.slam.imu_yaw import ImuYawTracker
 from desktop.nav.slam.scan_matcher import (
     ScanMatcher,
@@ -102,6 +104,9 @@ class MCLPoseSource(PoseSource):
         self._last_odom_recv_mono = 0.0
         self._last_ranges: Optional[np.ndarray] = None
         self._last_angles: Optional[np.ndarray] = None
+        # Recent (Pi ts, body-frame points) for the wheel-vs-IMU contest
+        # tie-breaker (~4 s at the 10 Hz scan rate).
+        self._scan_hist: Deque[Tuple[float, np.ndarray]] = deque(maxlen=48)
 
         self._counters: Dict[str, int] = {
             "odom_seen": 0,
@@ -119,6 +124,8 @@ class MCLPoseSource(PoseSource):
             "imu_obs_skipped_distrusted": 0,
             "scan_prior_at_scan_ts": 0,
             "scan_prior_fallback_now": 0,
+            "rotation_contests_judged": 0,
+            "rotation_contests_imu_wins": 0,
         }
         # EKF IMU re-bind epoch we last bound _yaw_offset against.
         self._imu_rebind_epoch_seen = 0
@@ -813,8 +820,58 @@ class MCLPoseSource(PoseSource):
                 self._counters["scan_obs_skipped_malformed"] += 1
             return
 
+        if msg.get("ts"):
+            self._scan_hist.append((scan_ts, points))
+            self._maybe_judge_rotation_contest(scan_ts)
+
         self._apply_scan_match_observation(
             points, scan_ts=scan_ts if msg.get("ts") else None)
+
+    def _maybe_judge_rotation_contest(self, newest_ts: float) -> None:
+        """Settle an open EKF wheel-vs-IMU dispute with two scans that
+        bracket it: the rotation between them, measured by the lidar alone,
+        says whether the wheels (slip / stalled spin) or the IMU (frozen)
+        lied. See desktop/localization/scan_rotation.py."""
+        contest = self._ekf.rotation_contest()
+        if contest is None or newest_ts < contest[1]:
+            return
+        t0, _t1 = contest
+        hist = list(self._scan_hist)
+        before = [h for h in hist if h[0] <= t0]
+        if before:
+            a = before[-1]
+        else:
+            # No scan that old (startup / rate gaps): use the oldest one; the
+            # claims are measured over the actual scan interval anyway.
+            a = hist[0]
+        b = hist[-1]
+        claims = self._ekf.rotation_between(a[0], b[0]) if b[0] > a[0] else None
+        if claims is None:
+            verdict, detail = "unknown", "no wheel/IMU history over the scan pair"
+        else:
+            wheel, imu = claims
+            hyps = {"wheels": wheel, "imu": imu}
+            t_start = time.monotonic()
+            result = estimate_rotation(a[1], b[1], hyps)
+            verdict = judge(result, hyps)
+            ms = (time.monotonic() - t_start) * 1000.0
+            if result is None:
+                detail = "scans too sparse"
+            else:
+                detail = (
+                    f"scans {math.degrees(result.dtheta):+.0f}° (fit {result.score:.2f}) "
+                    f"vs wheels {math.degrees(wheel):+.0f}° "
+                    f"({result.hypothesis_scores['wheels']:.2f}) / IMU "
+                    f"{math.degrees(imu):+.0f}° ({result.hypothesis_scores['imu']:.2f}) "
+                    f"over {b[0] - a[0]:.1f}s, {ms:.0f}ms")
+        changed = self._ekf.resolve_rotation_contest(verdict)
+        with self._lock:
+            self._counters["rotation_contests_judged"] += 1
+            if changed:
+                self._counters["rotation_contests_imu_wins"] += 1
+                # The heading just stepped: drive consumers must re-pick.
+                self._correction_discrete_seq += 1
+        logger.info("mcl_pose: wheel/IMU contest -> %s (%s)", verdict, detail)
 
 
 def _wrap(a: float) -> float:

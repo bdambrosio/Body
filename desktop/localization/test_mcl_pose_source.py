@@ -200,3 +200,61 @@ class TestMCLOdomReset(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRotationContest(unittest.TestCase):
+    """Wheel-vs-IMU dispute settled by scan-to-scan rotation (2026-11-01)."""
+
+    def _src_with_trip(self):
+        from desktop.fusion.test_ekf_pose_tracker import _imu
+
+        src = MCLPoseSource(
+            _corridor_map(),
+            pf_config=ParticleFilterConfig(n_particles=200, device="cpu"),
+            config=MCLPoseSourceConfig(min_evidence_cells=50),
+        )
+        ekf = src._ekf
+        for i in range(250):
+            ekf.update_imu(_imu(100.0 + i * 0.01, 0.0))
+        ekf.update_odom(102.5, 0.0, 0.0, 0.0)
+        t = 103.0
+        for i in range(61):            # wheels +0.72 rad, IMU flat
+            ts = t + i * 0.02
+            ekf.update_imu(_imu(ts, 0.0))
+            ekf.update_odom(ts, 0.0, 0.0, 0.012 * i)
+        self.assertIsNotNone(ekf.rotation_contest())
+        return src, t
+
+    def test_scans_side_with_imu_and_bump_correction_seq(self) -> None:
+        from desktop.localization.test_scan_rotation import _scan
+
+        src, t = self._src_with_trip()
+        seq0 = src.correction_summary()["n_discrete"]
+        src._scan_hist.append((t - 0.05, _scan(0.3, 0.2, 0.4)))
+        src._scan_hist.append((t + 1.2, _scan(0.3, 0.2, 0.42, seed=1)))  # ~1° turn
+        src._maybe_judge_rotation_contest(t + 1.2)
+        self.assertIsNone(src._ekf.rotation_contest())
+        self.assertEqual(src.match_summary()["rotation_contests_imu_wins"], 1)
+        self.assertGreater(src.correction_summary()["n_discrete"], seq0)
+        self.assertTrue(src._ekf.imu_trusted())
+        self.assertAlmostEqual(src._ekf.pose_at(t + 1.2)[2], 0.0, places=2)
+
+    def test_scans_side_with_wheels_keeps_distrust(self) -> None:
+        from desktop.localization.test_scan_rotation import _scan
+
+        src, t = self._src_with_trip()
+        src._scan_hist.append((t - 0.05, _scan(0.3, 0.2, 0.4)))
+        src._scan_hist.append((t + 1.2, _scan(0.3, 0.2, 0.4 + 0.72, seed=1)))
+        src._maybe_judge_rotation_contest(t + 1.2)
+        self.assertIsNone(src._ekf.rotation_contest())
+        self.assertEqual(src.match_summary()["rotation_contests_imu_wins"], 0)
+        self.assertFalse(src._ekf.imu_trusted())
+
+    def test_waits_for_a_scan_after_the_trip(self) -> None:
+        from desktop.localization.test_scan_rotation import _scan
+
+        src, t = self._src_with_trip()
+        trip_t1 = src._ekf.rotation_contest()[1]
+        src._scan_hist.append((t - 0.05, _scan(0.3, 0.2, 0.4)))
+        src._maybe_judge_rotation_contest(trip_t1 - 0.01)
+        self.assertIsNotNone(src._ekf.rotation_contest())

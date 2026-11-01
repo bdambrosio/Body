@@ -17,6 +17,10 @@ Robustness (fragility review S1/S6/X4/I2/I4):
   rotation; a frozen IMU (wheels turned, IMU flat) is distrusted — heading
   from wheels, with the missed rotation restored at trip time — until the
   IMU visibly moves again, then the offset is re-bound.
+  The trip also opens a *contest*: wheels slipping or spinning against an
+  obstacle look identical, so the pose source compares two lidar scans
+  bracketing the window (desktop/localization/scan_rotation.py) and calls
+  resolve_rotation_contest(); an "imu" verdict reverts θ to the IMU heading.
 - State interpolation is wrap-safe in θ.
 """
 
@@ -117,6 +121,16 @@ class EkfPoseTracker:
         # reset, guard revival). Consumers that keep their own offset against
         # the raw IMU yaw (MCL) re-bind when it changes.
         self._imu_rebind_epoch = 0
+        # Cumulative (ts, wheel yaw, IMU yaw) for rotation_between(); kept
+        # independently of the odom/IMU buffers so a contest's window
+        # (~1 s before the trip + scan lag) is always covered.
+        self._rot_hist: Deque[Tuple[float, float, float]] = deque()
+        self._rot_wheel_cum = 0.0
+        self._rot_imu_cum = 0.0
+        # Open wheel-vs-IMU contest awaiting a scan-to-scan verdict:
+        # {"t0", "t1", "offset", "opened_ts"} or None.
+        self._contest: Optional[Dict[str, float]] = None
+        self._contest_counts = {"imu": 0, "wheels": 0, "unknown": 0, "expired": 0}
 
     def update_imu(self, reading: ImuReading) -> None:
         self._last_mag_valid = reading.mag_valid
@@ -149,6 +163,7 @@ class EkfPoseTracker:
             # The next sample is the new baseline (no ds across the reset).
             self._last_raw_odom = None
             self._guard_win.clear()
+            self._contest = None
             if reason == "clock_step":
                 # Timestamps before/after the step are incomparable.
                 self._state_buf.clear()
@@ -185,6 +200,7 @@ class EkfPoseTracker:
             self._guard_win.clear()
             self._last_imu_world_yaw = None
             self._imu_distrusted = False
+            self._contest = None
             self._imu_epoch_seen = self._imu.epoch()
             self._imu_rebind_pending = False
             self._x = 0.0
@@ -266,6 +282,8 @@ class EkfPoseTracker:
                 "odom_resets": self._odom_resets,
                 "imu_distrusted": self._imu_distrusted,
                 "imu_guard_trips": self._imu_guard_trips,
+                "rotation_contest_open": self._contest is not None,
+                "rotation_contest_verdicts": dict(self._contest_counts),
                 "imu_epoch": self._imu.epoch(),
             }
 
@@ -310,6 +328,7 @@ class EkfPoseTracker:
                 self._imu_epoch_seen = ep
                 self._imu_rebind_pending = True
                 self._guard_win.clear()
+                self._contest = None
                 self._last_imu_world_yaw = None
             if yaw is not None and self._imu_rebind_pending:
                 yaw = self._rebind_yaw_offset_locked(ts, yaw)
@@ -365,6 +384,94 @@ class EkfPoseTracker:
         self._last_imu_world_yaw = self._theta
         return self._theta
 
+    # ---- wheel-vs-IMU contest (scan-to-scan tie-breaker) -------------------
+
+    _ROT_HIST_S = 5.0
+    _CONTEST_TTL_S = 3.0
+
+    def _record_rotation_locked(
+        self, ts: float, prev_ts: float, dth_enc: float, dimu: float,
+    ) -> None:
+        if not self._rot_hist or self._rot_hist[-1][0] < prev_ts - 0.5:
+            # Start (or restart after a gap) at the step's own start time.
+            self._rot_hist.append((prev_ts, self._rot_wheel_cum, self._rot_imu_cum))
+        self._rot_wheel_cum += dth_enc
+        self._rot_imu_cum += dimu
+        self._rot_hist.append((ts, self._rot_wheel_cum, self._rot_imu_cum))
+        cutoff = ts - self._ROT_HIST_S
+        while len(self._rot_hist) > 2 and self._rot_hist[0][0] < cutoff:
+            self._rot_hist.popleft()
+
+    def _expire_contest_locked(self, ts: float) -> None:
+        c = self._contest
+        if c is not None and ts - c["opened_ts"] > self._CONTEST_TTL_S:
+            self._contest = None
+            self._contest_counts["expired"] += 1
+            logger.warning("ekf: wheel/IMU contest got no scan verdict in %.0fs — "
+                           "keeping wheel heading", self._CONTEST_TTL_S)
+
+    def rotation_contest(self) -> Optional[Tuple[float, float]]:
+        """(t0, t1) of an open wheel-vs-IMU dispute awaiting a scan verdict:
+        compare a scan at/before t0 with one at/after t1. None when none."""
+        with self._lock:
+            c = self._contest
+            return None if c is None else (c["t0"], c["t1"])
+
+    def rotation_between(self, ta: float, tb: float) -> Optional[Tuple[float, float]]:
+        """(wheel, IMU) net rotation over [ta, tb] from the guard history, or
+        None when the history doesn't cover it."""
+        with self._lock:
+            h = list(self._rot_hist)
+        # Small tolerance at both ends: scan and odom ticks don't align.
+        if len(h) < 2 or ta < h[0][0] - 0.15 or tb > h[-1][0] + 0.2 or tb <= ta:
+            return None
+
+        def at(t: float) -> Tuple[float, float]:
+            if t >= h[-1][0]:
+                return h[-1][1], h[-1][2]
+            for (t0, w0, i0), (t1, w1, i1) in zip(h, h[1:]):
+                if t0 <= t <= t1:
+                    a = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+                    return w0 + a * (w1 - w0), i0 + a * (i1 - i0)
+            return h[0][1], h[0][2]
+
+        wa, ia = at(ta)
+        wb, ib = at(tb)
+        return wb - wa, ib - ia
+
+    def resolve_rotation_contest(self, verdict: str) -> bool:
+        """Apply a scan verdict ("imu" | "wheels" | "unknown") to the open
+        contest. "imu": the wheels lied (slip / stalled spin) — trust the IMU
+        again and snap θ back to its heading under the pre-trip offset (undoing
+        any revival re-bind). Others keep the wheel heading. Returns True when
+        θ was changed."""
+        with self._lock:
+            c = self._contest
+            if c is None:
+                return False
+            self._contest = None
+            key = verdict if verdict in self._contest_counts else "unknown"
+            self._contest_counts[key] += 1
+            if verdict != "imu":
+                return False
+            latest = self._imu.latest()
+            if latest is None:
+                return False
+            raw_yaw = latest[1]
+            self._yaw_offset = c["offset"]
+            new_theta = _wrap(raw_yaw - self._yaw_offset)
+            dth = _wrap(new_theta - self._theta)
+            self._theta = new_theta
+            self._imu_distrusted = False
+            self._guard_win.clear()
+            self._last_imu_world_yaw = None
+            self._imu_rebind_epoch += 1
+            if self._last_raw_odom is not None:
+                self._append_state(self._last_raw_odom[0])
+        logger.warning("ekf: scans side with the IMU (wheels slipped) — heading "
+                       "corrected %+.0f°", math.degrees(dth))
+        return True
+
     def _imu_guard_locked(
         self, ts: float, prev_ts: float, dth_enc: float, yaw: float,
     ) -> Optional[float]:
@@ -376,6 +483,8 @@ class EkfPoseTracker:
         if not n.imu_guard_enabled or prev_imu is None:
             return None if self._imu_distrusted else yaw
         dimu = _wrap(yaw - prev_imu)
+        self._record_rotation_locked(ts, prev_ts, dth_enc, dimu)
+        self._expire_contest_locked(ts)
         dt = max(ts - prev_ts, 1e-3)
         # A wheel-yaw step faster than any real chassis rotation is a glitch
         # (or a reset the epoch fields didn't flag), not evidence.
@@ -395,6 +504,18 @@ class EkfPoseTracker:
                 self._imu_distrusted = True
                 self._imu_guard_trips += 1
                 if frozen:
+                    # Wheels slipping / spinning against an obstacle look
+                    # exactly like this too. Provisionally follow the wheels,
+                    # but open a contest: a scan-to-scan rotation over the
+                    # window decides, and an "imu" verdict reverts to the
+                    # IMU heading via the offset saved here.
+                    t0 = self._guard_win[0][0] if self._guard_win else ts
+                    self._contest = {
+                        "t0": t0 - n.imu_guard_window_s / 10.0,
+                        "t1": ts,
+                        "offset": self._yaw_offset,
+                        "opened_ts": ts,
+                    }
                     # Restore the rotation the frozen IMU hid during the
                     # window's earlier ticks (θ followed the flat IMU yaw
                     # until now); this tick's dθ_enc is applied by the

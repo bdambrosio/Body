@@ -284,6 +284,72 @@ class TestEkfPoseTracker(unittest.TestCase):
         assert pose is not None
         self.assertAlmostEqual(pose[2], _wrap(0.012 * 160), places=1)
 
+    def _trip_with_flat_imu(self, t: float, n: int = 61) -> None:
+        # Wheels report 0.6 rad/s for 1.2 s while the IMU stays at 0.
+        for i in range(n):
+            ts = t + i * 0.02
+            self.ekf.update_imu(_imu(ts, 0.0))
+            self.ekf.update_odom(ts, 0.0, 0.0, 0.012 * i)
+
+    def test_frozen_trip_opens_contest_with_history(self) -> None:
+        self._settle()
+        t = 103.0
+        self._trip_with_flat_imu(t)
+        c = self.ekf.rotation_contest()
+        self.assertIsNotNone(c)
+        assert c is not None
+        self.assertLess(c[0], c[1])
+        rot = self.ekf.rotation_between(t, t + 1.2)
+        assert rot is not None
+        self.assertAlmostEqual(rot[0], 0.012 * 60, places=3)
+        self.assertAlmostEqual(rot[1], 0.0, places=3)
+
+    def test_imu_verdict_reverts_to_imu_heading_even_after_revival(self) -> None:
+        # Wheels slipped (2026-11-01): IMU right at 0; then the robot really
+        # turns +0.3 rad with both agreeing → guard revives and re-binds to
+        # the wrong heading. The scan verdict must undo that re-bind.
+        self._settle()
+        t = 103.0
+        self._trip_with_flat_imu(t)
+        wheel0 = 0.012 * 60
+        for i in range(1, 61):
+            ts = t + 1.2 + i * 0.02
+            self.ekf.update_imu(_imu(ts, 0.01 * i))
+            self.ekf.update_odom(ts, 0.0, 0.0, wheel0 + 0.01 * i)
+        self.assertFalse(self.ekf.diagnostics()["imu_distrusted"])
+        # Without the verdict θ would now sit ~0.6 rad (the slip) too high.
+        self.assertGreater(self.ekf.pose_at(ts)[2], 1.0)
+        self.assertTrue(self.ekf.resolve_rotation_contest("imu"))
+        self.assertIsNone(self.ekf.rotation_contest())
+        self.assertAlmostEqual(self.ekf.pose_at(ts)[2], 0.6, places=2)
+        ts = t + 1.2 + 61 * 0.02
+        self.ekf.update_imu(_imu(ts, 0.61))
+        self.ekf.update_odom(ts, 0.0, 0.0, wheel0 + 0.61)
+        pose = self.ekf.pose_at(ts)
+        assert pose is not None
+        self.assertAlmostEqual(pose[2], 0.61, places=2)
+        self.assertEqual(self.ekf.diagnostics()["rotation_contest_verdicts"]["imu"], 1)
+
+    def test_wheels_verdict_keeps_wheel_heading(self) -> None:
+        self._settle()
+        t = 103.0
+        self._trip_with_flat_imu(t)
+        before = self.ekf.pose_at(t + 1.2)
+        self.assertFalse(self.ekf.resolve_rotation_contest("wheels"))
+        self.assertTrue(self.ekf.diagnostics()["imu_distrusted"])
+        self.assertEqual(self.ekf.pose_at(t + 1.2), before)
+
+    def test_contest_expires_without_verdict(self) -> None:
+        self._settle()
+        t = 103.0
+        self._trip_with_flat_imu(t)
+        for i in range(1, 200):
+            ts = t + 1.2 + i * 0.02
+            self.ekf.update_imu(_imu(ts, 0.0))
+            self.ekf.update_odom(ts, 0.0, 0.0, 0.012 * 60)
+        self.assertIsNone(self.ekf.rotation_contest())
+        self.assertEqual(self.ekf.diagnostics()["rotation_contest_verdicts"]["expired"], 1)
+
     def test_pose_at_wrap_safe_interpolation(self) -> None:
         # S6: interpolating between θ=3.13 and θ=-3.13 must stay near ±π.
         self._settle()
