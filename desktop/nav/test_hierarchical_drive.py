@@ -1091,6 +1091,64 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertFalse(hd.request_resume())
         self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
 
+    # ── Self-recovery (desktop/nav/recovery.py) ─────────────────────
+
+    def _with_recovery(self, verdicts=None, **hooks):
+        from desktop.localization.pose_verify import OK, Verdict
+        from desktop.nav.recovery import RecoveryHooks, RecoverySupervisor
+        from desktop.nav.test_recovery import FakeVerifier
+        hd, io, po = self._build(points=((5.0, 0.0),))
+        sup = RecoverySupervisor(RecoveryHooks(
+            verifier=FakeVerifier(verdicts or [Verdict(OK, "fine")]), **hooks))
+        hd.set_recovery(sup)
+        return hd, io, po, sup
+
+    def test_pose_lost_auto_resumes_after_link_stable(self):
+        hd, io, po, sup = self._with_recovery()
+        self._drive_to_sending(hd)
+        po.pose = None
+        self.assertEqual(hd.tick(10.0), HierState.SUSPENDED)
+        self.assertIsNotNone(hd.recovery_status())
+        po.pose = (0.5, 0.0, 0.0)
+        sent = len(io.sent)
+        t = 10.1
+        while t < 11.9:                               # < 2 s stable: hold
+            self.assertEqual(hd.tick(t), HierState.SUSPENDED)
+            t += 0.1
+        self.assertEqual(len(io.sent), sent)
+        while hd.state() is HierState.SUSPENDED and t < 13.0:
+            hd.tick(t)
+            t += 0.1
+        self.assertEqual(hd.state(), HierState.ALIGNING)
+        self.assertEqual(hd.tick(t), HierState.SELECT_SUBGOAL)
+        self.assertEqual(hd.tick(t), HierState.DRIVING_SUBGOAL)
+        self.assertIsNone(hd.recovery_status())
+
+    def test_teleop_suspend_never_auto_resumes(self):
+        hd, io, po, sup = self._with_recovery()
+        self._drive_to_sending(hd)
+        hd.notify_teleop(True)
+        t = 0.0
+        while t < 30.0:
+            self.assertEqual(hd.tick(t), HierState.SUSPENDED)
+            t += 0.5
+        self.assertTrue(hd.request_resume())
+
+    def test_operator_resume_and_stop_still_work_while_recovering(self):
+        hd, io, po, sup = self._with_recovery()
+        self._drive_to_sending(hd)
+        po.pose = None
+        hd.tick(1.0)
+        self.assertTrue(hd.request_resume())
+        self.assertFalse(sup.active())
+        hd2, io2, po2, sup2 = self._with_recovery()
+        self._drive_to_sending(hd2)
+        po2.pose = None
+        hd2.tick(1.0)
+        hd2.stop()
+        self.assertFalse(sup2.active())
+        self.assertEqual(hd2.state(), HierState.IDLE)
+
     def test_select_pose_loss_suspends(self):
         # Pose lost when a sub-goal completes (the re-pick step) must suspend
         # rather than send a goto from a stale pose. With the same-tick handoff

@@ -41,6 +41,7 @@ from body.lib.tier2_subgoal import (
     Tier2Config, bearing_to_waypoint, furthest_free_point,
 )
 from desktop.nav.patrol import PatrolRunner, passed_waypoint
+from desktop.nav.recovery import RESUME
 from desktop.nav.route_planner import (
     RouteConfig, RoutePlan, path_to_body, plan_route, visible_subgoal_along_path,
 )
@@ -153,10 +154,12 @@ class HierState(enum.Enum):
     ADVANCE_WAYPOINT = "ADVANCE_WAYPOINT"
     ARRIVED = "ARRIVED"
     BLOCKED = "BLOCKED"
-    # Pose/telemetry went stale mid-drive (typically a connectivity drop).
-    # Tier-3 is canceled and the drive HOLDS here — it does NOT auto-resume
-    # when the pose returns. The operator must call request_resume() so the
-    # bot can't silently lurch back into motion on an intermittent reconnect.
+    # Pose/telemetry went stale mid-drive (typically a connectivity drop), or
+    # the operator took teleop. Tier-3 is canceled. With a RecoverySupervisor
+    # attached (set_recovery), a pose_lost hold recovers on its own: link
+    # stable -> pose verified (lidar, camera fallback) -> re-localized if
+    # wrong -> resumed (desktop/nav/recovery.py). Without one, or for teleop,
+    # it holds for request_resume() (operator).
     SUSPENDED = "SUSPENDED"
     FAILED = "FAILED"
 
@@ -399,6 +402,9 @@ class HierarchicalDrive:
         self._advisory_run: int = -1
         self._advisory_hold_until: float = 0.0
         self._tick_now: float = 0.0   # tick() stamp, for handlers entered mid-tick
+        # Optional self-recovery for pose_lost suspends (None = operator only).
+        self._recovery: Optional[Any] = None
+        self._auto_resumes = 0
 
     # ── Control ──────────────────────────────────────────────────────
 
@@ -408,6 +414,8 @@ class HierarchicalDrive:
         self._state = state
 
     def start(self) -> None:
+        if self._recovery is not None:
+            self._recovery.cancel()
         self._block_started_at = None
         self._block_gave_up = False
         self._block_reason = None
@@ -435,20 +443,52 @@ class HierarchicalDrive:
         )
 
     def stop(self) -> None:
+        if self._recovery is not None:
+            self._recovery.cancel()
         self._io.cancel()
         self._subgoal_body = None
         self._held_tier = None
         self._to(HierState.IDLE)
 
+    def set_recovery(self, supervisor: Optional[Any]) -> None:
+        """Attach a RecoverySupervisor (desktop/nav/recovery.py): pose_lost
+        suspends then recover without the operator. None = operator only."""
+        self._recovery = supervisor
+
+    def recovery_status(self) -> Optional[Dict[str, Any]]:
+        r = self._recovery
+        if r is None or not r.active():
+            return None
+        return r.status(self._tick_now)
+
     def _enter_suspended(self, reason: str) -> None:
         # Pose/telemetry lost while driving. Revoke the in-flight goto so the
-        # Pi isn't still chasing the old goal when the link returns, then hold
-        # in SUSPENDED until the operator explicitly resumes.
-        logger.warning("hier: suspended (%s) — holding for operator resume", reason)
+        # Pi isn't still chasing the old goal when the link returns. A
+        # pose_lost hold recovers on its own when a supervisor is attached;
+        # otherwise (and always for teleop) it waits for request_resume().
+        auto = self._recovery is not None and reason == "pose_lost"
+        logger.warning("hier: suspended (%s) — %s", reason,
+                       "self-recovering" if auto else "holding for operator resume")
         self._io.cancel()
         self._subgoal_body = None
         self._block_reason = reason
         self._to(HierState.SUSPENDED)
+        if auto:
+            self._recovery.begin(self._tick_now, reason)
+        elif self._recovery is not None:
+            self._recovery.cancel()
+
+    def _tick_suspended(self, now: float) -> None:
+        r = self._recovery
+        if r is None or self._block_reason != "pose_lost" or not r.active():
+            return
+        if r.step(now, link_ok=self._pose.world_pose() is not None,
+                  goal_live=False) == RESUME:
+            self._auto_resumes += 1
+            logger.info("hier: auto-resume from SUSPENDED (pose_lost) — %s",
+                        r.resume_detail)
+            self._resume_resets()
+            self._to(HierState.ALIGNING)
 
     def request_resume(self) -> bool:
         """Operator-initiated resume after a SUSPENDED (connectivity) hold or
@@ -462,13 +502,18 @@ class HierarchicalDrive:
         if self._state not in (HierState.SUSPENDED, HierState.BLOCKED):
             return False
         logger.info("hier: operator resume from %s", self._state.value)
+        if self._recovery is not None:
+            self._recovery.cancel()
+        self._resume_resets()
+        self._to(HierState.ALIGNING)
+        return True
+
+    def _resume_resets(self) -> None:
         self._block_started_at = None
         self._block_gave_up = False
         self._block_reason = None
-        self._leg_started_at = None          # operator resume = fresh leg budget
+        self._leg_started_at = None          # resume = fresh leg budget
         self._consecutive_rejects = 0
-        self._to(HierState.ALIGNING)
-        return True
 
     # States in which the drive may have (or is about to issue) a live Tier-3
     # goal — the ones an operator teleop takeover must interrupt.
@@ -690,8 +735,12 @@ class HierarchicalDrive:
                 self._tick_advance()
             elif s == HierState.BLOCKED:
                 self._tick_blocked(now)
-            # IDLE / ARRIVED / FAILED are terminal/inert. SUSPENDED is inert
-            # too — it only leaves via request_resume() (operator) or stop().
+            elif s == HierState.SUSPENDED:
+                # Self-recovery (pose_lost + supervisor); else inert until
+                # request_resume() (operator) or stop().
+                self._tick_suspended(now)
+                break
+            # IDLE / ARRIVED / FAILED are terminal/inert.
             if self._state == prev or self._state not in self._CHAIN_STATES:
                 break
         return self._state

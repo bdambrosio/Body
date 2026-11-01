@@ -30,6 +30,8 @@ from desktop.chassis.config import StubConfig
 from desktop.chassis.controller import StubController
 from desktop.localization.config import LocalizationConfig
 from desktop.localization.controller import LocalizationController
+from desktop.localization.pose_verify import PoseVerifier
+from desktop.nav.recovery import RecoveryHooks, RecoverySupervisor
 from desktop.world_map.costmap import CostmapConfig, build_costmap
 from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
@@ -896,6 +898,11 @@ class NavMainWindow(QMainWindow):
             else:
                 br = hd.block_reason()
                 txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
+                rs = hd.recovery_status()
+                if rs is not None:
+                    nxt = rs.get("next_try_in_s")
+                    txt += f"  RECOVERING: {rs['phase']}" + (
+                        f" ({nxt:.0f}s)" if nxt is not None else "")
                 # VLM read of the current block run (applied or log-only).
                 vr = (self._block_adj.last_verdict()
                       if self._block_adj is not None else None)
@@ -1090,49 +1097,60 @@ class NavMainWindow(QMainWindow):
                 ),
             )
 
-    def _try_checkpoint_relocate(self) -> bool:
-        """Recognize which checkpoint we're at and seat the pose there —
-        robust on a metrically-loose map (where the global scan-match snaps to
-        the wrong self-similar basin). Returns True if a checkpoint matched."""
+    def _checkpoint_relocate_match(self):
+        """Headless checkpoint recognition (no UI): the match, or None.
+        Local search around the believed pose first, then a cold start."""
         matcher = self._checkpoint_matcher(CheckpointMatchConfig())
         if matcher is None:
-            return False
+            return None
         ar = self.fuser.pose_source.latest_scan_polar()
         if ar is None:
-            return False
+            return None
         latest = self.fuser.pose_source.latest_pose()
         yaw = float(latest[0][2]) if latest is not None else None
         prior_xy = ((float(latest[0][0]), float(latest[0][1]))
                     if latest is not None else None)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            m = matcher.relocalize(
-                ar[0], ar[1], yaw_hint=yaw, prior_xy=prior_xy,
-                xy_half_m=0.6, theta_half_rad=math.radians(60.0))
-            if m is None:
-                # The believed pose may be the thing that is wrong (10-31:
-                # heading off by far more than 60 deg after an IMU glitch +
-                # a hand drive; the local search could not see cp_008 and
-                # the operator had to Set location). Cold-start: every
-                # checkpoint, full circle of heading, no prior demotion. The
-                # ambiguity guard still rejects look-alike corridors.
-                m = matcher.relocalize(ar[0], ar[1], yaw_hint=None, prior_xy=None,
-                                       xy_half_m=0.6, theta_half_rad=math.pi)
-                if m is not None:
-                    logger.info("relocate: local checkpoint search failed; cold-start "
-                                "recognized %s", getattr(m, "checkpoint_id", m))
-        finally:
-            QApplication.restoreOverrideCursor()
+        m = matcher.relocalize(
+            ar[0], ar[1], yaw_hint=yaw, prior_xy=prior_xy,
+            xy_half_m=0.6, theta_half_rad=math.radians(60.0))
         if m is None:
-            return False
-        # Seat the PF pose at the recognized spot (relocate_at recovers yaw on
-        # the locally-healed patch); re-seed an active checkpoint localizer.
-        self.fuser.request_relocate_at(m.pose[0], m.pose[1], reason="ui_relocate_cp")
-        self._reset_depth_memory("ui_relocate_cp")
+            # The believed pose may be the thing that is wrong (10-31:
+            # heading off by far more than 60 deg after an IMU glitch +
+            # a hand drive; the local search could not see cp_008 and
+            # the operator had to Set location). Cold-start: every
+            # checkpoint, full circle of heading, no prior demotion. The
+            # ambiguity guard still rejects look-alike corridors.
+            m = matcher.relocalize(ar[0], ar[1], yaw_hint=None, prior_xy=None,
+                                   xy_half_m=0.6, theta_half_rad=math.pi)
+            if m is not None:
+                logger.info("relocate: local checkpoint search failed; cold-start "
+                            "recognized %s", getattr(m, "checkpoint_id", m))
+        return m
+
+    def _seat_checkpoint_match(self, m, reason: str) -> dict:
+        """Seat the PF pose at a recognized checkpoint (relocate_at recovers
+        yaw on the locally-healed patch; it moves the localization pose, not
+        the patrol frame); re-seed an active checkpoint localizer."""
+        result = dict(self.fuser.request_relocate_at(m.pose[0], m.pose[1], reason=reason))
+        self._reset_depth_memory(reason)
         if self._cp_localizer is not None:
             odom = self._cp_odom()
             if odom is not None:
                 self._cp_localizer.seed(m.pose, odom)
+        return result
+
+    def _try_checkpoint_relocate(self) -> bool:
+        """Recognize which checkpoint we're at and seat the pose there —
+        robust on a metrically-loose map (where the global scan-match snaps to
+        the wrong self-similar basin). Returns True if a checkpoint matched."""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            m = self._checkpoint_relocate_match()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if m is None:
+            return False
+        self._seat_checkpoint_match(m, "ui_relocate_cp")
         QMessageBox.information(
             self, "Re-localize",
             f"Recognized checkpoint {m.checkpoint_id} "
@@ -1474,11 +1492,42 @@ class NavMainWindow(QMainWindow):
             sink=self._ensure_handoff_gate(),
             costmap_provider=self._planning_costmap,
         )
+        self._hier_drive.set_recovery(self._build_recovery())
         self._shared_view.set_patrol_active_wp_index(0)
         # Fresh run: the robot may have been carried since the memory was
         # built (wheel odom can't see that). Whatever is in view comes back.
         self._reset_depth_memory("go")
         self._hier_drive.start()
+
+    # ── Self-recovery (desktop/nav/recovery.py) ──────────────────────
+
+    def _build_recovery(self) -> RecoverySupervisor:
+        """Supervisor that resumes a pose_lost suspend without the operator:
+        link stable -> pose verified on the lidar (camera fallback) ->
+        checkpoint re-localize if wrong -> resume, backing off but never
+        giving up."""
+        ps = self.fuser.pose_source
+        verifier = PoseVerifier(
+            ps.match_summary,
+            lambda: self._pose_health.median_quality(time.time()),
+        )
+        return RecoverySupervisor(RecoveryHooks(
+            verifier=verifier,
+            relocalize=self._auto_relocalize,
+        ))
+
+    def _auto_relocalize(self) -> tuple:
+        """Recovery's re-localize: checkpoint recognition only (it seats the
+        localization pose; the global relocate would rewrite the patrol
+        frame, which a running drive must not see). -> (ok, detail)."""
+        m = self._checkpoint_relocate_match()
+        if m is None:
+            return False, "no checkpoint recognized"
+        res = self._seat_checkpoint_match(m, "auto_recovery_cp")
+        if not res.get("success", False):
+            return False, f"relocate_at at {m.checkpoint_id} failed: {res.get('reason')}"
+        self._pose_health.reset()
+        return True, f"{m.checkpoint_id} (inlier {m.inlier_frac:.2f})"
 
     # ── Pose provider (PF posterior, or checkpoint re-anchor) ────────
 
