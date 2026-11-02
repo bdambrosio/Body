@@ -63,6 +63,11 @@ class BagRecorder:
         with self._lock:
             f = self._jsonl(name)
             f.write(json.dumps(msg, separators=(",", ":")) + "\n")
+            # Low-rate files (frames, events) are flushed per line so a
+            # killed process keeps them; odom/IMU are high-rate and rely on
+            # the OS buffer + close().
+            if name not in ("odom.jsonl", "imu.jsonl"):
+                f.flush()
 
     def add_odom(self, msg: Dict[str, Any]) -> None:
         self.add_json("odom.jsonl", msg)
@@ -169,10 +174,15 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return out
 
 
-def iter_bag(bag_dir: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
-    """Yield ("odom" | "imu" | "scan", message) merged in timestamp order,
+def iter_bag(bag_dir: str, *, scan_delay_s: float = 0.2) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Yield ("odom" | "imu" | "scan", message) merged in arrival order,
     each scan message in the body/lidar/scan wire shape (ranges with None
-    for no return, intensities, unknown_bins)."""
+    for no return, intensities, unknown_bins).
+
+    A scan is stamped at mid-sweep but reaches the desktop ~0.1–0.2 s later,
+    after the odometry for that instant: it is delivered ``scan_delay_s``
+    after its ts, as live. Delivered at its own ts, the EKF has no pose for
+    it yet and the mapper skips it (the 11-02 replay lost 43 % of nodes)."""
     streams: List[Tuple[float, int, str, Dict[str, Any]]] = []
     for kind, name in (("odom", "odom.jsonl"), ("imu", "imu.jsonl")):
         for k, m in enumerate(_read_jsonl(os.path.join(bag_dir, name))):
@@ -191,7 +201,7 @@ def iter_bag(bag_dir: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
                     "intensities": [int(v) for v in z["intensities"][i]],
                     "unknown_bins": [int(b) for b in np.nonzero(unk)[0]],
                 }
-                streams.append((msg["ts"], k, "scan", msg))
+                streams.append((msg["ts"] + scan_delay_s, k, "scan", msg))
                 k += 1
     # Stable by (ts, arrival) so odom/imu at the same ts precede the scan.
     order = {"odom": 0, "imu": 1, "scan": 2}
