@@ -134,3 +134,46 @@ class TestFirstHit(unittest.TestCase):
         self.assertEqual(g.first_hit_ts[c], 0.0)
         g.integrate(*one_beam(1.0), (0, 0, 0), 20.0)
         self.assertEqual(g.first_hit_ts[c], 20.0)
+
+
+class TestSeeThrough(unittest.TestCase):
+    """A reference wall counts as seen-through only when the beam crosses
+    it and carries on (11-02: 65 'missing' on wall faces)."""
+
+    def _grid(self, wall_cells):
+        g = SessionGrid(META)
+        wall = np.zeros((100, 100), dtype=bool)
+        for c in wall_cells:
+            wall[c] = True
+        g.set_wall_mask(wall)
+        return g
+
+    def test_beam_crossing_thin_wall_counts(self):
+        g = SessionGrid(META)
+        wc = cell(g, 1.01, 0.01)
+        g = self._grid([wc])
+        g.integrate(*one_beam(2.0), (0, 0, 0), 1.0)
+        self.assertEqual(g.through[wc], 1)
+
+    def test_beam_ending_just_past_wall_is_not_through(self):
+        g = SessionGrid(META)
+        wc = cell(g, 1.01, 0.01)
+        g = self._grid([wc])
+        g.integrate(*one_beam(1.15), (0, 0, 0), 1.0)    # real wall one cell further
+        self.assertEqual(g.through[wc], 0)
+
+    def test_beam_along_a_wall_line_is_not_through(self):
+        g = SessionGrid(META)
+        i0, j0 = cell(g, 0.51, 0.01)
+        cells = [(i0 + k, j0) for k in range(20)]   # 1 m of wall along the beam (by index: float steps leave gaps)
+        g = self._grid(cells)
+        g.integrate(*one_beam(2.0), (0, 0, 0), 1.0)
+        self.assertEqual(int(g.through.sum()), 0)
+
+    def test_hit_resets_through(self):
+        g = SessionGrid(META)
+        wc = cell(g, 1.01, 0.01)
+        g = self._grid([wc])
+        g.integrate(*one_beam(2.0), (0, 0, 0), 1.0)
+        g.integrate(*one_beam(1.0), (0, 0, 0), 2.0)
+        self.assertEqual(g.through[wc], 0)

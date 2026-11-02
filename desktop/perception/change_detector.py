@@ -58,6 +58,9 @@ class ChangeDetectorConfig:
     # seen free (``free_at``) before it counts as moving. A static edge
     # whose visible part slides as the robot drives never passes.
     moving_require_vacated: bool = True
+    # ... checked on the cells the track's FIRST points hit (a desk or lamp
+    # seen as several legs has its centroid in free space between them).
+    moving_vacated_frac: float = 0.6
     # Static sweep.
     new_min_score: float = 1.5         # SessionGrid score ("solidly hit")
     new_min_age_s: float = 3.0         # occupied episode at least this long
@@ -66,6 +69,11 @@ class ChangeDetectorConfig:
     # the first sweep that found the blob and the one that reports it.
     new_min_baseline_m: float = 0.5
     missing_max_score: float = -2.0    # reference wall seen through this much
+    # ... and crossed by at least this many scans (SessionGrid.through):
+    # beams that carried on behind it, not ones grazing its face. The
+    # 11-02 hallway_loop lap: 65 "missing" on a 20-minute-old map, every one
+    # on a wall face.
+    missing_min_through: int = 3
     missing_min_cells: int = 3
     missing_min_extent_m: float = 0.25
     # Only solid reference walls can go missing: a wall cell with at least
@@ -101,6 +109,7 @@ class _Track:
     last_ts: float
     pts: Deque[Tuple[float, float, float]] = field(default_factory=lambda: deque(maxlen=200))
     hits: int = 0
+    first_pts: Optional[np.ndarray] = None   # world xy of the first sighting
     moving: bool = False
     path_m: float = 0.0
     extent_m: float = 0.0
@@ -208,6 +217,10 @@ class ChangeDetector:
                           ) -> List[Tuple[float, float, float, int]]:
         """(x, y, extent_m, n_points) of endpoint clusters on reference-free
         space away from reference walls."""
+        return [c[:4] for c in self._residual_clusters(points_body, pose)]
+
+    def _residual_clusters(self, points_body: np.ndarray, pose: Pose):
+        """Like residual_clusters plus each cluster's world points."""
         cfg = self.cfg
         if points_body.shape[0] == 0:
             return []
@@ -236,7 +249,8 @@ class ChangeDetector:
             extent = float(math.hypot(px.max() - px.min(), py.max() - py.min()))
             if extent > cfg.cluster_max_extent_m:
                 continue
-            out.append((float(px.mean()), float(py.mean()), extent, n))
+            out.append((float(px.mean()), float(py.mean()), extent, n,
+                        np.stack([px, py], axis=1)))
         return out
 
     def observe_scan(self, ts: float, points_body: np.ndarray, pose: Pose,
@@ -247,11 +261,11 @@ class ChangeDetector:
         check."""
         cfg = self.cfg
         events: List[ChangeEvent] = []
-        clusters = self.residual_clusters(points_body, pose)
+        clusters = self._residual_clusters(points_body, pose)
         # Greedy nearest-neighbour association, closest pairs first.
         pairs = []
         for ti, t in enumerate(self._tracks):
-            for ci, (x, y, _e, _n) in enumerate(clusters):
+            for ci, (x, y, _e, _n, _p) in enumerate(clusters):
                 d = math.hypot(x - t.xy[0], y - t.xy[1])
                 if d <= cfg.track_gate_m:
                     pairs.append((d, ti, ci))
@@ -262,14 +276,17 @@ class ChangeDetector:
             used_t.add(ti)
             used_c.add(ci)
             t = self._tracks[ti]
-            x, y, e, _n = clusters[ci]
+            x, y, e, _n, _pts = clusters[ci]
             t.path_m += math.hypot(x - t.xy[0], y - t.xy[1])
             t.pts.append((ts, x, y))
             t.last_ts = ts
             t.hits += 1
             t.extent_m = max(t.extent_m, e)
-            vacated = (free_at is None or not cfg.moving_require_vacated
-                       or free_at(t.pts[0][1], t.pts[0][2]))
+            vacated = True
+            if free_at is not None and cfg.moving_require_vacated:
+                fp = t.first_pts if t.first_pts is not None else np.array([[t.pts[0][1], t.pts[0][2]]])
+                vacated = (np.mean([bool(free_at(float(px_), float(py_))) for px_, py_ in fp])
+                           >= cfg.moving_vacated_frac)
             if (not t.moving and t.hits >= cfg.moving_min_hits
                     and t.disp() >= cfg.moving_min_disp_m and vacated):
                 t.moving = True
@@ -277,9 +294,10 @@ class ChangeDetector:
                 events.append(ChangeEvent(
                     KIND_MOVING, STATUS_APPEARED, t.tid, ts, x, y,
                     extent_m=t.extent_m, speed_mps=t.path_m / dt))
-        for ci, (x, y, e, _n) in enumerate(clusters):
+        for ci, (x, y, e, _n, pts) in enumerate(clusters):
             if ci not in used_c:
-                t = _Track(next(self._ids), ts, ts, hits=1, extent_m=e)
+                t = _Track(next(self._ids), ts, ts, hits=1, extent_m=e,
+                           first_pts=pts[:: max(1, len(pts) // 20)])
                 t.pts.append((ts, x, y))
                 self._tracks.append(t)
         alive = []
@@ -302,7 +320,8 @@ class ChangeDetector:
         return [coords[c] for c in _components(coords) if c.size >= min_cells]
 
     def sweep(self, now_ts: float, score: np.ndarray, first_hit_ts: np.ndarray,
-              robot_xy: Optional[Tuple[float, float]] = None) -> List[ChangeEvent]:
+              robot_xy: Optional[Tuple[float, float]] = None,
+              through: Optional[np.ndarray] = None) -> List[ChangeEvent]:
         """``score`` / ``first_hit_ts``: the SessionGrid layers (same grid as
         the reference). ``now_ts`` on the Pi clock (latest scan ts).
         ``robot_xy``: robot position now, for the two-viewpoint gate on
@@ -314,6 +333,8 @@ class ChangeDetector:
                     & (first_hit_ts > 0.0)
                     & (first_hit_ts <= now_ts - cfg.new_min_age_s))
         missing_mask = (score <= cfg.missing_max_score) & self.solid_wall
+        if through is not None:
+            missing_mask &= through >= cfg.missing_min_through
         missing = []
         for b in self._blobs(missing_mask, cfg.missing_min_cells):
             bx, by = self._center(b[:, 0], b[:, 1])

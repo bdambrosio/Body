@@ -26,6 +26,8 @@ class ChangeSession:
         meta = {"nx": rm.nx, "ny": rm.ny, "resolution_m": rm.resolution_m,
                 "origin_x_m": rm.origin_x_m, "origin_y_m": rm.origin_y_m}
         self.grid = SessionGrid(meta, grid_cfg)
+        # Reference walls → the "seen through" layer missing-walls need.
+        self.grid.set_wall_mask(rm.driveable_int8() == 0)
         self.detector = (ChangeDetector(rm.driveable_int8(), rm.distance_field_m, meta, det_cfg)
                          if detect else None)
         self.sweep_s = sweep_s
@@ -49,8 +51,9 @@ class ChangeSession:
         events = det.observe_scan(ts, pts, pose, free_at=g.is_free)
         if ts - self._last_sweep >= self.sweep_s:
             self._last_sweep = ts
-            score, first = g.layers()
-            events += det.sweep(ts, score, first, robot_xy=(pose[0], pose[1]))
+            score, first, through = g.layers()
+            events += det.sweep(ts, score, first, robot_xy=(pose[0], pose[1]),
+                                through=through)
         return events
 
     def reset(self) -> None:

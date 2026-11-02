@@ -54,6 +54,13 @@ class SessionGridConfig:
     free_over_prior_wall: float = -2.0
     # Overriding reference-map FREE with "blocked" (a new object) uses
     # occ_thresh; the planner's inflation does the rest.
+    # "Seen through" a reference wall (the evidence a wall is MISSING, as
+    # opposed to a beam grazing its face under a 1-cell pose/map offset):
+    # the beam must carry on at least through_beyond_m past the cell, and
+    # be out of the wall within through_cross_m on both sides of it (a beam
+    # running along inside a wall line does not count).
+    through_beyond_m: float = 0.30
+    through_cross_m: float = 0.15
 
 
 
@@ -72,6 +79,10 @@ class SessionGrid:
         self.last_hit_ts = np.zeros((self.nx, self.ny), dtype=np.float64)
         self.last_free_ts = np.zeros((self.nx, self.ny), dtype=np.float64)
         self.first_hit_ts = np.zeros((self.nx, self.ny), dtype=np.float64)
+        # Scans that saw THROUGH a reference wall cell (see config); reset
+        # when the cell is hit again. Needs set_wall_mask().
+        self.through = np.zeros((self.nx, self.ny), dtype=np.uint16)
+        self._wall: Optional[np.ndarray] = None
         self.version = 0          # bumps on every integrate / reset
         self.scans_integrated = 0
         self.scans_skipped = 0
@@ -87,7 +98,15 @@ class SessionGrid:
             self.last_hit_ts.fill(0.0)
             self.last_free_ts.fill(0.0)
             self.first_hit_ts.fill(0.0)
+            self.through.fill(0)
             self.version += 1
+
+    def set_wall_mask(self, wall: Optional[np.ndarray]) -> None:
+        """Reference walls (bool, this grid's shape) for the see-through
+        layer; None disables it."""
+        if wall is not None and wall.shape != (self.nx, self.ny):
+            raise ValueError("wall mask shape mismatch")
+        self._wall = None if wall is None else wall.astype(bool)
 
     def note_skipped(self) -> None:
         self.scans_skipped += 1
@@ -136,6 +155,30 @@ class SessionGrid:
         hit_flat = _flat(hi, hj)
         free_flat = np.setdiff1d(_flat(fi, fj), hit_flat, assume_unique=True)
 
+        through_flat = np.zeros(0, dtype=np.int64)
+        wall = self._wall
+        if wall is not None and bi.size:
+            inb = (fi >= 0) & (fi < self.nx) & (fj >= 0) & (fj < self.ny)
+            on_wall = np.zeros(fi.shape, dtype=bool)
+            on_wall[inb] = wall[fi[inb], fj[inb]]
+            if on_wall.any():
+                wb, ws = bi[on_wall], si[on_wall]
+                tt = t[ws]
+                far = np.where(is_hit, r, cfg.max_range_m)[wb]
+
+                def _wall_at(d):
+                    ci, cj = self._cells(x0 + d * cos_a[wb], y0 + d * sin_a[wb])
+                    ok_ = (ci >= 0) & (ci < self.nx) & (cj >= 0) & (cj < self.ny) & (d > 0)
+                    out = np.zeros(d.shape, dtype=bool)
+                    out[ok_] = wall[ci[ok_], cj[ok_]]
+                    return out
+                crossing = ((far - tt >= cfg.through_beyond_m)
+                            & ~_wall_at(tt - cfg.through_cross_m)
+                            & ~_wall_at(tt + cfg.through_cross_m))
+                through_flat = np.setdiff1d(
+                    np.unique(fi[on_wall][crossing] * self.ny + fj[on_wall][crossing]),
+                    hit_flat, assume_unique=True)
+
         with self._lock:
             s = self.score.reshape(-1)
             n = self.n_obs.reshape(-1)
@@ -152,6 +195,9 @@ class SessionGrid:
             fh[new_ep] = ts
             ended = free_flat[s[free_flat] <= 0.0]
             fh[ended] = 0.0
+            th_ = self.through.reshape(-1)
+            th_[through_flat] = np.minimum(np.iinfo(np.uint16).max - 1, th_[through_flat]) + 1
+            th_[hit_flat] = 0
             self.version += 1
             self.scans_integrated += 1
         return int(touched.size)
@@ -207,10 +253,10 @@ class SessionGrid:
             return False
         return bool(self.score[i, j] < -self.cfg.occ_thresh)
 
-    def layers(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Copies of (score, first_hit_ts) for the change detector."""
+    def layers(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Copies of (score, first_hit_ts, through) for the change detector."""
         with self._lock:
-            return self.score.copy(), self.first_hit_ts.copy()
+            return self.score.copy(), self.first_hit_ts.copy(), self.through.copy()
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
