@@ -113,6 +113,18 @@ class Tier3Goal:
     tol: float
     final_heading: Optional[float] = None
     v_max: Optional[float] = None
+    omega_max: Optional[float] = None
+
+
+def goal_params(base: DriveParams, g: "Tier3Goal") -> DriveParams:
+    """Per-goal speed caps can only slow the robot: v_max is clamped to
+    [v_min_mps, configured v_max], omega_max to (0, configured omega_max]."""
+    kw = {}
+    if g.v_max is not None:
+        kw["v_max"] = max(base.v_min_mps, min(base.v_max, float(g.v_max)))
+    if g.omega_max is not None and float(g.omega_max) > 0.0:
+        kw["omega_max"] = min(base.omega_max, float(g.omega_max))
+    return replace(base, **kw) if kw else base
 
 
 @dataclass
@@ -200,7 +212,7 @@ class Tier3Controller:
         if g is None:
             raise RuntimeError("Tier3Controller.step without a goal")
         cfg = self.cfg
-        gp = cfg.params if g.v_max is None else replace(cfg.params, v_max=float(g.v_max))
+        gp = goal_params(cfg.params, g)
         dt = 0.0 if self.last_tick is None else min(0.5, max(0.0, now_mono - self.last_tick))
         self.last_tick = now_mono
 

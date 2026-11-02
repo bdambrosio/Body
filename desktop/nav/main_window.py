@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import shutil
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -49,7 +50,14 @@ from desktop.nav.recovery_log import RecoveryLogger, default_recovery_dir
 from .patrol import PatrolRunner
 from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
-from .pose_health import PoseHealthMonitor
+from .pose_health import SUPPORT_GOOD, SUPPORT_OFF_MAP, PoseHealthMonitor, PoseSupportMonitor
+from desktop.world_map.session_grid import SessionGrid
+from desktop.perception.change_detector import ChangeDetector
+from desktop.perception.change_report import (
+    ChangeLabeler, ChangeReporter, default_explore_dir,
+)
+from desktop.tasks.locate import CameraModel
+from body.lib.zenoh_helpers import load_body_config
 from .tracing import CAT_PLAN, LEVEL_WARN, Tracer
 
 from .camera_panels import CameraPanels, build_camera_snapshot
@@ -371,9 +379,36 @@ class NavMainWindow(QMainWindow):
         # observation establishes baseline without emitting).
         self._last_plan_ok: Optional[bool] = None
         # Pose-health divergence detector: fed each redraw from the scan
-        # matcher so the rolling quality window is warm. Telemetry only —
-        # reset on relocate; no auto-action is wired to it.
+        # matcher so the rolling quality window is warm. Reset on relocate.
+        # The drive reads it as "pose doubt" (HierConfig.pose_doubt_action,
+        # log-only by default) and the recovery verifier as its baseline.
         self._pose_health = PoseHealthMonitor()
+        # Explore plan A1/A2: how well the reference map supports the pose
+        # (good / weak / off_map), and the session observation grid it
+        # gates. Both are fed from the MCL scan thread (listener below).
+        self._pose_support = PoseSupportMonitor()
+        self._support_lock = threading.Lock()
+        self._support_level_logged: Optional[str] = None
+        self._session_grid: Optional[SessionGrid] = None
+        self._plan_cm_built_at = 0.0
+        # Explore plan B: change detection on the same supported scans
+        # (observe-only: events + VLM labels to ~/body-logs/explore/<ts>/).
+        self._change_detector: Optional[ChangeDetector] = None
+        self._change_sweep_ts = 0.0
+        self._change_reporter = ChangeReporter(default_explore_dir())
+        self._change_labeler: Optional[ChangeLabeler] = None
+        if self._vlm_worker is not None:
+            try:
+                cam = CameraModel.from_config(load_body_config().get("oakd", {}))
+            except Exception:
+                logger.exception("change labeler: camera config failed; defaults")
+                cam = CameraModel.from_config({})
+            self._change_labeler = ChangeLabeler(
+                FrameGrabber(self.chassis, PFPoseProvider(self.fuser).world_pose).grab,
+                self._vlm_worker, cam, self._change_reporter)
+        add_listener = getattr(self.fuser.pose_source, "add_scan_listener", None)
+        if add_listener is not None:
+            add_listener(self._on_scan_observed)
         # Right-click append target for patrol-edit mode. Wired to
         # SharedMapView in `_build_ui` (next block).
         self._shared_view.set_patrol_append_callback(
@@ -775,6 +810,7 @@ class NavMainWindow(QMainWindow):
             )
         except Exception:
             logger.exception("pose-health ingest failed; skipping")
+        self._log_pose_support()
 
         # The hierarchical drive runs its own loop (Tier-3 owns cmd_vel via
         # body/drive/goto); tick() runs on _hier_timer (fast, decoupled).
@@ -954,6 +990,7 @@ class NavMainWindow(QMainWindow):
         self.chassis.set_cmd_vel(0.0, 0.0)
         result = dict(self.fuser.request_relocate(reason=reason))
         self._reset_depth_memory(reason)
+        self._reset_session_grid(reason)
         if result.get("success"):
             result["shift_count"] = self._apply_relocate_to_patrol(result)
             # Fresh fix — drop stale low-quality samples so the health
@@ -1082,6 +1119,7 @@ class NavMainWindow(QMainWindow):
 
         result = dict(self.fuser.request_relocate_at(x_w, y_w, reason="ui_locate"))
         self._reset_depth_memory("ui_locate")
+        self._reset_session_grid("ui_locate")
         if result.get("success"):
             result["shift_count"] = self._apply_relocate_to_patrol(result)
             shift = int(result.get("shift_count", 0))
@@ -1144,6 +1182,7 @@ class NavMainWindow(QMainWindow):
         the patrol frame); re-seed an active checkpoint localizer."""
         result = dict(self.fuser.request_relocate_at(m.pose[0], m.pose[1], reason=reason))
         self._reset_depth_memory(reason)
+        self._reset_session_grid(reason)
         if self._cp_localizer is not None:
             odom = self._cp_odom()
             if odom is not None:
@@ -1335,8 +1374,14 @@ class NavMainWindow(QMainWindow):
         snap = self._last_snap
         if snap is None:
             return self._last_costmap
-        key = id(snap)
-        if self._plan_cm is not None and self._plan_cm_key == key:
+        grid = self._session_grid
+        key = (id(snap), grid.version if grid is not None else -1)
+        if self._plan_cm is not None and (
+                self._plan_cm_key == key
+                # Rebuild for new session observations at most once a second
+                # (build_costmap on the full grid is tens of ms, UI thread).
+                or (self._plan_cm_key[0] == key[0]
+                    and time.monotonic() - self._plan_cm_built_at < 1.0)):
             return self._plan_cm
         try:
             meta = snap["meta"]
@@ -1352,16 +1397,123 @@ class NavMainWindow(QMainWindow):
                 logger.info("planning map: reference prior resampled (%d free, %d blocked cells)",
                             int((prior == 1).sum()), int((prior == 0).sum()))
             snap2 = dict(snap)
-            snap2["driveable"] = merge_prior(snap["driveable"], self._prior_cache[1])
             latest = self.fuser.pose_source.latest_pose()
             pose = latest[0] if latest is not None else None
+            grid = self._session_grid
+            if grid is not None and grid.meta_key() == mkey:
+                # What this session's lidar saw wins over the reference prior
+                # (clearing a prior wall needs extra evidence — SessionGrid).
+                snap2["driveable"] = grid.planning_layer(
+                    self._prior_cache[1],
+                    exclude_xy=(pose[0], pose[1]) if pose is not None else None)
+            else:
+                snap2["driveable"] = merge_prior(snap["driveable"], self._prior_cache[1])
             cfg = replace(self._costmap_config, unknown_is_lethal=False)
             cm = build_costmap(snap2, cfg, pose=pose)
         except Exception:
             logger.exception("planning costmap build failed; using the display costmap")
             cm = self._last_costmap
         self._plan_cm, self._plan_cm_key = cm, key
+        self._plan_cm_built_at = time.monotonic()
         return cm
+
+    # ── Session grid + pose support (explore plan A1/A2) ─────────────
+
+    def _on_scan_observed(self, scan_ts, ranges, angles, summary) -> None:
+        """MCL scan thread: update pose support; write the scan into the
+        session grid only while the map supports the pose."""
+        now = time.time()
+        with self._support_lock:
+            self._pose_support.ingest(summary, now, seq=summary.get("scan_obs_run"))
+            level = self._pose_support.level(now)
+            ok = level == SUPPORT_GOOD and self._pose_support.scan_ok(summary)
+        grid = self._session_grid
+        rm = self.fuser.reference_map
+        mkey = (int(rm.nx), int(rm.ny), float(rm.resolution_m),
+                float(rm.origin_x_m), float(rm.origin_y_m))
+        if grid is None or grid.meta_key() != mkey:
+            grid = SessionGrid({"nx": rm.nx, "ny": rm.ny,
+                                "resolution_m": rm.resolution_m,
+                                "origin_x_m": rm.origin_x_m,
+                                "origin_y_m": rm.origin_y_m})
+            self._session_grid = grid
+        if not ok:
+            grid.note_skipped()
+            return
+        pose = tuple(summary["scan_pose_world"])
+        grid.integrate(ranges, angles, pose, scan_ts)
+        try:
+            self._detect_changes(scan_ts, ranges, angles, pose, grid, rm)
+        except Exception:
+            logger.exception("change detection failed; continuing")
+
+    def _detect_changes(self, scan_ts, ranges, angles, pose, grid, rm) -> None:
+        det = self._change_detector
+        if det is None or det.ref.shape != (grid.nx, grid.ny):
+            det = ChangeDetector(rm.driveable_int8(), rm.distance_field_m,
+                                 {"resolution_m": rm.resolution_m,
+                                  "origin_x_m": rm.origin_x_m,
+                                  "origin_y_m": rm.origin_y_m})
+            self._change_detector = det
+        r = np.asarray(ranges, dtype=np.float64)
+        a = np.asarray(angles, dtype=np.float64)
+        ok = np.isfinite(r) & (r >= grid.cfg.min_range_m) & (r <= grid.cfg.max_range_m)
+        pts = np.stack([r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok])], axis=1)
+        events = det.observe_scan(scan_ts, pts, pose)
+        if scan_ts - self._change_sweep_ts >= 2.0:
+            self._change_sweep_ts = scan_ts
+            score, first = grid.layers()
+            events += det.sweep(scan_ts, score, first)
+        if not events:
+            return
+        latest = self.fuser.pose_source.latest_pose()
+        now_pose = latest[0] if latest is not None else None
+        for ev in events:
+            self._change_reporter.report(ev, robot_pose=pose)
+            if self._change_labeler is not None:
+                self._change_labeler.maybe_label(ev, now_pose)
+
+    def _pose_doubt(self) -> Optional[str]:
+        """Drive hook: why the map does not support the pose, or None."""
+        now = time.time()
+        if self._pose_health.is_lost(now):
+            q = self._pose_health.median_quality(now)
+            return f"lost (median quality {q:.2f})" if q is not None else "lost"
+        level = self.pose_support_level()
+        if level == SUPPORT_OFF_MAP:
+            return "off_map"
+        return None
+
+    def pose_support_level(self) -> str:
+        with self._support_lock:
+            return self._pose_support.level(time.time())
+
+    def _log_pose_support(self) -> None:
+        """UI tick: log support-level transitions (tuning data for the
+        thresholds — they are untested on the robot)."""
+        now = time.time()
+        with self._support_lock:
+            level = self._pose_support.level(now)
+            med = self._pose_support.medians(now)
+        if level != self._support_level_logged:
+            grid = self._session_grid
+            logger.info("pose support: %s -> %s (median quality %s, coverage %s; session grid %s)",
+                        self._support_level_logged, level,
+                        f"{med[0]:.2f}" if med else "-", f"{med[1]:.2f}" if med else "-",
+                        grid.stats() if grid is not None else "-")
+            self._support_level_logged = level
+
+    def _reset_session_grid(self, reason: str) -> None:
+        """The pose was just rewritten (relocate / set location): what the
+        grid holds may be in the wrong place. Start over."""
+        grid = self._session_grid
+        if grid is not None:
+            logger.info("session grid reset (%s): %s", reason, grid.stats())
+            grid.reset()
+        if self._change_detector is not None:
+            self._change_detector.reset()
+        with self._support_lock:
+            self._pose_support.reset()
 
     def _latest_rgb(self) -> Optional[dict]:
         st = self.chassis.state
@@ -1504,6 +1656,7 @@ class NavMainWindow(QMainWindow):
             costmap_provider=self._planning_costmap,
         )
         self._hier_drive.set_recovery(self._build_recovery())
+        self._hier_drive.set_pose_doubt(self._pose_doubt)
         self._shared_view.set_patrol_active_wp_index(0)
         # Fresh run: the robot may have been carried since the memory was
         # built (wheel odom can't see that). Whatever is in view comes back.

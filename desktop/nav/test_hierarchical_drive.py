@@ -1276,3 +1276,46 @@ class TestHierarchicalDrive(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPoseDoubt(unittest.TestCase):
+    """Explore plan A2: pose doubt is observe-only by default; "suspend"
+    routes it through the pose_lost suspend after a hold time."""
+
+    def _build(self, action, why):
+        io = FakeDriveIO(scan=_clear_scan())
+        hd = HierarchicalDrive(_runner(((2.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,
+                               HierConfig(pose_doubt_action=action, pose_doubt_hold_s=2.0))
+        state = {"why": why}
+        hd.set_pose_doubt(lambda: state["why"])
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        return hd, io, state
+
+    def test_log_only_keeps_driving(self):
+        hd, _, _ = self._build("log", "off_map")
+        for t in (0.5, 1.0, 3.0, 5.0):
+            hd.tick(t)
+        self.assertNotEqual(hd.state(), HierState.SUSPENDED)
+
+    def test_suspend_after_hold(self):
+        hd, io, _ = self._build("suspend", "off_map")
+        self.assertEqual(hd.tick(1.0), HierState.DRIVING_SUBGOAL)   # within hold
+        self.assertEqual(hd.tick(2.5), HierState.SUSPENDED)
+        self.assertEqual(hd.block_reason(), "pose_lost")
+        self.assertGreaterEqual(io.cancels, 1)
+
+    def test_brief_doubt_does_not_suspend(self):
+        hd, _, st = self._build("suspend", "lost")
+        hd.tick(1.0)
+        st["why"] = None
+        hd.tick(1.5)
+        st["why"] = "lost"
+        hd.tick(2.6)                     # hold restarted at 2.6
+        self.assertNotEqual(hd.state(), HierState.SUSPENDED)
+
+    def test_off_ignores(self):
+        hd, _, _ = self._build("off", "off_map")
+        hd.tick(10.0)
+        self.assertNotEqual(hd.state(), HierState.SUSPENDED)

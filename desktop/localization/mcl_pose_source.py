@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -75,6 +75,10 @@ class MCLPoseSource(PoseSource):
         )
         self._slam = slam
         self._evidence = self._build_evidence(reference_map)
+        self._known = self._build_known(reference_map)
+        # Called after each scan observation with (scan_ts, ranges, angles,
+        # scan-match summary) — the session grid / change detector hook.
+        self._scan_listeners: List[Callable[[float, np.ndarray, np.ndarray, Dict[str, Any]], None]] = []
         self._ekf = EkfPoseTracker(noise=load_slam_config().fusion)
         self._imu_tracker = ImuYawTracker()
         self._pose_buffer = PoseBuffer()
@@ -145,9 +149,43 @@ class MCLPoseSource(PoseSource):
     def _build_evidence(reference_map: ReferenceMap) -> np.ndarray:
         return (reference_map.occupancy_log_odds > 0.0).astype(np.float32)
 
+    @staticmethod
+    def _build_known(reference_map: ReferenceMap) -> np.ndarray:
+        """Cells the reference map has an opinion on (free or wall)."""
+        return reference_map.driveable_int8() != -1
+
     def _refresh_map(self, reference_map: ReferenceMap) -> None:
         self._map = reference_map
         self._evidence = self._build_evidence(reference_map)
+        self._known = self._build_known(reference_map)
+
+    def add_scan_listener(
+        self, cb: Callable[[float, np.ndarray, np.ndarray, Dict[str, Any]], None],
+    ) -> None:
+        """``cb(scan_ts, ranges, angles, summary)`` after every scan
+        observation, on the scan thread. ``summary`` is a copy of the
+        scan-match summary, including ``map_coverage`` and
+        ``scan_pose_world`` (None when the scan ts was outside the pose
+        buffer). Listener exceptions are logged and swallowed."""
+        self._scan_listeners.append(cb)
+
+    def _map_coverage(self, points_xy: np.ndarray, pose: Tuple[float, float, float]) -> float:
+        """Fraction of scan endpoints, placed at ``pose``, that land on a
+        cell the reference map knows (free or wall). Low = the robot is
+        looking at space the map has never seen (off the map)."""
+        if points_xy.shape[0] == 0:
+            return 0.0
+        c, s_ = math.cos(pose[2]), math.sin(pose[2])
+        wx = pose[0] + c * points_xy[:, 0] - s_ * points_xy[:, 1]
+        wy = pose[1] + s_ * points_xy[:, 0] + c * points_xy[:, 1]
+        m = self._map
+        i = np.floor((wx - m.origin_x_m) / m.resolution_m).astype(np.int64)
+        j = np.floor((wy - m.origin_y_m) / m.resolution_m).astype(np.int64)
+        known = self._known
+        inb = (i >= 0) & (i < known.shape[0]) & (j >= 0) & (j < known.shape[1])
+        hits = np.zeros(points_xy.shape[0], dtype=bool)
+        hits[inb] = known[i[inb], j[inb]]
+        return float(hits.mean())
 
     def update(
         self, ts: float, x: float, y: float, theta: float, *,
@@ -523,6 +561,19 @@ class MCLPoseSource(PoseSource):
                 n_eff_after=n_eff_after,
                 resampled=resampled,
             )
+            # Pose-support inputs (explore plan A2): map coverage at the
+            # best alignment, and the posterior carried back to the scan's
+            # own ts (prior at scan_ts + the correction this scan applied).
+            self._last_scan_match["map_coverage"] = self._map_coverage(
+                points_xy, (result.pose.x, result.pose.y, result.pose.theta))
+            if scan_pose is not None:
+                self._last_scan_match["scan_pose_world"] = [
+                    prior_pose.x + (posterior[0] - now_pose.x),
+                    prior_pose.y + (posterior[1] - now_pose.y),
+                    _wrap(prior_pose.theta + _wrap(posterior[2] - now_pose.theta)),
+                ]
+            else:
+                self._last_scan_match["scan_pose_world"] = None
             self._counters["scan_match_run"] += 1
             self._counters["scan_obs_run"] += 1
         return True
@@ -824,8 +875,17 @@ class MCLPoseSource(PoseSource):
             self._scan_hist.append((scan_ts, points))
             self._maybe_judge_rotation_contest(scan_ts)
 
-        self._apply_scan_match_observation(
+        applied = self._apply_scan_match_observation(
             points, scan_ts=scan_ts if msg.get("ts") else None)
+        if applied and self._scan_listeners:
+            with self._lock:
+                summary = dict(self._last_scan_match)
+                summary["scan_obs_run"] = self._counters["scan_obs_run"]
+            for cb in list(self._scan_listeners):
+                try:
+                    cb(scan_ts, ranges_arr, angles, summary)
+                except Exception:
+                    logger.exception("mcl_pose: scan listener failed")
 
     def _maybe_judge_rotation_contest(self, newest_ts: float) -> None:
         """Settle an open EKF wheel-vs-IMU dispute with two scans that

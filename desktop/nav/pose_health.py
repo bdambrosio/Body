@@ -127,3 +127,120 @@ class PoseHealthMonitor:
     def reset(self) -> None:
         self._samples.clear()
         self._last_seq = None
+
+
+# ── Pose support (explore plan A2) ───────────────────────────────────
+
+SUPPORT_UNKNOWN = "unknown"
+SUPPORT_GOOD = "good"
+SUPPORT_WEAK = "weak"
+SUPPORT_OFF_MAP = "off_map"
+
+
+@dataclass
+class PoseSupportConfig:
+    # Per-scan gate for writing observations into the world (session grid,
+    # change detector): the scan must sit on the map and match it.
+    scan_min_coverage: float = 0.6
+    scan_min_quality: float = 0.15
+    # Rolling-window levels.
+    window_s: float = 3.0
+    min_samples: int = 3
+    off_map_coverage: float = 0.35   # median coverage below → off_map
+    good_coverage: float = 0.6       # median coverage below → weak
+    good_quality: float = 0.15       # median quality below → weak
+    min_points: int = 30
+    max_samples: int = 64
+
+
+def _summary_quality(summary: Dict[str, Any]) -> Optional[float]:
+    n = int(summary.get("n_points", 0) or 0)
+    if n <= 0:
+        return None
+    return float(summary.get("score_best", summary.get("score", 0.0))) / n
+
+
+class PoseSupportMonitor:
+    """How much the reference map supports the current pose.
+
+    ``good``    — the scan sits on mapped space and matches it;
+    ``weak``    — on the map but matching poorly (crowd, moved furniture,
+                  or a pose going wrong), or only partly on the map;
+    ``off_map`` — most of what the lidar sees is space the map never saw:
+                  the PF is dead-reckoning, whatever its timestamps say.
+
+    Fed with scan-match summaries that carry ``map_coverage`` (MCLPoseSource
+    adds it). Pure logic, no I/O; the caller owns threading.
+    """
+
+    def __init__(self, config: Optional[PoseSupportConfig] = None):
+        self.config = config or PoseSupportConfig()
+        self._samples: Deque[Tuple[float, float, float]] = deque()  # ts, quality, coverage
+        self._last_seq: Optional[int] = None
+
+    def scan_ok(self, summary: Optional[Dict[str, Any]]) -> bool:
+        """Per-scan gate: may this scan be written into the world model?"""
+        if not summary or not summary.get("valid"):
+            return False
+        if summary.get("scan_pose_world") is None:
+            return False
+        if int(summary.get("n_points", 0) or 0) < self.config.min_points:
+            return False
+        q = _summary_quality(summary)
+        cov = summary.get("map_coverage")
+        return (q is not None and cov is not None
+                and q >= self.config.scan_min_quality
+                and float(cov) >= self.config.scan_min_coverage)
+
+    def ingest(self, summary: Optional[Dict[str, Any]], now: float, *,
+               seq: Optional[int] = None) -> None:
+        if not summary or not summary.get("valid") or summary.get("map_coverage") is None:
+            return
+        if seq is not None:
+            if seq == self._last_seq:
+                return
+            self._last_seq = seq
+        if int(summary.get("n_points", 0) or 0) < self.config.min_points:
+            return
+        q = _summary_quality(summary)
+        if q is None:
+            return
+        self._samples.append((now, q, float(summary["map_coverage"])))
+        self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.config.window_s
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        while len(self._samples) > self.config.max_samples:
+            self._samples.popleft()
+
+    @staticmethod
+    def _median(vals) -> float:
+        v = sorted(vals)
+        n = len(v)
+        return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+    def medians(self, now: float) -> Optional[Tuple[float, float]]:
+        """(median quality, median coverage) over the window, or None."""
+        self._prune(now)
+        if not self._samples:
+            return None
+        return (self._median(s[1] for s in self._samples),
+                self._median(s[2] for s in self._samples))
+
+    def level(self, now: float) -> str:
+        self._prune(now)
+        cfg = self.config
+        if len(self._samples) < cfg.min_samples:
+            return SUPPORT_UNKNOWN
+        q, cov = self.medians(now)
+        if cov < cfg.off_map_coverage:
+            return SUPPORT_OFF_MAP
+        if cov < cfg.good_coverage or q < cfg.good_quality:
+            return SUPPORT_WEAK
+        return SUPPORT_GOOD
+
+    def reset(self) -> None:
+        self._samples.clear()
+        self._last_seq = None

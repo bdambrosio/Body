@@ -265,6 +265,13 @@ class HierConfig:
     # with the veto (10-31): the hits were phantoms 92 % of the time.
     stamp_block_hits: bool = False
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
+    # Pose doubt (explore plan A2): the pose is fresh but the map no longer
+    # supports it (scan-match quality collapsed, or the robot is off the
+    # map). "log" = warn once per episode only (default until the
+    # thresholds are tuned on the robot); "suspend" = treat it as pose_lost
+    # (self-recovery verifies / re-localizes); "off" = ignore.
+    pose_doubt_action: str = "log"
+    pose_doubt_hold_s: float = 2.0         # doubt must persist this long
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
     # projection is only the no-scan fallback.
@@ -412,6 +419,9 @@ class HierarchicalDrive:
         self._tick_now: float = 0.0   # tick() stamp, for handlers entered mid-tick
         # Optional self-recovery for pose_lost suspends (None = operator only).
         self._recovery: Optional[Any] = None
+        self._pose_doubt_fn: Optional[Callable[[], Optional[str]]] = None
+        self._doubt_since: Optional[float] = None
+        self._doubt_reported = False
         self._auto_resumes = 0
         self._suspend_link_back = False
         # Blocked-leg escalation (see HierConfig.escalation_waits_s).
@@ -467,6 +477,42 @@ class HierarchicalDrive:
         self._subgoal_body = None
         self._held_tier = None
         self._to(HierState.IDLE)
+
+    def set_pose_doubt(self, fn: Optional[Callable[[], Optional[str]]]) -> None:
+        """``fn()`` returns a reason string ("lost", "off_map", ...) while
+        the map does not support the pose, else None. See
+        ``HierConfig.pose_doubt_action``."""
+        self._pose_doubt_fn = fn
+
+    def _check_pose_doubt(self, now: float) -> bool:
+        """True when the drive was suspended for pose doubt this tick."""
+        fn, action = self._pose_doubt_fn, self._cfg.pose_doubt_action
+        if fn is None or action == "off":
+            return False
+        try:
+            why = fn()
+        except Exception:
+            logger.exception("hier: pose-doubt check failed")
+            return False
+        if why is None:
+            if self._doubt_reported:
+                logger.info("hier: pose doubt cleared")
+            self._doubt_since, self._doubt_reported = None, False
+            return False
+        if self._doubt_since is None:
+            self._doubt_since = now
+        if now - self._doubt_since < self._cfg.pose_doubt_hold_s:
+            return False
+        if not self._doubt_reported:
+            self._doubt_reported = True
+            logger.warning("hier: pose doubt (%s) for %.1f s — %s", why,
+                           now - self._doubt_since,
+                           "suspending" if action == "suspend" else "observe only")
+        if action == "suspend":
+            self._doubt_since, self._doubt_reported = None, False
+            self._enter_suspended("pose_lost")
+            return True
+        return False
 
     def set_recovery(self, supervisor: Optional[Any]) -> None:
         """Attach a RecoverySupervisor (desktop/nav/recovery.py): pose_lost
@@ -741,6 +787,15 @@ class HierarchicalDrive:
     def current_subgoal_body(self) -> Optional[Tuple[float, float]]:
         return self._subgoal_body
 
+    def _leg_v_max(self) -> Optional[float]:
+        """Speed cap for the current leg: the target waypoint's own
+        ``v_max_mps`` (if any) under the drive-wide ``sub_v_max``."""
+        caps = [self._cfg.sub_v_max]
+        wp = self._runner.current_target()
+        caps.append(getattr(wp, "v_max_mps", None) if wp is not None else None)
+        caps = [float(c) for c in caps if c is not None]
+        return min(caps) if caps else None
+
     def current_waypoint_world(self) -> Optional[Tuple[float, float]]:
         return self._waypoint
 
@@ -762,6 +817,9 @@ class HierarchicalDrive:
         # DRIVING->SELECT->(ADVANCE->SELECT)->DRIVING (<=4 hops); the cap is a
         # backstop against a pathological cycle, not an expected limit.
         self._tick_now = now
+        if self._state in (HierState.SELECT_SUBGOAL, HierState.DRIVING_SUBGOAL):
+            if self._check_pose_doubt(now):
+                return self._state
         for _ in range(6):
             prev = self._state
             s = prev
@@ -892,7 +950,7 @@ class HierarchicalDrive:
             pose=pose, bearing_rad=bearing, src=src, free_dist_m=free_dist,
             subgoal_body=(bx, by),
             target_body=(horizon_d * math.cos(bearing), horizon_d * math.sin(bearing)),
-            arrival_tol_m=self._cfg.subgoal_arrival_tol_m, v_max=self._cfg.sub_v_max,
+            arrival_tol_m=self._cfg.subgoal_arrival_tol_m, v_max=self._leg_v_max(),
             grid_rows=(grid.tolist() if grid is not None else None),
             meta=meta))
         if self._hold(2):
@@ -909,7 +967,7 @@ class HierarchicalDrive:
         # projection has no scan → latest-odom anchoring (anchor_ts None).
         kwargs: Dict[str, Any] = {
             "arrival_tol_m": self._cfg.subgoal_arrival_tol_m,
-            "v_max": self._cfg.sub_v_max,
+            "v_max": self._leg_v_max(),
         }
         anchor_ts = (meta or {}).get("_scan_ts") if src in ("clear", "fan", "route") else None
         if anchor_ts is not None:

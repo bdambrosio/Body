@@ -548,3 +548,32 @@ class TestEndpointLatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGoalSpeedCaps(unittest.TestCase):
+    """Per-goal v_max / omega_max can only slow the robot (explore plan A3)."""
+
+    def _goal(self, **kw):
+        return tc.Tier3Goal(cmd_id=1, x=1.0, y=0.0, tol=0.1, **kw)
+
+    def test_no_caps_returns_base(self):
+        base = tc.DriveParams()
+        self.assertIs(tc.goal_params(base, self._goal()), base)
+
+    def test_v_max_clamped_to_configured_max(self):
+        base = tc.DriveParams(v_max=0.18)
+        self.assertAlmostEqual(tc.goal_params(base, self._goal(v_max=0.5)).v_max, 0.18)
+
+    def test_v_max_below_v_min_is_raised_to_v_min(self):
+        base = tc.DriveParams(v_max=0.18, v_min_mps=0.08)
+        self.assertAlmostEqual(tc.goal_params(base, self._goal(v_max=0.02)).v_max, 0.08)
+
+    def test_slow_v_max_honoured(self):
+        base = tc.DriveParams(v_max=0.18)
+        self.assertAlmostEqual(tc.goal_params(base, self._goal(v_max=0.10)).v_max, 0.10)
+
+    def test_omega_max_only_lowers(self):
+        base = tc.DriveParams(omega_max=0.6)
+        self.assertAlmostEqual(tc.goal_params(base, self._goal(omega_max=0.3)).omega_max, 0.3)
+        self.assertAlmostEqual(tc.goal_params(base, self._goal(omega_max=2.0)).omega_max, 0.6)
+        self.assertAlmostEqual(tc.goal_params(base, self._goal(omega_max=0.0)).omega_max, 0.6)

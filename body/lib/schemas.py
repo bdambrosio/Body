@@ -29,6 +29,7 @@ def drive_goto(
     final_heading_rad: float | None = None,
     arrival_tol_m: float | None = None,
     v_max: float | None = None,
+    omega_max: float | None = None,
     kind: str = "goto",
 ) -> dict[str, Any]:
     """body/drive/goto — Tier-3 drive command (see docs/drive_tier3_spec.md).
@@ -53,6 +54,8 @@ def drive_goto(
         msg["arrival_tol_m"] = float(arrival_tol_m)
     if v_max is not None:
         msg["v_max"] = float(v_max)
+    if omega_max is not None:
+        msg["omega_max"] = float(omega_max)
     return msg
 
 

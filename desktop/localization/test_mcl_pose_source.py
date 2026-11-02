@@ -174,6 +174,64 @@ class TestMCLScanMatch(unittest.TestCase):
         self.assertEqual(src.match_summary()["scan_prior_fallback_now"], 1)
 
 
+class TestPoseSupportInputs(unittest.TestCase):
+    """Explore plan A2: map coverage + scan-time pose + scan listeners."""
+
+    def _src(self):
+        ref = _corridor_map()
+        src = MCLPoseSource(
+            ref,
+            pf_config=ParticleFilterConfig(n_particles=200, device="cpu"),
+            config=MCLPoseSourceConfig(min_evidence_cells=50),
+        )
+        src._mcl.seed_at(2.0, 1.6, 0.0, sigma_xy_m=0.01, sigma_theta_rad=0.01)
+        return ref, src
+
+    def test_coverage_on_and_off_map(self) -> None:
+        _, src = self._src()
+        # The fixture's corridor interior (-0.4) reads as unknown; walls
+        # are known. Points from (2.0, 1.6) onto both walls:
+        on = np.array([[0.0, -1.2], [1.0, 1.2], [-1.0, -1.3]])
+        self.assertEqual(src._map_coverage(on, (2.0, 1.6, 0.0)), 1.0)
+        off = np.array([[10.0, 0.0], [20.0, 0.0], [0.5, -1.2], [-30.0, 0.0]])
+        self.assertAlmostEqual(src._map_coverage(off, (2.0, 1.6, 0.0)), 0.25)
+
+    def test_summary_carries_coverage_and_scan_pose(self) -> None:
+        ref, src = self._src()
+        src._pose_buffer.append(10.0, (2.0, 1.6, 0.0))
+        src._pose_buffer.append(10.2, (2.1, 1.6, 0.0))
+        angles = np.linspace(-math.pi, math.pi, 90, endpoint=False)
+        points = src._scan_points(_raycast_scan(ref, (2.0, 1.6, 0.0), angles), angles)
+        self.assertTrue(src._apply_scan_match_observation(points, scan_ts=10.0))
+        sm = src.scan_match_summary()
+        self.assertGreater(sm["map_coverage"], 0.9)
+        self.assertIsNotNone(sm["scan_pose_world"])
+        self.assertAlmostEqual(sm["scan_pose_world"][1], 1.6, delta=0.1)
+        # Scan ts outside the buffer → no trustworthy scan-time pose.
+        self.assertTrue(src._apply_scan_match_observation(points, scan_ts=99.0))
+        self.assertIsNone(src.scan_match_summary()["scan_pose_world"])
+
+    def test_listener_called_from_on_scan(self) -> None:
+        import json
+        from types import SimpleNamespace
+        ref, src = self._src()
+        src._seeded = True
+        got = []
+        src.add_scan_listener(lambda ts, r, a, s: got.append((ts, len(r), s)))
+        src.add_scan_listener(lambda *a: 1 / 0)   # a broken listener is contained
+        angles = np.linspace(-math.pi, math.pi, 90, endpoint=False)
+        ranges = _raycast_scan(ref, (2.0, 1.6, 0.0), angles)
+        msg = {"ts": 10.0, "angle_min": float(angles[0]),
+               "angle_increment": float(angles[1] - angles[0]),
+               "ranges": [None if not np.isfinite(r) else float(r) for r in ranges]}
+        src._on_scan(SimpleNamespace(payload=json.dumps(msg).encode()))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], 10.0)
+        self.assertEqual(got[0][1], 90)
+        self.assertIn("map_coverage", got[0][2])
+        self.assertIn("scan_obs_run", got[0][2])
+
+
 class TestMCLOdomReset(unittest.TestCase):
     def test_odom_session_change_does_not_predict_jump(self) -> None:
         ref = _corridor_map()

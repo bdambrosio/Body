@@ -87,6 +87,10 @@ class Waypoint:
     # A marker that must be reached as placed: never relaxed, never skipped
     # — the drive blocks (and pauses) if it cannot be reached.
     must_visit: bool = False
+    # Speed cap (m/s) for the legs driven toward this marker — e.g. a slow
+    # approach into clutter or unmapped space. None = the drive default.
+    # Tier-3 clamps it to its configured [v_min, v_max]; it can only slow.
+    v_max_mps: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -99,6 +103,8 @@ class Waypoint:
             d["radius_m"] = float(self.radius_m)
         if self.must_visit:
             d["must_visit"] = True
+        if self.v_max_mps is not None:
+            d["v_max_mps"] = float(self.v_max_mps)
         return d
 
     @classmethod
@@ -111,6 +117,7 @@ class Waypoint:
             hold_s=float(d.get("hold_s", 0.0)),
             radius_m=(float(r) if r is not None else None),
             must_visit=bool(d.get("must_visit", False)),
+            v_max_mps=(float(d["v_max_mps"]) if d.get("v_max_mps") is not None else None),
         )
 
 

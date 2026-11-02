@@ -403,6 +403,8 @@ def main() -> None:
                 final_heading=(float(g["final_heading_rad"])
                                if g.get("final_heading_rad") is not None else None),
                 v_max=float(g["v_max"]) if g.get("v_max") is not None else None,
+                omega_max=(float(g["omega_max"])
+                           if g.get("omega_max") is not None else None),
             ), now_mono, (float(odom["x"]), float(odom["y"]), odom_theta))
 
         # Heading = wheel odom + the IMU-vs-wheel divergence since the goal

@@ -282,6 +282,7 @@ class DriveClient:
         final_heading_rad: Optional[float] = None,
         arrival_tol_m: Optional[float] = None,
         v_max: Optional[float] = None,
+        omega_max: Optional[float] = None,
         anchor_ts: Optional[float] = None,
     ) -> Optional[int]:
         """Publish a body-frame goal. Returns the cmd_id, or None if no
@@ -317,6 +318,8 @@ class DriveClient:
             msg["arrival_tol_m"] = arrival_tol_m
         if v_max is not None:
             msg["v_max"] = v_max
+        if omega_max is not None:
+            msg["omega_max"] = omega_max
         self._publish_tracked(cid, msg)
         return cid
 
