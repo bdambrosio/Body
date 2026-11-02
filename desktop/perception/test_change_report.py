@@ -120,3 +120,49 @@ class TestLabeler(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLabelWhilePresent(unittest.TestCase):
+    """A change reported out of view is labelled later, when it comes into
+    view while still present (11-02 black cat)."""
+
+    def _lab(self, clock):
+        rep = ChangeReporter(None)
+        grabs = []
+
+        def grab(on_frame, on_fail=None, **kw):
+            grabs.append(1)
+            on_frame(PosedFrame("r", b"j", 640, 400, 1.0, 1.0, (0.0, 0.0, 0.0)))
+            return "r"
+        lab = ChangeLabeler(grab, SyncWorker(), CAM, rep,
+                            detect_fn=lambda jpeg: SimpleNamespace(boxes=[box("cat", 320)]),
+                            clock=lambda: clock[0])
+        return rep, lab, grabs
+
+    def test_behind_then_in_view(self):
+        clock = [100.0]
+        rep, lab, grabs = self._lab(clock)
+        ev = ChangeEvent(KIND_NEW, STATUS_APPEARED, 54, 0.0, 2.0, 0.0)
+        lab.track(ev)
+        self.assertFalse(lab.poll((4.0, 0.0, 0.0)))          # change is behind the robot
+        self.assertEqual(lab.pending(), [54])
+        clock[0] += 5
+        self.assertTrue(lab.poll((0.0, 0.0, 0.0)))           # now dead ahead, 2 m
+        self.assertEqual(lab.pending(), [])
+        self.assertEqual(len(grabs), 1)
+        clock[0] += 5
+        self.assertFalse(lab.poll((0.0, 0.0, 0.0)))          # labelled once
+
+    def test_gone_before_in_view_is_dropped(self):
+        clock = [100.0]
+        rep, lab, grabs = self._lab(clock)
+        lab.track(ChangeEvent(KIND_NEW, STATUS_APPEARED, 7, 0.0, 2.0, 0.0))
+        lab.track(ChangeEvent(KIND_NEW, STATUS_GONE, 7, 1.0, 2.0, 0.0))
+        self.assertFalse(lab.poll((0.0, 0.0, 0.0)))
+        self.assertEqual(grabs, [])
+
+    def test_missing_not_tracked(self):
+        clock = [100.0]
+        rep, lab, grabs = self._lab(clock)
+        lab.track(ChangeEvent(KIND_MISSING, STATUS_APPEARED, 8, 0.0, 2.0, 0.0))
+        self.assertEqual(lab.pending(), [])

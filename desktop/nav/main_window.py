@@ -54,6 +54,7 @@ from .pose_health import SUPPORT_GOOD, SUPPORT_OFF_MAP, PoseHealthMonitor, PoseS
 from desktop.world_map.session_grid import SessionGrid
 from desktop.perception.change_session import ChangeSession
 from desktop.perception.scan_recorder import ScanRecorder
+from desktop.mapping.bag import BagRecorder
 from desktop.perception.change_report import (
     ChangeLabeler, ChangeReporter, default_explore_dir,
 )
@@ -399,6 +400,15 @@ class NavMainWindow(QMainWindow):
         # Every observed scan + its pose verdict, for offline replay
         # (scripts/replay_changes.py). Flushed in chunks and on close.
         self._scan_recorder = ScanRecorder(explore_dir)
+        # Pose-tagged RGB frames for after-the-fact review ("which frames
+        # were looking at change #54?" — scripts/frames_at.py). ~1 Hz while
+        # the robot moves, every 10 s when parked; same layout as a mapping
+        # bag's frames (frame_NNNNN.jpg + frames.jsonl).
+        self._frame_bag = BagRecorder(explore_dir)
+        self._frame_grabber_rec = FrameGrabber(
+            self.chassis, PFPoseProvider(self.fuser).world_pose)
+        self._frame_rec_inflight_until = 0.0
+        self._frame_rec_last: Optional[tuple] = None   # (mono, pose)
         self._change_labeler: Optional[ChangeLabeler] = None
         if self._vlm_worker is not None:
             try:
@@ -814,6 +824,7 @@ class NavMainWindow(QMainWindow):
         except Exception:
             logger.exception("pose-health ingest failed; skipping")
         self._log_pose_support()
+        self._maybe_record_frame()
 
         # The hierarchical drive runs its own loop (Tier-3 owns cmd_vel via
         # body/drive/goto); tick() runs on _hier_timer (fast, decoupled).
@@ -1453,14 +1464,49 @@ class NavMainWindow(QMainWindow):
         except Exception:
             logger.exception("session grid / change detection failed; continuing")
             return
-        if not events:
-            return
-        latest = self.fuser.pose_source.latest_pose()
-        now_pose = latest[0] if latest is not None else None
         for ev in events:
             self._change_reporter.report(ev, robot_pose=pose)
             if self._change_labeler is not None:
-                self._change_labeler.maybe_label(ev, now_pose)
+                self._change_labeler.track(ev)
+        if self._change_labeler is not None:
+            # Every scan: label a present change the moment it is in view.
+            latest = self.fuser.pose_source.latest_pose()
+            self._change_labeler.poll(latest[0] if latest is not None else None)
+
+    def _maybe_record_frame(self) -> None:
+        """UI tick: one pose-tagged 640 px frame per second while moving
+        (>= 0.10 m or 10° since the last), one per 10 s when parked; one
+        request in flight."""
+        now = time.monotonic()
+        if now < self._frame_rec_inflight_until or not self._frame_bag.enabled:
+            return
+        latest = self.fuser.pose_source.latest_pose()
+        pose = latest[0] if latest is not None else None
+        last = self._frame_rec_last
+        if last is not None:
+            dt = now - last[0]
+            if dt < 1.0:
+                return
+            moved = (pose is not None and last[1] is not None and (
+                math.hypot(pose[0] - last[1][0], pose[1] - last[1][1]) >= 0.10
+                or abs(math.remainder(pose[2] - last[1][2], 2 * math.pi)) >= math.radians(10)))
+            if not moved and dt < 10.0:
+                return
+        self._frame_rec_last = (now, pose)
+
+        def on_frame(frame) -> None:
+            self._frame_rec_inflight_until = 0.0
+            try:
+                self._frame_bag.add_frame(frame.recv_ts, frame.pose, frame.jpeg, pi_ts=frame.pi_ts)
+            except Exception:
+                logger.exception("frame record failed")
+
+        def on_fail(_rid, _err) -> None:
+            self._frame_rec_inflight_until = 0.0
+
+        rid = self._frame_grabber_rec.grab(on_frame, on_fail, max_width=640, jpeg_quality=70)
+        # The controller expires unanswered requests silently after 5 s.
+        self._frame_rec_inflight_until = (now + 6.0) if rid is not None else 0.0
 
     def _pose_doubt(self) -> Optional[str]:
         """Drive hook: why the map does not support the pose, or None."""
@@ -2081,6 +2127,10 @@ class NavMainWindow(QMainWindow):
             self._tracer.close()
         except Exception:
             pass
+        try:
+            self._frame_bag.close()
+        except Exception:
+            logger.exception("frame recorder close failed")
         try:
             path = self._scan_recorder.flush()
             if path:

@@ -123,7 +123,15 @@ def pick_box(boxes: List[Any], cam: CameraModel, bearing: float,
 
 
 class ChangeLabeler:
-    """At most one label request in flight; each change labelled once."""
+    """At most one label request in flight; each change labelled once.
+
+    Changes are labelled while they are *present*, not only when they first
+    appear: ``track()`` every event, ``poll()`` with the robot pose often
+    (every scan). A change reported while behind the robot gets its photo
+    the first time it is in the camera's view within range and still there
+    (11-02: a black cat in the hallway was reported from behind and was dead
+    ahead of the camera for 10 s before leaving; the labeller had only tried
+    at the report)."""
 
     def __init__(self, grab: Callable[..., Optional[str]], worker: Any,
                  camera: CameraModel, reporter: ChangeReporter, *,
@@ -150,6 +158,33 @@ class ChangeLabeler:
         self._busy = False
         self._last_req = -1e9
         self._done: set = set()
+        self._pending: Dict[int, ChangeEvent] = {}   # present, not yet labelled
+
+    def track(self, ev: ChangeEvent) -> None:
+        """Feed every change event: appeared moving/new changes become
+        pending; gone ones are dropped."""
+        with self._lock:
+            if ev.status == STATUS_APPEARED and ev.kind in (KIND_MOVING, KIND_NEW):
+                if ev.change_id not in self._done:
+                    self._pending[ev.change_id] = ev
+            else:
+                self._pending.pop(ev.change_id, None)
+
+    def poll(self, pose: Optional[Pose]) -> bool:
+        """Try to label the nearest pending change that is in view.
+        Returns True when a frame request went out."""
+        if pose is None:
+            return False
+        with self._lock:
+            cands = [e for e in self._pending.values() if self.in_view(pose, e.x, e.y)]
+        if not cands:
+            return False
+        cands.sort(key=lambda e: expected_bearing(pose, e.x, e.y)[1])
+        return self.maybe_label(cands[0], pose)
+
+    def pending(self) -> List[int]:
+        with self._lock:
+            return sorted(self._pending)
 
     def in_view(self, pose: Pose, x: float, y: float) -> bool:
         b, r = expected_bearing(pose, x, y)
@@ -169,6 +204,7 @@ class ChangeLabeler:
             self._busy = True
             self._last_req = now
             self._done.add(ev.change_id)
+            self._pending.pop(ev.change_id, None)
 
         def on_fail(_rid: str, err: str) -> None:
             logger.info("change #%d: frame grab failed (%s)", ev.change_id, err)
