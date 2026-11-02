@@ -52,7 +52,8 @@ from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
 from .pose_health import SUPPORT_GOOD, SUPPORT_OFF_MAP, PoseHealthMonitor, PoseSupportMonitor
 from desktop.world_map.session_grid import SessionGrid
-from desktop.perception.change_detector import ChangeDetector
+from desktop.perception.change_session import ChangeSession
+from desktop.perception.scan_recorder import ScanRecorder
 from desktop.perception.change_report import (
     ChangeLabeler, ChangeReporter, default_explore_dir,
 )
@@ -188,12 +189,11 @@ class NavMainWindow(QMainWindow):
         )
         reset_act = QAction("Reset world", self)
         reset_act.setToolTip(
-            "Clear the accumulated world map and re-anchor to the "
-            "robot's current pose."
+            "Re-anchor the localization frame to the robot's current odom "
+            "pose and clear this session's observations. Does NOT build a "
+            "map — mapping is `python -m desktop.mapping`."
         )
-        reset_act.triggered.connect(
-            lambda: self.fuser.request_reset(reason="ui_reset")
-        )
+        reset_act.triggered.connect(self._on_reset_world)
         self._map_toolbar.addAction(reset_act)
 
         relocate_act = QAction("Re-localize", self)
@@ -393,9 +393,12 @@ class NavMainWindow(QMainWindow):
         self._plan_cm_built_at = 0.0
         # Explore plan B: change detection on the same supported scans
         # (observe-only: events + VLM labels to ~/body-logs/explore/<ts>/).
-        self._change_detector: Optional[ChangeDetector] = None
-        self._change_sweep_ts = 0.0
-        self._change_reporter = ChangeReporter(default_explore_dir())
+        self._change_session: Optional[ChangeSession] = None
+        explore_dir = default_explore_dir()
+        self._change_reporter = ChangeReporter(explore_dir)
+        # Every observed scan + its pose verdict, for offline replay
+        # (scripts/replay_changes.py). Flushed in chunks and on close.
+        self._scan_recorder = ScanRecorder(explore_dir)
         self._change_labeler: Optional[ChangeLabeler] = None
         if self._vlm_worker is not None:
             try:
@@ -1427,43 +1430,29 @@ class NavMainWindow(QMainWindow):
             self._pose_support.ingest(summary, now, seq=summary.get("scan_obs_run"))
             level = self._pose_support.level(now)
             ok = level == SUPPORT_GOOD and self._pose_support.scan_ok(summary)
-        grid = self._session_grid
+        cs = self._change_session
         rm = self.fuser.reference_map
         mkey = (int(rm.nx), int(rm.ny), float(rm.resolution_m),
                 float(rm.origin_x_m), float(rm.origin_y_m))
-        if grid is None or grid.meta_key() != mkey:
-            grid = SessionGrid({"nx": rm.nx, "ny": rm.ny,
-                                "resolution_m": rm.resolution_m,
-                                "origin_x_m": rm.origin_x_m,
-                                "origin_y_m": rm.origin_y_m})
-            self._session_grid = grid
+        if cs is None or cs.meta_key() != mkey:
+            cs = ChangeSession(rm)
+            self._change_session = cs
+            self._session_grid = cs.grid
+        pose = summary.get("scan_pose_world")
+        n = summary.get("n_points") or 0
+        self._scan_recorder.add(
+            scan_ts, ranges, angles, pose, ok,
+            (float(summary.get("score_best", 0.0)) / n) if n else None,
+            summary.get("map_coverage"))
         if not ok:
-            grid.note_skipped()
+            cs.grid.note_skipped()
             return
-        pose = tuple(summary["scan_pose_world"])
-        grid.integrate(ranges, angles, pose, scan_ts)
+        pose = tuple(pose)
         try:
-            self._detect_changes(scan_ts, ranges, angles, pose, grid, rm)
+            events = cs.observe(scan_ts, ranges, angles, pose)
         except Exception:
-            logger.exception("change detection failed; continuing")
-
-    def _detect_changes(self, scan_ts, ranges, angles, pose, grid, rm) -> None:
-        det = self._change_detector
-        if det is None or det.ref.shape != (grid.nx, grid.ny):
-            det = ChangeDetector(rm.driveable_int8(), rm.distance_field_m,
-                                 {"resolution_m": rm.resolution_m,
-                                  "origin_x_m": rm.origin_x_m,
-                                  "origin_y_m": rm.origin_y_m})
-            self._change_detector = det
-        r = np.asarray(ranges, dtype=np.float64)
-        a = np.asarray(angles, dtype=np.float64)
-        ok = np.isfinite(r) & (r >= grid.cfg.min_range_m) & (r <= grid.cfg.max_range_m)
-        pts = np.stack([r[ok] * np.cos(a[ok]), r[ok] * np.sin(a[ok])], axis=1)
-        events = det.observe_scan(scan_ts, pts, pose)
-        if scan_ts - self._change_sweep_ts >= 2.0:
-            self._change_sweep_ts = scan_ts
-            score, first = grid.layers()
-            events += det.sweep(scan_ts, score, first)
+            logger.exception("session grid / change detection failed; continuing")
+            return
         if not events:
             return
         latest = self.fuser.pose_source.latest_pose()
@@ -1503,15 +1492,17 @@ class NavMainWindow(QMainWindow):
                         grid.stats() if grid is not None else "-")
             self._support_level_logged = level
 
+    def _on_reset_world(self) -> None:
+        self.fuser.request_reset(reason="ui_reset")
+        self._reset_session_grid("ui_reset")
+
     def _reset_session_grid(self, reason: str) -> None:
         """The pose was just rewritten (relocate / set location): what the
         grid holds may be in the wrong place. Start over."""
-        grid = self._session_grid
-        if grid is not None:
-            logger.info("session grid reset (%s): %s", reason, grid.stats())
-            grid.reset()
-        if self._change_detector is not None:
-            self._change_detector.reset()
+        cs = self._change_session
+        if cs is not None:
+            logger.info("session grid reset (%s): %s", reason, cs.grid.stats())
+            cs.reset()
         with self._support_lock:
             self._pose_support.reset()
 
@@ -2090,6 +2081,13 @@ class NavMainWindow(QMainWindow):
             self._tracer.close()
         except Exception:
             pass
+        try:
+            path = self._scan_recorder.flush()
+            if path:
+                logger.info("scan recorder: %d scans, last chunk %s",
+                            self._scan_recorder.n_recorded, path)
+        except Exception:
+            logger.exception("scan recorder flush failed")
         if self._vlm_worker is not None:
             self._vlm_worker.stop(timeout_s=0.5)
         # Stop any in-flight hierarchical drive and close the DriveClient

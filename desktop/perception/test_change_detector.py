@@ -135,3 +135,62 @@ class TestStatic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTightGates(unittest.TestCase):
+    """11-02 patrol tightening: viewpoint baseline, solid walls, vacated."""
+
+    def setUp(self):
+        self.ref, self.dist = room()
+        self.d = ChangeDetector(self.ref, self.dist, META)
+        self.score = np.zeros((N, N), dtype=np.float32)
+        self.first = np.zeros((N, N))
+
+    def test_new_needs_two_viewpoints(self):
+        self.score[60:63, 60:63] = 2.5
+        self.first[60:63, 60:63] = 1.0
+        self.assertEqual(self.d.sweep(10.0, self.score, self.first, robot_xy=(1.0, 1.0)), [])
+        self.assertEqual(self.d.sweep(12.0, self.score, self.first, robot_xy=(1.2, 1.0)), [])
+        ev = self.d.sweep(14.0, self.score, self.first, robot_xy=(1.6, 1.0))
+        self.assertEqual([(e.kind, e.status) for e in ev], [(KIND_NEW, STATUS_APPEARED)])
+
+    def test_unreported_blob_vanishes_quietly(self):
+        self.score[60:63, 60:63] = 2.5
+        self.first[60:63, 60:63] = 1.0
+        self.d.sweep(10.0, self.score, self.first, robot_xy=(1.0, 1.0))
+        self.score[60:63, 60:63] = -1.0
+        self.assertEqual(self.d.sweep(12.0, self.score, self.first, robot_xy=(2.0, 1.0)), [])
+        self.assertEqual(self.d.static_changes(), [])
+
+    def test_small_new_blob_ignored(self):
+        self.score[60:62, 60] = 2.5          # 2 cells
+        self.first[60:62, 60] = 1.0
+        self.assertEqual(self.d.sweep(10.0, self.score, self.first), [])
+
+    def test_near_wall_new_ignored(self):
+        self.score[5:8, 60:63] = 2.5         # 0.15–0.25 m from the wall
+        self.first[5:8, 60:63] = 1.0
+        self.assertEqual(self.d.sweep(10.0, self.score, self.first), [])
+
+    def test_speckle_wall_cannot_go_missing(self):
+        ref = self.ref.copy()
+        for k in range(0, 20, 3):
+            ref[60, 30 + k] = 0                # isolated wall specks
+        d = ChangeDetector(ref, self.dist, META)
+        self.score[60, 30:50] = -2.5
+        self.assertEqual(d.sweep(5.0, self.score, self.first), [])
+
+    def test_short_missing_ignored(self):
+        self.score[0:3, 50:52] = -2.5          # 10 cm of wall
+        self.assertEqual(self.d.sweep(5.0, self.score, self.first), [])
+
+    def test_moving_needs_vacated_start(self):
+        pose = (3.0, 1.0, 0.0)
+        ev = []
+        for k in range(12):
+            ev += self.d.observe_scan(k * 0.1, blob_points(4.0, 1.0 + 0.1 * k, pose), pose,
+                                      free_at=lambda x, y: False)
+        self.assertEqual(ev, [])
+        ev = self.d.observe_scan(1.2, blob_points(4.0, 2.2, pose), pose,
+                                 free_at=lambda x, y: True)
+        self.assertEqual([(e.kind, e.status) for e in ev], [(KIND_MOVING, STATUS_APPEARED)])

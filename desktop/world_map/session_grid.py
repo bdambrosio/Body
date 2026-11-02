@@ -199,6 +199,14 @@ class SessionGrid:
         out[free & wall & (s <= cfg.free_over_prior_wall)] = 1
         return out
 
+    def is_free(self, x: float, y: float) -> bool:
+        """Is world (x, y) currently seen free by this session?"""
+        i = int(math.floor((x - self.ox) / self.res))
+        j = int(math.floor((y - self.oy) / self.res))
+        if not (0 <= i < self.nx and 0 <= j < self.ny):
+            return False
+        return bool(self.score[i, j] < -self.cfg.occ_thresh)
+
     def layers(self) -> Tuple[np.ndarray, np.ndarray]:
         """Copies of (score, first_hit_ts) for the change detector."""
         with self._lock:

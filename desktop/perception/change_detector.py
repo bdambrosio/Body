@@ -27,7 +27,7 @@ import itertools
 import math
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -42,9 +42,10 @@ STATUS_GONE = "gone"
 
 @dataclass(frozen=True)
 class ChangeDetectorConfig:
-    # Residuals: ignore endpoints this close to a reference wall (pose and
-    # map error live there).
-    wall_margin_m: float = 0.15
+    # Ignore evidence this close to a reference wall (pose and map error
+    # live there). 0.15 on the 11-02 patrol left 111 of 170 "new" reports
+    # within 0.25 m of a wall — registration churn, not objects.
+    wall_margin_m: float = 0.30
     cluster_eps_m: float = 0.20        # bucket size for clustering endpoints
     cluster_min_points: int = 3
     cluster_max_extent_m: float = 1.0  # bigger → misalignment, not an object
@@ -53,12 +54,23 @@ class ChangeDetectorConfig:
     track_lost_s: float = 1.0
     moving_min_disp_m: float = 0.4
     moving_min_hits: int = 4
+    # A real mover leaves free space behind: its first position must be
+    # seen free (``free_at``) before it counts as moving. A static edge
+    # whose visible part slides as the robot drives never passes.
+    moving_require_vacated: bool = True
     # Static sweep.
     new_min_score: float = 1.5         # SessionGrid score ("solidly hit")
     new_min_age_s: float = 3.0         # occupied episode at least this long
-    new_min_cells: int = 2
+    new_min_cells: int = 3              # a 15 cm face (the 4-cell try dropped a 16 cm box)
+    # Seen from two viewpoints: the robot must have moved this far between
+    # the first sweep that found the blob and the one that reports it.
+    new_min_baseline_m: float = 0.5
     missing_max_score: float = -2.0    # reference wall seen through this much
     missing_min_cells: int = 3
+    missing_min_extent_m: float = 0.25
+    # Only solid reference walls can go missing: a wall cell with at least
+    # this many wall cells in its 3x3 neighbourhood (not mapping speckle).
+    missing_solid_neighbours: int = 3
     static_match_m: float = 0.4        # same change across sweeps
     near_track_m: float = 0.4          # a stopped moving object isn't "new" yet
 
@@ -111,6 +123,9 @@ class _Static:
     cells: np.ndarray          # flat indices
     first_ts: float
     last_seen_ts: float
+    first_robot: Optional[Tuple[float, float]] = None
+    reported: bool = False
+    extent_m: float = 0.0
 
 
 def _components(coords: np.ndarray, connect8: bool = True) -> List[np.ndarray]:
@@ -155,6 +170,14 @@ class ChangeDetector:
         self.ox = float(meta["origin_x_m"])
         self.oy = float(meta["origin_y_m"])
         self.nx, self.ny = ref_driveable.shape
+        wall = (ref_driveable == 0)
+        nb = np.zeros(wall.shape, dtype=np.int16)
+        pw = np.pad(wall, 1).astype(np.int16)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di or dj:
+                    nb += pw[1 + di:1 + di + self.nx, 1 + dj:1 + dj + self.ny]
+        self.solid_wall = wall & (nb >= self.cfg.missing_solid_neighbours)
         self._ids = itertools.count(1)
         self._tracks: List[_Track] = []
         self._static: List[_Static] = []
@@ -173,7 +196,8 @@ class ChangeDetector:
 
     def static_changes(self) -> List[Dict[str, Any]]:
         return [{"id": c.cid, "kind": c.kind, "x": c.x, "y": c.y,
-                 "n_cells": int(c.cells.size)} for c in self._static]
+                 "n_cells": int(c.cells.size), "reported": c.reported}
+                for c in self._static]
 
     def reset(self) -> None:
         self._tracks.clear()
@@ -215,7 +239,12 @@ class ChangeDetector:
             out.append((float(px.mean()), float(py.mean()), extent, n))
         return out
 
-    def observe_scan(self, ts: float, points_body: np.ndarray, pose: Pose) -> List[ChangeEvent]:
+    def observe_scan(self, ts: float, points_body: np.ndarray, pose: Pose,
+                     free_at: Optional[Callable[[float, float], bool]] = None
+                     ) -> List[ChangeEvent]:
+        """``free_at(x, y)``: is that world point currently seen free (the
+        SessionGrid)? Needed for ``moving_require_vacated``; None skips the
+        check."""
         cfg = self.cfg
         events: List[ChangeEvent] = []
         clusters = self.residual_clusters(points_body, pose)
@@ -239,8 +268,10 @@ class ChangeDetector:
             t.last_ts = ts
             t.hits += 1
             t.extent_m = max(t.extent_m, e)
+            vacated = (free_at is None or not cfg.moving_require_vacated
+                       or free_at(t.pts[0][1], t.pts[0][2]))
             if (not t.moving and t.hits >= cfg.moving_min_hits
-                    and t.disp() >= cfg.moving_min_disp_m):
+                    and t.disp() >= cfg.moving_min_disp_m and vacated):
                 t.moving = True
                 dt = max(1e-3, ts - t.first_ts)
                 events.append(ChangeEvent(
@@ -270,20 +301,27 @@ class ChangeDetector:
         coords = np.argwhere(mask)
         return [coords[c] for c in _components(coords) if c.size >= min_cells]
 
-    def sweep(self, now_ts: float, score: np.ndarray, first_hit_ts: np.ndarray
-              ) -> List[ChangeEvent]:
+    def sweep(self, now_ts: float, score: np.ndarray, first_hit_ts: np.ndarray,
+              robot_xy: Optional[Tuple[float, float]] = None) -> List[ChangeEvent]:
         """``score`` / ``first_hit_ts``: the SessionGrid layers (same grid as
-        the reference). ``now_ts`` on the Pi clock (latest scan ts)."""
+        the reference). ``now_ts`` on the Pi clock (latest scan ts).
+        ``robot_xy``: robot position now, for the two-viewpoint gate on
+        "new" (None → the gate is skipped)."""
         cfg = self.cfg
         events: List[ChangeEvent] = []
         new_mask = ((score >= cfg.new_min_score) & (self.ref == 1)
                     & (self.ref_dist >= cfg.wall_margin_m)
                     & (first_hit_ts > 0.0)
                     & (first_hit_ts <= now_ts - cfg.new_min_age_s))
-        missing_mask = (score <= cfg.missing_max_score) & (self.ref == 0)
+        missing_mask = (score <= cfg.missing_max_score) & self.solid_wall
+        missing = []
+        for b in self._blobs(missing_mask, cfg.missing_min_cells):
+            bx, by = self._center(b[:, 0], b[:, 1])
+            if math.hypot(np.ptp(bx), np.ptp(by)) + self.res >= cfg.missing_min_extent_m:
+                missing.append(b)
         found: List[Tuple[str, np.ndarray]] = (
             [(KIND_NEW, b) for b in self._blobs(new_mask, cfg.new_min_cells)]
-            + [(KIND_MISSING, b) for b in self._blobs(missing_mask, cfg.missing_min_cells)])
+            + [(KIND_MISSING, b) for b in missing])
         matched = set()
         for kind, cells in found:
             cx, cy = self._center(cells[:, 0], cells[:, 1])
@@ -299,15 +337,22 @@ class ChangeDetector:
                         math.hypot(sc.x - x, sc.y - y) <= cfg.static_match_m:
                     hit = sc
                     break
-            if hit is not None:
-                matched.add(hit.cid)
-                hit.x, hit.y, hit.cells, hit.last_seen_ts = x, y, flat, now_ts
-                continue
-            sc = _Static(next(self._ids), kind, x, y, flat, now_ts, now_ts)
-            self._static.append(sc)
-            matched.add(sc.cid)
             extent = float(math.hypot(np.ptp(cx), np.ptp(cy)) + self.res)
-            events.append(ChangeEvent(kind, STATUS_APPEARED, sc.cid, now_ts, x, y,
+            if hit is None:
+                hit = _Static(next(self._ids), kind, x, y, flat, now_ts, now_ts,
+                              first_robot=robot_xy)
+                self._static.append(hit)
+            matched.add(hit.cid)
+            hit.x, hit.y, hit.cells, hit.last_seen_ts, hit.extent_m = x, y, flat, now_ts, extent
+            if hit.reported:
+                continue
+            if kind == KIND_NEW and robot_xy is not None and hit.first_robot is not None:
+                base = math.hypot(robot_xy[0] - hit.first_robot[0],
+                                  robot_xy[1] - hit.first_robot[1])
+                if base < cfg.new_min_baseline_m:
+                    continue
+            hit.reported = True
+            events.append(ChangeEvent(kind, STATUS_APPEARED, hit.cid, now_ts, x, y,
                                       extent_m=extent, n_cells=int(flat.size)))
         # Unmatched: gone only if its cells are *observed* back to normal.
         keep = []
@@ -318,6 +363,8 @@ class ChangeDetector:
                 continue
             vals = flat_score[sc.cells]
             back = (vals < 0.0).all() if sc.kind == KIND_NEW else (vals > 0.5).all()
+            if back and not sc.reported:
+                continue                       # never reported: drop quietly
             if back:
                 events.append(ChangeEvent(
                     sc.kind, STATUS_GONE, sc.cid, now_ts, sc.x, sc.y,
