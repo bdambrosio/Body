@@ -222,6 +222,25 @@ class EkfPoseTracker:
                     self._append_state(ots)
         return (0.0, 0.0, 0.0)
 
+    def rebind_world_to(self, pose: PoseTuple) -> Optional[Pose]:
+        """Like ``rebind_world_to_current`` but the robot's current odom
+        pose becomes world ``pose`` instead of the origin — a mapping run
+        started at a known spot of an older map comes out roughly in that
+        map's frame (patrols/checkpoints still need re-authoring)."""
+        out = self.rebind_world_to_current()
+        x, y, theta = float(pose[0]), float(pose[1]), _wrap(float(pose[2]))
+        with self._lock:
+            self._x, self._y, self._theta = x, y, theta
+            latest_imu = self._imu.latest()
+            if latest_imu is not None:
+                # theta = raw_yaw - offset  ->  offset = raw_yaw - theta
+                self._yaw_offset = _wrap(latest_imu[1] - theta)
+            if self._state_buf:
+                ts = self._state_buf[-1][0]
+                self._state_buf.clear()
+                self._append_state(ts)
+        return out if out is None else (x, y, theta)
+
     def is_ready(self) -> bool:
         with self._lock:
             return self._seeded and self._imu.is_settled()

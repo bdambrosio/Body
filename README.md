@@ -183,7 +183,7 @@ The units assume Body lives at `/home/bruce/Body`, the launcher venv is `/home/b
 ```bash
 cd /path/to/Body
 export PYTHONPATH="$(pwd)"
-# First map only: teleop-drive and save a reference_map.npz
+# First map only: teleop-drive and save a reference_map.npz (see "Mapping a house")
 desktop/.venv/bin/python -m desktop.mapping --router tcp/192.168.1.50:7447
 # Thereafter: drive against the map (manual teleop + autonomous patrols)
 desktop/.venv/bin/python -m desktop.nav --router tcp/192.168.1.50:7447 \
@@ -269,6 +269,45 @@ desktop/.venv/bin/python -m desktop.nav.drive_timing_logger --router tcp/PI_IP:7
 # ...drive a patrol, Ctrl-C to stop + summarize. Re-read a capture:
 desktop/.venv/bin/python -m desktop.nav.drive_timing_logger --analyze drive_timing_*.jsonl
 ```
+
+## Mapping a house (`desktop.mapping`)
+
+`python -m desktop.mapping --router tcp/PI_IP:7447` builds the reference map from a
+teleop drive (EKF prior + local scan-match; loop closure and the periodic graph
+optimiser are **off** in `config.json → slam` — the 2026-11-02 review showed the
+closure gates accept the robot's own recent nodes and bend a perfect run by metres;
+a submap-based closure is the next mapping stage). The run is also **recorded as a
+bag** (`~/Body/maps/<session>/bag_<ts>/`: every scan with intensities, odom, IMU,
+and a pose-tagged RGB keyframe every 0.5 m) so later mapping backends rebuild the
+map offline from the same drive: `scripts/replay_mapping.py <bag_dir>`.
+
+Flags: `--seed-pose X Y THETA_DEG` declares the start pose so the new map comes out
+in an older map's frame; `--prior-map old/reference_map.npz` carries that map's
+checkpoints and no-go mask into the new one (only meaningful with `--seed-pose`);
+`--no-record` / `--bag-dir`.
+
+Procedure for a good map with this mapper:
+
+1. People and pets out of the rooms being mapped; close doors you want mapped as
+   walls. Don't let anyone stand next to the robot.
+2. Wait for the status line to say **heading: imu**. Park the robot where the map's
+   origin should be (the old map's origin if you use `--seed-pose`) and press
+   **Reset map** once, standing still.
+3. Drive at ≤ 0.2 m/s and turn at ≤ 0.3 rad/s. Fast turns smear the rear of each
+   scan (no deskew yet). Turn in place slowly once in each room.
+4. Pass within ~4 m of every wall. Beams beyond 5 m clear free space but map no
+   wall. Lap the middle of large rooms.
+5. There is no loop closure: keep drift small by returning through rooms you have
+   already mapped, and avoid long one-way trips down featureless hallways. If a wall
+   doubles or the pose jumps, stop, **Reset map**, and redo that section.
+6. Don't bump furniture. If the heading label leaves **imu**, stop until it is back
+   (the lidar now settles wheel-vs-IMU disputes — `contests n/m` in the status line
+   — but a verdict needs a few seconds of clean scans).
+7. **Save map** several times along the way, with the robot stopped. A new node is
+   only added after 0.10 m / 5° of motion, so a parked robot adds nothing.
+8. Afterwards, in `map_editor`: clean leftover specks, repaint keep-outs if you did
+   not carry them over, re-capture checkpoints, and re-author patrols — the frame
+   never matches the old map exactly.
 
 ## Map editing (`desktop.map_editor`)
 

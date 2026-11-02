@@ -37,6 +37,25 @@ def main(argv=None) -> int:
         "--map-stale-s", type=float, default=2.0,
         help="Local map staleness threshold (safety).",
     )
+    p.add_argument(
+        "--no-record", action="store_true",
+        help="Do not record the raw bag (scans/odom/IMU/RGB keyframes).",
+    )
+    p.add_argument(
+        "--bag-dir", default=None,
+        help="Where to record the bag (default ~/Body/maps/<session>/bag_<ts>/).",
+    )
+    p.add_argument(
+        "--prior-map", default=None,
+        help="Older reference_map.npz whose checkpoints and no-go mask are "
+             "carried into the new map (use with --seed-pose).",
+    )
+    p.add_argument(
+        "--seed-pose", nargs=3, type=float, metavar=("X", "Y", "THETA_DEG"),
+        default=None,
+        help="Declare the robot's start pose in world metres/degrees so the "
+             "new map comes out in an older map's frame.",
+    )
     p.add_argument("--no-autoconnect", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
@@ -47,11 +66,19 @@ def main(argv=None) -> int:
     )
     log = logging.getLogger(__name__)
     router = resolve_router(args.router)
+    seed = None
+    if args.seed_pose is not None:
+        import math
+        seed = (args.seed_pose[0], args.seed_pose[1], math.radians(args.seed_pose[2]))
     config = MappingConfig(
         router=router,
         extent_m=args.extent_m,
         resolution_m=args.resolution_m,
         map_stale_s=args.map_stale_s,
+        record=not args.no_record,
+        bag_dir=args.bag_dir,
+        prior_map=args.prior_map,
+        seed_pose=seed,
     )
     chassis_config = StubConfig(
         router=router,

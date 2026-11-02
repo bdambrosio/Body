@@ -13,6 +13,7 @@ from desktop.reference_map.reference_map import (
     LOG_ODDS_MIN,
     LOG_ODDS_OCC,
     build_reference_map_from_log_odds,
+    despeckle_log_odds,
     ReferenceMap,
 )
 
@@ -35,6 +36,8 @@ class OccupancyBuilder:
         resolution_m: float,
         max_range_m: float = 5.0,
         occ_range_falloff: float = 0.4,
+        min_range_m: float = 0.15,
+        far_clear_m: float = 4.5,
     ):
         self._res = float(resolution_m)
         self._extent = float(extent_m)
@@ -43,6 +46,14 @@ class OccupancyBuilder:
         self._origin_x = -extent_m / 2.0
         self._origin_y = -extent_m / 2.0
         self._max_range = float(max_range_m)
+        # Returns closer than this are the robot's own body / mixed pixels
+        # (the driver's self-mask only covers one sector).
+        self._min_range = float(min_range_m)
+        # A real return BEYOND max_range still proves the beam crossed free
+        # space: clear it out to far_clear_m with no hit. Without this the
+        # middle of rooms wider than max_range stays unknown (lethal-ish to
+        # the planner). No-return beams (NaN) still clear nothing.
+        self._far_clear = float(far_clear_m)
         # Endpoint-uncertainty model (cheap, deterministic): the true hit
         # smears across more cells the farther the beam, because a fixed
         # pose/heading error projects to a cross-range spread of ~r·σθ. We
@@ -87,14 +98,20 @@ class OccupancyBuilder:
         sin_t = math.sin(theta)
         updated = 0
         for r, a in zip(ranges_m, angles_rad):
-            if not np.isfinite(r) or r <= 0 or r > self._max_range:
+            if not np.isfinite(r) or r < self._min_range:
                 continue
+            hit = r <= self._max_range
+            if not hit:
+                if self._far_clear <= 0.0:
+                    continue
+                r = self._far_clear
             bx = r * math.cos(a)
             by = r * math.sin(a)
             wx = x0 + cos_t * bx - sin_t * by
             wy = y0 + sin_t * bx + cos_t * by
             updated += self._cast_ray(
-                x0, y0, wx, wy, hit=True, occ_weight=self._occ_weight(r),
+                x0, y0, wx, wy, hit=hit,
+                occ_weight=self._occ_weight(r) if hit else 1.0,
             )
         return updated
 
@@ -146,15 +163,19 @@ class OccupancyBuilder:
         session_id: str = "",
         trajectory: np.ndarray | None = None,
         metadata: dict | None = None,
+        despeckle: bool = False,
+        nogo_mask: np.ndarray | None = None,
     ) -> ReferenceMap:
+        lo = despeckle_log_odds(self.log_odds) if despeckle else self.log_odds.copy()
         return build_reference_map_from_log_odds(
-            self.log_odds.copy(),
+            lo,
             resolution_m=self._res,
             origin_x_m=self._origin_x,
             origin_y_m=self._origin_y,
             session_id=session_id or None,
             trajectory=trajectory,
             metadata=metadata,
+            nogo_mask=nogo_mask,
         )
 
     def snapshot_for_ui(self) -> dict:

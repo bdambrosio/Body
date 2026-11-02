@@ -62,9 +62,20 @@ class SlamConfig:
     scan_match_xy_half_m: float = 0.30
     scan_match_theta_half_deg: float = 8.0
     min_improvement: float = 10.0
-    loop_closure_search_radius_m: float = 2.0
+    # Loop closure is OFF by default (-1, never 0: two identical poses have
+    # hypot 0 <= 0). The 11-02 review showed the closure gates accept the
+    # robot's own recent nodes and bend a perfect run by metres; a proper
+    # submap/travel-gated closure is Stage 1 of the mapping plan.
+    loop_closure_search_radius_m: float = -1.0
     loop_closure_min_response: float = 0.35
-    graph_optimize_every_n_nodes: int = 5
+    # Periodic optimise+full-rebuild is OFF by default (it is a no-op
+    # without closures and froze the UI past ~250 nodes).
+    graph_optimize_every_n_nodes: int = 1000000000
+    # Keyframe gate: a new graph node only after this much motion since
+    # the last one (standing still adds nothing — people next to a parked
+    # robot no longer saturate into walls; node cost stays flat).
+    keyframe_min_dist_m: float = 0.10
+    keyframe_min_rot_deg: float = 5.0
     submap_node_count: int = 20
     min_submap_evidence_cells: int = 200
     resolution_m: float = 0.05
@@ -126,14 +137,16 @@ def load_slam_config(path: Optional[Path] = None) -> SlamFusionConfig:
         ),
         min_improvement=_float(slam_sec, "min_improvement", 10.0),
         loop_closure_search_radius_m=_float(
-            slam_sec, "loop_closure_search_radius_m", 2.0,
+            slam_sec, "loop_closure_search_radius_m", -1.0,
         ),
         loop_closure_min_response=_float(
             slam_sec, "loop_closure_min_response", 0.35,
         ),
         graph_optimize_every_n_nodes=_int(
-            slam_sec, "graph_optimize_every_n_nodes", 5,
+            slam_sec, "graph_optimize_every_n_nodes", 1000000000,
         ),
+        keyframe_min_dist_m=_float(slam_sec, "keyframe_min_dist_m", 0.10),
+        keyframe_min_rot_deg=_float(slam_sec, "keyframe_min_rot_deg", 5.0),
         submap_node_count=_int(slam_sec, "submap_node_count", 20),
         min_submap_evidence_cells=_int(
             slam_sec, "min_submap_evidence_cells", 200,

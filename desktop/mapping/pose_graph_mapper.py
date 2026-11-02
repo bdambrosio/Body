@@ -7,7 +7,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -61,7 +61,7 @@ class PoseGraphMapper:
     _display_builder: Optional[OccupancyBuilder] = field(default=None, repr=False)
     _matcher: ScanMatcher = field(default=None, repr=False)  # type: ignore[assignment]
     _loop_matcher: ScanMatcher = field(default=None, repr=False)  # type: ignore[assignment]
-    _last_match_mono: float = field(default=0.0, repr=False)
+    _last_match_mono: float = field(default=-1e18, repr=False)
     _trajectory: Deque[Tuple[float, float, float, float]] = field(
         default_factory=lambda: deque(maxlen=4096),
         repr=False,
@@ -71,6 +71,10 @@ class PoseGraphMapper:
     _last_match_accepted: bool = field(default=False, repr=False)
     _optimize_count: int = field(default=0, repr=False)
     _loop_closure_count: int = field(default=0, repr=False)
+    _keyframes_skipped: int = field(default=0, repr=False)
+    _edge_rejects: int = field(default=0, repr=False)
+    # Rate-limit clock; a bag replay substitutes the scan clock.
+    _clock: Callable[[], float] = field(default=time.monotonic, repr=False)
 
     def __post_init__(self) -> None:
         if self._matcher is None:
@@ -89,12 +93,14 @@ class PoseGraphMapper:
             self._nodes.clear()
             self._edges.clear()
             self._trajectory.clear()
-            self._last_match_mono = 0.0
+            self._last_match_mono = -1e18
             self._last_loop_closure_ts = 0.0
             self._last_match_improvement = 0.0
             self._last_match_accepted = False
             self._optimize_count = 0
             self._loop_closure_count = 0
+            self._keyframes_skipped = 0
+            self._edge_rejects = 0
             self._display_builder = OccupancyBuilder(
                 extent_m=self.slam_config.extent_m,
                 resolution_m=self.slam_config.resolution_m,
@@ -116,7 +122,7 @@ class PoseGraphMapper:
         (S3): scan-match and loop-closure corrections carry forward, and a
         rejected match leaves the node where dead-reckoning from the graph
         puts it, not snapped back to the raw EKF frame."""
-        now_mono = time.monotonic()
+        now_mono = self._clock()
         hz = max(0.5, self.slam_config.match_hz)
         if now_mono - self._last_match_mono < 1.0 / hz:
             return False
@@ -126,6 +132,17 @@ class PoseGraphMapper:
         ekf_now = self.ekf.pose_at(ts)
         if ekf_now is None:
             return False
+        # Keyframe gate: no node without motion since the last one (the
+        # slot is not consumed either — the next scan after the robot moves
+        # becomes the node, not the one up to 1/hz later).
+        with self._lock:
+            last_ekf = self._nodes[-1].ekf_pose if self._nodes else None
+        if last_ekf is not None:
+            d = relative_pose(last_ekf, ekf_now)
+            if (math.hypot(d[0], d[1]) < self.slam_config.keyframe_min_dist_m
+                    and abs(d[2]) < math.radians(self.slam_config.keyframe_min_rot_deg)):
+                self._keyframes_skipped += 1
+                return False
         self._last_match_mono = now_mono
 
         scan_xy = lidar_scan_to_xy(ranges_m, angles_rad)
@@ -145,21 +162,37 @@ class PoseGraphMapper:
 
             submap, evidence_count = self._match_evidence()
             if evidence_count >= self.slam_config.min_submap_evidence_cells:
-                result = self._matcher.search(
-                    scan_xy,
-                    prior_pose,
-                    submap,
-                    self._display_builder.origin_x_m,
-                    self._display_builder.origin_y_m,
-                    self._display_builder.resolution_m,
-                )
+                # A best pose on the window edge is either an aliased slide
+                # along a corridor (reject) or a real correction bigger than
+                # the window (a 15° kick: the window is ±8°). Tell them
+                # apart by re-centring the search on the edge pose: a real
+                # correction settles inside the next window, a slide walks
+                # to the edge again.
+                centre = prior_pose
+                result = None
+                for _attempt in range(3):
+                    result = self._matcher.search(
+                        scan_xy,
+                        centre,
+                        submap,
+                        self._display_builder.origin_x_m,
+                        self._display_builder.origin_y_m,
+                        self._display_builder.resolution_m,
+                    )
+                    if not (result.accepted and getattr(result, "search_exhausted", False)):
+                        break
+                    centre = result.pose
+                accepted = bool(result.accepted) and not bool(
+                    getattr(result, "search_exhausted", False))
+                if result.accepted and not accepted:
+                    self._edge_rejects += 1
                 corrected = (
                     (result.pose.x, result.pose.y, result.pose.theta)
-                    if result.accepted
+                    if accepted
                     else prior
                 )
                 self._last_match_improvement = float(result.improvement)
-                self._last_match_accepted = bool(result.accepted)
+                self._last_match_accepted = accepted
             else:
                 corrected = prior
                 self._last_match_improvement = 0.0
@@ -225,18 +258,23 @@ class PoseGraphMapper:
         *,
         session_id: str = "",
         metadata: Optional[dict] = None,
+        nogo_mask: Optional[np.ndarray] = None,
     ) -> ReferenceMap:
         with self._lock:
-            self._optimize_graph()
-            self._rebuild_display_map()
+            if self._loop_closure_count > 0:
+                self._optimize_graph()
+                self._rebuild_display_map()
             assert self._display_builder is not None
             traj = None
-            if self._trajectory:
-                traj = np.array(list(self._trajectory), dtype=np.float64)
+            if self._nodes:
+                traj = np.array([(n.ts, n.x, n.y, n.theta) for n in self._nodes],
+                                dtype=np.float64)
             return self._display_builder.to_reference_map(
                 session_id=session_id,
                 trajectory=traj,
                 metadata=metadata or {"mapping_version": 2, "slam": "pose_graph"},
+                despeckle=True,
+                nogo_mask=nogo_mask,
             )
 
     def diagnostics(self) -> Dict[str, Any]:
@@ -249,6 +287,8 @@ class PoseGraphMapper:
                 "last_match_improvement": self._last_match_improvement,
                 "last_match_accepted": self._last_match_accepted,
                 "last_loop_closure_ts": self._last_loop_closure_ts,
+                "keyframes_skipped": self._keyframes_skipped,
+                "edge_rejects": self._edge_rejects,
             }
 
     def _add_node(
@@ -350,7 +390,9 @@ class PoseGraphMapper:
         self._last_loop_closure_ts = new_node.ts
 
     def _optimize_graph(self) -> None:
-        if len(self._nodes) < 2:
+        # Without closure edges every chain edge equals the current relative
+        # pose (zero error): a dense 3N x 3N solve that changes nothing.
+        if len(self._nodes) < 2 or self._loop_closure_count == 0:
             return
         poses = np.array(
             [[n.x, n.y, n.theta] for n in self._nodes],

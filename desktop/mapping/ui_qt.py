@@ -19,6 +19,7 @@ from desktop.mapping.controller import MappingConfig, MappingController
 from desktop.nav.camera_panels import CameraPanels, build_camera_snapshot
 from desktop.nav.safety_toolbar import SafetyToolbar
 from desktop.nav.teleop_panels import TeleopPanels, build_chassis_snapshot
+from desktop.perception.frames import FrameGrabber
 from desktop.world_map.map_views import SharedMapView, WorldDriveableView
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,9 @@ class MappingMainWindow(QMainWindow):
 
         reset_act = QAction("Reset map", self)
         reset_act.setToolTip(
-            "Clear the occupancy grid and start a fresh mapping session.",
+            "Clear the occupancy grid and start a fresh mapping session "
+            "with the world origin at the robot's current pose (or at "
+            "--seed-pose). Press it once, standing still, before driving.",
         )
         reset_act.triggered.connect(
             lambda: self.controller.request_reset(reason="ui_reset"),
@@ -69,8 +72,8 @@ class MappingMainWindow(QMainWindow):
 
         save_act = QAction("Save map", self)
         save_act.setToolTip(
-            "Export reference_map.npz and a snapshot bundle under "
-            "~/Body/sessions/<session_id>/.",
+            "Export reference_map.npz under ~/Body/maps/<session_id>/map_<ts>/. "
+            "Stop the robot first; save several times during a long run.",
         )
         save_act.triggered.connect(self._on_save)
         self._map_toolbar.addAction(save_act)
@@ -121,6 +124,8 @@ class MappingMainWindow(QMainWindow):
         self._v_splitter.setStretchFactor(0, 3)
         self._v_splitter.setStretchFactor(1, 1)
         self._splitter_balanced = False
+        self._keyframe_inflight = False
+        self._frame_grabber = None
 
         outer.addWidget(self._v_splitter, stretch=1)
 
@@ -241,6 +246,7 @@ class MappingMainWindow(QMainWindow):
         self._refresh_map_panel()
         self._refresh_status_panel()
         self._refresh_chassis_panel()
+        self._maybe_record_keyframe()
 
         if self._teleop.is_visible():
             self._teleop.update_state(
@@ -257,6 +263,31 @@ class MappingMainWindow(QMainWindow):
             self._camera_action.setChecked(self._cameras.is_visible())
         if self._vision_action.isChecked() != self._vision_dock.isVisible():
             self._vision_action.setChecked(self._vision_dock.isVisible())
+
+    def _maybe_record_keyframe(self) -> None:
+        """Bag: one pose-tagged RGB frame every keyframe_spacing_m of
+        travel (one request in flight; failures just try again later)."""
+        if self._keyframe_inflight or not self.controller.wants_keyframe():
+            return
+        if self._frame_grabber is None:
+            self._frame_grabber = FrameGrabber(
+                self.chassis, lambda: self.controller.mapper.display_pose())
+
+        def on_frame(frame) -> None:
+            self._keyframe_inflight = False
+            try:
+                self.controller.record_frame(frame.jpeg, pi_ts=frame.pi_ts)
+            except Exception:
+                logger.exception("keyframe record failed")
+
+        def on_fail(_rid: str, _err: str) -> None:
+            self._keyframe_inflight = False
+
+        rid = self._frame_grabber.grab(on_frame, on_fail, max_width=640, jpeg_quality=85)
+        self._keyframe_inflight = rid is not None
+        if rid is not None:
+            # The controller's expiry (5 s) never calls back; don't hang.
+            QTimer.singleShot(6000, lambda: setattr(self, "_keyframe_inflight", False))
 
     def _refresh_map_panel(self) -> None:
         snap = self.controller.snapshot_for_ui()
@@ -306,8 +337,12 @@ class MappingMainWindow(QMainWindow):
         if nodes is not None:
             cov_s = f"{cov_xy:.3f}" if cov_xy is not None else "—"
             imp_s = f"{match_imp:.1f}" if match_imp is not None else "—"
+            bag = (f"  bag {st.get('bag_scans', 0)}s/{st.get('bag_frames', 0)}f"
+                   if st.get("bag_dir") else "  bag off")
+            contests = st.get("contests_judged") or 0
+            c_s = f"  contests {st.get('contests_imu_wins', 0)}/{contests}" if contests else ""
             self._slam_lbl.setText(
-                f"slam: nodes={nodes}  Σ_xy={cov_s}  match+{imp_s}",
+                f"slam: nodes={nodes}  Σ_xy={cov_s}  match+{imp_s}{bag}{c_s}",
             )
         else:
             self._slam_lbl.setText("slam: —")

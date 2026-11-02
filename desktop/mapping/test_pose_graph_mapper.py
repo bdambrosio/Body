@@ -172,3 +172,109 @@ class TestPoseGraphMapper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKeyframeGate(unittest.TestCase):
+    """Mapping plan Stage 0: no node without motion; edge matches rejected;
+    export without closures skips the optimiser."""
+
+    def _mapper(self, traj, **kw):
+        kw.setdefault("match_hz", 100.0)
+        slam = SlamConfig(min_submap_evidence_cells=10**9, **kw)
+        return PoseGraphMapper(slam_config=slam, fusion_config=FusionNoiseConfig(),
+                               ekf=_MockEkf(traj))  # type: ignore[arg-type]
+
+    def test_stationary_scans_add_no_nodes(self):
+        traj = [(float(t), (0.0, 0.0, 0.0)) for t in range(10)] + [(10.0, (0.5, 0.0, 0.0))]
+        mapper = self._mapper(traj)
+        ranges, angles = _corridor_scan(0.0)
+        self.assertTrue(mapper.add_scan(0.0, ranges, angles))
+        for t in range(1, 10):
+            mapper._last_match_mono = 0.0
+            self.assertFalse(mapper.add_scan(float(t), ranges, angles))
+        mapper._last_match_mono = 0.0
+        self.assertTrue(mapper.add_scan(10.0, ranges, angles))
+        self.assertEqual(mapper.diagnostics()["node_count"], 2)
+        self.assertEqual(mapper.diagnostics()["keyframes_skipped"], 9)
+
+    def test_rotation_alone_is_a_keyframe(self):
+        traj = [(0.0, (0.0, 0.0, 0.0)), (1.0, (0.0, 0.0, math.radians(6.0)))]
+        mapper = self._mapper(traj)
+        ranges, angles = _corridor_scan(0.0)
+        self.assertTrue(mapper.add_scan(0.0, ranges, angles))
+        mapper._last_match_mono = 0.0
+        self.assertTrue(mapper.add_scan(1.0, ranges, angles))
+
+    def test_replay_clock(self):
+        traj = [(0.0, (0.0, 0.0, 0.0)), (0.1, (0.5, 0.0, 0.0)), (0.2, (1.0, 0.0, 0.0))]
+        mapper = self._mapper(traj, match_hz=2.0)
+        clock = {"t": 0.0}
+        mapper._clock = lambda: clock["t"]
+        ranges, angles = _corridor_scan(0.0)
+        self.assertTrue(mapper.add_scan(0.0, ranges, angles))
+        clock["t"] = 0.1
+        self.assertFalse(mapper.add_scan(0.1, ranges, angles))   # < 1/hz on the scan clock
+        clock["t"] = 0.6
+        self.assertTrue(mapper.add_scan(0.2, ranges, angles))
+
+    def test_export_without_closures_skips_optimiser(self):
+        traj = [(0.0, (0.0, 0.0, 0.0)), (1.0, (0.5, 0.0, 0.0))]
+        mapper = self._mapper(traj)
+        ranges, angles = _corridor_scan(0.0)
+        mapper.add_scan(0.0, ranges, angles)
+        mapper._last_match_mono = 0.0
+        mapper.add_scan(1.0, ranges, angles)
+        ref = mapper.to_reference_map(session_id="t")
+        self.assertEqual(mapper.diagnostics()["optimize_count"], 0)
+        self.assertEqual(ref.trajectory.shape, (2, 4))
+
+    def test_window_edge_match_rejected(self):
+        from types import SimpleNamespace
+        from desktop.nav.slam.types import Pose2D
+        traj = [(0.0, (0.0, 0.0, 0.0)), (1.0, (0.5, 0.0, 0.0))]
+        slam = SlamConfig(match_hz=100.0, min_submap_evidence_cells=0)
+        mapper = PoseGraphMapper(slam_config=slam, fusion_config=FusionNoiseConfig(),
+                                 ekf=_MockEkf(traj))  # type: ignore[arg-type]
+
+        class _EdgeMatcher:
+            def search(self, *a, **k):
+                return SimpleNamespace(pose=Pose2D(9.0, 9.0, 0.0), improvement=50.0,
+                                       score=100.0, score_prior=50.0, accepted=True,
+                                       search_exhausted=True)
+        mapper._matcher = _EdgeMatcher()
+        ranges, angles = _corridor_scan(0.0)
+        mapper.add_scan(0.0, ranges, angles)
+        mapper._last_match_mono = 0.0
+        mapper.add_scan(1.0, ranges, angles)
+        n1 = mapper._nodes[1]
+        self.assertAlmostEqual(n1.x, 0.5, places=6)       # prior kept, not 9.0
+        self.assertEqual(mapper.diagnostics()["edge_rejects"], 1)
+
+    def test_edge_match_recentred_then_accepted(self):
+        """A correction bigger than the window: the first search ends on
+        the edge, the re-centred one settles inside → accepted."""
+        from types import SimpleNamespace
+        from desktop.nav.slam.types import Pose2D
+        traj = [(0.0, (0.0, 0.0, 0.0)), (1.0, (0.5, 0.0, 0.0))]
+        slam = SlamConfig(match_hz=100.0, min_submap_evidence_cells=0)
+        mapper = PoseGraphMapper(slam_config=slam, fusion_config=FusionNoiseConfig(),
+                                 ekf=_MockEkf(traj))  # type: ignore[arg-type]
+        calls = []
+
+        class _Matcher:
+            def search(self, pts, prior, *a, **k):
+                calls.append((prior.x, prior.y, prior.theta))
+                edge = len(calls) == 1
+                return SimpleNamespace(
+                    pose=Pose2D(prior.x, prior.y, prior.theta + (0.14 if edge else 0.12)),
+                    improvement=50.0, score=100.0, score_prior=50.0, accepted=True,
+                    search_exhausted=edge)
+        mapper._matcher = _Matcher()
+        ranges, angles = _corridor_scan(0.0)
+        mapper.add_scan(0.0, ranges, angles)
+        mapper._last_match_mono = 0.0
+        mapper.add_scan(1.0, ranges, angles)
+        self.assertEqual(len(calls), 2)
+        self.assertAlmostEqual(calls[1][2], 0.14, places=6)       # re-centred on the edge pose
+        self.assertAlmostEqual(mapper._nodes[1].theta, 0.26, places=6)
+        self.assertEqual(mapper.diagnostics()["edge_rejects"], 0)

@@ -297,6 +297,29 @@ def _hysteresis_occupied(
         marker = grown
 
 
+def despeckle_log_odds(
+    log_odds: np.ndarray,
+    *,
+    denoise_min_neighbors: int = 2,
+    occupied_low_log_odds: float = OCCUPIED_LOG_ODDS_LOW_THRESHOLD,
+) -> np.ndarray:
+    """Copy of ``log_odds`` with occupied cells that the hysteresis +
+    speckle filter rejects reset to 0 (unknown). The planner's driveable
+    layer re-thresholds raw log-odds, so without this a single leftover
+    speck (a person who stood by the parked robot, a stereo-edge pixel)
+    becomes a robot-radius blocked disc after inflation while MCL — which
+    gets the filtered mask — never sees it. Mapping export only; the editor
+    keeps raw values so the operator's own paint is never second-guessed."""
+    occupied = _hysteresis_occupied(
+        log_odds, high_thresh=OCCUPIED_LOG_ODDS_THRESHOLD,
+        low_thresh=occupied_low_log_odds)
+    if denoise_min_neighbors > 0:
+        occupied = _drop_speckle(occupied, min_neighbors=denoise_min_neighbors)
+    out = log_odds.astype(np.float32, copy=True)
+    out[(out > OCCUPIED_LOG_ODDS_THRESHOLD) & ~occupied] = 0.0
+    return out
+
+
 def build_reference_map_from_log_odds(
     log_odds: np.ndarray,
     *,

@@ -288,9 +288,8 @@ class TestRotationContest(unittest.TestCase):
 
         src, t = self._src_with_trip()
         seq0 = src.correction_summary()["n_discrete"]
-        src._scan_hist.append((t - 0.05, _scan(0.3, 0.2, 0.4)))
-        src._scan_hist.append((t + 1.2, _scan(0.3, 0.2, 0.42, seed=1)))  # ~1° turn
-        src._maybe_judge_rotation_contest(t + 1.2)
+        src._maybe_judge_rotation_contest(t - 0.05, _scan(0.3, 0.2, 0.4))
+        src._maybe_judge_rotation_contest(t + 1.2, _scan(0.3, 0.2, 0.42, seed=1))  # ~1° turn
         self.assertIsNone(src._ekf.rotation_contest())
         self.assertEqual(src.match_summary()["rotation_contests_imu_wins"], 1)
         self.assertGreater(src.correction_summary()["n_discrete"], seq0)
@@ -301,9 +300,8 @@ class TestRotationContest(unittest.TestCase):
         from desktop.localization.test_scan_rotation import _scan
 
         src, t = self._src_with_trip()
-        src._scan_hist.append((t - 0.05, _scan(0.3, 0.2, 0.4)))
-        src._scan_hist.append((t + 1.2, _scan(0.3, 0.2, 0.4 + 0.72, seed=1)))
-        src._maybe_judge_rotation_contest(t + 1.2)
+        src._maybe_judge_rotation_contest(t - 0.05, _scan(0.3, 0.2, 0.4))
+        src._maybe_judge_rotation_contest(t + 1.2, _scan(0.3, 0.2, 0.4 + 0.72, seed=1))
         self.assertIsNone(src._ekf.rotation_contest())
         self.assertEqual(src.match_summary()["rotation_contests_imu_wins"], 0)
         self.assertFalse(src._ekf.imu_trusted())
@@ -313,6 +311,6 @@ class TestRotationContest(unittest.TestCase):
 
         src, t = self._src_with_trip()
         trip_t1 = src._ekf.rotation_contest()[1]
-        src._scan_hist.append((t - 0.05, _scan(0.3, 0.2, 0.4)))
-        src._maybe_judge_rotation_contest(trip_t1 - 0.01)
+        src._maybe_judge_rotation_contest(t - 0.05, _scan(0.3, 0.2, 0.4))
+        src._maybe_judge_rotation_contest(trip_t1 - 0.01, _scan(0.3, 0.2, 0.4))
         self.assertIsNotNone(src._ekf.rotation_contest())

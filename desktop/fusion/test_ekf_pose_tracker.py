@@ -369,3 +369,24 @@ def _wrap(a: float) -> float:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRebindWorldTo(unittest.TestCase):
+    def test_seed_pose_becomes_world_pose(self) -> None:
+        ekf = EkfPoseTracker(noise=FusionNoiseConfig())
+        for i in range(250):
+            ekf.update_imu(_imu(100.0 + i * 0.01, 0.3))
+        ekf.update_odom(102.5, 1.0, 2.0, 0.3)
+        ekf.rebind_world_to((5.0, -3.0, math.pi / 2))
+        p = ekf.pose_at(102.5)
+        self.assertAlmostEqual(p[0], 5.0, places=6)
+        self.assertAlmostEqual(p[1], -3.0, places=6)
+        self.assertAlmostEqual(p[2], math.pi / 2, places=6)
+        # Drive 1 m along the robot's own x: world y grows (heading +90°).
+        for i in range(1, 11):
+            ts = 102.5 + 0.1 * i
+            ekf.update_imu(_imu(ts, 0.3))
+            ekf.update_odom(ts, 1.0 + 0.1 * i * math.cos(0.3), 2.0 + 0.1 * i * math.sin(0.3), 0.3)
+        p = ekf.pose_at(103.5)
+        self.assertAlmostEqual(p[0], 5.0, delta=0.05)
+        self.assertAlmostEqual(p[1], -2.0, delta=0.05)
