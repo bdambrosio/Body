@@ -221,3 +221,41 @@ stray ≤ 0.32 m. A 15 cm post centred (0.45 m gaps ≈ the padded footprint)
   `hier: path stream (...): sends goals routes max_send_gap max_path_age
   starved stale blocks replans max_replan` — plus a log line when Tier-3
   reports `starved` and a warning on `path_stale`.
+
+## Robot A/B, 2026-11-03 12:41–12:54 (Hallway_loop, 2 laps each)
+
+| | sub-goal lap 1 | sub-goal lap 2 | path lap 1 | path lap 2 |
+|---|---|---|---|---|
+| lap time | 159 s | 172 s | 160 s | 155 s |
+| mean speed | 0.172 | 0.158 | 0.170 | 0.171 m/s |
+| near-stopped (< 0.05 m/s) | 6.5 % | 14.2 % | 8.2 % | 6.0 % |
+| Tier-3 goals | 53 gotos / 2 laps | | 3 path goals / 2 laps | |
+| re-picks | 37 | | 0 | |
+| blocks | 1 × path_blocked_live near home → 10 s window + escalation | | 2 × path_blocked ~0.6 s at the ridge | |
+| interventions | 0 | | 0 | |
+
+Staleness (owner asked to monitor): max refresh gap 0.40 s, max path age
+seen by Tier-3 0.30 s, starved 0, stale 0, skipped refreshes 0 — ~3× margin
+on the 1 s / 2 s limits. Quiet re-plan 25–58 ms typical, 107 ms max.
+
+The two path-mode blocks were both at the floor ridge: the desktop EKF's
+IMU guard trusts the wheels for ~0.3 s until the scan contest sides with
+the IMU, so the refresh streamed in that window was rotated ~28° and ran
+into the wall (block point 0.8 m to the side). The drive cancelled and sent
+a fresh goal from the corrected pose 0.6 s later. The tight approach to
+marker 1 near the cabinet, which blocked in sub-goal mode (10:50 and 12:46),
+went through cleanly both laps.
+
+Follow-ups: hold refreshes while a wheel/IMU contest is open; the Pi prints
+its path stats only for goals that end on their own (not for cancelled ones).
+
+## After the A/B (2026-11-03)
+
+* Path mode is the default (`HierConfig.path_mode=True`, nav
+  `--path-mode/--no-path-mode`); without Pi caps or a costmap the sub-goal
+  hops still run.
+* Ridge fix: while the EKF has an open wheel/IMU rotation contest the drive
+  holds path refreshes (≤ `path_hold_on_contest_s` 0.6 s, inside the 1 s
+  ttl); the verdict bumps the correction seq → immediate re-plan + refresh.
+  `contest_holds` in the stats line.
+* The Pi prints its path stats for cancelled goals too.

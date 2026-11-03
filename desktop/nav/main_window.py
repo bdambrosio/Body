@@ -108,7 +108,7 @@ class NavMainWindow(QMainWindow):
         *,
         use_checkpoint_pose: bool = False,
         vlm_advisor: str = "act",
-        path_mode: bool = False,
+        path_mode: bool = True,
     ) -> None:
         super().__init__()
         self._path_mode = bool(path_mode)
@@ -2175,7 +2175,7 @@ def run_app(
     *,
     use_checkpoint_pose: bool = False,
     vlm_advisor: str = "act",
-    path_mode: bool = False,
+    path_mode: bool = True,
 ) -> int:
     app = QApplication.instance() or QApplication([])
     win = NavMainWindow(fuser, fuser_config, chassis, chassis_config,

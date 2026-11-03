@@ -393,6 +393,8 @@ def main() -> None:
             return
 
         if g is None:
+            if tracked_cmd_id is not None:
+                print_path_stats(tracked_cmd_id, "canceled")
             if was_active:
                 # Cancel/stop/drop while driving: command zero NOW instead of
                 # letting the motors coast on the last cmd_vel until timeout.

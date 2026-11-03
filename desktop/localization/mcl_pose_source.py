@@ -336,6 +336,11 @@ class MCLPoseSource(PoseSource):
             return None
         return time.monotonic() - recv
 
+    def heading_contest_open(self) -> bool:
+        """True while the EKF has an unresolved wheel-vs-IMU rotation dispute
+        (its heading is the wheels' until a scan verdict lands, ~0.1–0.3 s)."""
+        return self._ekf.rotation_contest() is not None
+
     def imu_yaw(self) -> Optional[float]:
         """Latest settled IMU yaw (unwrapped rad, IMU's own reference), or
         None. The checkpoint-pose provider differences consecutive values so

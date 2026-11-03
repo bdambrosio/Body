@@ -158,6 +158,25 @@ class TestPathMode(unittest.TestCase):
         self.assertEqual(hd._pstats["replans"], n + 1)
         self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
 
+    def test_refreshes_hold_while_wheel_imu_contest_is_open(self):
+        cm = _world()
+        hd, io, po = _drive(cm, ((2.5, 0.0),))
+        cid = io.paths[0]["cmd_id"]
+        io.set_status(cmd_id=cid, state="DRIVING", mode="follow")
+        po.doubt = True
+        po.heading_in_doubt = lambda: po.doubt
+        n = len(io.paths)
+        for k in range(1, 6):                      # 0.5 s of an open contest
+            hd.tick(0.1 * k)
+        self.assertEqual(len(io.paths), n)         # nothing streamed
+        hd.tick(0.75)                              # held past the cap: stream again
+        self.assertEqual(len(io.paths), n + 1)
+        po.doubt = False
+        hd.tick(1.2)
+        self.assertGreater(len(io.paths), n + 1)
+        self.assertEqual(hd._pstats["holds"], 1)
+        self.assertEqual(io.cancels, 0)
+
     def test_terminal_arrival_finishes(self):
         cm = _world()
         hd, io, po = _drive(cm, ((1.0, 0.0),))

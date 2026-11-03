@@ -50,9 +50,11 @@ def _parse_args(argv):
         help="Reference map (reference_map.npz or legacy layers.npz). Required.",
     )
     p.add_argument(
-        "--path-mode", action="store_true",
-        help="Nav redesign step 3: stream the global path to Tier-3 (goto kind "
-             "'path') instead of sub-goals. Needs a Pi with caps ['path'].",
+        "--path-mode", action=argparse.BooleanOptionalAction, default=True,
+        help="Nav redesign step 3 (default on since the 11-03 robot A/B): stream "
+             "the global path to Tier-3 (goto kind 'path') instead of sub-goals. "
+             "Used only when the Pi reports caps ['path']; --no-path-mode forces "
+             "the old sub-goal hops.",
     )
     p.add_argument(
         "--relocate-on-load", action="store_true",

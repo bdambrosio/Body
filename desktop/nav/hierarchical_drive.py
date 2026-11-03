@@ -150,6 +150,12 @@ class PFPoseProvider:
         pose, ts = latest
         return (float(pose[0]), float(pose[1]), float(pose[2])), float(ts)
 
+    def heading_in_doubt(self) -> bool:
+        """An open wheel/IMU rotation contest: the heading may be off by the
+        disputed angle until the scan verdict (11-03 ridge)."""
+        fn = getattr(self._fuser.pose_source, "heading_contest_open", None)
+        return bool(callable(fn) and fn())
+
     def correction_seq(self) -> int:
         # Best-effort: the PF's *discrete*-correction count (relocates,
         # rebinds, posterior jumps past the discrete gates). NOT n_applied —
@@ -283,13 +289,18 @@ class HierConfig:
     # Nav redesign step 3: stream the global path to Tier-3 (goto kind
     # "path") instead of handing it one sub-goal at a time. Used only when
     # the Pi advertises caps ["path"]; otherwise the sub-goal hops remain.
-    path_mode: bool = False
+    path_mode: bool = True                # robot A/B 11-03: as good or better on every measure
     path_stream_hz: float = 4.0           # refresh rate (re-anchored from the live pose)
     path_replan_s: float = 1.0            # quiet global re-plan while following
     path_ttl_s: float = 1.0               # Tier-3: crawl after this, stop after 2×
     path_horizon_m: float = 4.0           # streamed length (≤ ~40 points at path_step_m)
     path_step_m: float = 0.10
     path_block_stamp_s: float = 20.0      # a path_blocked point is lethal for planning this long
+    # While the EKF disputes wheel vs IMU rotation (floor ridge), the pose may
+    # be ~25° off for ~0.3 s until the scan verdict: don't stream a path
+    # rotated by that (11-03: two path_blocked into the wall). Hold the last
+    # refresh at most this long — well inside path_ttl_s.
+    path_hold_on_contest_s: float = 0.6
     # Pose doubt (explore plan A2): the pose is fresh but the map no longer
     # supports it (scan-match quality collapsed, or the robot is off the
     # map). "log" = warn once per episode only (default until the
@@ -466,6 +477,7 @@ class HierarchicalDrive:
         self._path_block_world: List[Tuple[float, float]] = []
         self._path_block_at = -1e9
         self._path_mode_seen: Optional[str] = None
+        self._doubt_hold_since: Optional[float] = None
         self._pstats_reset()
 
     # ── Control ──────────────────────────────────────────────────────
@@ -484,7 +496,7 @@ class HierarchicalDrive:
     def _pstats_reset(self) -> None:
         self._pstats = {"sends": 0, "new_goals": 0, "routes": 0, "max_send_gap_s": 0.0,
                         "max_path_age_s": 0.0, "starved": 0, "stale": 0, "blocks": 0,
-                        "replans": 0, "max_replan_ms": 0.0}
+                        "replans": 0, "max_replan_ms": 0.0, "holds": 0}
 
     def _pstats_log(self, why: str) -> None:
         """Staleness monitoring (owner, 11-03): one line per via / stop."""
@@ -493,9 +505,9 @@ class HierarchicalDrive:
             return
         logger.info("hier: path stream (%s): sends=%d goals=%d routes=%d max_send_gap=%.2fs "
                     "max_path_age=%.2fs starved=%d stale=%d blocks=%d replans=%d "
-                    "max_replan=%.0fms", why, st["sends"], st["new_goals"], st["routes"],
-                    st["max_send_gap_s"], st["max_path_age_s"], st["starved"], st["stale"],
-                    st["blocks"], st["replans"], st["max_replan_ms"])
+                    "max_replan=%.0fms contest_holds=%d", why, st["sends"], st["new_goals"],
+                    st["routes"], st["max_send_gap_s"], st["max_path_age_s"], st["starved"],
+                    st["stale"], st["blocks"], st["replans"], st["max_replan_ms"], st["holds"])
         self._pstats_reset()
 
     def _to(self, state: HierState) -> None:
@@ -1671,6 +1683,16 @@ class HierarchicalDrive:
             return
 
         now = self._tick_now
+        doubt = bool(getattr(self._pose, "heading_in_doubt", lambda: False)())
+        if doubt:
+            if self._doubt_hold_since is None:
+                self._doubt_hold_since = now
+                self._pstats["holds"] += 1
+                logger.info("hier: wheel/IMU contest open — holding path refreshes")
+            if now - self._doubt_hold_since < self._cfg.path_hold_on_contest_s:
+                return                            # Tier-3 keeps the last good path
+        else:
+            self._doubt_hold_since = None
         cur_seq = self._pose_correction_seq()
         if cur_seq != self._sent_correction_seq:
             # A discrete pose correction: the path was planned from the old
