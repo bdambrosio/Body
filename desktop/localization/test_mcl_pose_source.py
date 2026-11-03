@@ -422,3 +422,22 @@ class TestUpdateMany(unittest.TestCase):
         s.update_many(jumped)
         self.assertEqual(s.match_summary()["teleports"], 1)
         self.assertLess(s._mcl.posterior_mean()[0] - 2.0, 0.5)   # the 1 m jump was not driven
+
+
+class TestOdomFreshnessOnFailure(unittest.TestCase):
+    def test_failed_step_leaves_odom_stale(self):
+        src = MCLPoseSource(
+            _corridor_map(), pf_config=ParticleFilterConfig(n_particles=50, device="cpu"),
+            config=MCLPoseSourceConfig(min_evidence_cells=50))
+        src.update_many([(1.0, 0.0, 0.0, 0.0, "s", 0)])
+        self.assertLess(src.odom_age_s(), 0.5)
+        src._last_odom_recv_mono -= 10.0
+
+        def boom(*a, **k):
+            raise RuntimeError("CUDA error: the launch timed out")
+        src._mcl_step = boom
+        with self.assertRaises(RuntimeError):
+            src.update_many([(1.02, 0.0, 0.0, 0.0, "s", 1)])
+        with self.assertRaises(RuntimeError):
+            src.update(1.04, 0.0, 0.0, 0.0)
+        self.assertGreater(src.odom_age_s(), 9.0)       # drive sees a stale pose -> stops

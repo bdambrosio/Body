@@ -262,8 +262,14 @@ class LocalizationController:
                 continue
             try:
                 self._ingest_odom(batch)
+                self._odom_failures = 0
             except Exception:
-                logger.exception("odom worker: update failed")
+                # Pose stops updating and odom goes stale (MCLPoseSource
+                # stamps freshness only on success), so the drive stops.
+                self._odom_failures = getattr(self, "_odom_failures", 0) + 1
+                if self._odom_failures in (1, 10) or self._odom_failures % 500 == 0:
+                    logger.exception("odom worker: update failed (%d in a row) — "
+                                     "localization is NOT updating", self._odom_failures)
 
     def _ingest_odom(self, batch: list) -> None:
         many = getattr(self.pose_source, "update_many", None)

@@ -192,13 +192,14 @@ class MCLPoseSource(PoseSource):
         session_id: Optional[str] = None, seq: Optional[int] = None,
     ) -> None:
         self._counters["odom_seen"] += 1
-        # Stamp desktop receive time (monotonic) on every odom, before any
-        # early return, so odom_age_s() reflects true receipt regardless of
-        # Pi clock or seeding/teleport branches below.
-        self._last_odom_recv_mono = time.monotonic()
         odom_reset = self._ekf.update_odom(
             ts, x, y, theta, session_id=session_id, seq=seq)
         self._mcl_step(ts, x, y, theta, odom_reset)
+        # Stamped only after the step succeeded (early returns inside it are
+        # normal): if the filter raises (11-03: dead CUDA context), odom must
+        # go stale so the drive's freshness gate stops the robot instead of
+        # driving on a frozen pose.
+        self._last_odom_recv_mono = time.monotonic()
 
     def update_many(self, samples: List[Tuple[float, float, float, float, Optional[str], Optional[int]]]) -> None:
         """Ingest a backlog of odom samples (ts, x, y, theta, session_id, seq)
@@ -209,7 +210,6 @@ class MCLPoseSource(PoseSource):
         0.5-120 s behind under desktop load and the robot got lost."""
         if not samples:
             return
-        self._last_odom_recv_mono = time.monotonic()
         cfg = self._config
         n = len(samples)
         prev = None
@@ -228,6 +228,7 @@ class MCLPoseSource(PoseSource):
             prev = (ts, x, y, theta)
         if n > 1:
             self._counters["odom_coalesced"] = self._counters.get("odom_coalesced", 0) + n - 1
+        self._last_odom_recv_mono = time.monotonic()      # only on success (see update)
 
     def _mcl_step(self, ts: float, x: float, y: float, theta: float, odom_reset: bool) -> None:
         with self._lock:

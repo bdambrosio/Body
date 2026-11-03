@@ -65,13 +65,9 @@ def _parse_args(argv):
 
 
 def _resolve_device(choice: str) -> str:
-    if choice != "auto":
-        return choice
-    try:
-        import torch
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except ImportError:
-        return "cpu"
+    # "auto" = CPU: the GPU is shared with vLLM, and a CUDA context it
+    # starves gets killed by the driver (11-03 Xid 8). See desktop/nav/__main__.
+    return "cpu" if choice == "auto" else choice
 
 
 def _build_localizer(router: str, args):

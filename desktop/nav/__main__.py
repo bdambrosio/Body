@@ -118,13 +118,12 @@ def _parse_args(argv):
 
 
 def _resolve_device(choice: str) -> str:
-    if choice != "auto":
-        return choice
-    try:
-        import torch
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except ImportError:
-        return "cpu"
+    # "auto" = CPU. 11-03: on CUDA the filter shared the RTX PRO 6000 with
+    # vLLM; a kernel queued > 7 s behind it, the driver killed the context
+    # (Xid 8, sticky error), every later odom update failed and the robot
+    # froze mid-patrol. 5000 particles on CPU: predict 0.2 ms, scan 20 ms.
+    # Pass --pf-device cuda explicitly to use a GPU.
+    return "cpu" if choice == "auto" else choice
 
 
 def main(argv=None) -> int:
