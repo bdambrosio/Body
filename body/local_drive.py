@@ -225,12 +225,15 @@ def main() -> None:
         )
 
     build = git_sha()
+    CAPS = ["path"]                         # goto kinds beyond the point goto (desktop checks)
 
     def publish_status(state: str, *, cmd_id: int, goal_body=None,
                        dist=0.0, v=0.0, omega=0.0, reason=None, mode=None,
                        path_body=None, plan_reason=None, watermark=None,
                        depth_hits=None, depth_seq=None, depth_bbox_px=None,
-                       depth_hit_body=None, depth_would_block=False) -> None:
+                       depth_hit_body=None, depth_would_block=False,
+                       path_seq=None, path_progress_m=None, path_age_s=None,
+                       block_body_xy=None) -> None:
         zenoh_helpers.publish_json(
             session, "body/drive/status",
             schemas.drive_status(
@@ -243,12 +246,16 @@ def main() -> None:
                 depth_hit_body=rounded_xy(depth_hit_body, 32),
                 depth_mem_body=mem_body,
                 depth_would_block=depth_would_block,
+                path_seq=path_seq, path_progress_m=path_progress_m,
+                path_age_s=path_age_s, block_body_xy=block_body_xy,
+                caps=CAPS,
             ),
         )
 
     # Main-loop-only state.
     mem_body = None                         # depth memory, live body frame, per tick
     tracked_cmd_id: Optional[int] = None
+    tracked_path_seq: Optional[int] = None
     was_active = False                      # commanded motion last tick
     imu_guard = cfg.get("imu_guard", {})
     yaw_corr = ImuYawCorrector(             # IMU-vs-wheel yaw divergence per goal
@@ -259,8 +266,51 @@ def main() -> None:
     )
     last_exc_print = 0.0
 
+    def anchor_pose_for(g: Dict[str, Any], odom: Dict[str, Any], odom_theta: float, *,
+                        allow_latest: bool):
+        """Odom pose the goal's body frame refers to (ring at anchor_ts), the
+        latest odom if allowed, else None."""
+        anchor = None
+        with lock:
+            if g.get("anchor_ts") is not None:
+                anchor = ring.pose_at(float(g["anchor_ts"]))
+            latest = ring.latest()
+        if anchor is None and allow_latest:
+            anchor = latest[1] if latest else (
+                float(odom["x"]), float(odom["y"]), odom_theta)
+        return anchor
+
+    def path_goal(g: Dict[str, Any], cmd_id: int, anchor) -> Tier3Goal:
+        pts = [(float(p[0]), float(p[1])) for p in g["path_xy"]]
+        if str(g.get("frame", "odom")) == "body":
+            pts = [body_to_odom(p, anchor) for p in pts]
+        return Tier3Goal(
+            cmd_id=cmd_id, x=pts[-1][0], y=pts[-1][1],
+            tol=float(g.get("arrival_tol_m") or t3_cfg.params.arrival_tol_m),
+            final_heading=(float(g["final_heading_rad"])
+                           if g.get("final_heading_rad") is not None else None),
+            v_max=float(g["v_max"]) if g.get("v_max") is not None else None,
+            omega_max=(float(g["omega_max"]) if g.get("omega_max") is not None else None),
+            path=tuple(pts), end_is_goal=bool(g.get("end_is_goal", True)),
+            ttl_s=float(g["ttl_s"]) if g.get("ttl_s") is not None else None,
+            route_id=int(g.get("route_id", 0)), path_seq=int(g.get("path_seq", 0)))
+
+    def print_path_stats(cmd_id: Optional[int], why: str) -> None:
+        g = ctrl.goal
+        if g is None or g.path is None:
+            return
+        st = ctrl.path_stats
+        print(f"local_drive: path goal {cmd_id} {why}: refreshes={st['refreshes']} "
+              f"max_gap={st['max_gap_s']:.2f}s starved={st['starved_episodes']} "
+              f"stale_blocks={st['stale_blocks']} skipped_refreshes={path_skips[0]}",
+              flush=True)
+
+    path_skips = [0]                        # refreshes dropped: anchor_ts outside the odom ring
+    stale_noted = [False]
+
     def drop_goal(reason: str) -> None:
         nonlocal tracked_cmd_id
+        print_path_stats(tracked_cmd_id, f"dropped ({reason})")
         with lock:
             cid = arb.drop(reason)
         ctrl.clear()
@@ -269,7 +319,7 @@ def main() -> None:
             print(f"local_drive: goal {cid} dropped ({reason})", flush=True)
 
     def tick(now_wall: float, now_mono: float) -> None:
-        nonlocal tracked_cmd_id, was_active, odom_reset_pending, imu_rebaseline, mem_body
+        nonlocal tracked_cmd_id, tracked_path_seq, was_active, odom_reset_pending, imu_rebaseline, mem_body
         nonlocal mem_reset_reason, last_done
         with lock:
             rejects = arb.take_rejects()
@@ -380,32 +430,51 @@ def main() -> None:
                     float(q["w"]), float(q["x"]), float(q["y"]), float(q["z"]))
 
         # New goal → anchor it in odom and reset per-goal state.
+        is_path = g.get("kind") == "path"
         if cmd_id != tracked_cmd_id:
+            if tracked_cmd_id is not None:
+                print_path_stats(tracked_cmd_id, "superseded")
             tracked_cmd_id = cmd_id
+            tracked_path_seq = int(g.get("path_seq", 0)) if is_path else None
+            path_skips[0] = 0
             yaw_corr.reset()    # goal frame = odom frame as of now
-            gx, gy = float(g["x_m"]), float(g["y_m"])
-            if str(g.get("frame", "odom")) == "body":
-                anchor = None
+            anchor = anchor_pose_for(g, odom, odom_theta, allow_latest=True)
+            if (str(g.get("frame", "odom")) == "body" and g.get("anchor_ts") is not None):
                 with lock:
-                    if g.get("anchor_ts") is not None:
-                        anchor = ring.pose_at(float(g["anchor_ts"]))
-                    latest = ring.latest()
-                if anchor is None:
-                    anchor = latest[1] if latest else (
-                        float(odom["x"]), float(odom["y"]), odom_theta)
+                    in_ring = ring.pose_at(float(g["anchor_ts"])) is not None
+                if not in_ring:
                     print(f"local_drive: body goal {cmd_id} anchor_ts "
                           f"{g.get('anchor_ts')!r} outside odom buffer — "
                           "anchored at latest odom", flush=True)
-                gx, gy = body_to_odom((gx, gy), anchor)
-            ctrl.start_goal(Tier3Goal(
-                cmd_id=cmd_id, x=gx, y=gy,
-                tol=float(g.get("arrival_tol_m") or t3_cfg.params.arrival_tol_m),
-                final_heading=(float(g["final_heading_rad"])
-                               if g.get("final_heading_rad") is not None else None),
-                v_max=float(g["v_max"]) if g.get("v_max") is not None else None,
-                omega_max=(float(g["omega_max"])
-                           if g.get("omega_max") is not None else None),
-            ), now_mono, (float(odom["x"]), float(odom["y"]), odom_theta))
+            if is_path:
+                ctrl.start_goal(path_goal(g, cmd_id, anchor), now_mono,
+                                (float(odom["x"]), float(odom["y"]), odom_theta))
+            else:
+                gx, gy = float(g["x_m"]), float(g["y_m"])
+                if str(g.get("frame", "odom")) == "body":
+                    gx, gy = body_to_odom((gx, gy), anchor)
+                ctrl.start_goal(Tier3Goal(
+                    cmd_id=cmd_id, x=gx, y=gy,
+                    tol=float(g.get("arrival_tol_m") or t3_cfg.params.arrival_tol_m),
+                    final_heading=(float(g["final_heading_rad"])
+                                   if g.get("final_heading_rad") is not None else None),
+                    v_max=float(g["v_max"]) if g.get("v_max") is not None else None,
+                    omega_max=(float(g["omega_max"])
+                               if g.get("omega_max") is not None else None),
+                ), now_mono, (float(odom["x"]), float(odom["y"]), odom_theta))
+        elif is_path and int(g.get("path_seq", 0)) != tracked_path_seq:
+            # Refresh of the active path: re-anchor it from the sender's fresh
+            # world pose. Never mis-anchor: a refresh whose anchor_ts is
+            # outside the odom ring is skipped (the next one will do).
+            tracked_path_seq = int(g.get("path_seq", 0))
+            anchor = anchor_pose_for(g, odom, odom_theta, allow_latest=False)
+            if anchor is None and str(g.get("frame", "odom")) == "body":
+                path_skips[0] += 1
+            else:
+                # The path is re-anchored on raw odom; restart the IMU-vs-wheel
+                # divergence with it so the two stay in one frame.
+                yaw_corr.reset()
+                ctrl.update_path(path_goal(g, cmd_id, anchor), now_mono)
 
         # Heading = wheel odom + the IMU-vs-wheel divergence since the goal
         # started (wheel odom misses externally forced rotation).
@@ -438,8 +507,15 @@ def main() -> None:
                        path_body=r.path_body, plan_reason=r.plan_reason,
                        depth_hits=r.depth_hits, depth_seq=r.depth_seq,
                        depth_bbox_px=r.depth_bbox_px, depth_hit_body=r.depth_hit_body,
-                       depth_would_block=r.depth_would_block)
+                       depth_would_block=r.depth_would_block,
+                       path_seq=r.path_seq, path_progress_m=r.path_progress_m,
+                       path_age_s=r.path_age_s, block_body_xy=r.block_body_xy)
+        if r.reason == "path_stale" and not stale_noted[0]:
+            print(f"local_drive: path goal {cmd_id} STALE — no refresh for "
+                  f"{r.path_age_s:.2f}s, stopped", flush=True)
+        stale_noted[0] = r.reason == "path_stale"
         if r.done:
+            print_path_stats(cmd_id, r.state)
             if r.state == STATE_ARRIVED and r.plan_reason:
                 print(f"local_drive: goal {cmd_id} ARRIVED at {r.plan_reason} "
                       f"endpoint (residual {r.dist:.2f} m)", flush=True)

@@ -399,6 +399,27 @@ def relative_pose(ref: Pose, pose: Pose) -> Pose:
     return (x, y, wrap_pi(pose[2] - ref[2]))
 
 
+MAX_PATH_POINTS = 200
+
+
+def _valid_path_msg(msg: Dict[str, Any]) -> bool:
+    """``kind: "path"``: ``path_xy`` 2..MAX_PATH_POINTS finite [x, y] pairs,
+    integer ``path_seq`` / ``route_id``, optional finite ``ttl_s`` > 0."""
+    pts = msg.get("path_xy")
+    if not isinstance(pts, (list, tuple)) or not 2 <= len(pts) <= MAX_PATH_POINTS:
+        return False
+    try:
+        for p in pts:
+            if len(p) != 2 or not all(math.isfinite(float(v)) for v in p):
+                return False
+        int(msg.get("path_seq", 0)); int(msg.get("route_id", 0))
+        if msg.get("ttl_s") is not None and not float(msg["ttl_s"]) > 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 class GotoArbiter:
     """``body/drive/goto`` acceptance, supersede watermark and the status that
     stands in for "no active goal" (pure; the caller holds the lock).
@@ -443,6 +464,15 @@ class GotoArbiter:
                 self.pending_canceled = revoked
             return "canceled"
         if cmd_id == self.watermark:
+            # Path mode (step 3): the same cmd_id with a higher path_seq is a
+            # refresh of the active path — swap it in, no restart.
+            if (kind == "path" and self.goal is not None
+                    and int(self.goal.get("cmd_id", -1)) == cmd_id
+                    and self.goal.get("kind") == "path"
+                    and _valid_path_msg(msg)
+                    and int(msg.get("path_seq", 0)) > int(self.goal.get("path_seq", 0))):
+                self.goal = dict(msg)
+                return "path_update"
             # A resend of the command already taken (the desktop re-sends
             # until it sees a status with its cmd_id): idempotent — status
             # for this id is already flowing, so neither restart nor reject.
@@ -452,7 +482,11 @@ class GotoArbiter:
             return "rejected"
         frame = str(msg.get("frame", "odom"))
         try:
-            float(msg["x_m"]); float(msg["y_m"])
+            if kind == "path":
+                if not _valid_path_msg(msg):
+                    raise ValueError("bad path")
+            else:                                 # goto (and, as before, any other kind)
+                float(msg["x_m"]); float(msg["y_m"])
             for k in ("arrival_tol_m", "final_heading_rad", "v_max"):
                 if msg.get(k) is not None:
                     float(msg[k])

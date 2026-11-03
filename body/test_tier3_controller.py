@@ -546,6 +546,185 @@ class TestEndpointLatch(unittest.TestCase):
         self.assertIsNone(ctrl.endpoint_odom)
 
 
+class PathSim(Sim):
+    """Sim driving a path goal, refreshed every ``refresh_s`` (None = never)."""
+
+    def __init__(self, segs, path, *, end_is_goal=True, ttl_s=1.0, refresh_s=0.25,
+                 cfg=T3, pose=(0.0, 0.0, 0.0), tol=0.12, stop_refresh_at=None):
+        super().__init__(segs, path[-1], pose=pose, tol=tol, cfg=cfg)
+        self.path = [tuple(p) for p in path]
+        self.end_is_goal, self.ttl_s = end_is_goal, ttl_s
+        self.refresh_s, self.stop_refresh_at = refresh_s, stop_refresh_at
+        self.seq = 1
+        self.route_id = 1
+        self.ctrl.start_goal(self._goal(), 0.0, pose)
+        self.next_refresh = refresh_s
+
+    def _goal(self):
+        return Tier3Goal(1, self.path[-1][0], self.path[-1][1], 0.12, path=tuple(self.path),
+                         end_is_goal=self.end_is_goal, ttl_s=self.ttl_s,
+                         route_id=self.route_id, path_seq=self.seq)
+
+    def refresh(self, path=None, route_id=None):
+        if path is not None:
+            self.path = [tuple(p) for p in path]
+        if route_id is not None:
+            self.route_id = route_id
+        self.seq += 1
+        self.ctrl.update_path(self._goal(), self.t)
+
+    def run(self, T=30.0, until=None):
+        dt = 0.1
+        r = None
+        while self.t < T:
+            if (self.refresh_s is not None and self.t >= self.next_refresh
+                    and (self.stop_refresh_at is None or self.t < self.stop_refresh_at)):
+                self.refresh()
+                self.next_refresh += self.refresh_s
+            g, m = rasterize_scan(raycast(self.pose, self.segs), 0.0, 2 * math.pi / N_BEAMS, RASTER)
+            r = self.ctrl.step(now_mono=self.t, now_wall=self.t, pose_now=self.pose,
+                               pose_scan=self.pose, grid=g, meta=m)
+            self.results.append(r)
+            self.min_clear = min(self.min_clear, min_clearance(self.pose, self.segs))
+            if r.done or r.terminal or (until is not None and until(r)):
+                return r
+            v, w = self.motor(*(r.cmd or (0.0, 0.0)))
+            x, y, th = self.pose
+            self.pose = (x + v * math.cos(th) * dt, y + v * math.sin(th) * dt, th + w * dt)
+            self.poses.append(self.pose)
+            self.t += dt
+        return r
+
+
+def _line(x0, y0, x1, y1, step=0.1):
+    n = max(1, int(round(math.hypot(x1 - x0, y1 - y0) / step)))
+    return [(x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n) for k in range(n + 1)]
+
+
+CORRIDOR = [(-0.5, -0.6, 6.0, -0.6), (-0.5, 0.6, 6.0, 0.6)]
+
+
+class TestPathMode(unittest.TestCase):
+    """Nav redesign step 3: Tier-3 follows a streamed path."""
+
+    def test_follows_and_arrives_without_slowing_at_refreshes(self):
+        sim = PathSim(CORRIDOR, _line(0, 0, 4.0, 0))
+        r = sim.run(40.0)
+        self.assertEqual(r.state, STATE_ARRIVED)
+        self.assertNotIn("path_blocked", sim.reasons())
+        mid = [x.v for x in sim.results if x.path_progress_m and 0.8 < x.path_progress_m < 3.0]
+        self.assertGreater(min(mid), 0.9 * T3.params.v_max)   # refreshes don't slow it
+        self.assertGreater(sim.ctrl.path_stats["refreshes"], 50)
+
+    def test_curved_path_round_a_corner(self):
+        segs = [(-0.5, -0.6, 2.6, -0.6), (2.6, -0.6, 2.6, 3.0),
+                (-0.5, 0.6, 1.4, 0.6), (1.4, 0.6, 1.4, 3.0)]
+        path = _line(0, 0, 2.0, 0) + _line(2.0, 0, 2.0, 2.5)[1:]
+        sim = PathSim(segs, path)
+        r = sim.run(40.0)
+        self.assertEqual(r.state, STATE_ARRIVED)
+        self.assertGreater(sim.min_clear, 0.11)
+
+    def test_obstacle_on_path_rejoins_within_limit(self):
+        # Centred (two equal sides: the side latch must stop the flip-flop)
+        # and off-centre posts.
+        for r_, y in ((0.08, 0.0), (0.08, 0.05), (0.15, -0.1), (0.15, 0.2)):
+            with self.subTest(radius=r_, y=y):
+                segs = CORRIDOR + post(1.6, y, r_)
+                sim = PathSim(segs, _line(0, 0, 4.0, 0))
+                r = sim.run(50.0)
+                self.assertEqual(r.state, STATE_ARRIVED)
+                self.assertIn("rejoin", [x.mode for x in sim.results])
+                self.assertGreater(sim.min_clear, 0.11)
+                self.assertLessEqual(max(abs(p[1]) for p in sim.poses), 0.5)
+
+    def test_gap_at_footprint_limit_is_a_clean_block(self):
+        # 0.15 m post centred in a 1.2 m corridor: 0.45 m each side, about
+        # the padded footprint. Point mode ends boxed_in beside it; path mode
+        # must stop clear of it and report where.
+        segs = CORRIDOR + post(1.6, 0.0, 0.15)
+        sim = PathSim(segs, _line(0, 0, 4.0, 0))
+        r = sim.run(20.0, until=lambda x: x.reason == "path_blocked" or x.state == STATE_ARRIVED)
+        if r.reason == "path_blocked":
+            self.assertIsNotNone(r.block_body_xy)
+        self.assertGreater(sim.min_clear, 0.11)
+
+    def test_wall_across_path_is_path_blocked_with_location(self):
+        segs = CORRIDOR + [(1.5, -0.6, 1.5, 0.6)]
+        sim = PathSim(segs, _line(0, 0, 4.0, 0))
+        r = sim.run(20.0, until=lambda x: x.reason == "path_blocked")
+        self.assertEqual(r.reason, "path_blocked")
+        bx, by = r.block_body_xy
+        self.assertGreater(bx, 0.9)
+        self.assertLess(bx, 1.6 - sim.pose[0] + 0.1)
+        self.assertLess(min_clearance(sim.pose, segs), 1.5)
+        self.assertGreater(sim.min_clear, 0.11)
+
+    def test_detour_beyond_limit_is_blocked_not_taken(self):
+        # A 1.4 m wide box on the path in a wide room: going round strays
+        # > 0.5 m, so Tier-3 reports the block instead of detouring.
+        segs = [(1.5, -0.7, 1.7, -0.7), (1.7, -0.7, 1.7, 0.7),
+                (1.7, 0.7, 1.5, 0.7), (1.5, 0.7, 1.5, -0.7)]
+        sim = PathSim(segs, _line(0, 0, 4.0, 0))
+        r = sim.run(20.0, until=lambda x: x.reason == "path_blocked")
+        self.assertEqual(r.reason, "path_blocked")
+        self.assertLessEqual(max(abs(p[1]) for p in sim.poses), 0.5)
+
+    def test_stale_path_crawls_then_stops_then_resumes(self):
+        sim = PathSim(CORRIDOR, _line(0, 0, 5.0, 0), stop_refresh_at=2.0, ttl_s=1.0)
+        r = sim.run(8.0, until=lambda x: x.reason == "path_stale")
+        self.assertEqual(r.reason, "path_stale")
+        starved = [x for x in sim.results if x.mode == "starved"]
+        self.assertTrue(starved)
+        self.assertTrue(all(x.v <= T3.params.v_min_mps + 1e-9 for x in starved))
+        t_stale = sim.t
+        self.assertGreater(t_stale, 3.7)          # last refresh 1.75 s + 2 × ttl
+        self.assertLess(t_stale, 4.0)
+        self.assertEqual(sim.ctrl.path_stats["stale_blocks"], 1)
+        sim.stop_refresh_at = None
+        sim.next_refresh = sim.t
+        r = sim.run(sim.t + 2.0, until=lambda x: x.mode == "follow" and x.v > 0.1)
+        self.assertEqual(r.mode, "follow")
+
+    def test_horizon_end_holds_until_extended(self):
+        sim = PathSim(CORRIDOR, _line(0, 0, 1.5, 0), end_is_goal=False)
+        sim.run(20.0, until=lambda x: x.mode == "starved" and x.v == 0.0 and x.omega == 0.0)
+        self.assertNotEqual(sim.results[-1].state, STATE_ARRIVED)
+        self.assertGreater(sim.pose[0], 1.3)
+        held_at = sim.pose[0]
+        sim.run(sim.t + 3.0)                     # still not extended: stays put
+        self.assertAlmostEqual(sim.pose[0], held_at, delta=0.02)
+        sim.refresh(path=_line(sim.pose[0], 0, 3.5, 0))
+        sim.end_is_goal = True
+        r = sim.run(sim.t + 30.0)
+        self.assertEqual(r.state, STATE_ARRIVED)
+
+    def test_stalled_robot_still_trips_no_progress_despite_refreshes(self):
+        sim = PathSim(CORRIDOR, _line(0, 0, 4.0, 0))
+        sim.motor = lambda v, w: (0.0, 0.0)       # wheels commanded, nothing moves
+        r = sim.run(10.0, until=lambda x: x.reason == "no_progress")
+        self.assertEqual(r.reason, "no_progress")
+        self.assertLess(sim.t, T3.no_progress_timeout_s + 1.0)
+
+    def test_no_deadline_in_path_mode(self):
+        cfg = replace(T3, goal_deadline_s=5.0)
+        sim = PathSim(CORRIDOR, _line(0, 0, 4.0, 0), cfg=cfg)
+        r = sim.run(60.0)
+        self.assertEqual(r.state, STATE_ARRIVED)
+        self.assertGreater(sim.t, 15.0)
+
+    def test_new_route_id_clears_a_terminal_block(self):
+        sim = PathSim(CORRIDOR, _line(0, 0, 4.0, 0))
+        sim.ctrl.terminal = "rotate_timeout"
+        r = sim.ctrl.step(now_mono=0.0, now_wall=0.0, pose_now=sim.pose, pose_scan=None,
+                          grid=None, meta=None)
+        self.assertTrue(r.terminal)
+        sim.refresh()                             # same route: still terminal
+        self.assertEqual(sim.ctrl.terminal, "rotate_timeout")
+        sim.refresh(route_id=2)                   # re-planned: the resume
+        self.assertIsNone(sim.ctrl.terminal)
+
+
 if __name__ == "__main__":
     unittest.main()
 

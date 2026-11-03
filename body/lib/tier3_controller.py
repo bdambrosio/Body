@@ -51,6 +51,10 @@ from body.lib.local_planner import (
     LocalPlanConfig, lookahead_on_path, path_cost, path_remaining_m,
     plan_local, transform_path, trim_path,
 )
+from body.lib.path_follow import (
+    PathFollowConfig, cumulative, first_blocked, max_deviation, point_at, project,
+    raster_lookup, rejoin_index, resample,
+)
 
 Point2 = Tuple[float, float]
 Pose = Tuple[float, float, float]
@@ -103,6 +107,7 @@ class Tier3Config:
     terminal_zero_ticks: int = 3           # zero cmds after a terminal block, then silent
     slow_retry: bool = True                # fix 4 retries before re-aiming
     seal_unknown_next_to_hits: bool = True # planner: unknown touching a hit is wall
+    path: PathFollowConfig = PathFollowConfig()   # path mode (goto kind "path", step 3)
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,16 @@ class Tier3Goal:
     final_heading: Optional[float] = None
     v_max: Optional[float] = None
     omega_max: Optional[float] = None
+    # Path mode (nav redesign step 3): ``path`` is a robot-first polyline in
+    # the odom frame and (x, y) is its end. ``route_id`` changes only when the
+    # sender re-planned (a refresh with the same route_id is just a newer
+    # copy); ``end_is_goal`` False = the end is the sender's horizon, not a
+    # place to stop.
+    path: Optional[Tuple[Point2, ...]] = None
+    end_is_goal: bool = True
+    ttl_s: Optional[float] = None
+    route_id: int = 0
+    path_seq: int = 0
 
 
 def goal_params(base: DriveParams, g: "Tier3Goal") -> DriveParams:
@@ -146,6 +161,11 @@ class TickResult:
     depth_bbox_px: Optional[Tuple[int, int, int, int, int, int]] = None  # u0,v0,u1,v1,w,h
     depth_hit_body: Optional[Any] = None   # (N, 2) body x, y of the veto hits
     depth_would_block: bool = False        # veto fired but depth_act is off (observe-only)
+    # Path mode
+    path_seq: Optional[int] = None         # the refresh being followed
+    path_progress_m: Optional[float] = None  # arc length done along it
+    path_age_s: Optional[float] = None     # time since the last refresh
+    block_body_xy: Optional[Point2] = None  # path_blocked: where (live body frame)
 
 
 class Tier3Controller:
@@ -183,10 +203,46 @@ class Tier3Controller:
         self.terminal_ticks = 0
         self.last_tick: Optional[float] = None
         self._depth.reset()
+        self.path_rx_at = now
+        self._path_cum = None
+        self.path_s: Optional[float] = None
+        self.path_stats = {"refreshes": 0, "max_gap_s": 0.0, "starved_episodes": 0,
+                           "stale_blocks": 0}
+        self._starved = False
+        self._stale = False
+        self.rejoin_side: Optional[int] = None
+        self._path_refreshed = False
 
     def start_goal(self, goal: Tier3Goal, now_mono: float, pose_now: Pose) -> None:
         self.goal = goal
         self._reset_state(now_mono, pose_now)
+        if goal.path is not None:
+            self._path_cum = cumulative(goal.path)
+
+    def update_path(self, goal: Tier3Goal, now_mono: float) -> None:
+        """A newer copy of the active path goal (same cmd_id, higher
+        path_seq): swap the polyline, keep progress / rotation state. A new
+        ``route_id`` means the sender re-planned (e.g. after a block): that
+        resets the progress clock and clears a terminal block — it is the
+        resume."""
+        old = self.goal
+        self.goal = goal
+        gap = now_mono - self.path_rx_at
+        st = self.path_stats
+        st["refreshes"] += 1
+        st["max_gap_s"] = max(st["max_gap_s"], gap)
+        self.path_rx_at = now_mono
+        self._path_cum = cumulative(goal.path) if goal.path is not None else None
+        self.path_s = None
+        self.prev_path_odom = None
+        self._path_refreshed = True          # re-reference progress, keep its timer
+        if old is None or goal.route_id != old.route_id:
+            self.prog_best = None
+            self.prog_at = now_mono
+            self.terminal = None
+            self.terminal_ticks = 0
+            self.realign_time = 0.0
+            self.last_translate_at = now_mono
 
     def clear(self) -> None:
         self.goal = None
@@ -228,19 +284,40 @@ class Tier3Controller:
         dist = math.hypot(bx, by)
         gb = (bx, by)
 
+        path_mode = g.path is not None and self._path_cum is not None
+        path_len = path_rem = s_rob = 0.0
+        age = ttl = 0.0
+        if path_mode:
+            s_rob, _lat = project(g.path, self._path_cum, (pose_now[0], pose_now[1]),
+                                  self.path_s, cfg.path.back_window_m)
+            self.path_s = s_rob
+            path_len = float(self._path_cum[-1])
+            path_rem = max(0.0, path_len - s_rob)
+            age = now_mono - self.path_rx_at
+            ttl = float(g.ttl_s or cfg.path.default_ttl_s)
+
         def res(state: str, cmd, **kw) -> TickResult:
+            if path_mode:
+                kw.setdefault("path_seq", g.path_seq)
+                kw.setdefault("path_progress_m", s_rob)
+                kw.setdefault("path_age_s", age)
             return TickResult(state=state, cmd=cmd, goal_body=gb, dist=dist, **kw)
 
         if self.terminal is not None:
             return self._terminal(gb, dist)
 
-        deadline_hit = cfg.goal_deadline_s > 0 and now_mono - self.goal_started_at > cfg.goal_deadline_s
+        # Path mode: a route leg can take minutes; staleness, no_progress and
+        # the sender's route watchdog bound it instead of the deadline.
+        deadline_hit = (not path_mode and cfg.goal_deadline_s > 0
+                        and now_mono - self.goal_started_at > cfg.goal_deadline_s)
         rot_budget_hit = (cfg.rotate_timeout_s > 0
                           and now_mono - self.last_translate_at > cfg.rotate_timeout_s)
 
         # Arrival (+ optional final-heading rotate). The deadline and the
         # rotation budget bound the final-heading turn too (T13).
-        if dist <= g.tol:
+        at_goal = (dist <= g.tol and (not path_mode
+                                       or (g.end_is_goal and path_rem <= g.tol + 0.3)))
+        if at_goal:
             if g.final_heading is None or self.final_aligned:
                 return res(STATE_ARRIVED, (0.0, 0.0), done=True)
             if deadline_hit:
@@ -257,6 +334,29 @@ class Tier3Controller:
 
         if deadline_hit:
             return self._enter_terminal("deadline", gb, dist)
+
+        starved = False
+        if path_mode:
+            # Staleness: the sender keeps the path fresh; without refreshes,
+            # crawl at v_min, then stop (the desktop link may be up while its
+            # planner is wedged — 11-03).
+            if age > cfg.path.stale_factor * ttl:
+                if not self._stale:
+                    self.path_stats["stale_blocks"] += 1
+                self._stale = True
+                self.prog_at = now_mono
+                return res(STATE_BLOCKED, (0.0, 0.0), reason="path_stale")
+            self._stale = False
+            at_horizon = not g.end_is_goal and path_rem <= cfg.path.end_hold_m
+            starved = age > ttl or at_horizon
+            if starved and not self._starved:
+                self.path_stats["starved_episodes"] += 1
+            self._starved = starved
+            if at_horizon:
+                # At the sender's horizon: wait for the path to be extended.
+                self.prog_at = now_mono
+                self.last_translate_at = now_mono
+                return res(STATE_DRIVING, (0.0, 0.0), mode="starved")
 
         if grid is None or meta is None or pose_scan is None:
             self.prog_at = now_mono
@@ -289,71 +389,85 @@ class Tier3Controller:
             # The veto refuses these; the planner must not route through them.
             cm.lethal = cm.lethal | ub
             cm.cost[ub] = np.inf
-        plan = plan_local(work, meta, goal_s, cfg.plan, costmap=cm,
-                          start_body=(rel[0], rel[1]))
-        plan = self._latch_endpoint(plan, work, meta, cm, goal_s, rel, pose_scan)
+        beyond = 0.0
+        if path_mode:
+            got = self._plan_on_path(g, work, meta, cm, rel, pose_scan, s_rob, path_len)
+            if got[0] is None:
+                self.prog_at = now_mono
+                return res(STATE_BLOCKED, (0.0, 0.0), reason="path_blocked", mode="plan",
+                           block_body_xy=_to_frame(got[1], rel))
+            chosen, plan_reason, beyond = got
+            adopted_new = plan_reason != self.prev_reason
+            self.prev_reason = plan_reason
+        else:
+            plan = plan_local(work, meta, goal_s, cfg.plan, costmap=cm,
+                              start_body=(rel[0], rel[1]))
+            plan = self._latch_endpoint(plan, work, meta, cm, goal_s, rel, pose_scan)
 
-        if not plan.ok:
-            self.prev_path_odom = None
-            self.prog_at = now_mono
-            if plan.reason == "at_frontier":
-                # Already at the closest reachable cell to the goal.
-                return res(STATE_ARRIVED, (0.0, 0.0), done=True, plan_reason="frontier")
-            return res(STATE_BLOCKED, (0.0, 0.0), reason=plan.reason, mode="plan")
+            if not plan.ok:
+                self.prev_path_odom = None
+                self.prog_at = now_mono
+                if plan.reason == "at_frontier":
+                    # Already at the closest reachable cell to the goal.
+                    return res(STATE_ARRIVED, (0.0, 0.0), done=True, plan_reason="frontier")
+                return res(STATE_BLOCKED, (0.0, 0.0), reason=plan.reason, mode="plan")
 
-        # Path hysteresis: keep following the previous path while it is
-        # collision-free, we are still on it, its endpoint is as good as the
-        # fresh plan's (no more than ~a cell farther from the goal — frontier
-        # endpoints along a wall are near-ties that flip with quantization),
-        # and it is not clearly more expensive (T4 homotopy flip-flop).
-        chosen = plan.path_body
-        plan_reason = plan.reason
-        adopted_new = True
-        resm = float(meta["resolution_m"])
-        if (self.prev_path_odom and cfg.path_hysteresis > 0
-                and _endpoint_class(self.prev_reason) == _endpoint_class(plan.reason)):
-            old_s = [odom_to_body(p, pose_scan) for p in self.prev_path_odom]
-            old_trim, dev = trim_path(old_s, (rel[0], rel[1]))
-            end_new = plan.path_body[-1]
-            core = dilate_disk(work == 0, cfg.plan.costmap.footprint_radius_m / resm) | (work == 0)
-            if ub is not None:
-                core = core | ub
-            if dev <= cfg.path_max_deviation_m and old_trim:
-                c_old = path_cost(old_trim, cm, cfg.plan, lethal=core)
-                if self.rotating and math.isfinite(c_old):
-                    # Turning in place to line up with a committed path: the
-                    # body-aligned grid re-quantizes under the rotation and
-                    # every fresh 8-connected path rotates with the robot, so
-                    # re-planning here chases its own tail. Keep the path
-                    # while it is still collision-free.
-                    keep = True
-                else:
-                    good_end = (math.hypot(old_trim[-1][0] - goal_s[0], old_trim[-1][1] - goal_s[1])
-                                <= math.hypot(end_new[0] - goal_s[0], end_new[1] - goal_s[1])
-                                + 1.5 * resm)
-                    new_trim, _ = trim_path(plan.path_body, (rel[0], rel[1]))
-                    c_new = path_cost(new_trim, cm, cfg.plan)
-                    keep = (good_end and math.isfinite(c_old)
-                            and c_old <= c_new * (1.0 + cfg.path_hysteresis))
-                if keep:
-                    chosen = old_trim
-                    plan_reason = self.prev_reason or plan.reason
-                    adopted_new = False
-        self.prev_path_odom = transform_path(chosen, pose_scan)
-        self.prev_reason = plan_reason
+            # Path hysteresis: keep following the previous path while it is
+            # collision-free, we are still on it, its endpoint is as good as the
+            # fresh plan's (no more than ~a cell farther from the goal — frontier
+            # endpoints along a wall are near-ties that flip with quantization),
+            # and it is not clearly more expensive (T4 homotopy flip-flop).
+            chosen = plan.path_body
+            plan_reason = plan.reason
+            adopted_new = True
+            resm = float(meta["resolution_m"])
+            if (self.prev_path_odom and cfg.path_hysteresis > 0
+                    and _endpoint_class(self.prev_reason) == _endpoint_class(plan.reason)):
+                old_s = [odom_to_body(p, pose_scan) for p in self.prev_path_odom]
+                old_trim, dev = trim_path(old_s, (rel[0], rel[1]))
+                end_new = plan.path_body[-1]
+                core = dilate_disk(work == 0, cfg.plan.costmap.footprint_radius_m / resm) | (work == 0)
+                if ub is not None:
+                    core = core | ub
+                if dev <= cfg.path_max_deviation_m and old_trim:
+                    c_old = path_cost(old_trim, cm, cfg.plan, lethal=core)
+                    if self.rotating and math.isfinite(c_old):
+                        # Turning in place to line up with a committed path: the
+                        # body-aligned grid re-quantizes under the rotation and
+                        # every fresh 8-connected path rotates with the robot, so
+                        # re-planning here chases its own tail. Keep the path
+                        # while it is still collision-free.
+                        keep = True
+                    else:
+                        good_end = (math.hypot(old_trim[-1][0] - goal_s[0], old_trim[-1][1] - goal_s[1])
+                                    <= math.hypot(end_new[0] - goal_s[0], end_new[1] - goal_s[1])
+                                    + 1.5 * resm)
+                        new_trim, _ = trim_path(plan.path_body, (rel[0], rel[1]))
+                        c_new = path_cost(new_trim, cm, cfg.plan)
+                        keep = (good_end and math.isfinite(c_old)
+                                and c_old <= c_new * (1.0 + cfg.path_hysteresis))
+                    if keep:
+                        chosen = old_trim
+                        plan_reason = self.prev_reason or plan.reason
+                        adopted_new = False
+            self.prev_path_odom = transform_path(chosen, pose_scan)
+            self.prev_reason = plan_reason
 
-        # A best-effort endpoint (snapped onto free space / closest reachable
-        # cell) that the robot has reached is an arrival, not a dead-end (T8).
-        if plan_reason in PARTIAL_ENDPOINTS:
-            ex, ey = chosen[-1]
-            if math.hypot(ex - rel[0], ey - rel[1]) <= max(0.5 * g.tol, 0.6 * resm):
-                return res(STATE_ARRIVED, (0.0, 0.0), done=True, plan_reason=plan_reason)
+            # A best-effort endpoint (snapped onto free space / closest reachable
+            # cell) that the robot has reached is an arrival, not a dead-end (T8).
+            if plan_reason in PARTIAL_ENDPOINTS:
+                ex, ey = chosen[-1]
+                if math.hypot(ex - rel[0], ey - rel[1]) <= max(0.5 * g.tol, 0.6 * resm):
+                    return res(STATE_ARRIVED, (0.0, 0.0), done=True, plan_reason=plan_reason)
 
         # Everything below is in the CURRENT body frame.
         path_now = [_to_frame(p, rel) for p in chosen]
-        remaining = path_remaining_m(path_now)
+        remaining = path_remaining_m(path_now) + beyond
         look = lookahead_on_path(path_now, cfg.lookahead_m) or (bx, by)
         v, omega, _ld, bearing, rot_next = steer_to_body_point(look, gp, self.rotating)
+        if starved and v > gp.v_min_mps:
+            omega *= gp.v_min_mps / v           # same arc, slower
+            v = gp.v_min_mps
         if rot_next:
             omega, self.rot_dir = latched_rotate_omega(
                 bearing, self.rot_dir if self.rotating else 0, gp,
@@ -444,16 +558,109 @@ class Tier3Controller:
         if self.prog_best is None or remaining < self.prog_best - cfg.no_progress_eps_m:
             self.prog_best = remaining
             self.prog_at = now_mono
-        elif adopted_new:
-            self.prog_best = remaining          # new route: new reference, same timer
+        elif adopted_new or self._path_refreshed:
+            self.prog_best = remaining          # new route / refresh: new reference, same timer
         elif now_mono - self.prog_at > cfg.no_progress_timeout_s:
             return res(STATE_BLOCKED, (0.0, 0.0), reason="no_progress")
 
-        return res(STATE_DRIVING, (v, omega), v=v, omega=omega, mode="follow",
+        self._path_refreshed = False
+        mode = "follow"
+        if path_mode:
+            mode = "starved" if starved else ("rejoin" if plan_reason == "rejoin" else "follow")
+        return res(STATE_DRIVING, (v, omega), v=v, omega=omega, mode=mode,
                    **depth_report,
                    path_body=path_now, plan_reason=plan_reason)
 
     # ── helpers ──────────────────────────────────────────────────────
+    def _plan_on_path(self, g: Tier3Goal, work, meta, cm, rel: Pose, pose_scan: Pose,
+                      s_rob: float, path_len: float):
+        """Path mode planning, in the scan frame. Returns (chosen path,
+        plan_reason "ok" | "rejoin", path length beyond the checked horizon)
+        or (None, block point) when the path is obstructed with no rejoin
+        point within the raster and ``max_rejoin_deviation_m``."""
+        pc = self.cfg.path
+        path_scan = [odom_to_body(p, pose_scan) for p in g.path]
+        cum = self._path_cum
+        lethal = raster_lookup(cm.lethal, meta)
+        samples = resample(path_scan, cum, s_rob, min(path_len, s_rob + pc.horizon_m), pc.step_m)
+        i0, n_on = first_blocked(samples, lethal)
+        n_on = max(1, min(n_on, len(samples)))
+        beyond = max(0.0, path_len - samples[n_on - 1][0])
+        if i0 is None:
+            self.rejoin_side = None
+            return [(rel[0], rel[1])] + [p for _s, p in samples[:n_on]], "ok", beyond
+        block_pt = samples[i0][1]
+        j = rejoin_index(samples, i0, lethal, pc.rejoin_clear_m)
+        if j is None:
+            return None, block_pt
+        # Aim past the obstruction, not at its edge: a target right where the
+        # path clears forces a sharp turn back that pure pursuit cuts into the
+        # obstacle's footprint (swept_block beside a post).
+        k = j
+        while (k + 1 < n_on and samples[k + 1][0] - samples[j][0] <= pc.rejoin_lead_m
+               and not lethal(samples[k + 1][1])):
+            k += 1
+        j = k
+        rest = [p for _s, p in samples[j + 1:n_on]]
+        span = samples[max(0, i0 - 3):j + 1]
+        # Side latch: an obstacle centred on the path has two near-equal
+        # sides and a fresh A* each tick flips between them (turning in place
+        # until the rotation budget runs out). Once a detour has picked a
+        # side, later plans stay on it: the other side of the obstructed
+        # stretch is closed off for the planner. Fresh every tick otherwise,
+        # so planner and swept veto see the same footprint.
+        detour = None
+        if self.rejoin_side is not None:
+            detour = self._rejoin_plan(work, meta, cm, rel, samples[j][1], path_scan, cum,
+                                       close_side=-self.rejoin_side, span=span)
+        if detour is None:
+            detour = self._rejoin_plan(work, meta, cm, rel, samples[j][1], path_scan, cum)
+        if detour is None:
+            self.rejoin_side = None
+            return None, block_pt
+        side = _detour_side(detour, path_scan, cum)
+        if side != 0:
+            self.rejoin_side = side
+        return detour + rest, "rejoin", beyond
+
+    def _rejoin_plan(self, work, meta, cm, rel: Pose, target: Point2, path_scan, cum,
+                     close_side: Optional[int] = None, span=None) -> Optional[List[Point2]]:
+        """Local A* from the robot to ``target`` within the stray limit, or
+        None. ``close_side`` (+1 left / −1 right of the path) blocks that side
+        of ``span`` for this plan."""
+        if close_side is not None and span:
+            res_m = float(meta["resolution_m"])
+            ox, oy = float(meta["origin_x_m"]), float(meta["origin_y_m"])
+            nx, ny = cm.lethal.shape
+            extra = np.zeros_like(cm.lethal)
+            pts = [p for _s, p in span]
+            for a, b in zip(pts, pts[1:]):
+                tx, ty = b[0] - a[0], b[1] - a[1]
+                n = math.hypot(tx, ty)
+                if n < 1e-9:
+                    continue
+                lx, ly = -ty / n * close_side, tx / n * close_side
+                for d in np.arange(0.0, self.cfg.path.max_rejoin_deviation_m + res_m, 0.5 * res_m):
+                    for t in (0.0, 0.5):
+                        px = a[0] + t * tx + lx * d
+                        py = a[1] + t * ty + ly * d
+                        ci, cj = int((px - ox) // res_m), int((py - oy) // res_m)
+                        if 0 <= ci < nx and 0 <= cj < ny:
+                            extra[ci, cj] = True
+            near = (np.hypot(ox + (np.arange(nx)[:, None] + 0.5) * res_m - rel[0],
+                             oy + (np.arange(ny)[None, :] + 0.5) * res_m - rel[1])
+                    <= self.cfg.seed_clear_radius_m)
+            extra &= ~near                       # never wall the robot in
+            cm = replace(cm, lethal=cm.lethal | extra,
+                         cost=np.where(extra, np.inf, cm.cost).astype(cm.cost.dtype))
+        plan = plan_local(work, meta, target, self.cfg.plan, costmap=cm,
+                          start_body=(rel[0], rel[1]))
+        if not plan.ok or plan.reason != "ok":
+            return None
+        if max_deviation(plan.path_body, path_scan, cum) > self.cfg.path.max_rejoin_deviation_m:
+            return None
+        return list(plan.path_body)
+
     def _latch_endpoint(self, plan, work, meta, cm, goal_s, rel, pose_scan):
         """Hold a best-effort endpoint fixed in odom (fix 3 "snap once").
 
@@ -584,6 +791,21 @@ def _endpoint_class(reason: Optional[str]) -> Optional[str]:
     # under a goal near the lethal edge; the endpoint-distance test in the
     # hysteresis decides whether an old path is still as good.
     return "endpoint" if reason in ("ok", "snapped", "frontier") else reason
+
+
+def _detour_side(detour: List[Point2], path: List[Point2], cum) -> int:
+    """+1 if the detour passes left of the path (its direction of travel),
+    −1 right, 0 if it never leaves the path by more than 5 cm."""
+    acc = 0.0
+    for p in detour:
+        sp, lat = project(path, cum, p)
+        if lat < 0.05:
+            continue
+        a = point_at(path, cum, max(0.0, sp - 0.02))
+        b = point_at(path, cum, sp + 0.02)
+        q = point_at(path, cum, sp)
+        acc += (b[0] - a[0]) * (p[1] - q[1]) - (b[1] - a[1]) * (p[0] - q[0])
+    return 0 if acc == 0.0 else (1 if acc > 0 else -1)
 
 
 def _to_frame(p: Point2, rel: Pose) -> Point2:

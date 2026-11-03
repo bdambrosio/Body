@@ -555,5 +555,43 @@ class TestImuWindowGuard(unittest.TestCase):
         self.assertAlmostEqual(c.corrected_theta(0.2, 1.5, yaw_rate=0.0), 0.3)
 
 
+class TestGotoArbiterPath(unittest.TestCase):
+    def _p(self, cid, seq, n=3, **kw):
+        m = {"kind": "path", "cmd_id": cid, "frame": "body", "path_seq": seq, "route_id": 1,
+             "path_xy": [[0.1 * k, 0.0] for k in range(n)]}
+        m.update(kw)
+        return m
+
+    def test_refresh_updates_in_place_and_old_seq_is_absorbed(self):
+        a = GotoArbiter()
+        self.assertEqual(a.on_command(self._p(7, 1)), "accepted")
+        self.assertEqual(a.on_command(self._p(7, 2, n=5)), "path_update")
+        self.assertEqual(len(a.goal["path_xy"]), 5)
+        self.assertEqual(a.on_command(self._p(7, 2)), "duplicate")
+        self.assertEqual(a.on_command(self._p(7, 1)), "duplicate")
+        self.assertEqual(a.goal["path_seq"], 2)
+
+    def test_malformed_paths_rejected(self):
+        a = GotoArbiter()
+        self.assertEqual(a.on_command(self._p(1, 1, n=1)), "malformed")
+        self.assertEqual(a.on_command(self._p(2, 1, path_xy=[[0, 0], [1, "x"]])), "malformed")
+        self.assertEqual(a.on_command(self._p(3, 1, ttl_s=0)), "malformed")
+        self.assertEqual(a.on_command(self._p(4, 1, path_xy=[[0, 0], [float("nan"), 1]])), "malformed")
+        self.assertIsNone(a.goal)
+
+    def test_refresh_cannot_revive_a_dropped_goal(self):
+        a = GotoArbiter()
+        a.on_command(self._p(7, 1))
+        a.drop("e_stop")
+        self.assertEqual(a.on_command(self._p(7, 2)), "duplicate")
+        self.assertIsNone(a.goal)
+
+    def test_new_cmd_id_supersedes(self):
+        a = GotoArbiter()
+        a.on_command(self._p(7, 5))
+        self.assertEqual(a.on_command(self._p(8, 1)), "accepted")
+        self.assertEqual(a.goal["cmd_id"], 8)
+
+
 if __name__ == "__main__":
     unittest.main()

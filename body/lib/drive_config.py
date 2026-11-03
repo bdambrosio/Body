@@ -222,4 +222,13 @@ def tier3_config(body_cfg: Dict[str, Any]):
         seed_clear_radius_m=float(
             cfg.get("seed_clear_radius_m", plan.costmap.footprint_radius_m)),
         slow_retry=bool(cfg.get("slow_retry", d.slow_retry)),
+        path=path_follow_config(body_cfg),
     )
+
+
+def path_follow_config(body_cfg: Dict[str, Any]):
+    """``local_drive.path`` — Tier-3 path mode (nav redesign step 3)."""
+    from body.lib.path_follow import PathFollowConfig
+    c = body_cfg.get("local_drive", {}).get("path", {}) or {}
+    d = PathFollowConfig()
+    return PathFollowConfig(**{k: type(getattr(d, k))(c[k]) for k in c if hasattr(d, k)})

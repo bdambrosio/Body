@@ -247,6 +247,13 @@
       "max_abs_omega_radps": 0.7,
       "max_range_m": 0.8
     },
+    "path": {
+      "horizon_m": 2.0,
+      "max_rejoin_deviation_m": 0.5,
+      "default_ttl_s": 1.0,
+      "stale_factor": 2.0,
+      "end_hold_m": 0.10
+    },
     "depth_veto": {
       "enabled": true,
       "act": true,

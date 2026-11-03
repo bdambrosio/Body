@@ -57,6 +57,35 @@ using the odom pose interpolated at the scan's mid-sweep `ts`; the robot's
 current pose is expressed in that frame (A\* start, swept-arc start), and the
 path is re-expressed in the live body frame for following.
 
+### `kind: "path"` — path mode (nav redesign step 3)
+The sender streams a polyline instead of a point; Tier-3 follows it rather
+than re-planning its own route. Design: `docs/nav_step3_path_streaming.md`.
+
+| field | type | meaning |
+|---|---|---|
+| `path_xy` | [[x,y],…] | 2–200 points, robot-first, in `frame` (`"body"` + `anchor_ts` as for a body goal, or `"odom"`) |
+| `path_seq` | int | refresh counter. Same `cmd_id` + higher `path_seq` → the arbiter swaps the path in place (`path_update`): **no** Tier-3 reset. Equal/lower → absorbed as a resend |
+| `route_id` | int | changes only when the sender **re-planned**. A new `route_id` resets the progress clock / rotation budget and clears a terminal block — it is how the sender resumes after a block |
+| `end_is_goal` | bool | true: the end is the destination (`ARRIVED` within `arrival_tol_m`, optional `final_heading_rad`). false: the end is the sender's horizon — Tier-3 holds within `end_hold_m` of it (`mode=starved`) until the path is extended |
+| `ttl_s` | float? | refresh deadline (default `local_drive.path.default_ttl_s`, 1.0 s) |
+
+Behaviour (`Tier3Controller` path branch, `body/lib/path_follow.py`): every
+tick the path ahead (≤ `horizon_m` 2 m, on the raster) is checked against the
+same costmap as point mode. Clear → pure pursuit along it. Obstructed → local
+A\* to a rejoin point ≥ `rejoin_lead_m` past the obstruction, only if the
+detour stays within `max_rejoin_deviation_m` (0.5 m) of the path; a side
+latch keeps later re-plans on the side first chosen (an obstacle centred on
+the path otherwise flips the detour every tick); `mode=rejoin`. No rejoin →
+`BLOCKED:path_blocked` with `block_body_xy` (where, live body frame). No
+refresh for `ttl_s` → v capped at `v_min` (`mode=starved`); for
+`stale_factor` × `ttl_s` → `BLOCKED:path_stale`. The per-goal deadline does
+not apply; `no_progress` uses remaining path length, re-referenced at each
+refresh without restarting its timer. Each refresh is re-anchored on raw
+odom (a refresh whose `anchor_ts` is outside the odom ring is skipped) and
+restarts the IMU-vs-wheel yaw divergence with it. The Pi logs per path goal
+`refreshes / max_gap / starved / stale_blocks / skipped_refreshes` when it
+ends, and each `path_stale` as it happens.
+
 ### `body/drive/status` (Pi → sender) — `schemas.drive_status`
 Published every control tick.
 | field | type | meaning |
@@ -78,8 +107,8 @@ refused during e-stop — is reported as `FAULT:<reason>` under its `cmd_id`
 | `goal_body_xy` | [float,float]? | active goal in the *live* body frame (for display) |
 | `dist_remaining_m` | float | range to goal (on a best-effort `ARRIVED`: the residual) |
 | `v_mps`, `omega_radps` | float | commanded velocity this tick |
-| `blocked_reason` | str? | BLOCKED: `boxed_in`\|`start_blocked`\|`goal_out_of_map`\|`swept_block`\|`depth_block`\|`no_progress`\|`deadline`\|`rotate_timeout`\|`no_scan`; FAULT: `odom_stale`\|`odom_reset`\|`e_stop`\|`internal_error` |
-| `mode` | str? | `follow`\|`rotate`\|`realign`\|`held`\|`plan` — `rotate`/`realign` = turning in place (the desktop must not re-pick on bearing drift then) |
+| `blocked_reason` | str? | BLOCKED: `path_blocked`\|`path_stale`\|`boxed_in`\|`start_blocked`\|`goal_out_of_map`\|`swept_block`\|`depth_block`\|`no_progress`\|`deadline`\|`rotate_timeout`\|`no_scan`; FAULT: `odom_stale`\|`odom_reset`\|`e_stop`\|`internal_error` |
+| `mode` | str? | `follow`\|`rotate`\|`realign`\|`held`\|`plan`\|`rejoin`\|`starved` — `rotate`/`realign` = turning in place (the desktop must not re-pick on bearing drift then) |
 | `plan_reason` | str? | `ok`\|`snapped`\|`frontier`; on `ARRIVED` (and the `IDLE` right after it, same `cmd_id`), `snapped`/`frontier` = reached the best reachable stand-in for an unreachable goal |
 | `path_body_xy` | list? | the A\* path being followed (display/inspector) |
 | `depth_hits`, `depth_seq` | int? | with `depth_block`: veto hit count and the depth frame's `seq` |
@@ -87,6 +116,9 @@ refused during e-stop — is reported as `FAULT:<reason>` under its `cmd_id`
 | `depth_hit_body` | list? | with `depth_block`: body-frame [x,y] of the veto hits (≤ 32, nearest first) |
 | `depth_mem_body` | list? | any state: depth-memory cells (live body frame; all cells with x > −0.3 m within 2 m, ≤ 400, nearest first) that Tier-3 plans around; Tier-2 marches around them too |
 | `build` | str? | Pi git sha — the desktop flags a stale deploy |
+| `caps` | list? | goto kinds beyond the point goto this Tier-3 supports (`["path"]`) |
+| `path_seq`, `path_progress_m`, `path_age_s` | | path mode: the refresh being followed, arc length done along it, time since the last refresh |
+| `block_body_xy` | [x,y]? | with `path_blocked`: the first obstructed path point (live body frame) |
 
 ## cmd_vel ownership (arbitration)
 

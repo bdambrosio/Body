@@ -208,5 +208,94 @@ class TestLocalDriveLoop(unittest.TestCase):
         self.assertEqual(log["after_exception"]["state"], "FAULT")  # latched, loop alive
 
 
+class TestPathGoalLoop(unittest.TestCase):
+    """goto kind "path" through the real loop: accept + caps, refresh in place
+    (no restart), stale refresh ignored, anchoring, starvation → path_stale."""
+
+    def test_path_lifecycle(self):
+        bus = _Bus()
+        cfg = dict(zenoh_helpers.load_body_config())
+        cfg["local_drive"] = dict(cfg["local_drive"], enabled=True)
+        cfg["local_drive"]["depth_veto"] = dict(cfg["local_drive"]["depth_veto"], enabled=False)
+        seq = [0]
+        x_now = [0.0]
+
+        def feed():
+            now = time.time()
+            for ts in (now - 0.02, now):
+                seq[0] += 1
+                bus.send("body/odom", _odom(ts, x=x_now[0], seq=seq[0]))
+            bus.send("body/lidar/scan", _scan(now - 0.01))
+            return now
+
+        def path_msg(path_seq, route_id=1, x0=0.0, ttl=0.2, anchor=None):
+            return {"kind": "path", "cmd_id": 10, "frame": "body", "path_seq": path_seq,
+                    "route_id": route_id, "ttl_s": ttl, "end_is_goal": False,
+                    "anchor_ts": anchor, "path_xy": [[x0 + 0.1 * k, 0.0] for k in range(21)]}
+
+        log = {}
+        script = []
+        at = script.append
+        at(lambda: (feed(), bus.send("body/status", {"e_stop_active": False}),
+                    bus.send("body/motor_state", {"e_stop_active": False, "stall_detected": False})))
+
+        def s1():
+            now = feed()
+            bus.send("body/drive/goto", path_msg(1, anchor=now))
+        at(s1)
+
+        def s2():
+            log["first"] = bus.statuses()[-1]
+            x_now[0] = 0.5                     # robot moved 0.5 m
+            now = feed()
+            # refresh: path again starts 1 m ahead of the robot in ITS body
+            # frame, anchored now → odom 1.5 .. 3.5
+            bus.send("body/drive/goto", path_msg(2, x0=1.0, anchor=now))
+        at(s2)
+
+        def s3():
+            log["refreshed"] = bus.statuses()[-1]
+            now = feed()
+            bus.send("body/drive/goto", path_msg(1, x0=-5.0, anchor=now))   # older seq: ignored
+        at(s3)
+
+        def s4():
+            log["after_old"] = bus.statuses()[-1]
+            time.sleep(0.45)                   # > 2 × ttl without a refresh
+            feed()
+        at(s4)
+
+        def s5():
+            log["stale"] = bus.statuses()[-1]
+            raise _Stop()
+        at(s5)
+
+        def fake_sleep(next_tick, _period):
+            script.pop(0)()
+            return next_tick
+
+        with mock.patch.object(zenoh_helpers, "load_body_config", return_value=cfg), \
+             mock.patch.object(zenoh_helpers, "open_session", return_value=object()), \
+             mock.patch.object(zenoh_helpers, "declare_subscriber_json", bus.subscribe), \
+             mock.patch.object(zenoh_helpers, "publish_json", bus.publish), \
+             mock.patch.object(local_drive, "HandoffGate", _FakeGate), \
+             mock.patch.object(local_drive, "git_sha", return_value="test"), \
+             mock.patch.object(local_drive, "_sleep_to", fake_sleep), \
+             mock.patch.object(local_drive.signal, "signal"):
+            with self.assertRaises(_Stop):
+                local_drive.main()
+
+        f = log["first"]
+        self.assertEqual((f["cmd_id"], f["state"], f["path_seq"]), (10, "DRIVING", 1))
+        self.assertIn("path", f["caps"])
+        r = log["refreshed"]
+        self.assertEqual((r["cmd_id"], r["path_seq"]), (10, 2))
+        # end of the refreshed path: odom 3.5, robot at 0.5 → 3.0 ahead
+        self.assertAlmostEqual(r["goal_body_xy"][0], 3.0, delta=0.05)
+        self.assertEqual(log["after_old"]["path_seq"], 2)
+        st = log["stale"]
+        self.assertEqual((st["state"], st["blocked_reason"]), ("BLOCKED", "path_stale"))
+
+
 if __name__ == "__main__":
     unittest.main()

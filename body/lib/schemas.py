@@ -80,6 +80,11 @@ def drive_status(
     depth_hit_body: list | None = None,
     depth_mem_body: list | None = None,
     depth_would_block: bool = False,
+    path_seq: int | None = None,
+    path_progress_m: float | None = None,
+    path_age_s: float | None = None,
+    block_body_xy: tuple[float, float] | list[float] | None = None,
+    caps: list | None = None,
 ) -> dict[str, Any]:
     """body/drive/status — Tier-3 drive status (see docs/drive_tier3_spec.md).
 
@@ -138,6 +143,17 @@ def drive_status(
         msg["depth_mem_body"] = [[float(p[0]), float(p[1])] for p in depth_mem_body]
     if depth_would_block:
         msg["depth_would_block"] = True      # observe-only veto fired (local_drive.depth_veto.act=false)
+    # Path mode (goto kind "path", nav redesign step 3).
+    if path_seq is not None:
+        msg["path_seq"] = int(path_seq)
+    if path_progress_m is not None:
+        msg["path_progress_m"] = round(float(path_progress_m), 3)
+    if path_age_s is not None:
+        msg["path_age_s"] = round(float(path_age_s), 3)
+    if block_body_xy is not None:
+        msg["block_body_xy"] = [round(float(block_body_xy[0]), 3), round(float(block_body_xy[1]), 3)]
+    if caps:
+        msg["caps"] = list(caps)
     if build is not None:
         msg["build"] = build
     return msg
