@@ -35,8 +35,8 @@ def _parse_args(argv):
                         "(e.g. tcp/192.168.8.60:7447)")
     p.add_argument("--pf-particles", type=int, default=5000,
                    help="particle count for the live MCL pose")
-    p.add_argument("--pf-device", choices=("auto", "cpu", "cuda"),
-                   default="auto", help="particle filter device")
+    p.add_argument("--pf-device", type=str, default="auto",
+                   help="particle filter device: auto (RTX 5060 Ti, else CPU) | cpu | cuda | cuda:N")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 

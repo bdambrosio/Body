@@ -59,15 +59,15 @@ def _parse_args(argv):
         help="run global relocalization once the first scan arrives",
     )
     p.add_argument("--pf-particles", type=int, default=5000)
-    p.add_argument("--pf-device", choices=("auto", "cpu", "cuda"), default="auto")
+    p.add_argument("--pf-device", type=str, default="auto")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p.parse_args(argv)
 
 
 def _resolve_device(choice: str) -> str:
-    # "auto" = CPU: the GPU is shared with vLLM, and a CUDA context it
-    # starves gets killed by the driver (11-03 Xid 8). See desktop/nav/__main__.
-    return "cpu" if choice == "auto" else choice
+    # RTX 5060 Ti, never the vLLM GPU (desktop/utils/torch_device.py).
+    from desktop.utils.torch_device import resolve_pf_device
+    return resolve_pf_device(choice)
 
 
 def _build_localizer(router: str, args):

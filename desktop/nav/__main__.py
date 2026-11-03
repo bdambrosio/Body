@@ -52,8 +52,8 @@ def _parse_args(argv):
         help="Run global localization once the first scan arrives.",
     )
     p.add_argument(
-        "--pf-device", choices=("auto", "cpu", "cuda"), default="auto",
-        help="MCL particle filter device.",
+        "--pf-device", type=str, default="auto",
+        help="MCL particle filter device: auto (RTX 5060 Ti, else CPU) | cpu | cuda | cuda:N.",
     )
     p.add_argument(
         "--pf-particles", type=int, default=5000,
@@ -118,12 +118,9 @@ def _parse_args(argv):
 
 
 def _resolve_device(choice: str) -> str:
-    # "auto" = CPU. 11-03: on CUDA the filter shared the RTX PRO 6000 with
-    # vLLM; a kernel queued > 7 s behind it, the driver killed the context
-    # (Xid 8, sticky error), every later odom update failed and the robot
-    # froze mid-patrol. 5000 particles on CPU: predict 0.2 ms, scan 20 ms.
-    # Pass --pf-device cuda explicitly to use a GPU.
-    return "cpu" if choice == "auto" else choice
+    # RTX 5060 Ti, never the vLLM GPU (desktop/utils/torch_device.py).
+    from desktop.utils.torch_device import resolve_pf_device
+    return resolve_pf_device(choice)
 
 
 def main(argv=None) -> int:

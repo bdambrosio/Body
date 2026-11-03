@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 
 def resolve_device(choice: str) -> str:
     """Mirror pi_drive/__main__._resolve_device."""
-    # "auto" = CPU: the GPU is shared with vLLM, and a CUDA context it
-    # starves gets killed by the driver (11-03 Xid 8). See desktop/nav/__main__.
-    return "cpu" if choice == "auto" else choice
+    # RTX 5060 Ti, never the vLLM GPU (desktop/utils/torch_device.py).
+    from desktop.utils.torch_device import resolve_pf_device
+    return resolve_pf_device(choice)
 
 
 def pose_relative(a, b):
