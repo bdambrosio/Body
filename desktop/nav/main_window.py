@@ -58,6 +58,7 @@ from desktop.mapping.bag import BagRecorder
 from desktop.perception.change_report import (
     ChangeLabeler, ChangeReporter, default_explore_dir,
 )
+from desktop.perception.change_store import ChangeStore
 from desktop.tasks.locate import CameraModel
 from body.lib.zenoh_helpers import load_body_config
 from .tracing import CAT_PLAN, LEVEL_WARN, Tracer
@@ -398,7 +399,22 @@ class NavMainWindow(QMainWindow):
         # (observe-only: events + VLM labels to ~/body-logs/explore/<ts>/).
         self._change_session: Optional[ChangeSession] = None
         explore_dir = default_explore_dir()
-        self._change_reporter = ChangeReporter(explore_dir)
+        # Explore Phase C: per-map store of places that usually differ from
+        # the map (owner-approved background). Lives next to the map.
+        self._change_store = None
+        try:
+            mp = getattr(self.fuser_config, "map_path", "") or ""
+            if mp:
+                self._change_store = ChangeStore(
+                    os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(mp))),
+                                 "change_store.json"))
+                self._change_store.begin_session(os.path.basename(explore_dir.rstrip("/")))
+                logger.info("change store: %s %s", self._change_store.path,
+                            self._change_store.summary())
+        except Exception:
+            logger.exception("change store unavailable; reporting every change")
+            self._change_store = None
+        self._change_reporter = ChangeReporter(explore_dir, store=self._change_store)
         # Every observed scan + its pose verdict, for offline replay
         # (scripts/replay_changes.py). Flushed in chunks and on close.
         self._scan_recorder = ScanRecorder(explore_dir)
@@ -1466,6 +1482,8 @@ class NavMainWindow(QMainWindow):
             cs.grid.note_skipped()
             return
         pose = tuple(pose)
+        if self._change_store is not None:
+            self._change_store.note_pose(pose[0], pose[1])
         try:
             events = cs.observe(scan_ts, ranges, angles, pose)
         except Exception:
@@ -2131,6 +2149,11 @@ class NavMainWindow(QMainWindow):
             self._depth_stop_logger.flush()      # last depth burst, if one is open
         except Exception:
             pass
+        try:
+            if self._change_store is not None:
+                self._change_store.end_session()
+        except Exception:
+            logger.exception("change store: end of session failed")
         # Flush + close any open trace file so the last events aren't
         # left in an unclosed handle (line-buffering covers writes, but
         # close releases the fd cleanly for any tail consumer).

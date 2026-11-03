@@ -112,8 +112,12 @@ def default_explore_dir() -> str:
 
 class ChangeReporter:
     def __init__(self, out_dir: Optional[str], *, keep: int = 50,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, store: Optional[Any] = None):
+        """``store``: an explore-Phase-C ``ChangeStore`` — reports matching an
+        approved background place are written (verdict ``expected``) but not
+        announced."""
         self.out_dir = out_dir
+        self.store = store
         self._clock = clock
         self._lock = threading.Lock()
         self._recent: Deque[Dict[str, Any]] = deque(maxlen=keep)
@@ -133,9 +137,19 @@ class ChangeReporter:
         rec = {"type": "change", "wall_ts": self._clock(), **ev.to_dict()}
         if robot_pose is not None:
             rec["robot"] = [round(float(v), 3) for v in robot_pose]
-        key = f"{ev.kind}/{ev.status}"
+        verdict = None
+        if self.store is not None:
+            try:
+                verdict, eid = self.store.classify(ev)
+                rec["verdict"] = verdict
+                if eid is not None:
+                    rec["store_entry"] = eid
+            except Exception:
+                logger.exception("change store: classify failed")
+        key = f"{ev.kind}/{ev.status}" + (f"/{verdict}" if verdict else "")
         with self._lock:
-            self._recent.append(rec)
+            if verdict != "expected":
+                self._recent.append(rec)
             self.counts[key] = self.counts.get(key, 0) + 1
         extra = ""
         if ev.speed_mps is not None:
@@ -144,14 +158,33 @@ class ChangeReporter:
             extra += f" path {ev.path_m:.1f} m"
         if ev.duration_s is not None:
             extra += f" after {ev.duration_s:.0f} s"
-        logger.info("change #%d %s %s at (%.2f, %.2f)%s", ev.change_id, ev.kind,
-                    ev.status, ev.x, ev.y, extra)
+        if verdict == "expected":
+            logger.debug("change #%d %s %s at (%.2f, %.2f) — expected (store entry %s)",
+                         ev.change_id, ev.kind, ev.status, ev.x, ev.y, rec.get("store_entry"))
+        else:
+            logger.info("change #%d %s %s at (%.2f, %.2f)%s%s", ev.change_id, ev.kind,
+                        ev.status, ev.x, ev.y, extra, f" [{verdict}]" if verdict else "")
         self._write(rec)
         return rec
 
     def label(self, change_id: int, label: str, **detail: Any) -> None:
         rec = {"type": "label", "wall_ts": self._clock(), "change_id": change_id,
                "label": label, **detail}
+        if self.store is not None:
+            try:
+                if self.store.on_label(change_id, label) == "novel":
+                    rec["verdict"] = "novel"
+                    logger.warning("change #%d: labelled %r at a background place known as "
+                                   "something else — reporting it", change_id, label)
+                    with self._lock:
+                        for r in self._recent:
+                            if r.get("change_id") == change_id:
+                                break
+                        else:
+                            self._recent.append({"type": "change", "change_id": change_id,
+                                                 "label": label, "verdict": "novel"})
+            except Exception:
+                logger.exception("change store: label failed")
         with self._lock:
             for r in self._recent:
                 if r.get("change_id") == change_id and r.get("type") == "change":
