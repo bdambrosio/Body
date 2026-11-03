@@ -314,3 +314,52 @@ class TestRotationContest(unittest.TestCase):
         src._maybe_judge_rotation_contest(t - 0.05, _scan(0.3, 0.2, 0.4))
         src._maybe_judge_rotation_contest(trip_t1 - 0.01, _scan(0.3, 0.2, 0.4))
         self.assertIsNotNone(src._ekf.rotation_contest())
+
+
+class TestBootPose(unittest.TestCase):
+    """A map built in its own frame carries ``boot_pose`` (11-03: the
+    11-02 map is rotated ~51° from the power-on frame)."""
+
+    def _src(self, meta):
+        log_odds = np.full((80, 40), -0.4, dtype=np.float32)
+        log_odds[:, :8] = 0.85
+        log_odds[:, -8:] = 0.85
+        ref = build_reference_map_from_log_odds(
+            log_odds, resolution_m=0.08, origin_x_m=0.0, origin_y_m=0.0,
+            session_id="test", metadata=meta)
+        return MCLPoseSource(
+            ref, pf_config=ParticleFilterConfig(n_particles=100, device="cpu"),
+            config=MCLPoseSourceConfig(min_evidence_cells=50))
+
+    def test_default_is_origin(self):
+        src = self._src(None)
+        self.assertEqual(src._boot_pose, (0.0, 0.0, 0.0))
+        src._seed_at_boot_pose(1.0, 2.0, 0.3, (0.7,))
+        for a, b in zip(src.to_world(1.0, 2.0, 0.3), (0.0, 0.0, 0.0)):
+            self.assertAlmostEqual(a, b, places=9)
+        self.assertAlmostEqual(src._yaw_offset, 0.7)
+
+    def test_seed_maps_current_odom_to_boot_pose(self):
+        bp = (0.49, -0.16, math.radians(50.5))
+        src = self._src({"boot_pose": list(bp)})
+        src._seed_at_boot_pose(-0.84, -0.35, 0.2, (1.1,))
+        for a, b in zip(src.to_world(-0.84, -0.35, 0.2), bp):
+            self.assertAlmostEqual(a, b, places=9)
+        m = src._mcl.posterior_mean()
+        self.assertAlmostEqual(m[0], bp[0], delta=0.1)
+        self.assertAlmostEqual(m[1], bp[1], delta=0.1)
+        # IMU world yaw = imu - offset == boot heading at seed time.
+        self.assertAlmostEqual(math.remainder(1.1 - src._yaw_offset - bp[2], 2 * math.pi), 0.0)
+        # Driving 1 m straight ahead in odom moves 1 m along the boot heading.
+        x1, y1, _ = src.to_world(-0.84 + math.cos(0.2), -0.35 + math.sin(0.2), 0.2)
+        self.assertAlmostEqual(x1 - bp[0], math.cos(bp[2]), places=9)
+        self.assertAlmostEqual(y1 - bp[1], math.sin(bp[2]), places=9)
+
+    def test_rebind_uses_boot_pose(self):
+        bp = (0.49, -0.16, math.radians(50.5))
+        src = self._src({"boot_pose": list(bp)})
+        src._seeded = True
+        src._last_odom = (10.0, 3.0, 1.0, -0.4)
+        src.rebind_world_to_current()
+        for a, b in zip(src.to_world(3.0, 1.0, -0.4), bp):
+            self.assertAlmostEqual(a, b, places=9)

@@ -221,16 +221,14 @@ class MCLPoseSource(PoseSource):
                 ekf_pose = self._ekf.pose_at(ts)
                 if ekf_pose is None:
                     return
-                self._mcl.seed_at(0.0, 0.0, 0.0)
-                self._off_x, self._off_y, self._off_theta = x, y, theta
-                imu = self._imu_tracker.yaw_at(ts)
-                if imu is not None:
-                    self._yaw_offset = _wrap(imu[0])
+                self._seed_at_boot_pose(x, y, theta, self._imu_tracker.yaw_at(ts))
                 self._last_odom = (ts, x, y, theta)
                 self._last_ekf_pose = ekf_pose
                 self._seeded = True
                 self._record_pose(ts)
-                logger.info("mcl_pose: seeded at odom (%+.2f, %+.2f)", x, y)
+                bx, by, bth = self._boot_pose
+                logger.info("mcl_pose: seeded at odom (%+.2f, %+.2f) -> map (%+.2f, %+.2f, %+.1f°)",
+                            x, y, bx, by, math.degrees(bth))
                 return
 
             assert self._last_odom is not None
@@ -346,10 +344,7 @@ class MCLPoseSource(PoseSource):
             imu = self._imu_tracker.yaw_at(ts)
             self._ekf.rebind_world_to_current()
             self._imu_rebind_epoch_seen = self._ekf.imu_rebind_epoch()
-            self._mcl.seed_at(0.0, 0.0, 0.0)
-            self._off_x, self._off_y, self._off_theta = x, y, theta
-            if imu is not None:
-                self._yaw_offset = _wrap(imu[0])
+            self._seed_at_boot_pose(x, y, theta, imu)
             self._last_ekf_pose = self._ekf.pose_at(ts)
             self._pose_buffer.clear()
             self._record_pose(ts)
@@ -361,6 +356,31 @@ class MCLPoseSource(PoseSource):
             self._correction_discrete_seq += 1
             self._last_scan_match = {"valid": False}
             return (x, y, theta)
+
+    @property
+    def _boot_pose(self) -> Pose:
+        """Map-frame pose of the robot where it powers on (home). A map built
+        in its own frame (e.g. map_20261102_140056, rotated ~51° from the
+        boot frame) stores it as metadata ``boot_pose`` [x, y, theta_rad];
+        maps without it were built from the boot pose, so (0, 0, 0)."""
+        bp = (getattr(self._map, "metadata", None) or {}).get("boot_pose")
+        try:
+            return (float(bp[0]), float(bp[1]), float(bp[2]))
+        except (TypeError, ValueError, IndexError):
+            return (0.0, 0.0, 0.0)
+
+    def _seed_at_boot_pose(self, x: float, y: float, theta: float,
+                           imu: Optional[Tuple[float, ...]]) -> None:
+        """Seed MCL at the boot pose and set the odom->world offset so
+        to_world(x, y, theta) == the boot pose (caller holds the lock)."""
+        bx, by, bth = self._boot_pose
+        self._mcl.seed_at(bx, by, bth)
+        self._off_theta = _wrap(theta - bth)
+        c, s_ = math.cos(self._off_theta), math.sin(self._off_theta)
+        self._off_x = x - (c * bx - s_ * by)
+        self._off_y = y - (s_ * bx + c * by)
+        if imu is not None:
+            self._yaw_offset = _wrap(imu[0] - bth)
 
     def to_world(self, x_o: float, y_o: float, th_o: float) -> Pose:
         dx = x_o - self._off_x
