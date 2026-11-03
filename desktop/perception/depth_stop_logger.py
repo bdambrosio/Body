@@ -32,7 +32,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _fired(status: Optional[Dict[str, Any]]) -> Optional[str]:
+def depth_fired(status: Optional[Dict[str, Any]]) -> Optional[str]:
     """'would_block' (observe-only veto), 'depth_block' (real stop) or None."""
     if not isinstance(status, dict):
         return None
@@ -86,17 +86,21 @@ class DepthStopLogger:
 
     def observe(self, status: Optional[Dict[str, Any]], *,
                 depth: Optional[Dict[str, Any]], rgb: Optional[Dict[str, Any]],
-                pose: Optional[tuple]) -> Optional[str]:
+                pose: Optional[tuple], edge: bool = False) -> Optional[str]:
         """Call on every status / redraw. Returns the saved base path on a
-        new event (the burst file follows ``post_s`` later)."""
+        new event (the burst file follows ``post_s`` later). ``edge=True``:
+        ``status`` is a rising edge latched off the status stream
+        (DriveClient.pop_depth_event) — a stop that may have started and
+        ended between redraws — so it counts even if the last status seen
+        here was already firing."""
         now = self._clock()
         if self._dir is not None:
             self._push(now, status, depth, pose)
             if self._burst is not None and now - self._burst["t0"] >= self._post_s:
                 self.flush()
-        kind = _fired(status)
+        kind = depth_fired(status)
         on = kind is not None
-        rising = on and not self._prev
+        rising = on and (edge or not self._prev)
         self._prev = on
         if not rising or self._dir is None:
             return None

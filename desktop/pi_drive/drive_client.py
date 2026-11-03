@@ -28,6 +28,7 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from desktop.chassis.transport import control_put, open_session
+from desktop.perception.depth_stop_logger import depth_fired
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,10 @@ class DriveClient:
         self._subs: list[Any] = []
         self._lock = threading.Lock()
         self._status: Optional[Dict[str, Any]] = None
+        # Rising edge of a depth stop / would-block, latched off the stream
+        # so a stop shorter than a UI redraw still gets logged (11-03).
+        self._depth_on = False
+        self._depth_event: Optional[Dict[str, Any]] = None
         self._odom: Optional[Dict[str, Any]] = None
         self._scan: Optional[Dict[str, Any]] = None
         # Seed from wall-clock so cmd_ids strictly exceed any previous
@@ -144,6 +149,10 @@ class DriveClient:
             with self._lock:
                 self._status = obj
                 self._note_status_locked(obj)
+                on = depth_fired(obj) is not None
+                if on and not self._depth_on and self._depth_event is None:
+                    self._depth_event = obj
+                self._depth_on = on
                 if self._trace is not None:
                     try:
                         self._trace.write(
@@ -253,6 +262,13 @@ class DriveClient:
     def is_acked(self, cmd_id: int) -> bool:
         with self._lock:
             return cmd_id in self._acked
+
+    def pop_depth_event(self) -> Optional[Dict[str, Any]]:
+        """The first depth-stop / would-block status since the last call
+        (its rising edge), or None. Clears the latch."""
+        with self._lock:
+            ev, self._depth_event = self._depth_event, None
+            return dict(ev) if ev is not None else None
 
     def latest_status(self) -> Optional[Dict[str, Any]]:
         with self._lock:

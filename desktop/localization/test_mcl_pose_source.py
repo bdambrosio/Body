@@ -363,3 +363,62 @@ class TestBootPose(unittest.TestCase):
         src.rebind_world_to_current()
         for a, b in zip(src.to_world(3.0, 1.0, -0.4), bp):
             self.assertAlmostEqual(a, b, places=9)
+
+
+class TestUpdateMany(unittest.TestCase):
+    """Coalesced odom (11-03 backlog fix) must land where per-sample does."""
+
+    def _src(self):
+        return MCLPoseSource(
+            _corridor_map(), pf_config=ParticleFilterConfig(n_particles=200, device="cpu"),
+            config=MCLPoseSourceConfig(min_evidence_cells=50))
+
+    def _seed(self, src):
+        src._mcl.seed_at(2.0, 1.6, 0.0, sigma_xy_m=1e-4, sigma_theta_rad=1e-4)
+        src._seeded = True
+        src._ekf.is_ready = lambda: True
+        src._ekf.update_odom = lambda *a, **k: False
+        src._ekf.pose_at = lambda ts: src._raw[ts]
+        src._raw = {}
+
+    def _samples(self, src, n=50, v=0.2, w=0.4, dt=0.02):
+        out, x, y, th = [], 0.0, 0.0, 0.0
+        for k in range(n):
+            ts = 10.0 + k * dt
+            th += w * dt
+            x += v * dt * math.cos(th)
+            y += v * dt * math.sin(th)
+            src._raw[ts] = (x, y, th)
+            out.append((ts, x, y, th, "s", k))
+        return out
+
+    def test_batch_matches_per_sample(self):
+        a, b = self._src(), self._src()
+        for s in (a, b):
+            self._seed(s)
+        sa, sb = self._samples(a), self._samples(b)
+        a._last_odom, a._last_ekf_pose = (9.98, 0, 0, 0), (0.0, 0.0, 0.0)
+        b._last_odom, b._last_ekf_pose = (9.98, 0, 0, 0), (0.0, 0.0, 0.0)
+        for smp in sa:
+            a.update(smp[0], smp[1], smp[2], smp[3])
+        b.update_many(sb)
+        pa, pb = a._mcl.posterior_mean(), b._mcl.posterior_mean()
+        self.assertAlmostEqual(pa[0], pb[0], delta=0.02)
+        self.assertAlmostEqual(pa[1], pb[1], delta=0.02)
+        self.assertAlmostEqual(pa[2], pb[2], delta=0.02)
+        self.assertGreater(pb[0] - 2.0, 0.15)            # it really moved
+        self.assertEqual(b._last_odom[0], sb[-1][0])
+        self.assertEqual(b.match_summary()["teleports"], 0)
+
+    def test_jump_inside_batch_is_still_a_teleport(self):
+        s = self._src()
+        self._seed(s)
+        smp = self._samples(s, n=10)
+        ts = smp[5][0]
+        jumped = [(t, x + (1.0 if t >= ts else 0.0), y, th, sid, q) for t, x, y, th, sid, q in smp]
+        for t, x, y, th, _sid, _q in jumped:
+            s._raw[t] = (x, y, th)
+        s._last_odom, s._last_ekf_pose = (9.98, 0, 0, 0), (0.0, 0.0, 0.0)
+        s.update_many(jumped)
+        self.assertEqual(s.match_summary()["teleports"], 1)
+        self.assertLess(s._mcl.posterior_mean()[0] - 2.0, 0.5)   # the 1 m jump was not driven

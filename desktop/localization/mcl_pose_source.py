@@ -86,6 +86,7 @@ class MCLPoseSource(PoseSource):
         self._scan_rate_lock = threading.Lock()
 
         self._seeded = False
+        self._fallback_run = 0
         self._last_odom: Optional[Tuple[float, float, float, float]] = None
         self._last_ekf_pose: Optional[Pose] = None
         self._off_x = 0.0
@@ -197,6 +198,38 @@ class MCLPoseSource(PoseSource):
         self._last_odom_recv_mono = time.monotonic()
         odom_reset = self._ekf.update_odom(
             ts, x, y, theta, session_id=session_id, seq=seq)
+        self._mcl_step(ts, x, y, theta, odom_reset)
+
+    def update_many(self, samples: List[Tuple[float, float, float, float, Optional[str], Optional[int]]]) -> None:
+        """Ingest a backlog of odom samples (ts, x, y, theta, session_id, seq)
+        in order. Every sample goes to the EKF (cheap); the MCL step — the
+        expensive part — runs for the last one, plus around any odom reset
+        or teleport-sized jump so those branches still see the neighbouring
+        samples. 11-03: odom handled one MCL step per 50 Hz sample fell
+        0.5-120 s behind under desktop load and the robot got lost."""
+        if not samples:
+            return
+        self._last_odom_recv_mono = time.monotonic()
+        cfg = self._config
+        n = len(samples)
+        prev = None
+        stepped = -1
+        for k, (ts, x, y, theta, sid, seq) in enumerate(samples):
+            self._counters["odom_seen"] += 1
+            reset = self._ekf.update_odom(ts, x, y, theta, session_id=sid, seq=seq)
+            jump = prev is not None and (
+                math.hypot(x - prev[1], y - prev[2]) > cfg.teleport_distance_m
+                or abs(_wrap(theta - prev[3])) > cfg.teleport_rotation_rad)
+            if (reset or jump) and prev is not None and stepped != k - 1:
+                self._mcl_step(*prev, False)          # bring MCL up to just before
+            if reset or jump or k == n - 1:
+                self._mcl_step(ts, x, y, theta, reset)
+                stepped = k
+            prev = (ts, x, y, theta)
+        if n > 1:
+            self._counters["odom_coalesced"] = self._counters.get("odom_coalesced", 0) + n - 1
+
+    def _mcl_step(self, ts: float, x: float, y: float, theta: float, odom_reset: bool) -> None:
         with self._lock:
             if odom_reset and self._seeded and self._last_odom is not None:
                 # motor_controller restarted (X4): its odom frame is new. Do
@@ -513,8 +546,25 @@ class MCLPoseSource(PoseSource):
                          if scan_ts is not None else None)
             if scan_pose is not None:
                 self._counters["scan_prior_at_scan_ts"] += 1
+                if self._fallback_run >= 10:
+                    logger.warning("mcl_pose: scan prior back at scan ts after %d fallbacks",
+                                   self._fallback_run)
+                self._fallback_run = 0
             else:
                 self._counters["scan_prior_fallback_now"] += 1
+                self._fallback_run += 1
+                # 11-03: two minutes of scans fell outside the pose buffer
+                # (odom stopped reaching the posterior) and the robot got
+                # lost. Say which side of the buffer the scans fall on.
+                if scan_ts is not None and self._fallback_run in (10, 100, 1000):
+                    span = self._pose_buffer.span()
+                    lo, hi, n = span if span else (float("nan"),) * 2 + (0,)
+                    lo_odom = self._last_odom[0] if self._last_odom else float("nan")
+                    logger.warning(
+                        "mcl_pose: %d scans in a row outside the pose buffer: scan_ts-newest=%+.3fs "
+                        "scan_ts-oldest=%+.3fs n=%d last_odom_ts-newest=%+.3fs odom_age=%.2fs",
+                        self._fallback_run, scan_ts - hi, scan_ts - lo, n, lo_odom - hi,
+                        self.odom_age_s() or float("nan"))
         prior_tuple = scan_pose if scan_pose is not None else now_tuple
         prior_pose = Pose2D(*prior_tuple)
         now_pose = Pose2D(*now_tuple)

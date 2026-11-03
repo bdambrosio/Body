@@ -100,5 +100,23 @@ class TestDriveClient(unittest.TestCase):
         self.assertEqual(c._session.puts[-1][1]["kind"], "cancel")
 
 
+class TestDepthEventLatch(unittest.TestCase):
+    def test_short_stop_between_redraws_is_latched_once(self):
+        c = _client()
+        drive = {"state": "DRIVING", "cmd_id": 1}
+        stop = {"state": "BLOCKED", "blocked_reason": "depth_block", "cmd_id": 1, "depth_hits": 30}
+        self.assertIsNone(c.pop_depth_event())
+        c._on_status(_Sample(drive))
+        c._on_status(_Sample(stop))       # stop starts and ends before any redraw
+        c._on_status(_Sample(stop))
+        c._on_status(_Sample(drive))
+        ev = c.pop_depth_event()
+        self.assertEqual(ev["blocked_reason"], "depth_block")
+        self.assertIsNone(c.pop_depth_event())
+        self.assertEqual(c.latest_status()["state"], "DRIVING")
+        c._on_status(_Sample({"state": "DRIVING", "depth_would_block": True, "cmd_id": 1}))
+        self.assertTrue(c.pop_depth_event()["depth_would_block"])
+
+
 if __name__ == "__main__":
     unittest.main()

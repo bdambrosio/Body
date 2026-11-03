@@ -69,5 +69,20 @@ class TestDepthStopLogger(unittest.TestCase):
         self.assertIsNone(lg.flush())
 
 
+    def test_edge_flag_counts_a_latched_stop(self):
+        t = [100.0]
+        with tempfile.TemporaryDirectory() as d:
+            lg = DepthStopLogger(d, clock=lambda: t[0])
+            depth = {"depth": np.zeros((90, 120), np.uint16), "ts": 1.0}
+            stop = {"state": "BLOCKED", "blocked_reason": "depth_block"}
+            self.assertIsNotNone(lg.observe(stop, depth=depth, rgb=None, pose=None))
+            t[0] += 5.0
+            # The last status seen here was a stop, so a plain call is no edge,
+            # but a stop latched off the stream (ended and restarted between
+            # redraws) is.
+            self.assertIsNone(lg.observe(stop, depth=depth, rgb=None, pose=None))
+            self.assertIsNotNone(lg.observe(stop, depth=depth, rgb=None, pose=None, edge=True))
+
+
 if __name__ == "__main__":
     unittest.main()

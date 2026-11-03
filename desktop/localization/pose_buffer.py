@@ -51,6 +51,13 @@ class PoseBuffer:
             while len(self._buf) > 2 and self._buf[0][0] < cutoff:
                 self._buf.popleft()
 
+    def span(self) -> Optional[Tuple[float, float, int]]:
+        """(oldest ts, newest ts, n) or None when empty — for diagnostics."""
+        with self._lock:
+            if not self._buf:
+                return None
+            return self._buf[0][0], self._buf[-1][0], len(self._buf)
+
     def latest(self) -> Optional[Tuple[Pose, float]]:
         with self._lock:
             if not self._buf:

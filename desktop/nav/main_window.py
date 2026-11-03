@@ -835,10 +835,15 @@ class NavMainWindow(QMainWindow):
         try:
             drive_st = (self._drive_client.latest_status()
                         if self._drive_client is not None else None)
-            if drive_st is not None:
+            ev = (self._drive_client.pop_depth_event()
+                  if self._drive_client is not None else None)
+            if ev is not None or drive_st is not None:
+                depth_f, rgb_f = self._latest_depth_frame(), self._latest_rgb()
+                if ev is not None:
+                    self._depth_stop_logger.observe(
+                        ev, depth=depth_f, rgb=rgb_f, pose=pose, edge=True)
                 self._depth_stop_logger.observe(
-                    drive_st, depth=self._latest_depth_frame(),
-                    rgb=self._latest_rgb(), pose=pose)
+                    drive_st, depth=depth_f, rgb=rgb_f, pose=pose)
             self._cameras.set_depth_memory(
                 drive_st.get("depth_mem_body") if isinstance(drive_st, dict) else None)
         except Exception:

@@ -89,6 +89,10 @@ class LocalizationController:
         self._pub_world_status: Optional[Any] = None
         self._stop_event = threading.Event()
         self._publish_thread: Optional[threading.Thread] = None
+        # Odom: zenoh callback queues, one worker drains in batches.
+        self._odom_q: Deque[tuple] = deque()
+        self._odom_cv = threading.Condition()
+        self._odom_thread: Optional[threading.Thread] = None
 
         self._lock = threading.RLock()
         self._connected = False
@@ -161,6 +165,13 @@ class LocalizationController:
         if self._publish_thread is not None and self._publish_thread.is_alive():
             self._publish_thread.join(timeout=1.0)
         self._publish_thread = None
+        with self._odom_cv:
+            self._odom_cv.notify_all()
+        if self._odom_thread is not None and self._odom_thread.is_alive():
+            self._odom_thread.join(timeout=1.0)
+        self._odom_thread = None
+        with self._odom_cv:
+            self._odom_q.clear()
         disconnect_pose = getattr(self.pose_source, "disconnect", None)
         if callable(disconnect_pose):
             try:
@@ -214,6 +225,9 @@ class LocalizationController:
             return bytes(sample.payload)
 
     def _on_odom(self, sample: Any) -> None:
+        """Zenoh callback: decode and queue only. The pose update runs on
+        the odom worker, which drains the queue as one batch so a slow MCL
+        step can't build a backlog (11-03: odom fell up to 2 min behind)."""
         msg = _decode_json(self._payload_bytes(sample))
         if msg is None:
             return
@@ -222,10 +236,47 @@ class LocalizationController:
             return
         ts, x, y, theta = triple
         session_id, seq = epoch_fields(msg)
-        self.pose_source.update(ts, x, y, theta, session_id=session_id, seq=seq)
+        with self._odom_cv:
+            self._odom_q.append((ts, x, y, theta, session_id, seq))
+            self._odom_cv.notify()
+        self._ensure_odom_worker()
+
+    def _ensure_odom_worker(self) -> None:
+        if self._odom_thread is not None:
+            return
+        with self._odom_cv:
+            if self._odom_thread is not None:
+                return
+            self._odom_thread = threading.Thread(
+                target=self._odom_loop, name="odom-worker", daemon=True)
+            self._odom_thread.start()
+
+    def _odom_loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._odom_cv:
+                while not self._odom_q and not self._stop_event.is_set():
+                    self._odom_cv.wait(timeout=0.5)
+                batch = list(self._odom_q)
+                self._odom_q.clear()
+            if not batch:
+                continue
+            try:
+                self._ingest_odom(batch)
+            except Exception:
+                logger.exception("odom worker: update failed")
+
+    def _ingest_odom(self, batch: list) -> None:
+        many = getattr(self.pose_source, "update_many", None)
+        if callable(many):
+            many(batch)
+        else:
+            for ts, x, y, theta, session_id, seq in batch:
+                self.pose_source.update(ts, x, y, theta, session_id=session_id, seq=seq)
         with self._lock:
-            self._arr_odom.append(_now())
-            self._last_odom_ts = _now()
+            now = _now()
+            for _ in batch:
+                self._arr_odom.append(now)
+            self._last_odom_ts = now
             latest = self.pose_source.latest_pose()
             if latest is not None:
                 self._maybe_record_pose(latest[0], latest[1])
