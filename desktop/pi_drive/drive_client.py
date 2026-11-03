@@ -263,6 +263,52 @@ class DriveClient:
         with self._lock:
             return cmd_id in self._acked
 
+    def supports_path(self) -> bool:
+        """True when the Pi's Tier-3 advertises ``caps: ["path"]`` (goto
+        kind "path", nav redesign step 3) on its latest status."""
+        with self._lock:
+            st = self._status
+            return bool(isinstance(st, dict) and "path" in (st.get("caps") or ()))
+
+    def send_path(
+        self, path_body: list, anchor_ts: float, *,
+        cmd_id: Optional[int] = None, path_seq: int = 1, route_id: int = 1,
+        end_is_goal: bool = False, ttl_s: Optional[float] = None,
+        arrival_tol_m: Optional[float] = None, v_max: Optional[float] = None,
+        final_heading_rad: Optional[float] = None,
+    ) -> Optional[int]:
+        """Publish a path goal (``kind: "path"``) in the robot body frame at
+        ``anchor_ts`` (Pi odom ts the frame refers to). ``cmd_id`` None → a
+        new goal (new id, ack-tracked + resent like a goto); otherwise a
+        refresh of that goal (``path_seq`` must increase) — published once,
+        the next refresh is its retry. Returns the cmd_id, or None if not
+        connected."""
+        if self._session is None or len(path_body) < 2:
+            return None
+        new = cmd_id is None
+        if new:
+            with self._lock:
+                cmd_id = self._next_cmd_id_locked()
+        msg: Dict[str, Any] = {
+            "ts": time.time(), "cmd_id": int(cmd_id), "kind": "path", "frame": "body",
+            "anchor_ts": float(anchor_ts), "path_seq": int(path_seq),
+            "route_id": int(route_id), "end_is_goal": bool(end_is_goal),
+            "path_xy": [[round(float(x), 3), round(float(y), 3)] for x, y in path_body],
+        }
+        if ttl_s is not None:
+            msg["ttl_s"] = float(ttl_s)
+        if arrival_tol_m is not None:
+            msg["arrival_tol_m"] = float(arrival_tol_m)
+        if v_max is not None:
+            msg["v_max"] = float(v_max)
+        if final_heading_rad is not None:
+            msg["final_heading_rad"] = float(final_heading_rad)
+        if new:
+            self._publish_tracked(cmd_id, msg)
+        else:
+            control_put(self._session, GOTO_TOPIC, json.dumps(msg))
+        return cmd_id
+
     def pop_depth_event(self) -> Optional[Dict[str, Any]]:
         """The first depth-stop / would-block status since the last call
         (its rising edge), or None. Clears the latch."""

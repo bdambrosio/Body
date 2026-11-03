@@ -191,3 +191,33 @@ Sim results (corridor 1.2 m, posts on a 4 m path): centred 8 cm post and
 off-centre 8 / 15 cm posts → arrive, clearance ≥ 0.14 m (footprint 0.11),
 stray ≤ 0.32 m. A 15 cm post centred (0.45 m gaps ≈ the padded footprint)
 → clean `path_blocked`; point mode ends `boxed_in` beside it.
+
+## As built — desktop side (build step 3, 2026-11-03)
+
+* `nav --path-mode` → `HierConfig.path_mode`. Used only while the Pi's
+  status carries `caps: ["path"]`; otherwise (and with no costmap) the
+  sub-goal hops run unchanged. Default off until the robot A/B.
+* No new state: in path mode SELECT sends a path goal (new `cmd_id` if none
+  is live, else a refresh with the next `route_id` — a via advance), and
+  DRIVING streams refreshes at `path_stream_hz` 4 Hz from the latest pose
+  (`world_pose_stamped`: `anchor_ts` = the Pi odom ts that pose refers to),
+  quietly re-plans the global route every `path_replan_s` 1 s (and at once
+  on a discrete pose correction), and skips the sub-goal re-pick, bearing
+  drift, detour and pose-correction re-picks.
+* Streamed path: from the robot's projection on the global route, every
+  0.10 m, ≤ 4 m; `end_is_goal` only for the terminal when not truncated.
+  The path ends at the current via; the drive advances the via (pass test)
+  before Tier-3 reaches the end, and the next refresh carries the next leg
+  (`route_id`+1, same goal) — so no concatenation through the via.
+* Blocks: every Tier-3 BLOCKED/FAULT goes through the existing
+  `_enter_blocked` (which cancels the goal, X3) → retry window → escalation
+  ladder; a retry is a new path goal. A `path_blocked` point is stamped
+  lethal for planning for `path_block_stamp_s` 20 s (lidar-seen, so not
+  gated like depth hits).
+* Worker-thread planning: **not done** — measured global A* on the real map
+  at 1–22 ms (13.8 m leg) + costmap build ~25 ms, so a 1 Hz re-plan on the
+  UI thread is cheap. `max_replan_ms` is in the stats line to check.
+* Staleness monitoring (desktop): one line per via and at stop —
+  `hier: path stream (...): sends goals routes max_send_gap max_path_age
+  starved stale blocks replans max_replan` — plus a log line when Tier-3
+  reports `starved` and a warning on `path_stale`.

@@ -108,8 +108,10 @@ class NavMainWindow(QMainWindow):
         *,
         use_checkpoint_pose: bool = False,
         vlm_advisor: str = "act",
+        path_mode: bool = False,
     ) -> None:
         super().__init__()
+        self._path_mode = bool(path_mode)
         self.setWindowTitle("Body Nav")
         self.fuser = fuser
         self.fuser_config = fuser_config
@@ -1693,7 +1695,7 @@ class NavMainWindow(QMainWindow):
         runner = PatrolRunner(patrol)
         provider = self._make_pose_provider()
         self._hier_drive = HierarchicalDrive(
-            runner, provider, self._drive_client, HierConfig(),
+            runner, provider, self._drive_client, HierConfig(path_mode=self._path_mode),
             sink=self._ensure_handoff_gate(),
             costmap_provider=self._planning_costmap,
         )
@@ -2173,10 +2175,11 @@ def run_app(
     *,
     use_checkpoint_pose: bool = False,
     vlm_advisor: str = "act",
+    path_mode: bool = False,
 ) -> int:
     app = QApplication.instance() or QApplication([])
     win = NavMainWindow(fuser, fuser_config, chassis, chassis_config,
                         use_checkpoint_pose=use_checkpoint_pose,
-                        vlm_advisor=vlm_advisor)
+                        vlm_advisor=vlm_advisor, path_mode=path_mode)
     win.show()
     return app.exec()

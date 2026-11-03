@@ -42,6 +42,9 @@ from body.lib.tier2_subgoal import (
 )
 from desktop.nav.patrol import PatrolRunner, passed_waypoint
 from desktop.nav.recovery import RESUME
+from body.lib.path_follow import (
+    cumulative as pf_cumulative, project as pf_project, resample as pf_resample,
+)
 from desktop.nav.route_planner import (
     RouteConfig, RoutePlan, path_to_body, plan_route, visible_subgoal_along_path,
 )
@@ -134,6 +137,18 @@ class PFPoseProvider:
             return None
         pose = latest[0] if isinstance(latest, tuple) and len(latest) == 2 else latest
         return (float(pose[0]), float(pose[1]), float(pose[2]))
+
+    def world_pose_stamped(self) -> Optional[Tuple[Pose, float]]:
+        """(pose, Pi odom ts it refers to), with the same staleness gate as
+        ``world_pose`` — a streamed path is anchored on the Pi at that ts."""
+        latest = self._fuser.pose_source.latest_pose()
+        if latest is None or not (isinstance(latest, tuple) and len(latest) == 2):
+            return None
+        age = self._fuser.pose_source.odom_age_s()
+        if age is not None and age > self._max_pose_age_s:
+            return None
+        pose, ts = latest
+        return (float(pose[0]), float(pose[1]), float(pose[2])), float(ts)
 
     def correction_seq(self) -> int:
         # Best-effort: the PF's *discrete*-correction count (relocates,
@@ -265,6 +280,16 @@ class HierConfig:
     # with the veto (10-31): the hits were phantoms 92 % of the time.
     stamp_block_hits: bool = False
     sub_v_max: Optional[float] = None     # per-goto speed cap (None → Tier-3 default)
+    # Nav redesign step 3: stream the global path to Tier-3 (goto kind
+    # "path") instead of handing it one sub-goal at a time. Used only when
+    # the Pi advertises caps ["path"]; otherwise the sub-goal hops remain.
+    path_mode: bool = False
+    path_stream_hz: float = 4.0           # refresh rate (re-anchored from the live pose)
+    path_replan_s: float = 1.0            # quiet global re-plan while following
+    path_ttl_s: float = 1.0               # Tier-3: crawl after this, stop after 2×
+    path_horizon_m: float = 4.0           # streamed length (≤ ~40 points at path_step_m)
+    path_step_m: float = 0.10
+    path_block_stamp_s: float = 20.0      # a path_blocked point is lethal for planning this long
     # Pose doubt (explore plan A2): the pose is fresh but the map no longer
     # supports it (scan-match quality collapsed, or the robot is off the
     # map). "log" = warn once per episode only (default until the
@@ -431,8 +456,47 @@ class HierarchicalDrive:
         self._esc_cmd: Optional[int] = None
         self._esc_sent_at = 0.0
         self._esc_count = 0
+        # Path mode (step 3).
+        self._path_live = False                 # a path goal (self._cmd_id) is active on the Pi
+        self._path_seq = 0
+        self._route_id = 0
+        self._path_last_send = -1e9
+        self._path_last_plan = -1e9
+        self._path_s_hint: Optional[float] = None
+        self._path_block_world: List[Tuple[float, float]] = []
+        self._path_block_at = -1e9
+        self._path_mode_seen: Optional[str] = None
+        self._pstats_reset()
 
     # ── Control ──────────────────────────────────────────────────────
+
+    def _cancel_tier3(self) -> None:
+        """Revoke whatever Tier-3 is doing (goto or path goal)."""
+        self._path_live = False
+        self._io.cancel()
+
+    def _use_path(self) -> bool:
+        if not self._cfg.path_mode or self._costmap_provider is None:
+            return False
+        fn = getattr(self._io, "supports_path", None)
+        return bool(callable(fn) and fn())
+
+    def _pstats_reset(self) -> None:
+        self._pstats = {"sends": 0, "new_goals": 0, "routes": 0, "max_send_gap_s": 0.0,
+                        "max_path_age_s": 0.0, "starved": 0, "stale": 0, "blocks": 0,
+                        "replans": 0, "max_replan_ms": 0.0}
+
+    def _pstats_log(self, why: str) -> None:
+        """Staleness monitoring (owner, 11-03): one line per via / stop."""
+        st = self._pstats
+        if st["sends"] == 0:
+            return
+        logger.info("hier: path stream (%s): sends=%d goals=%d routes=%d max_send_gap=%.2fs "
+                    "max_path_age=%.2fs starved=%d stale=%d blocks=%d replans=%d "
+                    "max_replan=%.0fms", why, st["sends"], st["new_goals"], st["routes"],
+                    st["max_send_gap_s"], st["max_path_age_s"], st["starved"], st["stale"],
+                    st["blocks"], st["replans"], st["max_replan_ms"])
+        self._pstats_reset()
 
     def _to(self, state: HierState) -> None:
         if state is not self._state:
@@ -470,10 +534,11 @@ class HierarchicalDrive:
         )
 
     def stop(self) -> None:
+        self._pstats_log("stop")
         if self._recovery is not None:
             self._recovery.cancel()
         self._esc_clear(full=True)
-        self._io.cancel()
+        self._cancel_tier3()
         self._subgoal_body = None
         self._held_tier = None
         self._to(HierState.IDLE)
@@ -543,7 +608,7 @@ class HierarchicalDrive:
         auto = self._recovery is not None and reason == "pose_lost"
         logger.warning("hier: suspended (%s) — %s", reason,
                        "self-recovering" if auto else "holding for operator resume")
-        self._io.cancel()
+        self._cancel_tier3()
         self._subgoal_body = None
         self._block_reason = reason
         self._to(HierState.SUSPENDED)
@@ -561,7 +626,7 @@ class HierarchicalDrive:
         if link_ok and not self._suspend_link_back:
             # The cancel sent on entry rode the same failing link — repeat it
             # once the link is back so Tier-3 can't still hold the old goal.
-            self._io.cancel()
+            self._cancel_tier3()
         self._suspend_link_back = link_ok
         if r.step(now, link_ok=link_ok, goal_live=False) == RESUME:
             self._auto_resumes += 1
@@ -638,7 +703,7 @@ class HierarchicalDrive:
         # its own if the block clears (a depth ghost vanishes) — while the UI
         # says BLOCKED/paused. Retries re-send a fresh goto anyway.
         if self._state is not HierState.BLOCKED:
-            self._io.cancel()
+            self._cancel_tier3()
         self._subgoal_body = None
         self._block_reason = reason
         if self._block_started_at is None:
@@ -676,7 +741,7 @@ class HierarchicalDrive:
             logger.info("hier: advisory hold %.1fs (%s)", adv.hold_s, adv.label)
         elif adv.action == "pause" and not self._block_gave_up:
             self._block_gave_up = True
-            self._io.cancel()
+            self._cancel_tier3()
             if self._recovery is not None:
                 # Caution-only: a static obstacle means wait longer before the
                 # next attempt — never motion, never forever.
@@ -913,6 +978,11 @@ class HierarchicalDrive:
         if self._hold(1):
             return
 
+        # Nav redesign step 3: hand Tier-3 the path itself.
+        if route is not None and self._use_path():
+            self._send_path_goal(new_route=True)
+            return
+
         # Tier-2 (contract I3): furthest live-visible CLEAR point along the
         # bearing on Tier-3's footprint-inflated scan (advisory clear-run).
         # Tier-3's A* snap remains the authority. No usable clear point with a
@@ -972,6 +1042,7 @@ class HierarchicalDrive:
         anchor_ts = (meta or {}).get("_scan_ts") if src in ("clear", "fan", "route") else None
         if anchor_ts is not None:
             kwargs["anchor_ts"] = anchor_ts
+        self._path_live = False                # a goto supersedes any path goal
         cid = self._io.send_goto_from_body(bx, by, **kwargs)
         if cid is None:
             # Send failed (no odom/connection). A previous goto may still be
@@ -1085,6 +1156,8 @@ class HierarchicalDrive:
             out.append((pose[0] + c * p[0] - s * p[1], pose[1] + s * p[0] + c * p[1]))
         if self._cfg.stamp_block_hits and self._tick_now - self._block_hits_at <= 20.0:
             out.extend(self._block_hits_world)
+        if self._tick_now - self._path_block_at <= self._cfg.path_block_stamp_s:
+            out.extend(self._path_block_world)       # lidar-seen: not a depth phantom
         return out
 
     def _note_block_hits(self, st: Dict[str, Any], pose: Optional[Pose]) -> None:
@@ -1172,7 +1245,7 @@ class HierarchicalDrive:
         if not self._sink.should_hold(tier):
             return False
         if self._held_tier is None:
-            self._io.cancel()
+            self._cancel_tier3()
         self._held_tier = tier
         # Time parked at an inspector breakpoint is not leg time: restart the
         # leg budget when the operator continues.
@@ -1311,12 +1384,16 @@ class HierarchicalDrive:
                 # lead-in points), leave Tier-3 driving and let the next
                 # SELECT_SUBGOAL goto supersede it (seamless via cmd_id).
                 if self._carrot_terminal():
-                    self._io.cancel()
+                    self._cancel_tier3()
                 self._to(HierState.ADVANCE_WAYPOINT)
                 return
 
         if self._leg_expired():
             self._enter_blocked("leg_timeout")
+            return
+
+        if self._path_live:
+            self._tick_driving_path(pose)
             return
 
         st = self._io.latest_status()
@@ -1427,6 +1504,184 @@ class HierarchicalDrive:
                             math.degrees(self._cfg.repick_hysteresis_rad))
                 self._to(HierState.SELECT_SUBGOAL)
 
+    # ── Path mode (nav redesign step 3) ──────────────────────────────
+
+    def _path_body_for_stream(self, pose: Pose):
+        """(robot-first body-frame polyline along the current global route,
+        truncated?) — the route from the robot's projection onward, resampled
+        every path_step_m up to path_horizon_m."""
+        world = self._route.path_world if (self._route and self._route.ok) else None
+        if not world or len(world) < 2:
+            return [], False
+        cum = pf_cumulative(world)
+        s, _lat = pf_project(world, cum, (pose[0], pose[1]), self._path_s_hint, 0.3)
+        self._path_s_hint = s
+        total = float(cum[-1])
+        s_end = min(total, s + self._cfg.path_horizon_m)
+        samples = pf_resample(world, cum, s, s_end, self._cfg.path_step_m)
+        pts = [(pose[0], pose[1])] + [p for _s, p in samples[1:]]
+        if len(pts) < 2:
+            pts = [(pose[0], pose[1]), samples[-1][1]]
+        return path_to_body(pts, pose), s_end < total - 1e-6
+
+    def _send_path_goal(self, *, new_route: bool) -> bool:
+        """Send the current route as a path goal: a new goal if none is live,
+        else a refresh (``new_route`` → next route_id: Tier-3 resets its
+        progress clock — used after a via advance / fresh plan)."""
+        stamped = getattr(self._pose, "world_pose_stamped", lambda: None)()
+        if stamped is None:
+            self._enter_suspended("pose_lost")
+            return False
+        pose, ts = stamped
+        if new_route:
+            self._path_s_hint = None
+        pts, truncated = self._path_body_for_stream(pose)
+        if len(pts) < 2:
+            self._enter_blocked("send_failed")
+            return False
+        terminal = self._carrot_terminal()
+        live = self._path_live and self._cmd_id is not None
+        if new_route:
+            self._route_id += 1
+            self._pstats["routes"] += 1
+        self._path_seq += 1
+        cid = self._io.send_path(
+            pts, ts, cmd_id=(self._cmd_id if live else None), path_seq=self._path_seq,
+            route_id=self._route_id, end_is_goal=terminal and not truncated,
+            ttl_s=self._cfg.path_ttl_s,
+            arrival_tol_m=self._cfg.waypoint_tol_m if terminal else None,
+            v_max=self._leg_v_max())
+        if cid is None:
+            self._enter_blocked("send_failed")
+            return False
+        now = self._tick_now
+        st = self._pstats
+        if self._path_last_send > -1e8 and live:
+            st["max_send_gap_s"] = max(st["max_send_gap_s"], now - self._path_last_send)
+        st["sends"] += 1
+        self._path_last_send = now
+        if not live:
+            st["new_goals"] += 1
+            self._cmd_id = cid
+            self._sent_pose_xy = (pose[0], pose[1])
+            self._sent_correction_seq = self._pose_correction_seq()
+            self._path_last_plan = now
+            logger.info("hier: path goal cmd=%d pose=(%.2f,%.2f,%.0f°) wp=(%.2f,%.2f) "
+                        "route=%d %d pts %.1f m%s", cid, pose[0], pose[1],
+                        math.degrees(pose[2]), *(self._waypoint or (float("nan"),) * 2),
+                        self._route_id, len(pts), self._route.distance_m if self._route else 0.0,
+                        " (end = goal)" if terminal and not truncated else "")
+        elif new_route:
+            logger.info("hier: path route %d -> wp=(%.2f,%.2f)", self._route_id,
+                        *(self._waypoint or (float("nan"),) * 2))
+        self._path_live = True
+        self._subgoal_body = pts[-1]
+        self._block_reason = None
+        self._to(HierState.DRIVING_SUBGOAL)
+        return True
+
+    def _replan_quiet(self, pose: Pose) -> None:
+        """Re-plan the global route while following (no state changes: a
+        failure keeps the old route; Tier-3 reports what it can't drive)."""
+        import time as _time
+        self._path_last_plan = self._tick_now
+        if self._costmap_provider is None or self._waypoint is None:
+            return
+        t0 = _time.monotonic()
+        try:
+            cm = self._costmap_provider()
+            if cm is None:
+                return
+            wp = None if self._in_lead_in() else self._runner.current_target()
+            plan = plan_route(cm, (pose[0], pose[1]), self._waypoint, self._route_cfg,
+                              extra_lethal_world=self._extra_lethal_world(pose),
+                              via_radius_m=getattr(wp, "radius_m", None),
+                              must_visit=bool(getattr(wp, "must_visit", False)))
+        except Exception:
+            logger.exception("hier: quiet re-plan failed; keeping the route")
+            return
+        ms = (_time.monotonic() - t0) * 1000.0
+        self._pstats["replans"] += 1
+        self._pstats["max_replan_ms"] = max(self._pstats["max_replan_ms"], ms)
+        if ms > 150.0:
+            logger.info("hier: quiet re-plan took %.0f ms", ms)
+        if plan.ok:
+            self._route = plan
+            self._carrot_relaxed = plan.target_world
+            self._path_s_hint = None
+
+    def _tick_driving_path(self, pose: Pose) -> None:
+        st = self._io.latest_status()
+        if st is not None and int(st.get("cmd_id", 0) or 0) == self._cmd_id:
+            state = st.get("state")
+            mode = st.get("mode")
+            age = st.get("path_age_s")
+            if isinstance(age, (int, float)):
+                self._pstats["max_path_age_s"] = max(self._pstats["max_path_age_s"], float(age))
+            if mode != self._path_mode_seen:
+                if mode == "starved":
+                    self._pstats["starved"] += 1
+                    logger.info("hier: Tier-3 path starved (age %.2fs)",
+                                float(age) if isinstance(age, (int, float)) else -1.0)
+                self._path_mode_seen = mode
+            if state == "REJECTED":
+                self._path_live = False
+                self._consecutive_rejects += 1
+                if self._consecutive_rejects > self._cfg.max_consecutive_rejects:
+                    self._enter_blocked("rejected")
+                    return
+                logger.warning("hier: path cmd=%s REJECTED (watermark=%s) — resend",
+                               self._cmd_id, st.get("watermark"))
+                self._to(HierState.SELECT_SUBGOAL)
+                return
+            self._consecutive_rejects = 0
+            if state in ("ARRIVED", "IDLE"):
+                # The path goal ended (only an end_is_goal path arrives).
+                self._path_live = False
+                self._to(HierState.ADVANCE_WAYPOINT if self._carrot_terminal()
+                         else HierState.SELECT_SUBGOAL)
+                return
+            if state in ("BLOCKED", "FAULT"):
+                reason = st.get("blocked_reason") or state
+                self._pstats["blocks"] += 1
+                if reason == "path_stale":
+                    self._pstats["stale"] += 1
+                    logger.warning("hier: Tier-3 stopped: path stale (age %s s) — the "
+                                   "stream is not getting through", age)
+                bxy = st.get("block_body_xy")
+                if reason == "path_blocked" and bxy:
+                    c, s_ = math.cos(pose[2]), math.sin(pose[2])
+                    self._path_block_world = [(pose[0] + c * bxy[0] - s_ * bxy[1],
+                                               pose[1] + s_ * bxy[0] + c * bxy[1])]
+                    self._path_block_at = self._tick_now
+                self._note_block_hits(st, pose)
+                self._enter_blocked(reason)
+                return
+            if state == "CANCELED":
+                self._path_live = False
+                self._to(HierState.FAILED)
+                return
+            if (state == "DRIVING" and self._block_started_at is not None
+                    and self._moved_since_send(pose) >= self._cfg.retry_progress_m):
+                self._block_started_at = None
+                self._block_gave_up = False
+                self._esc_clear(full=False)
+        elif self._cmd_id is not None and self._ack_failed(self._cmd_id):
+            self._enter_blocked("no_ack")
+            return
+
+        now = self._tick_now
+        cur_seq = self._pose_correction_seq()
+        if cur_seq != self._sent_correction_seq:
+            # A discrete pose correction: the path was planned from the old
+            # pose. Re-plan now; the refresh re-anchors from the corrected one.
+            self._sent_correction_seq = cur_seq
+            self._path_last_plan = -1e9
+        if now - self._path_last_plan >= self._cfg.path_replan_s:
+            self._replan_quiet(pose)
+        if now - self._path_last_send >= 1.0 / max(0.5, self._cfg.path_stream_hz):
+            self._send_path_goal(new_route=False)
+
     def _moved_since_send(self, pose: Pose) -> float:
         if self._sent_pose_xy is None:
             return 0.0
@@ -1484,6 +1739,7 @@ class HierarchicalDrive:
         self._carrot_relaxed = None
         next_idx, _lap_done = self._runner.on_arrived()
         logger.info("hier: waypoint reached -> next=%s", next_idx)
+        self._pstats_log(f"to waypoint {next_idx}")
         self._block_started_at = None              # fresh leg
         self._block_gave_up = False
         self._esc_clear(full=True)
@@ -1492,7 +1748,7 @@ class HierarchicalDrive:
         self._detour_repicks = 0
         self._block_skipped_via = False
         if next_idx is None:
-            self._io.cancel()
+            self._cancel_tier3()
             self._subgoal_body = None
             self._to(HierState.ARRIVED)
         else:
@@ -1555,7 +1811,7 @@ class HierarchicalDrive:
             self._leg_started_at = None
             self._consecutive_rejects = 0
             self._prefer_fan = True
-            self._io.cancel()
+            self._cancel_tier3()
             self._to(HierState.SELECT_SUBGOAL)
         elif rung == "wait":
             waits = self._cfg.escalation_waits_s
@@ -1584,7 +1840,7 @@ class HierarchicalDrive:
                 done = done or st.get("state") in (
                     "ARRIVED", "IDLE", "BLOCKED", "FAULT", "CANCELED", "REJECTED")
             if done:
-                self._io.cancel()
+                self._cancel_tier3()
                 self._esc_enter("replan", now)
         elif rung == "wait":
             if now >= self._esc_until:
@@ -1680,7 +1936,7 @@ class HierarchicalDrive:
                 # Re-send the revoke on give-up: the cancel on BLOCKED entry
                 # may have been lost, and a paused drive must not leave Tier-3
                 # holding (and possibly resuming) a goal (X3).
-                self._io.cancel()
+                self._cancel_tier3()
                 why = ("terminal for this leg" if terminal else
                        f"retry window ({self._cfg.blocked_retry_window_s:.1f}s) exhausted")
                 if self._recovery is not None:

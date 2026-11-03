@@ -50,6 +50,11 @@ def _parse_args(argv):
         help="Reference map (reference_map.npz or legacy layers.npz). Required.",
     )
     p.add_argument(
+        "--path-mode", action="store_true",
+        help="Nav redesign step 3: stream the global path to Tier-3 (goto kind "
+             "'path') instead of sub-goals. Needs a Pi with caps ['path'].",
+    )
+    p.add_argument(
         "--relocate-on-load", action="store_true",
         help="Run global localization once the first scan arrives.",
     )
@@ -211,7 +216,7 @@ def main(argv=None) -> int:
     try:
         return run_app(localizer, loc_config, chassis, chassis_config,
                        use_checkpoint_pose=args.checkpoint_pose,
-                       vlm_advisor=args.vlm_advisor)
+                       vlm_advisor=args.vlm_advisor, path_mode=args.path_mode)
     finally:
         try:
             chassis.shutdown()
