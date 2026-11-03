@@ -22,7 +22,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from desktop.fusion import load_slam_config as lsc  # noqa: E402
+import importlib  # noqa: E402
+lsc = importlib.import_module("desktop.fusion.load_slam_config")
 from desktop.mapping.bag import iter_bag  # noqa: E402
 from desktop.mapping.controller import MappingConfig, MappingController  # noqa: E402
 from desktop.mapping.export import export_mapping_session  # noqa: E402
