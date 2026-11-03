@@ -3,9 +3,14 @@
 ``ChangeReporter`` appends every change event (and every later label) to
 ``~/body-logs/explore/<session>/events.jsonl`` and keeps a short in-memory
 list for the UI. ``ChangeLabeler`` asks the VLM what a change is when it is
-in front of the camera: grab a pose-tagged frame, run ``detect()``, and take
-the box whose bearing best matches the change's world position. Labels are
-advisory — nothing here moves the robot.
+in front of the camera: grab a pose-tagged frame, crop it around the change's
+bearing (from the frame's own pose) and ask the VLM to classify the crop
+against a short closed class list. Labels are advisory — nothing here moves
+the robot.
+
+11-03: the old open-vocabulary ``detect()`` on the whole frame + "box nearest
+the bearing" labelled a clearly visible box ``unknown`` and the owner's legs
+``latch`` / ``jeans`` — never "person".
 """
 from __future__ import annotations
 
@@ -28,6 +33,76 @@ from desktop.tasks.locate import CameraModel, bbox_to_bearing
 logger = logging.getLogger(__name__)
 
 Pose = Tuple[float, float, float]
+
+# Closed class list for change labels (owner, 11-03: "small stuffed animal"
+# because a toy is easily mistaken for a pet).
+CHANGE_CLASSES = (
+    "person", "pet", "small stuffed animal", "box or bag", "furniture",
+    "door", "nothing there", "other",
+)
+_CLASSIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {"type": "string", "enum": list(CHANGE_CLASSES)},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "what": {"type": "string", "maxLength": 60},
+    },
+    "required": ["label", "confidence", "what"],
+}
+_CLASSIFY_PROMPT = (
+    "This image is cropped from a camera on a small floor-level robot in a house. "
+    "Its lidar just saw something {kind} near floor level about {range_m:.1f} m away, "
+    "roughly in the CENTRE of this image. What is that thing?\n"
+    "Answer with one label: {classes}.\n"
+    "- Legs, feet, shoes or trousers of someone standing or walking: person.\n"
+    "- A live cat or dog: pet. A soft toy shaped like an animal: small stuffed animal.\n"
+    "- An open or moving door, or its edge: door.\n"
+    "- If the centre shows only floor, wall or skirting board: nothing there.\n"
+    "Give your confidence (0-1) and a few words saying what you see."
+)
+
+
+def crop_box_px(cam: CameraModel, bearing: float, range_m: float, *,
+                half_width_m: float = 0.5, min_half_deg: float = 12.0) -> Optional[Tuple[int, int]]:
+    """(u0, u1) pixel columns of a crop centred on ``bearing`` (rad, + left)
+    wide enough for ~``half_width_m`` either side at ``range_m``. None when
+    the bearing is outside the image."""
+    if abs(bearing) >= math.radians(89.0):
+        return None
+    u = cam.cx - cam.fx * math.tan(bearing)
+    if not (0.0 <= u < cam.width):
+        return None
+    half_ang = max(math.radians(min_half_deg),
+                   math.atan2(half_width_m, max(range_m, 0.3)))
+    half_px = cam.fx * math.tan(half_ang)
+    u0 = int(max(0, math.floor(u - half_px)))
+    u1 = int(min(cam.width, math.ceil(u + half_px)))
+    return (u0, u1) if u1 - u0 >= 16 else None
+
+
+def crop_jpeg(jpeg: bytes, u0: int, u1: int) -> bytes:
+    """Full-height vertical strip [u0, u1) of a JPEG (a standing person fits)."""
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(jpeg)) as im:
+        out = io.BytesIO()
+        im.crop((u0, 0, u1, im.height)).convert("RGB").save(out, format="JPEG", quality=90)
+        return out.getvalue()
+
+
+def classify_crop(jpeg: bytes, *, kind: str, range_m: float,
+                  chat_json: Optional[Callable[..., Any]] = None) -> Optional[Dict[str, Any]]:
+    """Ask the VLM which CHANGE_CLASSES the crop's centre is (schema-enforced)."""
+    if chat_json is None:
+        from desktop.vision_service import chat_json
+    prompt = _CLASSIFY_PROMPT.format(
+        kind="appear" if kind == KIND_NEW else "move", range_m=range_m,
+        classes=", ".join(CHANGE_CLASSES))
+    ans = chat_json([{"role": "user", "content": prompt}], _CLASSIFY_SCHEMA,
+                    images=[jpeg], max_tokens=120, name="change_label")
+    if not isinstance(ans, dict) or ans.get("label") not in CHANGE_CLASSES:
+        return None
+    return ans
 
 
 def default_explore_dir() -> str:
@@ -140,10 +215,11 @@ class ChangeLabeler:
                  bearing_tol_rad: float = math.radians(12.0),
                  min_interval_s: float = 1.0,
                  clock: Callable[[], float] = time.monotonic):
-        """``grab(on_frame, on_fail, ...)``: ``FrameGrabber.grab``."""
+        """``grab(on_frame, on_fail, ...)``: ``FrameGrabber.grab``.
+        ``detect_fn(jpeg, kind=, range_m=)`` classifies a crop (default
+        ``classify_crop``)."""
         if detect_fn is None:
-            from desktop import vision_service
-            detect_fn = vision_service.detect
+            detect_fn = classify_crop
         self._grab = grab
         self._worker = worker
         self._cam = camera
@@ -221,34 +297,49 @@ class ChangeLabeler:
             self._busy = False
 
     def _on_frame(self, ev: ChangeEvent, frame: PosedFrame) -> None:
+        if frame.pose is None:
+            logger.info("change #%d: frame without pose — no label", ev.change_id)
+            self._release()
+            return
+        cam = self._cam.scaled(frame.width or self._cam.width, frame.height or self._cam.height)
+        bearing, rng = expected_bearing(frame.pose, ev.x, ev.y)
+        box = crop_box_px(cam, bearing, rng)
+        if box is None:
+            logger.info("change #%d: out of the frame by the time it arrived", ev.change_id)
+            self._release()
+            return
+        u0, u1 = box
+        detect = self._detect
+        kind = ev.kind
+
+        def query(jpeg: bytes) -> Any:
+            crop = crop_jpeg(jpeg, u0, u1)
+            return {"answer": detect(crop, kind=kind, range_m=rng), "crop": crop,
+                    "crop_px": [u0, u1], "range_m": rng}
+
         ok = self._worker.submit(VlmJob(
-            frame=frame, query=self._detect, kind="change_label",
+            frame=frame, query=query, kind="change_label",
             on_result=lambda res: self._on_result(ev, res)))
         if not ok:
             self._release()
 
     def _on_result(self, ev: ChangeEvent, res: VlmResult) -> None:
         try:
-            fr = res.frame
-            if res.error or res.verdict is None or fr is None or fr.pose is None:
+            v = res.verdict if isinstance(res.verdict, dict) else None
+            if res.error or v is None:
                 logger.info("change #%d: no label (%s)", ev.change_id, res.error or "no answer")
                 return
-            cam = self._cam.scaled(fr.width or self._cam.width, fr.height or self._cam.height)
-            bearing, rng = expected_bearing(fr.pose, ev.x, ev.y)
-            boxes = list(getattr(res.verdict, "boxes", []) or [])
-            pick = pick_box(boxes, cam, bearing, self._tol)
-            jpeg_path = self._rep.save_jpeg(f"change_{ev.change_id:05d}.jpg", fr.jpeg)
-            if pick is None:
-                self._rep.label(ev.change_id, "unknown", n_boxes=len(boxes),
-                                others=[b.label for b in boxes][:6],
-                                range_m=round(rng, 2), jpeg_path=jpeg_path,
+            jpeg_path = self._rep.save_jpeg(f"change_{ev.change_id:05d}.jpg", v["crop"])
+            ans = v.get("answer")
+            if not ans:
+                self._rep.label(ev.change_id, "unknown", crop_px=v["crop_px"],
+                                range_m=round(v["range_m"], 2), jpeg_path=jpeg_path,
                                 latency_s=round(res.latency_s, 2))
                 return
-            box, err = pick
-            self._rep.label(ev.change_id, box.label,
-                            bbox_px=[round(float(v), 1) for v in box.bbox],
-                            bearing_err_deg=round(math.degrees(err), 1),
-                            range_m=round(rng, 2), jpeg_path=jpeg_path,
+            self._rep.label(ev.change_id, ans["label"],
+                            confidence=round(float(ans.get("confidence", 0.0)), 2),
+                            what=str(ans.get("what", ""))[:60], crop_px=v["crop_px"],
+                            range_m=round(v["range_m"], 2), jpeg_path=jpeg_path,
                             latency_s=round(res.latency_s, 2))
         except Exception:
             logger.exception("change #%d: labelling failed", ev.change_id)

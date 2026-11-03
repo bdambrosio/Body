@@ -61,7 +61,44 @@ class SessionGridConfig:
     # running along inside a wall line does not count).
     through_beyond_m: float = 0.30
     through_cross_m: float = 0.15
+    # ...and must meet the wall at least this steeply (angle between beam and
+    # wall line). 11-03: every "missing" report on four patrols sat on a
+    # reference wall, mostly walls the lidar sweeps at a glancing angle — a
+    # shallow beam slips past a 5 cm wall cell under a few cm of pose error.
+    # Corners / blobs (no clear wall direction) keep the old test. 0 = off.
+    through_min_incidence_deg: float = 30.0
 
+
+
+def _box_sum(a: np.ndarray, r: int) -> np.ndarray:
+    """Sum over a (2r+1)² window (zero padded), via cumulative sums."""
+    p = np.pad(a, ((r + 1, r), (r + 1, r)))
+    c = p.cumsum(0).cumsum(1)
+    k = 2 * r + 1
+    return c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+
+
+def _wall_normals(wall: np.ndarray, r: int = 2, min_coherence: float = 0.5) -> np.ndarray:
+    """Unit normal (nx, ny, 2) of the wall line at each wall cell, from the
+    structure tensor of the wall mask over a (2r+1)² window — robust for
+    1-cell-thin lines, where a plain gradient vanishes at the centre. Cells
+    without a clear direction (corners, blobs: coherence below
+    ``min_coherence``) and non-wall cells get (0, 0)."""
+    w = wall.astype(np.float64)
+    gx = np.zeros_like(w)
+    gy = np.zeros_like(w)
+    gx[1:-1, :] = 0.5 * (w[2:, :] - w[:-2, :])
+    gy[:, 1:-1] = 0.5 * (w[:, 2:] - w[:, :-2])
+    jxx, jxy, jyy = _box_sum(gx * gx, r), _box_sum(gx * gy, r), _box_sum(gy * gy, r)
+    tr = jxx + jyy
+    diff = np.sqrt((jxx - jyy) ** 2 + 4.0 * jxy ** 2)
+    coh = np.where(tr > 1e-9, diff / np.maximum(tr, 1e-9), 0.0)
+    ang = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy)     # dominant gradient = normal direction
+    out = np.zeros(wall.shape + (2,))
+    ok = wall & (coh >= min_coherence)
+    out[ok, 0] = np.cos(ang[ok])
+    out[ok, 1] = np.sin(ang[ok])
+    return out
 
 
 class SessionGrid:
@@ -83,6 +120,7 @@ class SessionGrid:
         # when the cell is hit again. Needs set_wall_mask().
         self.through = np.zeros((self.nx, self.ny), dtype=np.uint16)
         self._wall: Optional[np.ndarray] = None
+        self._wall_normal: Optional[np.ndarray] = None
         self.version = 0          # bumps on every integrate / reset
         self.scans_integrated = 0
         self.scans_skipped = 0
@@ -107,6 +145,7 @@ class SessionGrid:
         if wall is not None and wall.shape != (self.nx, self.ny):
             raise ValueError("wall mask shape mismatch")
         self._wall = None if wall is None else wall.astype(bool)
+        self._wall_normal = None if wall is None else _wall_normals(self._wall)
 
     def note_skipped(self) -> None:
         self.scans_skipped += 1
@@ -175,6 +214,13 @@ class SessionGrid:
                 crossing = ((far - tt >= cfg.through_beyond_m)
                             & ~_wall_at(tt - cfg.through_cross_m)
                             & ~_wall_at(tt + cfg.through_cross_m))
+                if cfg.through_min_incidence_deg > 0 and self._wall_normal is not None:
+                    # |beam · wall normal| = sin(angle between beam and wall).
+                    nrm = self._wall_normal[fi[on_wall], fj[on_wall]]       # (K, 2), 0 = no direction
+                    has_dir = (nrm[:, 0] != 0) | (nrm[:, 1] != 0)
+                    sin_inc = np.abs(cos_a[wb] * nrm[:, 0] + sin_a[wb] * nrm[:, 1])
+                    steep = sin_inc >= math.sin(math.radians(cfg.through_min_incidence_deg))
+                    crossing &= steep | ~has_dir
                 through_flat = np.setdiff1d(
                     np.unique(fi[on_wall][crossing] * self.ny + fj[on_wall][crossing]),
                     hit_flat, assume_unique=True)

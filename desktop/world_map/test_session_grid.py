@@ -170,6 +170,32 @@ class TestSeeThrough(unittest.TestCase):
         g.integrate(*one_beam(2.0), (0, 0, 0), 1.0)
         self.assertEqual(int(g.through.sum()), 0)
 
+    def _wall_line_x(self, g, x=1.01, half_len_m=1.0):
+        """A straight reference wall along y at x (a 'missing' wall: no hits)."""
+        i, _ = cell(g, x, 0.0)
+        _, j0 = cell(g, x, -half_len_m)
+        _, j1 = cell(g, x, half_len_m)
+        return [(i, j) for j in range(j0, j1 + 1)]
+
+    def test_steep_beam_through_missing_wall_counts(self):
+        g = SessionGrid(META)
+        g = self._grid(self._wall_line_x(g))
+        for a in (0.0, math.radians(40)):            # 90° and 50° to the wall
+            g.integrate(*one_beam(2.5, a), (0, 0, 0), 1.0)
+        self.assertGreaterEqual(int((g.through > 0).sum()), 2)   # the 50° beam may cross two cells
+
+    def test_glancing_beam_does_not_count(self):
+        # 11-03: every "missing" on four patrols sat on walls swept at a
+        # glancing angle. 20° to the wall: not evidence it is gone.
+        g = SessionGrid(META)
+        g = self._grid(self._wall_line_x(g))
+        g.integrate(*one_beam(2.4, math.radians(70)), (0.6, -1.0, 0.0), 1.0)
+        self.assertEqual(int(g.through.sum()), 0)
+        g2 = SessionGrid(META, SessionGridConfig(through_min_incidence_deg=0.0))
+        g2.set_wall_mask(g._wall)
+        g2.integrate(*one_beam(2.4, math.radians(70)), (0.6, -1.0, 0.0), 1.0)
+        self.assertGreater(int(g2.through.sum()), 0)   # the old test counted it
+
     def test_hit_resets_through(self):
         g = SessionGrid(META)
         wc = cell(g, 1.01, 0.01)

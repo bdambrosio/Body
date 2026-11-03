@@ -30,11 +30,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from desktop.perception.change_detector import ChangeDetectorConfig  # noqa: E402
 from desktop.perception.change_session import ChangeSession  # noqa: E402
 from desktop.perception.scan_recorder import load_scans  # noqa: E402
+from desktop.world_map.session_grid import SessionGridConfig  # noqa: E402
 from desktop.reference_map.reference_map import load_reference_map  # noqa: E402
 
 
-def parse_sets(items):
-    cfg = ChangeDetectorConfig()
+def parse_sets(items, cfg=None):
+    cfg = cfg if cfg is not None else ChangeDetectorConfig()
     kw = {}
     for it in items or []:
         k, v = it.split("=", 1)
@@ -76,6 +77,9 @@ def main() -> int:
     ap.add_argument("run_dir")
     ap.add_argument("--set", action="append", metavar="KEY=VALUE",
                     help="ChangeDetectorConfig override (repeatable)")
+    ap.add_argument("--grid-set", action="append", metavar="KEY=VALUE",
+                    help="SessionGridConfig override (repeatable), e.g. "
+                         "through_min_incidence_deg=45")
     ap.add_argument("--all-scans", action="store_true",
                     help="integrate every scan with a pose, not just those the live run accepted")
     ap.add_argument("--events", help="write replayed events to this JSONL")
@@ -87,7 +91,8 @@ def main() -> int:
     if not paths:
         print(f"no scans_*.npz in {args.run_dir}", file=sys.stderr)
         return 1
-    cs = ChangeSession(rm, det_cfg=cfg)
+    grid_cfg = parse_sets(args.grid_set, SessionGridConfig())
+    cs = ChangeSession(rm, det_cfg=cfg, grid_cfg=grid_cfg)
     events, n, used = [], 0, 0
     for ts, ranges, angles, pose, ok, _q, _cov in load_scans(paths):
         n += 1
