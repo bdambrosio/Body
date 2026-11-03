@@ -2120,6 +2120,10 @@ class NavMainWindow(QMainWindow):
             self._redraw_timer.stop()
         except Exception:
             pass
+        try:
+            self._depth_stop_logger.flush()      # last depth burst, if one is open
+        except Exception:
+            pass
         # Flush + close any open trace file so the last events aren't
         # left in an unclosed handle (line-buffering covers writes, but
         # close releases the fd cleanly for any tail consumer).

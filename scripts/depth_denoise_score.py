@@ -3,7 +3,7 @@
 
     PYTHONPATH=. .venv/bin/python scripts/depth_denoise_score.py ~/body-logs/vlm/<session>[/...]
 
-Inputs: ``would_block_*.npz`` (observe-only veto: frames the raw veto WOULD
+Inputs: ``would_block_*.npz`` / ``depth_block_*.npz`` (single frames; ``*_burst.npz`` skipped) (observe-only veto: frames the raw veto WOULD
 have stopped on; assumed negatives unless listed in --positives) and
 ``run*_depth.npz`` (real stops). For each frame: raw veto hits (the 10-31
 rule: >= min_hits in the commanded-arc corridor), and hits after
@@ -52,7 +52,9 @@ def main() -> int:
     min_hits = args.min_hits or vcfg.min_hits
     files = []
     for d in args.dirs:
-        files += sorted(glob.glob(os.path.join(os.path.expanduser(d), "**", "would_block_*.npz"), recursive=True))
+        for pat in ("would_block_*.npz", "depth_block_*.npz"):
+            files += sorted(f for f in glob.glob(os.path.join(os.path.expanduser(d), "**", pat), recursive=True)
+                            if not f.endswith("_burst.npz"))
         files += sorted(glob.glob(os.path.join(os.path.expanduser(d), "**", "run*_depth.npz"), recursive=True))
     raw_fire = den_fire = 0
     for f in files:

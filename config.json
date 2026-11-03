@@ -249,7 +249,7 @@
     },
     "depth_veto": {
       "enabled": true,
-      "act": false,
+      "act": true,
       "denoise": {"enabled": true, "min_range_m": 0.25, "min_extent_m": 0.06, "min_height_m": 0.06},
       "stale_s": 0.5,
       "min_range_m": 0.08,
