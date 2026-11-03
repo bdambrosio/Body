@@ -15,7 +15,9 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+# No CUDA_VISIBLE_DEVICES pin (cbfe001 set "0", which under CUDA's default
+# FASTEST_FIRST order is the RTX PRO 6000 that vLLM fills — 11-03 Xid 8).
+# The particle filter picks its GPU by name: desktop/utils/torch_device.py.
 
 _NAV_DIR = Path(__file__).resolve().parent
 _DESKTOP = _NAV_DIR.parent
