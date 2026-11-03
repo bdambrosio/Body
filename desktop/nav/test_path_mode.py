@@ -177,6 +177,51 @@ class TestPathMode(unittest.TestCase):
         self.assertEqual(hd._pstats["holds"], 1)
         self.assertEqual(io.cancels, 0)
 
+    def test_route_watchdog_fires_when_no_progress(self):
+        cm = _world()
+        hd, io, po = _drive(cm, ((2.5, 0.0),))
+        cid = io.paths[0]["cmd_id"]
+        io.set_status(cmd_id=cid, state="DRIVING", mode="rejoin")   # busy, going nowhere
+        with self.assertLogs("desktop.nav.hierarchical_drive", "WARNING") as lg:
+            t = 0.0
+            while hd.state() == HierState.DRIVING_SUBGOAL and t < 30.0:
+                t += 0.25
+                hd.tick(t)
+        self.assertEqual(hd.block_reason(), "no_route_progress")
+        self.assertGreater(t, 15.0)
+        self.assertLess(t, 16.0)
+        self.assertTrue(any("no route progress" in m for m in lg.output))
+        hd.tick(t + 0.1)                     # terminal via: straight to escalation/pause
+        self.assertTrue(hd._block_gave_up)
+
+    def test_route_watchdog_skips_a_stuck_intermediate_via_first(self):
+        cm = _world()
+        hd, io, po = _drive(cm, ((1.5, 0.0), (1.5, 1.5)))
+        cid = io.paths[0]["cmd_id"]
+        io.set_status(cmd_id=cid, state="DRIVING", mode="follow")
+        t = 0.0
+        while hd.state() == HierState.DRIVING_SUBGOAL and t < 30.0:
+            t += 0.25
+            hd.tick(t)
+        hd.tick(t + 0.1)
+        hd.tick(t + 0.2)
+        self.assertEqual(hd.current_waypoint_world(), (1.5, 1.5))
+
+    def test_slow_progress_never_trips_the_watchdog_or_leg_deadline(self):
+        cm = _world([(-3.0, 0.6, 3.0, 0.65)])
+        hd, io, po = _drive(cm, ((2.8, 0.0),), leg_deadline_s=5.0, leg_deadline_mps=0.0)
+        cid = io.paths[0]["cmd_id"]
+        t = 0.0
+        x = 0.0
+        while t < 40.0 and x < 2.6:            # 0.065 m/s: ~40 s for the leg
+            t += 0.25
+            x += 0.065 * 0.25
+            po.pose = (x, 0.0, 0.0)
+            io.set_status(cmd_id=cid, state="DRIVING", mode="follow")
+            hd.tick(t)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
+        self.assertGreater(t, 30.0)
+
     def test_terminal_arrival_finishes(self):
         cm = _world()
         hd, io, po = _drive(cm, ((1.0, 0.0),))

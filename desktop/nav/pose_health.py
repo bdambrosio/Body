@@ -139,16 +139,21 @@ SUPPORT_OFF_MAP = "off_map"
 
 @dataclass
 class PoseSupportConfig:
+    # Thresholds from the 11-03 Hallway_loop runs (~4,900 scans): localized
+    # quality p5 0.58 / median 0.71, coverage median 0.87–0.92; misaligned
+    # (09:44 boot, 51° off) quality 0.22 / coverage 0.72; lost (09:53)
+    # quality median 0.23, p95 0.38 / coverage 0.65. The old 0.15 / 0.6 were
+    # guesses that called the misaligned pose "good".
     # Per-scan gate for writing observations into the world (session grid,
     # change detector): the scan must sit on the map and match it.
-    scan_min_coverage: float = 0.6
-    scan_min_quality: float = 0.15
+    scan_min_coverage: float = 0.75
+    scan_min_quality: float = 0.45
     # Rolling-window levels.
     window_s: float = 3.0
     min_samples: int = 3
     off_map_coverage: float = 0.35   # median coverage below → off_map
-    good_coverage: float = 0.6       # median coverage below → weak
-    good_quality: float = 0.15       # median quality below → weak
+    good_coverage: float = 0.80      # median coverage below → weak
+    good_quality: float = 0.45       # median quality below → weak
     min_points: int = 30
     max_samples: int = 64
 

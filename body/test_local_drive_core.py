@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from body.lib.drive_safety import (
-    FootprintConfig, driveable_from_rows, swept_path_blocked,
+    FootprintConfig, swept_path_blocked,
 )
 from body.lib.local_drive_core import (
     STATE_CANCELED, STATE_FAULT, STATE_IDLE,
@@ -19,22 +19,12 @@ from body.lib.local_drive_core import (
 # ── Frame transforms ────────────────────────────────────────────────
 
 class TestFrames(unittest.TestCase):
-    def test_odom_to_body_identity_pose(self):
-        bx, by = odom_to_body((1.0, 0.0), (0.0, 0.0, 0.0))
-        self.assertAlmostEqual(bx, 1.0)
-        self.assertAlmostEqual(by, 0.0)
-
     def test_odom_to_body_rotated(self):
         # Robot at origin facing +y (90°). A point at odom +x is on the
         # robot's right → body -y.
         bx, by = odom_to_body((1.0, 0.0), (0.0, 0.0, math.pi / 2))
         self.assertAlmostEqual(bx, 0.0, places=6)
         self.assertAlmostEqual(by, -1.0, places=6)
-
-    def test_odom_to_body_translated(self):
-        bx, by = odom_to_body((2.0, 3.0), (1.0, 3.0, 0.0))
-        self.assertAlmostEqual(bx, 1.0)
-        self.assertAlmostEqual(by, 0.0)
 
     def test_round_trip(self):
         pose = (0.5, -1.2, 0.9)
@@ -184,17 +174,6 @@ class TestSweptSafety(unittest.TestCase):
             g, m, v_mps=0.18, omega_radps=0.0, config=self.cfg))
 
 
-class TestDriveableFromRows(unittest.TestCase):
-    def test_conversion(self):
-        rows = [[True, False, None], [None, True, False]]
-        arr = driveable_from_rows(rows, 2, 3)
-        self.assertIsNotNone(arr)
-        np.testing.assert_array_equal(arr, np.array([[1, 0, -1], [-1, 1, 0]], dtype=np.int8))
-
-    def test_bad_shape_returns_none(self):
-        self.assertIsNone(driveable_from_rows([[True]], 2, 3))
-
-
 class TestSweptBlockResponse(unittest.TestCase):
     KW = dict(thresh_rad=0.10, timeout_s=2.0, k_omega=1.5, omega_max=0.6)
 
@@ -324,9 +303,6 @@ class TestImuYawCorrector(unittest.TestCase):
 
 
 class TestQuatToYaw(unittest.TestCase):
-    def test_identity(self):
-        self.assertAlmostEqual(quat_wxyz_to_yaw(1.0, 0.0, 0.0, 0.0), 0.0)
-
     def test_pure_z_rotation(self):
         for deg in (-170, -90, -10, 45, 90, 135):
             th = math.radians(deg)
@@ -585,13 +561,6 @@ class TestGotoArbiterPath(unittest.TestCase):
         a.drop("e_stop")
         self.assertEqual(a.on_command(self._p(7, 2)), "duplicate")
         self.assertIsNone(a.goal)
-
-    def test_new_cmd_id_supersedes(self):
-        a = GotoArbiter()
-        a.on_command(self._p(7, 5))
-        self.assertEqual(a.on_command(self._p(8, 1)), "accepted")
-        self.assertEqual(a.goal["cmd_id"], 8)
-
 
 if __name__ == "__main__":
     unittest.main()

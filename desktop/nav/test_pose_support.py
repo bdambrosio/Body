@@ -67,5 +67,26 @@ class TestPoseSupport(unittest.TestCase):
         self.assertEqual(m.level(t), SUPPORT_UNKNOWN)
 
 
+class TestThresholdsFromRobotData(unittest.TestCase):
+    """11-03 Hallway_loop medians: the misaligned boot (0.22 / 0.72) and the
+    lost robot (0.23 / 0.65) must not read "good"; localized (0.71 / 0.90,
+    and its p5 0.58 / 0.87) must."""
+
+    def level(self, q, cov):
+        m = PoseSupportMonitor()
+        for i in range(5):
+            m.ingest(summ(q=q, cov=cov), 100.0 + 0.2 * i, seq=i)
+        return m.level(100.8)
+
+    def test_misaligned_and_lost_are_weak(self):
+        self.assertEqual(self.level(0.22, 0.72), SUPPORT_WEAK)
+        self.assertEqual(self.level(0.23, 0.65), SUPPORT_WEAK)
+        self.assertEqual(self.level(0.38, 0.85), SUPPORT_WEAK)
+
+    def test_localized_is_good(self):
+        self.assertEqual(self.level(0.71, 0.90), SUPPORT_GOOD)
+        self.assertEqual(self.level(0.58, 0.87), SUPPORT_GOOD)
+
+
 if __name__ == "__main__":
     unittest.main()

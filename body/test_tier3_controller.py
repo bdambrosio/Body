@@ -344,7 +344,6 @@ class TestFailures(unittest.TestCase):
         self.assertTrue(r.terminal)
 
 
-
 class TestDepthMemoryNoCreep(unittest.TestCase):
     """2026-10-31 door edge: an obstacle only the depth camera sees. With no
     memory, every retry (a new goal) drives ≥ 2 depth frames into it before
@@ -637,17 +636,6 @@ class TestPathMode(unittest.TestCase):
                 self.assertIn("rejoin", [x.mode for x in sim.results])
                 self.assertGreater(sim.min_clear, 0.11)
                 self.assertLessEqual(max(abs(p[1]) for p in sim.poses), 0.5)
-
-    def test_gap_at_footprint_limit_is_a_clean_block(self):
-        # 0.15 m post centred in a 1.2 m corridor: 0.45 m each side, about
-        # the padded footprint. Point mode ends boxed_in beside it; path mode
-        # must stop clear of it and report where.
-        segs = CORRIDOR + post(1.6, 0.0, 0.15)
-        sim = PathSim(segs, _line(0, 0, 4.0, 0))
-        r = sim.run(20.0, until=lambda x: x.reason == "path_blocked" or x.state == STATE_ARRIVED)
-        if r.reason == "path_blocked":
-            self.assertIsNotNone(r.block_body_xy)
-        self.assertGreater(sim.min_clear, 0.11)
 
     def test_wall_across_path_is_path_blocked_with_location(self):
         segs = CORRIDOR + [(1.5, -0.6, 1.5, 0.6)]

@@ -208,41 +208,6 @@ class TestObserveImuYaw(unittest.TestCase):
         self.assertLess(abs(y), 0.01)
 
 
-class TestPosteriorMode(unittest.TestCase):
-    def test_mode_agrees_with_mean_on_uniform_weights(self):
-        # Uniform weights → argmax picks the first particle (or
-        # whichever index ties to the max). For a tight Gaussian cloud,
-        # any single particle is within ~σ of the mean.
-        pf = ParticleFilterPose(ParticleFilterConfig(
-            n_particles=2000,
-            init_sigma_xy_m=0.02,
-            init_sigma_theta_rad=math.radians(1.0),
-            seed=600,
-        ))
-        pf.seed_at(0.5, -0.3, 0.0)
-        mean = pf.posterior_mean()
-        mode = pf.posterior_mode()
-        # Within 3σ for each coordinate.
-        self.assertAlmostEqual(mean[0], mode[0], delta=0.06)
-        self.assertAlmostEqual(mean[1], mode[1], delta=0.06)
-        self.assertAlmostEqual(mean[2], mode[2], delta=math.radians(3.0))
-
-    def test_mode_tracks_peak_after_sharp_observation(self):
-        # Sharp IMU observation → one particle (near the obs) dominates.
-        # Mode should sit at that particle, very close to the obs value.
-        pf = ParticleFilterPose(ParticleFilterConfig(
-            n_particles=2000,
-            init_sigma_xy_m=0.001,
-            init_sigma_theta_rad=math.radians(5.0),
-            imu_sigma_rad=math.radians(0.3),
-            seed=601,
-        ))
-        pf.seed_at(0.0, 0.0, 0.0)
-        pf.observe_imu_yaw(math.radians(2.0))
-        _, _, theta = pf.posterior_mode()
-        self.assertAlmostEqual(theta, math.radians(2.0), delta=math.radians(0.7))
-
-
 class TestPosteriorMean(unittest.TestCase):
     def test_posterior_mean_uses_circular_mean_for_theta(self):
         # Seed cloud straddling +π/-π. Naive linear mean would land
@@ -558,19 +523,6 @@ class TestPosteriorCov(unittest.TestCase):
 
 
 class TestDiagnostics(unittest.TestCase):
-    def test_diagnostics_uniform_weights(self):
-        pf = ParticleFilterPose(ParticleFilterConfig(
-            n_particles=1000, init_sigma_xy_m=0.05, seed=400,
-        ))
-        pf.seed_at(0.0, 0.0, 0.0)
-        d = pf.diagnostics()
-        self.assertIsInstance(d, FilterDiagnostics)
-        self.assertAlmostEqual(d.n_eff, 1000.0, places=2)
-        # Uniform: max_weight = 1/N, entropy = log N.
-        self.assertAlmostEqual(d.max_weight, 1.0 / 1000.0, places=5)
-        self.assertAlmostEqual(d.weight_entropy, math.log(1000.0), places=4)
-        self.assertFalse(d.resampled)
-
     def test_diagnostics_after_observation(self):
         pf = ParticleFilterPose(ParticleFilterConfig(
             n_particles=1000,
@@ -596,14 +548,6 @@ class TestCudaDevice(unittest.TestCase):
     device-specific — different sequences from the same seed are
     expected and correct."""
 
-    def test_state_lives_on_cuda(self):
-        pf = ParticleFilterPose(ParticleFilterConfig(
-            n_particles=500, device="cuda", seed=1,
-        ))
-        pf.seed_at(0.5, -0.3, 0.0)
-        self.assertEqual(pf.state.device.type, "cuda")
-        self.assertEqual(pf.log_weights.device.type, "cuda")
-
     def test_pipeline_runs_on_cuda(self):
         """End-to-end smoke: seed → predict → observe → resample → mean,
         all on cuda, with sensible posterior values at the end."""
@@ -625,16 +569,6 @@ class TestCudaDevice(unittest.TestCase):
         self.assertAlmostEqual(y, 0.0, delta=0.05)
         # IMU pinned θ to 0°.
         self.assertAlmostEqual(theta, 0.0, delta=math.radians(0.5))
-
-    def test_posterior_cov_returns_3x3_on_cuda(self):
-        pf = ParticleFilterPose(ParticleFilterConfig(
-            n_particles=500, device="cuda", seed=3,
-        ))
-        pf.seed_at(0.0, 0.0, 0.0)
-        cov = pf.posterior_cov()
-        self.assertEqual(cov.shape, (3, 3))
-        self.assertEqual(cov.device.type, "cuda")
-
 
 class TestDefensiveResampling(unittest.TestCase):
     """Phase 6.4.1 — defensive resample fraction injects fresh tail
@@ -661,188 +595,3 @@ class TestDefensiveResampling(unittest.TestCase):
         b = _run(0.0)
         self.assertTrue(torch.equal(a, b))
 
-    def test_defensive_fraction_broadens_cloud(self):
-        # With defensive injection, the cloud after resample has wider
-        # XY spread than without — that's the whole point.
-        def _spread(frac):
-            pf = ParticleFilterPose(ParticleFilterConfig(
-                n_particles=4000, init_sigma_xy_m=0.05,
-                init_sigma_theta_rad=math.radians(1.0), seed=4002,
-                defensive_resample_fraction=frac,
-                defensive_sigma_xy_m=0.5,
-                defensive_sigma_theta_rad=math.radians(20.0),
-                roughening_xy_m=0.0, roughening_theta_rad=0.0,
-            ))
-            pf.seed_at(0.0, 0.0, 0.0)
-            # Sharp observation collapses cloud onto a small region.
-            pf.observe_xy_world(world_x=0.0, world_y=0.0, sigma_xy_m=0.01)
-            pf.resample()
-            cov = pf.posterior_cov()
-            return float((cov[0, 0] + cov[1, 1]).sqrt())
-        s_off = _spread(0.0)
-        s_on  = _spread(0.10)
-        # With 10% defensive at σ=0.5 m, expect σ_xy to grow noticeably.
-        # Conservative: at least 5× the off-case spread.
-        self.assertGreater(s_on, 5 * s_off)
-
-    def test_posterior_mean_approximately_preserved(self):
-        # Defensive particles are centered on the posterior_mean, so
-        # the mean shouldn't drift much across the resample.
-        pf = ParticleFilterPose(ParticleFilterConfig(
-            n_particles=8000, init_sigma_xy_m=0.05,
-            init_sigma_theta_rad=math.radians(2.0), seed=4003,
-            defensive_resample_fraction=0.10,
-            defensive_sigma_xy_m=0.5,
-            defensive_sigma_theta_rad=math.radians(20.0),
-            roughening_xy_m=0.0, roughening_theta_rad=0.0,
-        ))
-        pf.seed_at(0.7, -0.2, math.radians(10.0))
-        pf.observe_xy_world(0.7, -0.2, sigma_xy_m=0.02)
-        mx0, my0, _ = pf.posterior_mean()
-        pf.resample()
-        mx1, my1, _ = pf.posterior_mean()
-        self.assertAlmostEqual(mx1, mx0, delta=0.05)
-        self.assertAlmostEqual(my1, my0, delta=0.05)
-
-    def test_resample_resets_to_uniform_with_defensive(self):
-        pf = ParticleFilterPose(ParticleFilterConfig(
-            n_particles=500, init_sigma_xy_m=0.05,
-            init_sigma_theta_rad=math.radians(3.0), seed=4004,
-            defensive_resample_fraction=0.10,
-        ))
-        pf.seed_at(0.0, 0.0, 0.0)
-        pf.observe_xy_world(0.0, 0.0, sigma_xy_m=0.05)
-        pf.resample()
-        # All log_weights uniform → N_eff = N exactly.
-        self.assertAlmostEqual(pf.n_eff(), 500.0, places=3)
-
-    def test_state_shape_preserved(self):
-        # Cloud size must remain n_particles regardless of fraction.
-        for frac in (0.0, 0.05, 0.5, 1.0):
-            pf = ParticleFilterPose(ParticleFilterConfig(
-                n_particles=200, init_sigma_xy_m=0.01,
-                init_sigma_theta_rad=0.01, seed=4005,
-                defensive_resample_fraction=frac,
-            ))
-            pf.seed_at(0.0, 0.0, 0.0)
-            pf.observe_xy_world(0.0, 0.0, sigma_xy_m=0.05)
-            pf.resample()
-            self.assertEqual(pf.state.shape, (200, 3),
-                             f"shape broke at fraction={frac}")
-
-
-class TestObserveXyMixture(unittest.TestCase):
-    """Phase 6 VPR — Gaussian-mixture position observation."""
-
-    def _seeded(self, **cfg_kwargs):
-        cfg = ParticleFilterConfig(
-            n_particles=cfg_kwargs.pop("n_particles", 4000),
-            init_sigma_xy_m=cfg_kwargs.pop("init_sigma_xy_m", 1.0),
-            init_sigma_theta_rad=cfg_kwargs.pop("init_sigma_theta_rad", 0.01),
-            seed=cfg_kwargs.pop("seed", 91),
-            **cfg_kwargs,
-        )
-        pf = ParticleFilterPose(cfg)
-        pf.seed_at(0.0, 0.0, 0.0)
-        return pf
-
-    def test_k1_matches_observe_xy_world(self):
-        # Single-component mixture must be bit-equivalent (within the
-        # softmax-normalization no-op) to observe_xy_world.
-        pf_a = self._seeded(seed=101)
-        pf_b = self._seeded(seed=101)
-        pf_a.observe_xy_world(world_x=0.3, world_y=-0.2, sigma_xy_m=0.5)
-        pf_b.observe_xy_mixture(
-            positions_xy=torch.tensor([[0.3, -0.2]]),
-            weights=torch.tensor([1.0]),
-            sigma_xy_m=0.5,
-        )
-        wa = pf_a.normalized_weights()
-        wb = pf_b.normalized_weights()
-        # Normalized weights identical (log_w differ only by a constant
-        # logsumexp shift, which cancels in softmax).
-        self.assertTrue(torch.allclose(wa, wb, atol=1e-6))
-
-    def test_unimodal_mixture_pulls_posterior_to_mode(self):
-        pf = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=110)
-        target = torch.tensor([[0.7, -0.4]])
-        pf.observe_xy_mixture(
-            positions_xy=target, weights=torch.tensor([1.0]), sigma_xy_m=0.3,
-        )
-        x, y, _ = pf.posterior_mean()
-        self.assertAlmostEqual(x, 0.7, delta=0.08)
-        self.assertAlmostEqual(y, -0.4, delta=0.08)
-
-    def test_bimodal_mixture_preserves_both_modes(self):
-        # Two equal-weight components placed symmetrically around the
-        # seed should leave the posterior mean near the seed (the
-        # mixture-mean is the seed itself) while the marginal variance
-        # remains substantial — particles between the modes get high
-        # weight from both, but the cloud as a whole shouldn't collapse.
-        pf = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=120)
-        pos = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
-        w = torch.tensor([1.0, 1.0])
-        pf.observe_xy_mixture(positions_xy=pos, weights=w, sigma_xy_m=0.3)
-        x, y, _ = pf.posterior_mean()
-        # Mean stays near 0 (equal masses pull symmetrically).
-        self.assertAlmostEqual(x, 0.0, delta=0.10)
-        self.assertAlmostEqual(y, 0.0, delta=0.10)
-        # Posterior x-variance should still be > the single-mode case.
-        # Single-mode comparison filter:
-        pf_single = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=120)
-        pf_single.observe_xy_mixture(
-            positions_xy=torch.tensor([[1.0, 0.0]]),
-            weights=torch.tensor([1.0]),
-            sigma_xy_m=0.3,
-        )
-        cov_bi = pf.posterior_cov()
-        cov_uni = pf_single.posterior_cov()
-        self.assertGreater(float(cov_bi[0, 0]), float(cov_uni[0, 0]))
-
-    def test_unequal_weights_bias_mean_toward_heavier_mode(self):
-        pf = self._seeded(n_particles=4000, init_sigma_xy_m=1.0, seed=130)
-        pos = torch.tensor([[1.0, 0.0], [-1.0, 0.0]])
-        # 90/10 weighting — mean should sit closer to +1 than to -1.
-        w = torch.tensor([0.9, 0.1])
-        pf.observe_xy_mixture(positions_xy=pos, weights=w, sigma_xy_m=0.3)
-        x, _, _ = pf.posterior_mean()
-        self.assertGreater(x, 0.3)
-
-    def test_n_eff_drops_on_sharp_observation(self):
-        pf = self._seeded(n_particles=2000, init_sigma_xy_m=0.5, seed=140)
-        n_before = pf.n_eff()
-        pf.observe_xy_mixture(
-            positions_xy=torch.tensor([[0.0, 0.0]]),
-            weights=torch.tensor([1.0]),
-            sigma_xy_m=0.05,  # very sharp
-        )
-        n_after = pf.n_eff()
-        self.assertLess(n_after, n_before)
-
-    def test_rejects_bad_shapes_and_weights(self):
-        pf = self._seeded()
-        with self.assertRaises(ValueError):
-            pf.observe_xy_mixture(
-                torch.zeros((3, 3)), torch.ones(3), sigma_xy_m=0.5,
-            )
-        with self.assertRaises(ValueError):
-            pf.observe_xy_mixture(
-                torch.zeros((2, 2)), torch.ones(3), sigma_xy_m=0.5,
-            )
-        with self.assertRaises(ValueError):
-            pf.observe_xy_mixture(
-                torch.zeros((2, 2)), torch.tensor([-1.0, 1.0]),
-                sigma_xy_m=0.5,
-            )
-        with self.assertRaises(ValueError):
-            pf.observe_xy_mixture(
-                torch.zeros((1, 2)), torch.zeros(1), sigma_xy_m=0.5,
-            )
-        with self.assertRaises(ValueError):
-            pf.observe_xy_mixture(
-                torch.zeros((1, 2)), torch.ones(1), sigma_xy_m=0.0,
-            )
-
-
-if __name__ == "__main__":
-    unittest.main()

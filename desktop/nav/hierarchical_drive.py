@@ -231,49 +231,11 @@ class HierConfig:
     unstick_min_m: float = 0.30
     unstick_max_m: float = 0.50
     unstick_timeout_s: float = 15.0
-    # Tier-2 fan-out: when the straight clear-run toward the carrot fails (an
-    # obstacle — often one only Tier-3's depth memory knows — sits on the
-    # bearing), try bearings ±fan_step_deg … ±fan_max_deg and pick the one
-    # closest to the bearing that (a) is clear for ≥ fan_min_free_m on the
-    # same inflated mask, (b) lands within fan_corridor_m of the Tier-1 route
-    # segment (prev vertex → carrot) — no shortcuts through doorways/off the
-    # authored route — and (c) gets closer to the carrot. 0 disables.
-    fan_max_deg: float = 75.0
-    fan_step_deg: float = 15.0
-    fan_min_free_m: float = 0.35
-    fan_corridor_m: float = 0.75
-    # Detour re-pick: a Tier-2 sub-goal is "the furthest visible clear point",
-    # chosen on the obstacles known at that instant. If Tier-3's A* path to
-    # it is then much longer than the straight distance (obstacles appeared —
-    # typically its depth memory filling in — and it now plans a loop around
-    # them: 10-31, a 2 m loop for a 0.5 m goal while spinning in place), the
-    # goal is stale: re-pick, fan first. Needs detour_ticks consecutive Tier-3
-    # status ticks; at most detour_max_repicks per leg, so it cannot thrash
-    # cmd_ids (X1). 0 disables.
-    detour_ratio: float = 3.0
-    detour_min_path_m: float = 0.8
-    detour_ticks: int = 5
-    detour_max_repicks: int = 2
     # A retry that has really moved this far (world pose since its send) has
     # got past what blocked it: the consecutive-block retry window restarts,
     # so a second, unrelated block later in the same leg isn't charged for
     # the first one's time ("window exhausted" after 1 m of driving).
     retry_progress_m: float = 0.20
-    # Tier-3 ARRIVED/IDLE at a snapped/frontier endpoint (plan_reason, also
-    # carried on the IDLE after it) with the robot not having moved and the
-    # sub-goal not a tiny hop = a Tier-2 "clear" goal Tier-3 knows is
-    # blocked (e.g. depth memory). That is a block, not progress — a
-    # goto→ARRIVED loop otherwise runs at 10 Hz with no motion, invisible to
-    # the retry window, until leg_deadline_s.
-    arrived_min_motion_m: float = 0.05
-    # An intermediate carrot this close that Tier-2 cannot reach (no clear
-    # run ≥ min_subgoal_m toward it, no fan candidate that gains on it) is
-    # treated as passed: it is a route vertex, not a destination, and it is
-    # sitting inside an obstacle's inflation (10-31: waypoint 3 against a
-    # cabinet base; the robot parked 10–20 cm short of it, retrying
-    # clear_run_failed until the window ran out). The terminal waypoint is
-    # never skipped. Must exceed pass_proximity_m to matter.
-    blocked_carrot_skip_m: float = 0.40
     # Use Tier-3's depth memory (status depth_mem_body) in the desktop's
     # planning (global route stamp + live path check). Off since 10-31: the
     # remembered cells, inflated, sealed corridors on the session map and
@@ -301,6 +263,14 @@ class HierConfig:
     # rotated by that (11-03: two path_blocked into the wall). Hold the last
     # refresh at most this long — well inside path_ttl_s.
     path_hold_on_contest_s: float = 0.6
+    # Redesign step 5: route-progress watchdog (path mode). No decrease of the
+    # remaining route length by route_progress_eps_m for route_stall_s →
+    # block "no_route_progress" and escalate at once (via skip, then the
+    # ladder). Replaces the per-leg deadline in path mode; Tier-3's own 4 s
+    # no_progress covers a single stuck goal, this covers loops it can't see
+    # (re-joins, starved waits, oscillation).
+    route_stall_s: float = 15.0
+    route_progress_eps_m: float = 0.10
     # Pose doubt (explore plan A2): the pose is fresh but the map no longer
     # supports it (scan-match quality collapsed, or the robot is off the
     # map). "log" = warn once per episode only (default until the
@@ -376,7 +346,7 @@ class HierarchicalDrive:
         ``Costmap`` (or None). When given, each SELECT plans a global route
         robot → (relaxed) carrot on it and hands Tier-3 the furthest
         live-visible point along that path; the straight-bearing Tier-2
-        march (+ fan) is only the fallback when no costmap is available."""
+        march is only the fallback when no costmap is available."""
         self._runner = runner
         self._costmap_provider = costmap_provider
         self._route_cfg = route_cfg or RouteConfig()
@@ -411,12 +381,8 @@ class HierarchicalDrive:
         self._sink: HandoffSink = sink or NullHandoffSink()
         self._held_tier: Optional[int] = None    # which handoff we're paused at
         self._route_start: Optional[Tuple[float, float]] = None   # prev for vertex 0
-        self._detour_ticks = 0                      # consecutive detour status ticks
         self._block_skipped_via = False             # one via skip per leg
-        self._detour_last_ts: Optional[float] = None
-        self._detour_repicks = 0                    # per leg
-        self._prefer_fan = False                    # next SELECT: fan before straight
-        self._sent_src: Optional[str] = None        # clear | fan | blind of the live goto
+        self._sent_src: Optional[str] = None        # clear | route | blind of the live goto
         self._sent_pose_xy: Optional[Tuple[float, float]] = None   # world pose at send
         self._sent_dist: float = 0.0                # |sub-goal| at send
         self._prev_waypoint_xy: Optional[Tuple[float, float]] = None  # last vertex left
@@ -478,6 +444,8 @@ class HierarchicalDrive:
         self._path_block_at = -1e9
         self._path_mode_seen: Optional[str] = None
         self._doubt_hold_since: Optional[float] = None
+        self._rp_best: Optional[float] = None     # best remaining route length (step 5)
+        self._rp_at: float = 0.0
         self._pstats_reset()
 
     # ── Control ──────────────────────────────────────────────────────
@@ -534,10 +502,6 @@ class HierarchicalDrive:
         self._carrot_relaxed = None
         self._block_hits_world = []
         self._block_skipped_via = False
-        self._detour_ticks = 0
-        self._detour_last_ts = None
-        self._detour_repicks = 0
-        self._prefer_fan = False
         logger.info("hier: start (%d waypoints, %d lead-in)",
                     self._runner.n, max(0, len(self._lead_in) - 1))
         self._to(
@@ -1000,27 +964,14 @@ class HierarchicalDrive:
         # Tier-3's A* snap remains the authority. No usable clear point with a
         # live scan → BLOCKED (do not blind-project into obstacles). No scan →
         # blind horizon projection; Tier-3 reports no_scan if it cannot plan.
-        prefer_fan, self._prefer_fan = self._prefer_fan, False
         if route is not None:
             selected = self._select_along_route(route, pose)
-            if selected is None and not terminal and wp_dist <= self._cfg.blocked_carrot_skip_m:
-                logger.info("hier: carrot %.2f m away but the path to it is not "
-                            "live-clear — treating it as passed", wp_dist)
-                self._to(HierState.ADVANCE_WAYPOINT)
-                return
             if selected is None:
                 self._enter_blocked("path_blocked_live")
                 return
         else:
-            selected = self._select_subgoal_body(bearing, wp_dist, pose=pose,
-                                                 carrot=(cx, cy), prefer_fan=prefer_fan)
+            selected = self._select_subgoal_body(bearing, wp_dist)
         if selected is None:
-            if (not terminal and wp_dist <= self._cfg.blocked_carrot_skip_m
-                    and self._io.latest_scan() is not None):
-                logger.info("hier: carrot %.2f m away but no clear run to it — "
-                            "treating it as passed", wp_dist)
-                self._to(HierState.ADVANCE_WAYPOINT)
-                return
             self._enter_blocked("clear_run_failed")
             return
         (bx, by), src, free_dist, grid, meta = selected
@@ -1051,7 +1002,7 @@ class HierarchicalDrive:
             "arrival_tol_m": self._cfg.subgoal_arrival_tol_m,
             "v_max": self._leg_v_max(),
         }
-        anchor_ts = (meta or {}).get("_scan_ts") if src in ("clear", "fan", "route") else None
+        anchor_ts = (meta or {}).get("_scan_ts") if src in ("clear", "route") else None
         if anchor_ts is not None:
             kwargs["anchor_ts"] = anchor_ts
         self._path_live = False                # a goto supersedes any path goal
@@ -1265,9 +1216,7 @@ class HierarchicalDrive:
         return True
 
     def _select_subgoal_body(
-        self, bearing: float, wp_dist: float, *,
-        pose: Optional[Pose] = None, carrot: Optional[Tuple[float, float]] = None,
-        prefer_fan: bool = False,
+        self, bearing: float, wp_dist: float,
     ) -> Optional[Tuple[Tuple[float, float], str, float, Optional[Any], Optional[Dict[str, Any]]]]:
         """Tier-2 sub-goal toward ``bearing``, capped at ``wp_dist``.
 
@@ -1276,8 +1225,9 @@ class HierarchicalDrive:
         when a scan is present but the clear-run finds no usable point (caller
         should BLOCKED). Blind horizon projection only when there is no
         rasterizable scan. Returns ``((bx, by), source, free_dist_m, grid,
-        meta)`` — source ``clear``, ``fan`` (side bearing, see
-        ``HierConfig.fan_*``; needs ``pose`` + ``carrot``) or ``blind``.
+        meta)`` — source ``clear`` or ``blind``. Only used without a costmap
+        (no global route); the fan-out / detour special cases went with
+        path mode (redesign step 3).
         """
         t2 = self._cfg.tier2_cfg
         grid = meta = None
@@ -1287,25 +1237,6 @@ class HierarchicalDrive:
             res = furthest_free_point(march_grid, meta, bearing, march_cfg,
                                       max_dist_m=wp_dist)
             src = "clear"
-            if prefer_fan:
-                # Detour re-pick: the straight pick is what Tier-3 is looping
-                # around — try the sides first, straight only as fallback.
-                fan = self._fan_subgoal(march_grid, meta, march_cfg, bearing,
-                                        wp_dist, pose, carrot)
-                if fan is not None:
-                    res, src = fan, "fan"
-            straight_ok = res.ok and res.body_xy is not None
-            # Fan when the bearing is blocked outright, or only a short hop
-            # (< fan_min_free_m) short of an obstacle — inching up to it just
-            # to fail next tick wastes a cycle. A short straight hop is still
-            # the fallback when no side bearing qualifies.
-            short = (straight_ok and res.free_dist_m < self._cfg.fan_min_free_m
-                     and res.free_dist_m < wp_dist - 1e-6)
-            if src != "fan" and (not straight_ok or short):
-                fan = self._fan_subgoal(march_grid, meta, march_cfg, bearing,
-                                        wp_dist, pose, carrot)
-                if fan is not None:
-                    res, src = fan, "fan"
             if res is not None and res.ok and res.body_xy is not None:
                 meta = dict(meta)
                 ts = scan.get("ts")
@@ -1316,62 +1247,6 @@ class HierarchicalDrive:
         dist = min(wp_dist, t2.horizon_m)
         return ((dist * math.cos(bearing), dist * math.sin(bearing)),
                 "blind", dist, grid, meta)
-
-    def _fan_subgoal(self, march_grid, meta, march_cfg, bearing: float,
-                     wp_dist: float, pose: Optional[Pose],
-                     carrot: Optional[Tuple[float, float]]):
-        """Side-bearing clear-run when the straight one failed (see
-        ``HierConfig.fan_*``). Every candidate is a clear-run on the same
-        inflated mask (unknown = blocked), so the robot→sub-goal segment is
-        live-visible free space — it can't cross a wall. The route-corridor
-        and progress gates keep it from wandering off the authored route.
-        Smallest deviation wins; ties → closer to the carrot."""
-        cfg = self._cfg
-        if (pose is None or carrot is None or cfg.fan_max_deg <= 0
-                or cfg.fan_step_deg <= 0):
-            return None
-        prev = self._prev_vertex()
-        c, s = math.cos(pose[2]), math.sin(pose[2])
-        n = int(math.floor(cfg.fan_max_deg / cfg.fan_step_deg + 1e-9))
-        for k in range(1, n + 1):
-            best = None
-            for sign in (1.0, -1.0):
-                dev = sign * math.radians(k * cfg.fan_step_deg)
-                r = furthest_free_point(march_grid, meta, bearing + dev, march_cfg,
-                                        max_dist_m=wp_dist)
-                if not r.ok or r.body_xy is None or r.free_dist_m < cfg.fan_min_free_m:
-                    continue
-                # Pull the point back along its own (clear) ray until it is
-                # inside the route corridor: a sidestep, never a dive through
-                # an off-route doorway. Points on the clear ray are free on
-                # the inflated mask, so Tier-3 accepts them as-is.
-                ang = math.atan2(r.body_xy[1], r.body_xy[0])
-                ca, sa = math.cos(ang), math.sin(ang)
-                d = r.free_dist_m
-                step = float(march_cfg.step_m)
-                wx = wy = 0.0
-                d_wp = math.inf
-                while d >= cfg.fan_min_free_m:
-                    bx, by = d * ca, d * sa
-                    wx = pose[0] + c * bx - s * by
-                    wy = pose[1] + s * bx + c * by
-                    d_wp = math.hypot(carrot[0] - wx, carrot[1] - wy)
-                    if (_dist_to_segment((wx, wy), prev, carrot) <= cfg.fan_corridor_m
-                            and d_wp < wp_dist - 0.02):
-                        break
-                    d -= step
-                if d < cfg.fan_min_free_m:
-                    continue
-                if d < r.free_dist_m:
-                    r = replace(r, body_xy=(d * ca, d * sa), free_dist_m=d)
-                if best is None or d_wp < best[0]:
-                    best = (d_wp, r, dev)
-            if best is not None:
-                logger.info("hier: fan-out %+.0f° (straight bearing blocked) "
-                            "free=%.2f d_wp=%.2f", math.degrees(best[2]),
-                            best[1].free_dist_m, best[0])
-                return best[1]
-        return None
 
     def _depth_memory_body(self) -> Optional[list]:
         """``depth_mem_body`` from the latest Tier-3 status, if any (and the
@@ -1440,20 +1315,9 @@ class HierarchicalDrive:
             # the IDLE. Both mean "this sub-goal is done" → re-pick the next
             # one toward the same waypoint.
             if state in ("ARRIVED", "IDLE"):
-                moved = self._moved_since_send(pose)
-                if (st.get("plan_reason") in ("snapped", "frontier")
-                        and moved < self._cfg.arrived_min_motion_m
-                        and self._sent_dist >= self._cfg.subgoal_arrival_tol_m + 0.1):
-                    logger.info("hier: %s without motion (sub-goal %.2f m away, "
-                                "moved %.2f m) — treating as a block", state,
-                                self._sent_dist, moved)
-                    self._enter_blocked("arrived_no_motion")
-                    return
                 self._block_started_at = None      # sub-goal progress
                 self._block_gave_up = False
                 self._esc_clear(full=False)
-                self._detour_repicks = 0
-                self._detour_ticks = 0
                 logger.info("hier: re-pick (sub-goal %s)", state)
                 self._to(HierState.SELECT_SUBGOAL)
                 return
@@ -1478,10 +1342,6 @@ class HierarchicalDrive:
             self._enter_blocked("no_ack")
             return
 
-        if st is not None and int(st.get("cmd_id", 0) or 0) == self._cmd_id \
-                and st.get("state") == "DRIVING" and self._detour_check(st):
-            return
-
         # World-pose correction (re-anchor snap / relocate the odom frame never
         # saw): the current sub-goal is anchored in odom and now points the wrong
         # way relative to the corrected pose — re-pick from the corrected pose
@@ -1501,13 +1361,8 @@ class HierarchicalDrive:
         # bounds (X1). Belt and braces: never drift-re-pick while Tier-3 says
         # it is rotating/realigning. The difference must be wrapped — a tiny
         # real drift across ±π would otherwise read as ~2π.
-        # A fan sub-goal moves the robot off the bearing ON PURPOSE; the
-        # bearing to the carrot changes by design and a drift re-pick would
-        # abort the hop (and re-send the straight bearing that failed). Fan
-        # hops run to Tier-3 ARRIVED/IDLE.
         if (self._waypoint is not None and self._sent_world_bearing is not None
-                and tier3_mode not in _TIER3_TURNING_MODES
-                and self._sent_src != "fan"):
+                and tier3_mode not in _TIER3_TURNING_MODES):
             b = _world_bearing(pose, self._waypoint)
             drift = abs(wrap_pi(b - self._sent_world_bearing))
             if drift > self._cfg.repick_hysteresis_rad:
@@ -1572,6 +1427,9 @@ class HierarchicalDrive:
             st["max_send_gap_s"] = max(st["max_send_gap_s"], now - self._path_last_send)
         st["sends"] += 1
         self._path_last_send = now
+        if not live or new_route:
+            self._rp_best = None              # new goal / leg: new reference, fresh clock
+            self._rp_at = now
         if not live:
             st["new_goals"] += 1
             self._cmd_id = cid
@@ -1590,6 +1448,32 @@ class HierarchicalDrive:
         self._subgoal_body = pts[-1]
         self._block_reason = None
         self._to(HierState.DRIVING_SUBGOAL)
+        return True
+
+    def _route_remaining(self, pose: Pose) -> Optional[float]:
+        world = self._route.path_world if (self._route and self._route.ok) else None
+        if not world or len(world) < 2:
+            return None
+        cum = pf_cumulative(world)
+        s, _lat = pf_project(world, cum, (pose[0], pose[1]))
+        return max(0.0, float(cum[-1]) - s)
+
+    def _route_stalled(self, pose: Pose, now: float) -> bool:
+        """Step 5 watchdog. True when it fired (state changed to BLOCKED)."""
+        rem = self._route_remaining(pose)
+        if rem is None:
+            return False
+        if self._rp_best is None or rem < self._rp_best - self._cfg.route_progress_eps_m:
+            self._rp_best = rem
+            self._rp_at = now
+            return False
+        if now - self._rp_at <= self._cfg.route_stall_s:
+            return False
+        logger.warning("hier: no route progress for %.0fs (%.2f m to go, best %.2f m) — "
+                       "escalating", now - self._rp_at, rem, self._rp_best)
+        self._rp_best = None
+        self._rp_at = now
+        self._enter_blocked("no_route_progress")
         return True
 
     def _replan_quiet(self, pose: Pose) -> None:
@@ -1683,6 +1567,8 @@ class HierarchicalDrive:
             return
 
         now = self._tick_now
+        if self._route_stalled(pose, now):
+            return
         doubt = bool(getattr(self._pose, "heading_in_doubt", lambda: False)())
         if doubt:
             if self._doubt_hold_since is None:
@@ -1709,34 +1595,6 @@ class HierarchicalDrive:
             return 0.0
         return math.hypot(pose[0] - self._sent_pose_xy[0], pose[1] - self._sent_pose_xy[1])
 
-    def _detour_check(self, st: Dict[str, Any]) -> bool:
-        """See ``HierConfig.detour_*``. True when a re-pick was triggered."""
-        cfg = self._cfg
-        if cfg.detour_ratio <= 0:
-            return False
-        ts = st.get("ts")
-        if ts is not None and ts == self._detour_last_ts:
-            return False                    # same Tier-3 tick seen twice (20 vs 10 Hz)
-        self._detour_last_ts = ts
-        path = st.get("path_body_xy") or []
-        plen = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:]))
-        straight = float(st.get("dist_remaining_m") or 0.0)
-        detour = (plen >= cfg.detour_min_path_m
-                  and plen > cfg.detour_ratio * max(straight, 0.05))
-        self._detour_ticks = self._detour_ticks + 1 if detour else 0
-        if self._detour_ticks < max(1, cfg.detour_ticks):
-            return False
-        self._detour_ticks = 0
-        if self._detour_repicks >= cfg.detour_max_repicks:
-            return False                    # let Tier-3 drive its detour
-        self._detour_repicks += 1
-        self._prefer_fan = True
-        logger.info("hier: re-pick (Tier-3 path %.2f m for %.2f m straight — "
-                    "sub-goal stale; fan first, re-pick %d/%d)",
-                    plen, straight, self._detour_repicks, cfg.detour_max_repicks)
-        self._to(HierState.SELECT_SUBGOAL)
-        return True
-
     def _tick_advance(self) -> None:
         # Lead-in prefix: just step the lead-in carrot. The patrol runner is
         # untouched until the lead-in delivers us to the first marker.
@@ -1749,7 +1607,6 @@ class HierarchicalDrive:
             self._esc_clear(full=True)
             self._leg_started_at = None
             self._consecutive_rejects = 0
-            self._detour_repicks = 0
             self._block_skipped_via = False
             self._to(HierState.SELECT_SUBGOAL)
             return
@@ -1767,7 +1624,6 @@ class HierarchicalDrive:
         self._esc_clear(full=True)
         self._leg_started_at = None
         self._consecutive_rejects = 0
-        self._detour_repicks = 0
         self._block_skipped_via = False
         if next_idx is None:
             self._cancel_tier3()
@@ -1832,7 +1688,6 @@ class HierarchicalDrive:
             self._block_gave_up = False
             self._leg_started_at = None
             self._consecutive_rejects = 0
-            self._prefer_fan = True
             self._cancel_tier3()
             self._to(HierState.SELECT_SUBGOAL)
         elif rung == "wait":
@@ -1936,7 +1791,9 @@ class HierarchicalDrive:
             if self._esc_rung is not None:
                 self._tick_escalation(now)
             return                 # paused (window spent, or a pause advisory)
-        if terminal or now - self._block_started_at > self._cfg.blocked_retry_window_s:
+        stalled = self._block_reason == "no_route_progress"
+        if (terminal or stalled
+                or now - self._block_started_at > self._cfg.blocked_retry_window_s):
             # Escalation before a pause (redesign step 5, first rung): an
             # intermediate via that cannot be reached within the window is
             # skipped — it is a route hint. The terminal (or a must-visit
@@ -1960,6 +1817,7 @@ class HierarchicalDrive:
                 # holding (and possibly resuming) a goal (X3).
                 self._cancel_tier3()
                 why = ("terminal for this leg" if terminal else
+                       "no route progress" if stalled else
                        f"retry window ({self._cfg.blocked_retry_window_s:.1f}s) exhausted")
                 if self._recovery is not None:
                     logger.warning("hier: blocked (%s) — %s, escalating",
@@ -1979,6 +1837,8 @@ class HierarchicalDrive:
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _leg_expired(self) -> bool:
+        if self._path_live:
+            return False                  # path mode: the route-progress watchdog
         return (self._leg_started_at is not None
                 and self._cfg.leg_deadline_s > 0
                 and self._tick_now - self._leg_started_at > self._leg_deadline_s)

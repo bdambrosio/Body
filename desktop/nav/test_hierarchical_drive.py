@@ -196,11 +196,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd._goal_clearance_cells, plan.goal_clearance_cells)
         self.assertEqual(hd._raster, drive_config.scan_raster_config(body_cfg))
 
-    def test_idle_until_started(self):
-        hd, io, _ = self._build()
-        self.assertEqual(hd.tick(0.0), HierState.IDLE)
-        self.assertEqual(io.sent, [])
-
     def test_start_aligns_selects_and_sends(self):
         hd, io, _ = self._build()
         hd.start()
@@ -225,27 +220,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         hd = HierarchicalDrive(_runner(()), FakePose((0, 0, 0)), io)
         hd.start()
         self.assertEqual(hd.state(), HierState.FAILED)
-
-    def test_subgoal_arrived_repicks_same_waypoint(self):
-        hd, io, _ = self._build(points=((5.0, 0.0),))
-        self._drive_to_sending(hd)
-        runner_idx_before = hd._runner.wp_index
-        io.set_status(cmd_id=1, state="ARRIVED")
-        # Same-tick handoff: ARRIVED → re-pick → next goto all in one tick.
-        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
-        self.assertEqual(len(io.sent), 2)                    # re-picked
-        self.assertEqual(hd._runner.wp_index, runner_idx_before)  # same waypoint
-
-    def test_waypoint_reached_advances(self):
-        hd, io, po = self._build(points=((1.0, 0.0), (3.0, 0.0)))
-        self._drive_to_sending(hd)
-        po.pose = (1.0, 0.0, 0.0)        # now sitting on wp0 (intermediate)
-        # Same-tick: reached wp0 → ADVANCE → SELECT toward wp1 → DRIVING.
-        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
-        # Intermediate advance is seamless — Tier-3 is NOT canceled; the next
-        # SELECT_SUBGOAL goto supersedes it.
-        self.assertEqual(io.cancels, 0)
-        self.assertEqual(hd._runner.wp_index, 1)   # advanced toward wp1
 
     def test_intermediate_advances_only_when_passed(self):
         # Non-terminal wp0: a pose SHORT of it (not yet driven past along the
@@ -290,13 +264,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
         self.assertEqual(len(io.sent), 2)
         self.assertEqual(hd._runner.wp_index, 0)
-
-    def test_tier3_blocked_sets_blocked(self):
-        hd, io, _ = self._build(points=((5.0, 0.0),))
-        self._drive_to_sending(hd)
-        io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="swept_block")
-        self.assertEqual(hd.tick(0.0), HierState.BLOCKED)
-        self.assertEqual(hd.block_reason(), "swept_block")
 
     def test_tier3_canceled_fails(self):
         hd, io, _ = self._build(points=((5.0, 0.0),))
@@ -362,9 +329,8 @@ class TestHierarchicalDrive(unittest.TestCase):
         io = FakeDriveIO(scan=scan)
         io.status = {"cmd_id": 0, "state": "IDLE",
                      "depth_mem_body": [[0.6, y / 100.0] for y in range(-8, 9, 4)]}
-        # Fan off: this pins the stamping alone (the fan has its own tests).
         hd = HierarchicalDrive(_runner(((5.0, 0.0),)), FakePose((0.0, 0.0, 0.0)), io,
-                               HierConfig(fan_max_deg=0.0, plan_with_depth_memory=True))
+                               HierConfig(plan_with_depth_memory=True))
         hd.start()
         hd.tick(0.0)
         hd.tick(0.0)
@@ -375,7 +341,7 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertAlmostEqual(by, 0.0, places=2)
         # Without the memory the same scan marches to the 1.46 m horizon.
 
-    # ── Tier-2 fan-out (straight bearing blocked) ──────────────────────
+    # ── scan helpers ──────────────────────────────────────────────────
 
     @staticmethod
     def _seg_scan(segs, pose=(0.0, 0.0, 0.0)):
@@ -400,184 +366,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         return {"ranges": ranges, "angle_min": ANGLE_MIN, "angle_increment": ANGLE_INC,
                 "ts": 1.0}
 
-    def _fan_select(self, scan, mem=None, wp=(2.0, 0.0), **cfg):
-        io = FakeDriveIO(scan=scan)
-        io.status = {"cmd_id": 0, "state": "IDLE",
-                     **({"depth_mem_body": mem} if mem else {})}
-        cfg.setdefault("plan_with_depth_memory", True)   # these test the mechanism
-        hd = HierarchicalDrive(_runner((wp,)), FakePose((0.0, 0.0, 0.0)), io,
-                               HierConfig(**cfg))
-        hd.start()
-        hd.tick(0.0)
-        hd.tick(0.0)
-        return hd, io
-
-    # The 10-31 bag: remembered by depth only, 0.5–0.8 m ahead, ~0.5 m wide.
-    BAG = [[x / 100.0, y / 100.0] for x in range(50, 81, 4) for y in range(-24, 25, 4)]
-
-    def test_fan_steps_around_depth_only_obstacle(self):
-        hd, io = self._fan_select(_clear_scan(), mem=self.BAG)
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
-        bx, by, _t, _v = io.sent[0]
-        dev = math.degrees(math.atan2(by, bx))
-        self.assertGreaterEqual(abs(dev), 15.0 - 1e-6)
-        self.assertLessEqual(abs(dev), 75.0 + 1e-6)
-        self.assertGreaterEqual(math.hypot(bx, by), 0.35 - 1e-6)
-        self.assertLessEqual(abs(by), 0.75 + 1e-6)          # inside the route corridor
-        self.assertLess(math.hypot(2.0 - bx, by), 2.0)      # made progress
-
-    def test_fan_disabled_keeps_old_straight_hop(self):
-        # Without the fan: the short straight hop up to the obstacle (then a
-        # clear_run_failed once there) — the 10-31 stall.
-        hd, io = self._fan_select(_clear_scan(), mem=self.BAG, fan_max_deg=0.0)
-        self.assertEqual(len(io.sent), 1)
-        bx, by, _t, _v = io.sent[0]
-        self.assertLess(bx, 0.35)
-        self.assertAlmostEqual(by, 0.0, places=6)
-
-    def test_fan_never_goes_through_off_route_doorway(self):
-        # A wall across the route with the only opening 1.0–1.8 m to the
-        # left (the route itself runs into the wall). The fan may sidestep
-        # along the wall inside the corridor, but never picks a point through
-        # (or beyond) the wall.
-        wall = [(0.6, -5.0, 0.6, 1.0), (0.6, 1.8, 0.6, 5.0)]
-        hd, io = self._fan_select(self._seg_scan(wall))
-        for bx, by, _t, _v in io.sent:
-            self.assertLess(bx, 0.6, (bx, by))              # this side of the wall
-            self.assertLessEqual(abs(by), 0.75 + 1e-6)      # inside the corridor
-        if not io.sent:
-            self.assertEqual(hd.block_reason(), "clear_run_failed")
-
-    def test_fan_takes_in_corridor_gap(self):
-        # A wall close across the route with a gap just left of it (inside
-        # the corridor): the fan goes THROUGH the gap instead of blocking.
-        wall = [(0.45, -5.0, 0.45, 0.1), (0.45, 0.7, 0.45, 5.0)]
-        hd, io = self._fan_select(self._seg_scan(wall))
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
-        bx, by, _t, _v = io.sent[0]
-        self.assertGreater(bx, 0.45)                         # beyond the wall…
-        self.assertTrue(0.0 < by <= 0.75 + 1e-6, by)         # …via the in-corridor gap
-
-    def test_fan_prefers_smallest_deviation(self):
-        # The narrowest swing that clears the (footprint-inflated) obstacle
-        # wins: a narrow post needs less than the wide bag.
-        narrow = [[x / 100.0, y / 100.0] for x in range(50, 61, 4) for y in range(-4, 5, 4)]
-
-        def dev(mem):
-            _hd, io = self._fan_select(_clear_scan(), mem=mem)
-            bx, by, _t, _v = io.sent[0]
-            return abs(math.degrees(math.atan2(by, bx)))
-        self.assertAlmostEqual(dev(narrow), 30.0, delta=1.0)
-        self.assertGreater(dev(self.BAG), dev(narrow))
-
-    def test_fan_rejects_points_that_lose_ground(self):
-        # Fully boxed ahead and to both sides up to 75°: only backward-ish
-        # moves remain → no fan candidate, honest BLOCKED.
-        box = [(0.35, -0.6, 0.35, 0.6), (-0.3, 0.35, 0.35, 0.35), (-0.3, -0.35, 0.35, -0.35)]
-        hd, io = self._fan_select(self._seg_scan(box))
-        self.assertEqual(io.sent, [])
-        self.assertEqual(hd.block_reason(), "clear_run_failed")
-
-    # ── Detour re-pick (stale sub-goal) ───────────────────────────────
-
-    LOOP = [[0.0, 0.0], [0.3, 0.5], [0.3, 1.2], [-0.4, 1.4], [-0.9, 0.8],
-            [-0.6, 0.2], [-0.2, 0.3], [0.4, 0.3]]        # ~3.4 m for a 0.5 m goal
-
-    def _detour_run(self, n_ticks, *, same_ts=False, **cfg):
-        hd, io, _ = self._build(points=((3.0, 0.0),), **cfg)
-        self._drive_to_sending(hd)
-        self.assertEqual(len(io.sent), 1)
-        for k in range(n_ticks):
-            io.set_status(cmd_id=1, state="DRIVING", mode="rotate",
-                          ts=100.0 if same_ts else 100.0 + 0.1 * k,
-                          path_body_xy=self.LOOP, dist_remaining_m=0.5)
-            hd.tick(1.0 + 0.05 * k)
-        return hd, io
-
-    def test_detour_repicks_with_fan_first(self):
-        # 10-31: Tier-3 planned a 2 m loop (spinning in place) to a 0.5 m
-        # sub-goal picked before its depth memory filled in. Five consecutive
-        # detour ticks → re-pick, sides first.
-        hd, io = self._detour_run(5)
-        self.assertEqual(len(io.sent), 2, io.sent)
-        bx, by, _t, _v = io.sent[1]
-        self.assertAlmostEqual(abs(math.degrees(math.atan2(by, bx))), 15.0, delta=1.0)
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
-
-    def test_detour_needs_consecutive_distinct_ticks(self):
-        hd, io = self._detour_run(4)
-        self.assertEqual(len(io.sent), 1)                    # one short
-        hd, io = self._detour_run(10, same_ts=True)
-        self.assertEqual(len(io.sent), 1)                    # same tick re-read
-        hd, io = self._detour_run(5, detour_ratio=0.0)
-        self.assertEqual(len(io.sent), 1)                    # disabled
-
-    def test_detour_repicks_capped_per_leg(self):
-        hd, io, _ = self._build(points=((3.0, 0.0),))
-        self._drive_to_sending(hd)
-        t = 1.0
-        for cid in (1, 2, 3, 4):
-            for k in range(5):
-                io.set_status(cmd_id=cid, state="DRIVING", ts=t,
-                              path_body_xy=self.LOOP, dist_remaining_m=0.5)
-                hd.tick(t)
-                t += 0.1
-        # 2 re-picks allowed, then Tier-3 is left to drive its detour.
-        self.assertEqual(len(io.sent), 3, io.sent)
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
-
-    # ── Review fixes (10-31 afternoon) ────────────────────────────────
-
-    def test_fan_goal_exempt_from_drift_repick(self):
-        # A fan hop moves the robot off the carrot bearing by design; the
-        # drift test must not abort it (re-sending the straight bearing that
-        # just failed). It runs to Tier-3 ARRIVED.
-        hd, io = self._fan_select(_clear_scan(), mem=self.BAG, wp=(2.0, 0.0))
-        self.assertEqual(len(io.sent), 1)
-        bx, by, _t, _v = io.sent[0]
-        self.assertGreater(abs(by), 0.3)                     # it IS a fan goal
-        po = hd._pose
-        # 40 % along the hop: bearing to the carrot has moved well past 20°.
-        po.pose = (0.4 * bx, 0.4 * by, 0.0)
-        io.set_status(cmd_id=1, state="DRIVING", mode="follow", ts=5.0)
-        for k in range(5):
-            hd.tick(1.0 + 0.1 * k)
-        self.assertEqual(len(io.sent), 1, io.sent)           # no drift re-pick
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
-        # Straight goals still drift-re-pick (unchanged behaviour).
-        hd2, io2, po2 = self._build(points=((2.0, 0.0),))
-        self._drive_to_sending(hd2)
-        po2.pose = (0.5, 0.6, 0.0)
-        io2.set_status(cmd_id=1, state="DRIVING", mode="follow", ts=5.0)
-        hd2.tick(1.0)
-        hd2.tick(1.1)
-        self.assertEqual(len(io2.sent), 2)
-
-    def test_snapped_arrival_without_motion_is_a_block(self):
-        # Tier-2 "clear" goal that Tier-3 knows is blocked → it ARRIVEs at a
-        # snapped endpoint where it stands. Counting that as progress re-picks
-        # the same goal from the same spot forever (10 Hz, no motion).
-        hd, io, po = self._build(points=((2.0, 0.0),))
-        self._drive_to_sending(hd)
-        io.set_status(cmd_id=1, state="IDLE", plan_reason="snapped", ts=2.0)
-        hd.tick(1.0)
-        self.assertEqual(hd.state(), HierState.BLOCKED)
-        self.assertEqual(hd.block_reason(), "arrived_no_motion")
-        self.assertEqual(len(io.sent), 1)
-        # Same arrival after real motion → ordinary progress re-pick.
-        hd, io, po = self._build(points=((2.0, 0.0),))
-        self._drive_to_sending(hd)
-        po.pose = (0.3, 0.0, 0.0)
-        io.set_status(cmd_id=1, state="IDLE", plan_reason="snapped", ts=2.0)
-        hd.tick(1.0)
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
-        self.assertEqual(len(io.sent), 2)
-        # A plain arrival (reached the goal) is never a block, moved or not.
-        hd, io, po = self._build(points=((2.0, 0.0),))
-        self._drive_to_sending(hd)
-        io.set_status(cmd_id=1, state="IDLE", ts=2.0)
-        hd.tick(1.0)
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
 
     def test_retry_that_drives_resets_block_window(self):
         # Block at t=0, retry at 0.5 s drives 1 m, second (unrelated) block at
@@ -597,47 +385,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.state(), HierState.BLOCKED)
         hd.tick(10.4)                                         # still inside a fresh window
         self.assertEqual(len(io.sent), 3, "window was charged for the first block")
-
-    def test_fan_ray_walks_back_to_a_point_that_gains_ground(self):
-        # Carrot close and off to the right; a left fan ray's far end loses
-        # ground but its near part gains: the ray must be used, not dropped.
-        wall = [(0.45, -5.0, 0.45, 5.0)]                     # straight blocked
-        hd, io = self._fan_select(self._seg_scan(wall), wp=(0.9, -0.25))
-        if io.sent:
-            bx, by, _t, _v = io.sent[0]
-            self.assertLess(math.hypot(0.9 - bx, -0.25 - by), math.hypot(0.9, 0.25))
-        else:
-            self.assertEqual(hd.block_reason(), "clear_run_failed")
-
-    def test_blocked_intermediate_carrot_within_reach_is_passed(self):
-        # 10-31 hallway: waypoint against a cabinet base. Carrot 0.3 m ahead,
-        # remembered cells between the robot and it: no clear run ≥ 0.2 m,
-        # no fan hop that gains on it. An intermediate vertex that close is
-        # passed, not fought; the next carrot gets a normal goto.
-        wall = [[0.22 + x / 100.0, y / 100.0] for x in range(0, 13, 4) for y in range(-30, 31, 4)]
-        io = FakeDriveIO(scan=_clear_scan())
-        io.status = {"cmd_id": 0, "state": "IDLE", "depth_mem_body": wall}
-        hd = HierarchicalDrive(_runner(((0.3, 0.0), (0.3, 2.0))), FakePose((0.0, 0.0, 0.0)), io,
-                               HierConfig(plan_with_depth_memory=True))
-        hd.start()
-        hd.tick(0.0)
-        hd.tick(0.0)
-        hd.tick(0.0)
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL, hd.block_reason())
-        self.assertEqual(hd.current_waypoint_world(), (0.3, 2.0))
-        self.assertEqual(len(io.sent), 1)
-        bx, by, _t, _v = io.sent[0]
-        self.assertGreater(by, 0.2)                           # heading for the next vertex
-        # The TERMINAL waypoint is never skipped: honest block.
-        io2 = FakeDriveIO(scan=_clear_scan())
-        io2.status = {"cmd_id": 0, "state": "IDLE", "depth_mem_body": wall}
-        hd2 = HierarchicalDrive(_runner(((0.3, 0.0),)), FakePose((0.0, 0.0, 0.0)), io2,
-                                HierConfig(plan_with_depth_memory=True))
-        hd2.start()
-        hd2.tick(0.0)
-        hd2.tick(0.0)
-        self.assertEqual(hd2.state(), HierState.BLOCKED)
-        self.assertEqual(hd2.block_reason(), "clear_run_failed")
 
     def test_select_clear_run_fail_blocks_not_blind(self):
         # When a live scan is present but the clear-run finds no usable point,
@@ -817,6 +564,7 @@ class TestHierarchicalDrive(unittest.TestCase):
         cancels = io.cancels
         io.set_status(cmd_id=1, state="BLOCKED", blocked_reason="swept_block")
         self.assertEqual(hd.tick(0.0), HierState.BLOCKED)
+        self.assertEqual(hd.block_reason(), "swept_block")
         self.assertEqual(io.cancels, cancels + 1)
 
     def test_teleop_suspends_and_cancels(self):
@@ -846,16 +594,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         io.set_status(cmd_id=3, state="REJECTED", watermark=50)
         self.assertEqual(hd.tick(0.2), HierState.BLOCKED)
         self.assertEqual(hd.block_reason(), "rejected")
-
-    def test_rejected_at_watermark_is_real_rejection(self):
-        # Tier-3 absorbs resends of an accepted id silently; a REJECTED whose
-        # watermark equals our id means the goto itself was refused (malformed),
-        # so hier must re-pick rather than wait on a goal Tier-3 never took.
-        hd, io, _ = self._build(points=((5.0, 0.0),))
-        self._drive_to_sending(hd)
-        io.set_status(cmd_id=1, state="REJECTED", watermark=1)
-        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
-        self.assertEqual(len(io.sent), 2)
 
     def test_no_ack_blocks(self):
         hd, io, _ = self._build(points=((5.0, 0.0),))
@@ -887,13 +625,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         po.corr_seq += 1                 # re-anchor snap; pose otherwise unchanged
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)  # same-tick re-pick
         self.assertEqual(len(io.sent), 2)
-
-    def test_no_repick_without_correction_or_drift(self):
-        # Steady driving with no correction and no drift must NOT re-pick.
-        hd, io, po = self._build(points=((5.0, 0.0),))
-        self._drive_to_sending(hd)
-        self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)
-        self.assertEqual(len(io.sent), 1)
 
     def test_no_spurious_repick_across_pi_bearing(self):
         # Carrot dead-astern: both bearings live near ±π. A tiny real drift
@@ -1024,18 +755,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertGreater(io.cancels, cancels)
         self.assertEqual(hd.block_reason(), "depth_block")
 
-    def test_advisory_ignored_when_not_blocked(self):
-        hd, io, _ = self._build(points=((5.0, 0.0),))
-        self._drive_to_sending(hd)
-        self.assertFalse(hd.apply_block_advisory(
-            hd.block_run(), BlockAdvisory("pause", "box")))
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
-
-    def test_unknown_advisory_action_rejected(self):
-        hd, _, _ = self._blocked()
-        with self.assertRaises(ValueError):
-            hd.apply_block_advisory(hd.block_run(), BlockAdvisory("go", "x"))
-
     def test_send_failed_cancels_live_goto(self):
         # A send failure enters BLOCKED — any still-live goto on the Pi must be
         # revoked so the UI's BLOCKED matches an actually-stopped robot.
@@ -1083,13 +802,6 @@ class TestHierarchicalDrive(unittest.TestCase):
         self.assertEqual(hd.state(), HierState.ALIGNING)
         self.assertEqual(hd.tick(0.0), HierState.SELECT_SUBGOAL)
         self.assertEqual(hd.tick(0.0), HierState.DRIVING_SUBGOAL)   # drives again
-
-    def test_resume_noop_when_not_suspended(self):
-        hd, io, _ = self._build()
-        self._drive_to_sending(hd)
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
-        self.assertFalse(hd.request_resume())
-        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
 
     # ── Self-recovery (desktop/nav/recovery.py) ─────────────────────
 

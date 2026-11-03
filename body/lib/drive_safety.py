@@ -244,20 +244,3 @@ def swept_path_blocked(
 
     return False
 
-
-def driveable_from_rows(rows: Any, nx: int, ny: int) -> Optional[np.ndarray]:
-    """Convert the wire form of local_map ``driveable`` (list of lists of
-    bool|None: True clear, False blocked, None unknown) to int8 (-1/0/1).
-    Returns None if shape is wrong."""
-    if not isinstance(rows, list) or len(rows) != nx:
-        return None
-    out = np.full((nx, ny), -1, dtype=np.int8)
-    for i, row in enumerate(rows):
-        if not isinstance(row, list) or len(row) != ny:
-            return None
-        for j, v in enumerate(row):
-            if v is True:
-                out[i, j] = 1
-            elif v is False:
-                out[i, j] = 0
-    return out
