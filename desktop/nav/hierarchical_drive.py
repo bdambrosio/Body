@@ -276,7 +276,9 @@ class HierConfig:
     # map). "log" = warn once per episode only (default until the
     # thresholds are tuned on the robot); "suspend" = treat it as pose_lost
     # (self-recovery verifies / re-localizes); "off" = ignore.
-    pose_doubt_action: str = "log"
+    # "suspend" since 11-03: with the data-based pose-support thresholds
+    # (a0aa364) ~5,000 patrol scans gave no false "weak".
+    pose_doubt_action: str = "suspend"
     pose_doubt_hold_s: float = 2.0         # doubt must persist this long
     # Tier-2 clear-run uses tier2_cfg (horizon, step, min_subgoal, …) on a
     # footprint-inflated scan raster shared with Tier-3 (I8). Blind horizon
