@@ -169,6 +169,55 @@ def _pick_device(device_id: str | None) -> dai.DeviceInfo | None:
     return None
 
 
+# 11-03: the Pi booted with a 5.7-day-old clock, chrony stepped it while the
+# driver ran, DepthAI dropped the device, and the launcher's restart looked
+# for it while the old process still held it mid-reset → "no device found" →
+# synthetic stub for good. Wait a while for the device instead, and from the
+# stub keep looking: exit when it appears so the launcher restarts us for real.
+DEVICE_WAIT_S = 30.0
+STUB_PROBE_S = 10.0
+EXIT_DEVICE_APPEARED = 3
+
+
+def _wait_for_device(device_id: str | None, stop_ref: list[bool],
+                     timeout_s: float = DEVICE_WAIT_S) -> dai.DeviceInfo | None:
+    t_end = time.monotonic() + timeout_s
+    first = True
+    while True:
+        try:
+            d = _pick_device(device_id)
+        except Exception as e:  # noqa: BLE001 — XLink enumeration can throw mid-reset
+            print(f"[oakd] device enumeration failed: {e!r}", flush=True)
+            d = None
+        if d is not None or stop_ref[0] or time.monotonic() >= t_end:
+            return d
+        if first:
+            print(f"[oakd] no DepthAI device yet; retrying for {timeout_s:.0f}s", flush=True)
+            first = False
+        time.sleep(1.0)
+
+
+def _start_device_probe(device_id: str | None, stop_ref: list[bool],
+                        appeared: list[bool]) -> threading.Thread:
+    """While the stub runs: look for the device every STUB_PROBE_S; when it
+    shows up, stop the stub (the driver then exits EXIT_DEVICE_APPEARED)."""
+    def run() -> None:
+        while not stop_ref[0]:
+            time.sleep(STUB_PROBE_S)
+            try:
+                if _pick_device(device_id) is not None:
+                    print("[oakd] DepthAI device appeared; exiting the stub so the "
+                          "launcher restarts the real pipeline", flush=True)
+                    appeared[0] = True
+                    stop_ref[0] = True
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+    t = threading.Thread(target=run, name="oakd-device-probe", daemon=True)
+    t.start()
+    return t
+
+
 def _rgb_preview_dims(oakd_cfg: dict[str, Any]) -> tuple[int, int]:
     w = int(oakd_cfg.get("rgb_preview_width", 640))
     h = int(oakd_cfg.get("rgb_preview_height", 400))
@@ -858,6 +907,7 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
+    appeared: list[bool] = [False]
 
     try:
         if not oakd_cfg.get("imu_hardware_present", True):
@@ -866,12 +916,15 @@ def main() -> None:
                 "Luxonis notes some OAK-D-Lite (e.g. Kickstarter) have no IMU chip.",
                 flush=True,
             )
-            dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
-            if dev_info is None:
+            dev_id = device_id if isinstance(device_id, str) else None
+            dev_info = _wait_for_device(dev_id, stop_ref)
+            if dev_info is None and not stop_ref[0]:
                 print(
-                    "[oakd] no DepthAI device found; running synthetic IMU/depth stub.",
+                    "[oakd] no DepthAI device found; running synthetic IMU/depth stub "
+                    f"(probing for the device every {STUB_PROBE_S:.0f}s).",
                     flush=True,
                 )
+                _start_device_probe(dev_id, stop_ref, appeared)
                 _run_stub_imu_publisher(
                     session, oakd_cfg, interval_s, depth_period, stop_ref, config_pending
                 )
@@ -891,7 +944,8 @@ def main() -> None:
                         oakd_cfg, dev_info, session, interval_s, depth_period, stop_ref, config_pending
                     )
         else:
-            dev_info = _pick_device(device_id if isinstance(device_id, str) else None)
+            dev_info = _wait_for_device(device_id if isinstance(device_id, str) else None,
+                                        stop_ref)
             if dev_info is None:
                 print(
                     "oakd_driver: no DepthAI device found (connect OAK-D-Lite, check udev / USB)",
@@ -912,7 +966,7 @@ def main() -> None:
     finally:
         session.close()
 
-    sys.exit(0)
+    sys.exit(EXIT_DEVICE_APPEARED if appeared[0] else 0)
 
 
 if __name__ == "__main__":
