@@ -91,6 +91,10 @@ class Waypoint:
     # approach into clutter or unmapped space. None = the drive default.
     # Tier-3 clamps it to its configured [v_min, v_max]; it can only slow.
     v_max_mps: Optional[float] = None
+    # Face this world heading on arrival (explore's investigate legs: point
+    # the camera at the change). Path mode, terminal marker only. Runtime
+    # only — not serialized.
+    final_heading_rad: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {

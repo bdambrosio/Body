@@ -28,7 +28,7 @@ class PathIO(FakeDriveIO):
             cmd_id = self._cid
         self.paths.append(dict(cmd_id=cmd_id, new=new, path=list(path_body),
                                anchor_ts=anchor_ts, seq=path_seq, route=route_id,
-                               end=end_is_goal, ttl=ttl_s))
+                               end=end_is_goal, ttl=ttl_s, heading=final_heading_rad))
         return cmd_id
 
 
@@ -67,6 +67,24 @@ class TestPathMode(unittest.TestCase):
         self.assertEqual(p["ttl"], 1.0)
         seg = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(p["path"], p["path"][1:])]
         self.assertLessEqual(max(seg), 0.10 + 1e-6)
+
+    def test_final_heading_is_sent_in_the_odom_frame(self):
+        # Explore investigate legs: world heading → odom frame (Tier-3 compares
+        # final_heading_rad with its odom θ as-is).
+        cm = _world()
+        runner = _runner(((2.0, 0.0),))
+        runner.patrol.waypoints[0].final_heading_rad = math.radians(90)
+        io = PathIO(scan=_clear_scan())
+        io.odom_pose = lambda: (5.0, 5.0, math.radians(30))
+        po = StampedPose((0.0, 0.0, math.radians(10)))
+        hd = HierarchicalDrive(runner, po, io, HierConfig(path_mode=True),
+                               costmap_provider=lambda: cm)
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        self.assertAlmostEqual(io.paths[0]["heading"], math.radians(110))
+        hd2, io2, _ = _drive(cm, ((2.0, 0.0),))
+        self.assertIsNone(io2.paths[0]["heading"])       # no heading asked
 
     def test_falls_back_to_subgoals_without_caps(self):
         cm = _world()

@@ -122,6 +122,23 @@ class ChangeReporter:
         self._lock = threading.Lock()
         self._recent: Deque[Dict[str, Any]] = deque(maxlen=keep)
         self.counts: Dict[str, int] = {}
+        self._listeners: List[Callable[[Dict[str, Any]], None]] = []
+
+    def add_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        """``fn(rec)`` after every change / label record (explore's task
+        layer). Called on the reporting thread; must not block."""
+        self._listeners.append(fn)
+
+    def remove_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        if fn in self._listeners:
+            self._listeners.remove(fn)
+
+    def _notify(self, rec: Dict[str, Any]) -> None:
+        for fn in list(self._listeners):
+            try:
+                fn(dict(rec))
+            except Exception:
+                logger.exception("change report: listener failed")
 
     def _write(self, rec: Dict[str, Any]) -> None:
         if not self.out_dir:
@@ -165,6 +182,7 @@ class ChangeReporter:
             logger.info("change #%d %s %s at (%.2f, %.2f)%s%s", ev.change_id, ev.kind,
                         ev.status, ev.x, ev.y, extra, f" [{verdict}]" if verdict else "")
         self._write(rec)
+        self._notify(rec)
         return rec
 
     def label(self, change_id: int, label: str, **detail: Any) -> None:
@@ -191,6 +209,25 @@ class ChangeReporter:
                     r["label"] = label
         logger.info("change #%d labelled %r %s", change_id, label,
                     {k: v for k, v in detail.items() if k != "jpeg_path"})
+        self._write(rec)
+        self._notify(rec)
+
+    def investigated(self, change_id: int, outcome: str, **detail: Any) -> None:
+        """Explore's second look at a change: confirmed | dismissed | gone |
+        unreachable. A dismissal is negative evidence for the store (the place
+        does not count towards a proposal this patrol)."""
+        rec = {"type": "investigated", "wall_ts": self._clock(), "change_id": change_id,
+               "outcome": outcome, **detail}
+        if outcome == "dismissed" and self.store is not None:
+            try:
+                self.store.on_dismissed(change_id)
+            except Exception:
+                logger.exception("change store: dismiss failed")
+        with self._lock:
+            for r in self._recent:
+                if r.get("change_id") == change_id and r.get("type") == "change":
+                    r["investigated"] = outcome
+        logger.info("change #%d investigated: %s %s", change_id, outcome, detail)
         self._write(rec)
 
     def save_jpeg(self, name: str, jpeg: bytes) -> Optional[str]:

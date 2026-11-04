@@ -8,6 +8,7 @@ today; goto/explore/etc. later).
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -22,7 +23,7 @@ from dataclasses import replace
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel,
-    QMainWindow, QMessageBox, QSplitter, QToolBar, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QSpinBox, QSplitter, QToolBar, QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtCore import QUrl
@@ -47,7 +48,9 @@ from desktop.perception.depth_stop_logger import DepthStopLogger
 from desktop.perception.frames import FrameGrabber, SnapshotRing
 from desktop.perception.image_check import check_frames
 from desktop.nav.recovery_log import RecoveryLogger, default_recovery_dir
-from .patrol import PatrolRunner
+from .patrol import Patrol, PatrolRunner, Waypoint
+from .explore import ExploreConfig, ExploreMap
+from .tasks import ExploreContext, ExploreTask, Leg, TaskRunner
 from .patrol_panel import PatrolDock
 from .planner import AStarConfig, PlanResult, plan_path
 from .pose_health import SUPPORT_GOOD, SUPPORT_OFF_MAP, PoseHealthMonitor, PoseSupportMonitor
@@ -254,6 +257,21 @@ class NavMainWindow(QMainWindow):
         self._go_act.triggered.connect(self._on_go)
         self._map_toolbar.addAction(self._go_act)
 
+        self._explore_act = QAction("Explore", self)
+        self._explore_act.setToolTip(
+            "Explore the mapped house (docs/explore_phase_d.md): visit the "
+            "least-seen places, take a second look at anything new, return "
+            "home when done or when the time budget runs out. Starts from home. "
+            "Reports only — the map is never changed.")
+        self._explore_act.triggered.connect(self._on_explore)
+        self._map_toolbar.addAction(self._explore_act)
+        self._explore_budget = QSpinBox()
+        self._explore_budget.setRange(1, 120)
+        self._explore_budget.setValue(int(ExploreConfig().budget_min))
+        self._explore_budget.setSuffix(" min")
+        self._explore_budget.setToolTip("Explore time budget (then return home)")
+        self._map_toolbar.addWidget(self._explore_budget)
+
         self._cancel_act = QAction("Stop", self)
         self._cancel_act.setToolTip(
             "Stop the hierarchical drive and cancel the in-flight Tier-3 goto."
@@ -437,6 +455,10 @@ class NavMainWindow(QMainWindow):
             self._change_labeler = ChangeLabeler(
                 FrameGrabber(self.chassis, PFPoseProvider(self.fuser).world_pose).grab,
                 self._vlm_worker, cam, self._change_reporter)
+        # Explore Phase D (docs/explore_phase_d.md): task runner over legs.
+        self._task_runner: Optional[TaskRunner] = None
+        self._explore_map: Optional[ExploreMap] = None
+        self._explore_listener = None
         add_listener = getattr(self.fuser.pose_source, "add_scan_listener", None)
         if add_listener is not None:
             add_listener(self._on_scan_observed)
@@ -680,6 +702,8 @@ class NavMainWindow(QMainWindow):
                 self._hier_drive.notify_teleop(True)
             now = time.time()
             self._hier_drive.tick(now)
+            if self._task_runner is not None:
+                self._task_runner.tick(now)
             self._snapshot_ring.tick(now, active=self._hier_drive.state() not in (
                 HierState.IDLE, HierState.ARRIVED, HierState.FAILED))
             if self._block_adj is not None:
@@ -982,6 +1006,11 @@ class NavMainWindow(QMainWindow):
             else:
                 br = hd.block_reason()
                 txt = f"hier: {hd.state().value}" + (f"  {br[:16]}" if br else "")
+                tr = self._task_runner
+                if tr is not None and tr.leg is not None:
+                    es = tr.task.status()
+                    txt = (f"explore {tr.leg.purpose} · cov {es['coverage']:.0%} · "
+                           f"vp {es['visited']} · inv {es['investigated']}  ") + txt
                 rs = hd.recovery_status()
                 if rs is not None:
                     nxt = rs.get("next_try_in_s")
@@ -1667,47 +1696,9 @@ class NavMainWindow(QMainWindow):
                 "route on the map before Go.",
             )
             return
-        if not self._ensure_drive_client():
-            return
-        with self.chassis.state.lock:
-            connected = self.chassis.state.connected
-            live = self.chassis.state.live_command
-        if not connected:
-            QMessageBox.warning(
-                self, "Hierarchical drive", "Chassis disconnected — connect first.",
-            )
-            return
-        if live:
-            # Teleop and Tier-3 would fight over cmd_vel; the drive suspends
-            # itself the moment Live is armed, so refuse to start with it on.
-            QMessageBox.warning(
-                self, "Hierarchical drive",
-                "Live cmd (teleop) is armed — turn it off before Go.",
-            )
-            return
-        # Backstop for a Go right after connect: give the first odom/scan
-        # (both stream continuously, ~20 Hz / ~7 Hz) up to 1 s to arrive.
-        deadline = time.monotonic() + 1.0
-        while (self._drive_client.odom_pose() is None
-               or self._drive_client.latest_scan() is None) \
-                and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if self._drive_client.odom_pose() is None or self._drive_client.latest_scan() is None:
-            QMessageBox.warning(
-                self, "Hierarchical drive",
-                "No odom/scan from the Pi yet — wait for telemetry.",
-            )
-            return
-        # Nav redesign step 1: the authored markers are via-points; every
-        # leg is planned live on the world costmap (route_planner), the
-        # carrot relaxed/skipped when it sits in an obstacle, and Tier-3 gets
-        # the furthest live-visible point along that path. No one-shot
-        # expansion at Go any more (its vertices became hard targets).
-        if self._last_costmap is None:
-            QMessageBox.warning(
-                self, "Hierarchical drive",
-                "No costmap yet — wait for the map to render before Go.",
-            )
+        if self._task_runner is not None:
+            self._stop_hier_drive()
+        if not self._drive_preflight():
             return
         self._shared_view.set_planned_path([])
         runner = PatrolRunner(patrol)
@@ -1724,6 +1715,170 @@ class NavMainWindow(QMainWindow):
         # built (wheel odom can't see that). Whatever is in view comes back.
         self._reset_depth_memory("go")
         self._hier_drive.start()
+
+    def _drive_preflight(self, title: str = "Hierarchical drive") -> bool:
+        """Drive client up, chassis connected, teleop off, telemetry and a
+        costmap present (Go and Explore)."""
+        if not self._ensure_drive_client():
+            return False
+        with self.chassis.state.lock:
+            connected = self.chassis.state.connected
+            live = self.chassis.state.live_command
+        if not connected:
+            QMessageBox.warning(
+                self, title, "Chassis disconnected — connect first.",
+            )
+            return False
+        if live:
+            # Teleop and Tier-3 would fight over cmd_vel; the drive suspends
+            # itself the moment Live is armed, so refuse to start with it on.
+            QMessageBox.warning(
+                self, title,
+                "Live cmd (teleop) is armed — turn it off before Go.",
+            )
+            return False
+        # Backstop for a Go right after connect: give the first odom/scan
+        # (both stream continuously, ~20 Hz / ~7 Hz) up to 1 s to arrive.
+        deadline = time.monotonic() + 1.0
+        while (self._drive_client.odom_pose() is None
+               or self._drive_client.latest_scan() is None) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if self._drive_client.odom_pose() is None or self._drive_client.latest_scan() is None:
+            QMessageBox.warning(
+                self, title,
+                "No odom/scan from the Pi yet — wait for telemetry.",
+            )
+            return False
+        # Nav redesign step 1: the authored markers are via-points; every
+        # leg is planned live on the world costmap (route_planner), the
+        # carrot relaxed/skipped when it sits in an obstacle, and Tier-3 gets
+        # the furthest live-visible point along that path. No one-shot
+        # expansion at Go any more (its vertices became hard targets).
+        if self._last_costmap is None:
+            QMessageBox.warning(
+                self, title,
+                "No costmap yet — wait for the map to render before Go.",
+            )
+            return False
+        return True
+
+    # ── Explore (docs/explore_phase_d.md) ─────────────────────────────
+
+    def _on_explore(self) -> None:
+        title = "Explore"
+        hd = self._hier_drive
+        if self._task_runner is not None or (hd is not None and hd.state() not in (
+                HierState.IDLE, HierState.ARRIVED, HierState.FAILED)):
+            QMessageBox.information(self, title, "A drive is running — Stop it first.")
+            return
+        if not self._drive_preflight(title):
+            return
+        rm = self.fuser.reference_map
+        home = list((rm.metadata or {}).get("boot_pose") or (0.0, 0.0, 0.0))
+        latest = self.fuser.pose_source.latest_pose()
+        if latest is None:
+            QMessageBox.warning(self, title, "No pose yet.")
+            return
+        pose = latest[0]
+        d_home = math.hypot(pose[0] - home[0], pose[1] - home[1])
+        if d_home > 0.5:
+            QMessageBox.warning(
+                self, title,
+                f"Explore starts from home (the power-on pose at ({home[0]:.2f}, "
+                f"{home[1]:.2f})); the robot is {d_home:.1f} m away. Drive it home first.")
+            return
+        with self._support_lock:
+            level = self._pose_support.level(time.time())
+        if level != SUPPORT_GOOD:
+            QMessageBox.warning(self, title, f"Pose support is {level!r}, not good — "
+                                "localize first.")
+            return
+        snap = self._last_snap
+        if snap is None:
+            QMessageBox.warning(self, title, "No map snapshot yet.")
+            return
+        cfg = replace(ExploreConfig(), budget_min=float(self._explore_budget.value()))
+        em = self._explore_map
+        t0 = time.monotonic()
+        if em is None or em.drive.shape != snap["driveable"].shape or em.cfg != cfg:
+            em = ExploreMap(snap["driveable"], snap.get("nogo"), snap["meta"], cfg)
+            self._explore_map = em
+            logger.info("explore: map prepared in %.2fs — %d viewpoints, %d observable cells",
+                        time.monotonic() - t0, len(em.viewpoints), em.n_observable)
+        ctx = ExploreContext(
+            costmap=self._planning_costmap,
+            robot_xy=self._explore_robot_xy,
+            seen=self._explore_seen,
+            occupied_near=self._explore_occupied_near,
+            home_xy=(float(home[0]), float(home[1])),
+            on_investigated=lambda cid, o, det: self._change_reporter.investigated(
+                cid, o, **det),
+        )
+        task = ExploreTask(em, ctx, cfg)
+        self._explore_listener = task.on_change
+        self._change_reporter.add_listener(self._explore_listener)
+        self._stop_hier_drive()
+        self._reset_depth_memory("explore")
+        self._task_runner = TaskRunner(task, self._start_task_leg,
+                                       on_finished=self._on_task_finished)
+        logger.info("explore: start, budget %.0f min", cfg.budget_min)
+        self._task_runner.start(time.time())
+
+    def _explore_robot_xy(self):
+        latest = self.fuser.pose_source.latest_pose()
+        return None if latest is None else (float(latest[0][0]), float(latest[0][1]))
+
+    def _explore_seen(self):
+        g, em = self._session_grid, self._explore_map
+        if g is None or em is None or (g.nx, g.ny) != em.drive.shape:
+            return None
+        return g.seen_mask()
+
+    def _explore_occupied_near(self, xy, r):
+        g = self._session_grid
+        return None if g is None else g.occupied_near(xy[0], xy[1], r)
+
+    def _start_task_leg(self, leg: Leg) -> HierarchicalDrive:
+        """One leg = a one-waypoint patrol on the usual hierarchical drive
+        (route planning, path streaming, recovery, pose doubt)."""
+        patrol = Patrol(name=f"explore-{leg.purpose}", session_id="", authored_utc="",
+                        loop=False, laps=1, waypoints=[Waypoint(
+                            x_m=leg.xy[0], y_m=leg.xy[1], face_next=False,
+                            final_heading_rad=leg.final_heading)])
+        cfg = HierConfig(path_mode=self._path_mode, waypoint_tol_m=leg.arrival_tol_m,
+                         give_up_after_cycles=leg.give_up_after)
+        hd = HierarchicalDrive(
+            PatrolRunner(patrol), self._make_pose_provider(), self._drive_client, cfg,
+            sink=self._ensure_handoff_gate(), costmap_provider=self._planning_costmap)
+        hd.set_recovery(self._build_recovery())
+        hd.set_pose_doubt(self._pose_doubt)
+        self._hier_drive = hd
+        self._shared_view.set_planned_path([])
+        hd.start()
+        return hd
+
+    def _on_task_finished(self, why: str, summary: Dict[str, Any]) -> None:
+        if self._explore_listener is not None:
+            self._change_reporter.remove_listener(self._explore_listener)
+            self._explore_listener = None
+        self._task_runner = None
+        summary = dict(summary, finished=why, wall_ts=time.time())
+        out = self._change_reporter.out_dir
+        if out:
+            try:
+                os.makedirs(out, exist_ok=True)
+                path = os.path.join(out, f"explore_summary_{int(time.time())}.json")
+                with open(path, "w") as f:
+                    json.dump(summary, f, indent=1, default=str)
+                logger.info("explore: summary written to %s", path)
+            except OSError:
+                logger.exception("explore: summary write failed")
+        logger.info("explore: %s — %s", why, summary.get("headline"))
+        try:
+            self.statusBar().showMessage(f"Explore {why}: {summary.get('headline')}")
+        except Exception:
+            pass
 
     # ── Self-recovery (desktop/nav/recovery.py) ──────────────────────
 
@@ -1888,6 +2043,10 @@ class NavMainWindow(QMainWindow):
             hd.request_resume()
 
     def _stop_hier_drive(self) -> None:
+        tr = self._task_runner
+        if tr is not None:
+            self._task_runner = None
+            tr.stop()                       # stops the leg's drive, writes the summary
         if self._hier_drive is not None:
             self._hier_drive.stop()
             self._hier_drive = None

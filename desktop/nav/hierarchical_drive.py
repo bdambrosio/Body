@@ -228,6 +228,12 @@ class HierConfig:
     # pose check (re-localize if wrong) -> back off to a clear spot -> re-plan
     # with a fresh leg budget -> wait (these, capped at the last) -> repeat.
     escalation_waits_s: Tuple[float, ...] = (15.0, 30.0, 60.0, 120.0, 300.0)
+    # Explore (docs/explore_phase_d.md): after this many full ladder cycles
+    # (verify -> unstick -> replan, then blocked again) give the leg up —
+    # FAILED with fail_reason "abandoned" — instead of the wait rung. A
+    # patrol marker has to be reached (None = never give up); an explore
+    # viewpoint does not.
+    give_up_after_cycles: Optional[int] = None
     unstick_min_m: float = 0.30
     unstick_max_m: float = 0.50
     unstick_timeout_s: float = 15.0
@@ -431,6 +437,8 @@ class HierarchicalDrive:
         # Blocked-leg escalation (see HierConfig.escalation_waits_s).
         self._esc_rung: Optional[str] = None     # verify|unstick|replan|wait
         self._esc_wait_idx = 0
+        self._esc_cycles = 0                     # full ladder cycles this leg (give_up_after_cycles)
+        self._fail_reason: Optional[str] = None
         self._esc_until = 0.0
         self._esc_cmd: Optional[int] = None
         self._esc_sent_at = 0.0
@@ -504,6 +512,8 @@ class HierarchicalDrive:
         self._carrot_relaxed = None
         self._block_hits_world = []
         self._block_skipped_via = False
+        self._esc_cycles = 0
+        self._fail_reason = None
         logger.info("hier: start (%d waypoints, %d lead-in)",
                     self._runner.n, max(0, len(self._lead_in) - 1))
         self._to(
@@ -829,6 +839,21 @@ class HierarchicalDrive:
 
     def current_subgoal_body(self) -> Optional[Tuple[float, float]]:
         return self._subgoal_body
+
+    def _final_heading_odom(self) -> Optional[float]:
+        """The terminal marker's ``final_heading_rad`` (world) in the Pi's odom
+        frame: Tier-3 compares final_heading_rad with its odom heading as-is,
+        body-frame goal or not (body/local_drive.py path_goal). Offset = odom
+        θ − world θ, both now."""
+        wp = None if self._in_lead_in() else self._runner.current_target()
+        h = getattr(wp, "final_heading_rad", None)
+        if h is None:
+            return None
+        odom = getattr(self._io, "odom_pose", lambda: None)()
+        pose = self._pose.world_pose()
+        if odom is None or pose is None:
+            return None
+        return math.atan2(math.sin(h + odom[2] - pose[2]), math.cos(h + odom[2] - pose[2]))
 
     def _leg_v_max(self) -> Optional[float]:
         """Speed cap for the current leg: the target waypoint's own
@@ -1419,7 +1444,9 @@ class HierarchicalDrive:
             route_id=self._route_id, end_is_goal=terminal and not truncated,
             ttl_s=self._cfg.path_ttl_s,
             arrival_tol_m=self._cfg.waypoint_tol_m if terminal else None,
-            v_max=self._leg_v_max())
+            v_max=self._leg_v_max(),
+            final_heading_rad=(self._final_heading_odom()
+                               if terminal and not truncated else None))
         if cid is None:
             self._enter_blocked("send_failed")
             return False
@@ -1656,8 +1683,29 @@ class HierarchicalDrive:
         if self._esc_rung is None:
             first = "replan" if self._block_reason == "rejected" else "verify"
             self._esc_enter(first, now)
-        else:
-            self._esc_enter(self._ESC_NEXT[self._esc_rung], now)
+            return
+        nxt = self._ESC_NEXT[self._esc_rung]
+        limit = self._cfg.give_up_after_cycles
+        if nxt == "wait" and limit is not None:
+            self._esc_cycles += 1
+            if self._esc_cycles >= limit:
+                self._abandon(f"blocked ({self._block_reason}) after {self._esc_cycles} "
+                              f"recovery cycle(s)")
+                return
+        self._esc_enter(nxt, now)
+
+    def _abandon(self, why: str) -> None:
+        logger.warning("hier: leg abandoned — %s", why)
+        if self._recovery is not None:
+            self._recovery.cancel()
+        self._esc_clear(full=True)
+        self._cancel_tier3()
+        self._fail_reason = "abandoned"
+        self._to(HierState.FAILED)
+
+    def fail_reason(self) -> Optional[str]:
+        """Why the drive is FAILED: "abandoned" (give_up_after_cycles), else None."""
+        return self._fail_reason
 
     def _esc_enter(self, rung: str, now: float) -> None:
         self._esc_rung = rung

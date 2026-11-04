@@ -226,6 +226,22 @@ class ChangeStore:
                 return NOVEL
             return None
 
+    def on_dismissed(self, change_id: int) -> None:
+        """Explore looked again from another viewpoint and the change was not
+        there: this session's sighting doesn't count (not towards a proposal,
+        and a looked-at-but-absent patrol for expiry). An entry this sighting
+        created is dropped."""
+        with self._lock:
+            _verdict, eid = self._by_change.get(change_id, (None, None))
+            e = self.entries.get(eid) if eid is not None else None
+            if e is None:
+                return
+            self._seen_now.discard(eid)
+            if self.session in e.sessions:
+                e.sessions = [s for s in e.sessions if s != self.session]
+            if not e.sessions and e.state == ST_CANDIDATE:
+                del self.entries[eid]
+
     # ── owner actions ────────────────────────────────────────────────
     def set_state(self, eid: int, state: str) -> bool:
         with self._lock:

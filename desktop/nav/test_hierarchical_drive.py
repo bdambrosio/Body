@@ -929,6 +929,28 @@ class TestHierarchicalDrive(unittest.TestCase):
             hd.tick(t)
         self.assertIn("verify", hd.recovery_status()["phase"])
 
+    def test_explore_leg_is_abandoned_after_one_cycle(self):
+        # give_up_after_cycles (explore): verify -> unstick -> replan, blocked
+        # again -> FAILED("abandoned") instead of the wait rung.
+        hd, io, po = self._blocked_with_recovery(give_up_after_cycles=1)
+        self.assertIsNone(hd.fail_reason())
+        t = self._block_until_give_up(hd, io, 1.0)
+        while hd.recovery_status() and "unstick" not in hd.recovery_status()["phase"]:
+            t += 0.1
+            hd.tick(t)
+        io.set_status(cmd_id=io._cid, state="ARRIVED")
+        hd.tick(t + 0.1)
+        hd.tick(t + 0.2)                               # re-planned, driving again
+        t += 0.3
+        while hd.state() != HierState.FAILED and t < 200.0:
+            if io.sent:
+                io.set_status(cmd_id=io._cid, state="BLOCKED", blocked_reason="swept_block")
+            hd.tick(t)
+            t += 0.1
+        self.assertEqual(hd.state(), HierState.FAILED)
+        self.assertEqual(hd.fail_reason(), "abandoned")
+        self.assertIsNone(hd.recovery_status())
+
     def test_progress_ends_the_ladder(self):
         hd, io, po = self._blocked_with_recovery()
         t = self._block_until_give_up(hd, io, 1.0)

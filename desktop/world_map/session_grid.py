@@ -299,6 +299,34 @@ class SessionGrid:
             return False
         return bool(self.score[i, j] < -self.cfg.occ_thresh)
 
+    def seen_mask(self) -> np.ndarray:
+        """Cells any scan touched this session (explore coverage)."""
+        with self._lock:
+            return self.n_obs > 0
+
+    def occupied_near(self, x: float, y: float, r: float) -> Optional[bool]:
+        """Within ``r`` of world (x, y): True if any cell leans occupied, False
+        if observed and all free, None if nothing there was observed
+        (explore's investigate verdict)."""
+        k = int(math.ceil(r / self.res))
+        ci = int(math.floor((x - self.ox) / self.res))
+        cj = int(math.floor((y - self.oy) / self.res))
+        i0, i1 = max(0, ci - k), min(self.nx, ci + k + 1)
+        j0, j1 = max(0, cj - k), min(self.ny, cj + k + 1)
+        if i0 >= i1 or j0 >= j1:
+            return None
+        ii, jj = np.meshgrid(np.arange(i0, i1), np.arange(j0, j1), indexing="ij")
+        near = np.hypot((ii + 0.5) * self.res + self.ox - x,
+                        (jj + 0.5) * self.res + self.oy - y) <= r
+        with self._lock:
+            s = self.score[i0:i1, j0:j1][near]
+            n = self.n_obs[i0:i1, j0:j1][near]
+        if (s > self.cfg.occ_thresh).any():
+            return True
+        if (n > 0).any():
+            return False
+        return None
+
     def layers(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Copies of (score, first_hit_ts, through) for the change detector."""
         with self._lock:

@@ -33,6 +33,17 @@ class TestIntegrate(unittest.TestCase):
         self.assertEqual(g.last_hit_ts[cell(g, 1.01, 0.01)], 5.0)
         self.assertEqual(g.last_free_ts[cell(g, 0.5, 0.01)], 5.0)
 
+    def test_seen_and_occupied_near(self):
+        g = SessionGrid(META)
+        self.assertIsNone(g.occupied_near(1.0, 0.0, 0.15))
+        for ts in (1.0, 2.0):
+            g.integrate(*one_beam(1.0), (0.0, 0.0, 0.0), ts=ts)
+        self.assertTrue(g.seen_mask()[cell(g, 0.5, 0.01)])
+        self.assertFalse(g.seen_mask()[cell(g, 0.5, 1.0)])
+        self.assertTrue(g.occupied_near(1.0, 0.0, 0.15))
+        self.assertFalse(g.occupied_near(0.5, 0.0, 0.10))
+        self.assertIsNone(g.occupied_near(0.5, 1.0, 0.10))
+
     def test_pose_rotation(self):
         g = SessionGrid(META)
         g.integrate(*one_beam(1.0), (0.0, 0.0, math.pi / 2), ts=1.0)

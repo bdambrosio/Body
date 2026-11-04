@@ -21,7 +21,7 @@ emit the identical `body/drive/goto` command.
 | `frame` | str | `"odom"` or `"body"`; anything else → `REJECTED` |
 | `x_m`, `y_m` | float | goal point in the odom frame (`frame:"odom"`), or in the robot body frame at `anchor_ts` (`frame:"body"`) |
 | `anchor_ts` | float? | `frame:"body"` only: wall-clock time the body-frame point refers to (normally the `scan.ts` it was computed from). The Pi anchors the goal in odom with **its own odom ring buffer interpolated at `anchor_ts`**; outside the ~3 s buffer it falls back to the latest odom and logs |
-| `final_heading_rad` | float? | face this on arrival; omit = don't care |
+| `final_heading_rad` | float? | face this on arrival; omit = don't care. **Odom frame** (compared with the odom θ as-is, even for `frame: "body"` goals) |
 | `arrival_tol_m` | float? | per-command override of config |
 | `v_max` | float? | per-command speed override |
 | `kind` | str | `"goto"` \| `"cancel"` \| `"stop"` |

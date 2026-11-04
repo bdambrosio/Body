@@ -102,6 +102,39 @@ class TestChangeStore(unittest.TestCase):
         patrol(st, "near2", [], path=((1.0, 1.0),))
         self.assertNotIn(eid, st.entries)
 
+    def test_dismissed_sighting_does_not_count(self):
+        # Explore looked again and the change wasn't there: no session credit,
+        # and an entry that sighting created is dropped.
+        st = ChangeStore(None)
+        patrol(st, "s1", [ev()])
+        eid = next(iter(st.entries))
+        st.begin_session("s2")
+        e = ev(x=1.1)
+        st.classify(e)
+        st.on_dismissed(e.change_id)
+        st.end_session()
+        self.assertEqual(st.entries[eid].sessions, ["s1"])
+        st.begin_session("s3")
+        fresh = ev(x=-4.0)
+        st.classify(fresh)
+        st.on_dismissed(fresh.change_id)
+        self.assertEqual(list(st.entries), [eid])
+
+    def test_reporter_listener_and_investigated(self):
+        st = ChangeStore(None)
+        st.begin_session("live")
+        rep = ChangeReporter(None, store=st)
+        got = []
+        rep.add_listener(got.append)
+        e = ev()
+        rep.report(e)
+        rep.label(e.change_id, "box or bag")
+        self.assertEqual([r["type"] for r in got], ["change", "label"])
+        self.assertEqual(got[0]["verdict"], NOVEL)
+        rep.investigated(e.change_id, "dismissed")
+        self.assertEqual(st.entries, {})
+        self.assertEqual(rep.recent()[0]["investigated"], "dismissed")
+
     def test_persists_and_reporter_hides_expected(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "change_store.json")
