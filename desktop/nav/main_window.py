@@ -1812,6 +1812,7 @@ class NavMainWindow(QMainWindow):
             seen=self._explore_seen,
             occupied_near=self._explore_occupied_near,
             home_xy=(float(home[0]), float(home[1])),
+            home_heading=float(home[2]),
             on_investigated=lambda cid, o, det: self._change_reporter.investigated(
                 cid, o, **det),
         )

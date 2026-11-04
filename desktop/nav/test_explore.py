@@ -142,6 +142,7 @@ class Sim:
             seen=lambda: self.seen,
             occupied_near=lambda xy, r: self.occ.get(xy),
             home_xy=(0.5, 0.5),
+            home_heading=0.9,
             on_investigated=lambda cid, o, det: self.inv.append((cid, o, det)),
         )
         self.task = ExploreTask(self.em, ctx, self.cfg)
@@ -174,6 +175,7 @@ class TestExploreTask(unittest.TestCase):
             purposes.append(s.arrive(t).purpose)
         self.assertEqual(s.finished[0], "done")
         self.assertEqual(purposes[-1], "home")
+        self.assertAlmostEqual(s.drives[-1].leg.final_heading, 0.9)   # faces the boot heading
         self.assertGreaterEqual(purposes.count("viewpoint"), 2)
         self.assertGreaterEqual(s.finished[1]["coverage"], 0.9)
 

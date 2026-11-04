@@ -140,6 +140,7 @@ class ExploreContext:
     # True: still blocked there; False: seen free; None: not observed.
     occupied_near: Callable[[Pt, float], Optional[bool]]
     home_xy: Pt
+    home_heading: Optional[float] = None          # world rad; face it on the home leg
     on_investigated: Callable[[int, str, Dict[str, Any]], None] = lambda cid, o, d: None
 
 
@@ -223,7 +224,8 @@ class ExploreTask:
         self._phase = "home"
         self._end_reason = why
         logger.info("explore: %s — going home", why)
-        return Leg(self.ctx.home_xy, "home", self.cfg.home_arrival_tol_m, give_up_after=None)
+        return Leg(self.ctx.home_xy, "home", self.cfg.home_arrival_tol_m,
+                   final_heading=self.ctx.home_heading, give_up_after=None)
 
     def next_leg(self, now: float) -> Optional[Leg]:
         if self._t0 is None:
