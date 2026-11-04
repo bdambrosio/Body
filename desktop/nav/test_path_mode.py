@@ -251,5 +251,48 @@ class TestPathMode(unittest.TestCase):
         self.assertEqual(hd.state(), HierState.ARRIVED)
 
 
+    def _heading_drive(self, cm):
+        runner = _runner(((1.0, 0.0),))
+        runner.patrol.waypoints[0].final_heading_rad = math.radians(90)
+        io = PathIO(scan=_clear_scan())
+        io.odom_pose = lambda: (0.0, 0.0, 0.0)
+        po = StampedPose((0.0, 0.0, 0.0))
+        hd = HierarchicalDrive(runner, po, io, HierConfig(path_mode=True),
+                               costmap_provider=lambda: cm)
+        hd.start()
+        hd.tick(0.0)
+        hd.tick(0.0)
+        return hd, io, po
+
+    def test_final_turn_is_not_cancelled_at_the_terminal(self):
+        # 11-04 explore: the PF "reached" check cancelled Tier-3 the moment it
+        # began the final-heading turn. With a heading, wait for its ARRIVED.
+        hd, io, po = self._heading_drive(_world())
+        cid = io.paths[0]["cmd_id"]
+        po.pose = (0.95, 0.0, 0.0)
+        for k in range(1, 21):                            # 2 s of turning
+            po.ts = 100.0 + 0.1 * k
+            io.set_status(cmd_id=cid, state="DRIVING", mode="rotate")
+            hd.tick(0.5 + 0.1 * k)
+        self.assertEqual(io.cancels, 0)
+        self.assertEqual(hd.state(), HierState.DRIVING_SUBGOAL)
+        self.assertGreater(len(io.paths), 3)              # stream kept alive
+        io.set_status(cmd_id=cid, state="ARRIVED")
+        hd.tick(3.0)
+        hd.tick(3.0)
+        self.assertEqual(hd.state(), HierState.ARRIVED)
+
+    def test_final_turn_wait_is_bounded(self):
+        hd, io, po = self._heading_drive(_world())
+        cid = io.paths[0]["cmd_id"]
+        po.pose = (0.95, 0.0, 0.0)
+        io.set_status(cmd_id=cid, state="DRIVING", mode="rotate")
+        hd.tick(1.0)
+        hd.tick(14.0)                                     # > final_turn_wait_s
+        hd.tick(14.0)
+        self.assertEqual(hd.state(), HierState.ARRIVED)
+        self.assertGreaterEqual(io.cancels, 1)            # stopped as before
+
+
 if __name__ == "__main__":
     unittest.main()

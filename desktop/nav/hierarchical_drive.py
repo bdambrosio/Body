@@ -198,6 +198,11 @@ class HierConfig:
     # The carrot is always the next un-passed vertex, so the bearing tracks the
     # Tier-1 route. pass_proximity_m is only a small stall-guard fallback.
     pass_proximity_m: float = 0.20
+    # Terminal waypoint with final_heading_rad: once the PF says "reached",
+    # let Tier-3 finish its final turn and wait for its ARRIVED rather than
+    # cancelling (which pre-empted every turn, 11-04 explore run). Bounded
+    # here in case Tier-3 never reports it.
+    final_turn_wait_s: float = 12.0
     subgoal_arrival_tol_m: float = 0.15   # tol passed to Tier-3 for each sub-goal
     repick_hysteresis_rad: float = 0.35   # re-pick mid-leg if the bearing drifts past this
     # After a block, retry selection at this interval for the window below (so
@@ -390,6 +395,7 @@ class HierarchicalDrive:
         self._held_tier: Optional[int] = None    # which handoff we're paused at
         self._route_start: Optional[Tuple[float, float]] = None   # prev for vertex 0
         self._block_skipped_via = False             # one via skip per leg
+        self._final_turn_since: Optional[float] = None
         self._sent_src: Optional[str] = None        # clear | route | blind of the live goto
         self._sent_pose_xy: Optional[Tuple[float, float]] = None   # world pose at send
         self._sent_dist: float = 0.0                # |sub-goal| at send
@@ -491,6 +497,8 @@ class HierarchicalDrive:
     def _to(self, state: HierState) -> None:
         if state is not self._state:
             logger.info("hier: %s -> %s", self._state.value, state.value)
+            if state is not HierState.DRIVING_SUBGOAL:
+                self._final_turn_since = None
         self._state = state
 
     def start(self) -> None:
@@ -804,6 +812,27 @@ class HierarchicalDrive:
             return int(fn())
         except Exception:
             return 0
+
+    def _await_final_turn(self) -> bool:
+        """True while Tier-3 should be left to finish the terminal waypoint's
+        final-heading turn (its ARRIVED then advances us via the status path);
+        False once there is no turn to wait for or the wait has timed out."""
+        if not self._carrot_terminal() or self._cmd_id is None:
+            return False
+        wp = None if self._in_lead_in() else self._runner.current_target()
+        if getattr(wp, "final_heading_rad", None) is None:
+            return False
+        now = self._tick_now
+        if self._final_turn_since is None:
+            self._final_turn_since = now
+            logger.info("hier: at terminal — waiting for Tier-3's final turn to %.0f°",
+                        math.degrees(wp.final_heading_rad))
+            return True
+        if now - self._final_turn_since < self._cfg.final_turn_wait_s:
+            return True
+        logger.warning("hier: final turn not reported done after %.0fs — stopping anyway",
+                       self._cfg.final_turn_wait_s)
+        return False
 
     def _reached_waypoint(self, pose: Pose) -> bool:
         """Advance off the current carrot, for terminal and intermediate alike:
@@ -1293,7 +1322,9 @@ class HierarchicalDrive:
             return
         # Waypoint reached (PF-judged) supersedes any sub-goal progress.
         if pose is not None and self._waypoint is not None:
-            if self._reached_waypoint(pose):
+            # A pending final-heading turn keeps the normal tick (streaming,
+            # status) running until Tier-3 reports ARRIVED.
+            if self._reached_waypoint(pose) and not self._await_final_turn():
                 # Only stop at the terminal waypoint. For intermediates (incl.
                 # lead-in points), leave Tier-3 driving and let the next
                 # SELECT_SUBGOAL goto supersede it (seamless via cmd_id).
