@@ -74,6 +74,11 @@ class SharedMapView:
         self._show_scan_overlay: bool = True
         # LPR checkpoints to draw: list of (x_m, y_m, radius_m, id).
         self._checkpoints: List[Any] = []
+        # Change detections (desktop/nav/detections.py rows, duck-typed:
+        # change_id, kind, x, y, extent_m, present, investigated, label)
+        # + the one selected in the Detections dock.
+        self._detections: List[Any] = []
+        self._selected_detection: Optional[int] = None
         self._views: List["_WorldViewBase"] = []
         # Mission state shared across panels: a single goal pin in
         # world frame, and the most recently planned path. Both are
@@ -248,6 +253,29 @@ class SharedMapView:
         """Install checkpoints to draw: each (x_m, y_m, radius_m, id)."""
         self._checkpoints = list(cps) if cps else []
         self._notify()
+
+    # ── Detections overlay (change pins) ───────────────────────────
+
+    def detections(self) -> List[Any]:
+        return self._detections
+
+    def selected_detection(self) -> Optional[int]:
+        return self._selected_detection
+
+    def set_detections(self, rows: Optional[Sequence[Any]]) -> None:
+        self._detections = list(rows) if rows else []
+        self._notify()
+
+    def set_selected_detection(self, change_id: Optional[int]) -> None:
+        self._selected_detection = change_id
+        self._notify()
+
+    def center_on(self, x: float, y: float) -> None:
+        """Pan (keeping the zoom; 6 m across if auto-fit) so (x, y) is centred."""
+        side = 6.0
+        if self._view_rect is not None:
+            side = self._view_rect[1] - self._view_rect[0]
+        self.set_view_rect((x - side / 2, x + side / 2, y - side / 2, y + side / 2))
 
     # ── Patrol overlay ──────────────────────────────────────────────
 
@@ -572,6 +600,9 @@ class _WorldViewBase(QWidget):
             # LPR checkpoints (rings + ids) — where Recognize snaps landed.
             self._draw_checkpoints(p, ox, oy, side_px, side_world)
 
+            # Change detections (pins; under the robot marker).
+            self._draw_detections(p, ox, oy, side_px, side_world)
+
             # World origin (anchor) marker.
             self._draw_world_marker(
                 p, 0.0, 0.0, 0.0, ox, oy, side_px,
@@ -801,6 +832,45 @@ class _WorldViewBase(QWidget):
             p.drawEllipse(QPointF(cx, cy), 3.0, 3.0)
             if cid:
                 p.drawText(QPointF(cx + 5, cy - 5), cid)
+        p.restore()
+
+    _DETECTION_COLORS = {
+        "new": (255, 170, 40), "moving": (60, 220, 255), "missing": (200, 120, 255),
+    }
+
+    def _draw_detections(
+        self, p: QPainter, ox: int, oy: int, side_px: int, side_world: float,
+    ) -> None:
+        """Change pins: colour by kind (new orange, moving cyan, missing
+        violet); solid while present, faded once gone; a white ring once
+        explore investigated it; the dock's selection gets a big halo."""
+        rows = self._shared.detections()
+        if not rows:
+            return
+        sel = self._shared.selected_detection()
+        ppm = side_px / side_world if side_world > 0 else 0.0
+        p.save()
+        p.setClipRect(QRectF(ox, oy, side_px, side_px))
+        for d in rows:
+            cx, cy = self._world_to_widget(float(d.x), float(d.y))
+            r, g, b = self._DETECTION_COLORS.get(d.kind, (220, 220, 220))
+            alpha = 235 if d.present else 90
+            rad = min(12.0, max(4.0, 0.5 * min(float(d.extent_m or 0.0), 0.5) * ppm))
+            p.setPen(QPen(QColor(0, 0, 0, alpha), 1))
+            p.setBrush(QColor(r, g, b, alpha))
+            p.drawEllipse(QPointF(cx, cy), rad, rad)
+            if d.investigated:
+                p.setPen(QPen(QColor(255, 255, 255, alpha), 1.5))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(cx, cy), rad + 3, rad + 3)
+            if d.change_id == sel:
+                p.setPen(QPen(QColor(255, 255, 80), 2.5))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(cx, cy), rad + 9, rad + 9)
+            if d.change_id == sel or (d.label and (d.investigated or getattr(d, "alert", False))):
+                p.setPen(QColor(255, 255, 255, alpha))
+                p.drawText(QPointF(cx + rad + 3, cy - rad - 1),
+                           d.label or f"#{d.change_id}")
         p.restore()
 
     def _draw_scan_overlay(

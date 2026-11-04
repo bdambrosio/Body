@@ -229,6 +229,7 @@ class ChangeReporter:
                     r["investigated"] = outcome
         logger.info("change #%d investigated: %s %s", change_id, outcome, detail)
         self._write(rec)
+        self._notify(rec)
 
     def save_jpeg(self, name: str, jpeg: bytes) -> Optional[str]:
         if not self.out_dir:

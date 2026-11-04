@@ -20,7 +20,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 from dataclasses import replace
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication, QDockWidget, QFileDialog, QHBoxLayout, QLabel,
     QMainWindow, QMessageBox, QSpinBox, QSplitter, QToolBar, QVBoxLayout, QWidget,
@@ -52,6 +52,8 @@ from .patrol import Patrol, PatrolRunner, Waypoint
 from .explore import ExploreConfig, ExploreMap
 from .tasks import ExploreContext, ExploreTask, Leg, TaskRunner
 from .patrol_panel import PatrolDock
+from .detections import DetectionModel
+from .detections_panel import DetectionsDock, ReviewDialog
 from .planner import AStarConfig, PlanResult, plan_path
 from .pose_health import SUPPORT_GOOD, SUPPORT_OFF_MAP, PoseHealthMonitor, PoseSupportMonitor
 from desktop.world_map.session_grid import SessionGrid
@@ -100,6 +102,12 @@ _RUNTIME_CP_CFG = CheckpointMatchConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _RecordBridge(QObject):
+    """Change-reporter records arrive on worker threads; re-emit them on the
+    GUI thread (queued connection)."""
+    record = pyqtSignal(dict)
 
 
 class NavMainWindow(QMainWindow):
@@ -583,6 +591,18 @@ class NavMainWindow(QMainWindow):
         self.addDockWidget(
             Qt.DockWidgetArea.LeftDockWidgetArea, self._vision_dock,
         )
+        # Detections: what the change detector / labeller / explore noticed
+        # (desktop/nav/detections.py), live, with map pins.
+        self._detections = DetectionModel()
+        self._detections_alerted: set = set()
+        self._explore_started_wall: Optional[float] = None
+        self._review_dialog: Optional[ReviewDialog] = None
+        self._detections_dock = DetectionsDock(self._detections, self._shared_view, self)
+        self._detections_dock.attach_to(self)
+        self._detections_dock.review_requested.connect(lambda: self._open_review())
+        self._record_bridge = _RecordBridge(self)
+        self._record_bridge.record.connect(self._on_detection_record)
+        self._change_reporter.add_listener(self._record_bridge.record.emit)
 
     def _build_menu(self) -> None:
         view_menu = self.menuBar().addMenu("&View")
@@ -613,6 +633,11 @@ class NavMainWindow(QMainWindow):
         self._vision_action.setShortcut("Ctrl+Shift+V")
         self._vision_action.triggered.connect(self._vision_dock.setVisible)
         view_menu.addAction(self._vision_action)
+
+        self._detections_action = self._detections_dock.toggleViewAction()
+        self._detections_action.setText("Detections panel")
+        self._detections_action.setShortcut("Ctrl+Shift+D")
+        view_menu.addAction(self._detections_action)
 
         view_menu.addSeparator()
 
@@ -1824,6 +1849,7 @@ class NavMainWindow(QMainWindow):
         self._task_runner = TaskRunner(task, self._start_task_leg,
                                        on_finished=self._on_task_finished)
         logger.info("explore: start, budget %.0f min", cfg.budget_min)
+        self._explore_started_wall = time.time()
         self._task_runner.start(time.time())
 
     def _explore_robot_xy(self):
@@ -1880,6 +1906,38 @@ class NavMainWindow(QMainWindow):
             self.statusBar().showMessage(f"Explore {why}: {summary.get('headline')}")
         except Exception:
             pass
+        # End-of-run review: findings since Go + the store's places.
+        try:
+            self._open_review(headline=f"Explore {why}: {summary.get('headline')}",
+                              since=self._explore_started_wall or 0.0)
+        except Exception:
+            logger.exception("explore: review dialog failed")
+
+    # ── Detections (dock, map pins, review) ──────────────────────────
+
+    def _on_detection_record(self, rec: dict) -> None:
+        d = self._detections.ingest(rec)
+        self._detections_dock.refresh()
+        if d is not None and d.alert and d.change_id not in self._detections_alerted:
+            self._detections_alerted.add(d.change_id)
+            what = d.label or d.kind
+            if d.investigated == "confirmed":
+                what += " (confirmed)"
+            msg = f"Detected: {what} at ({d.x:.1f}, {d.y:.1f})"
+            logger.info("detections: %s [change #%d]", msg, d.change_id)
+            self.statusBar().showMessage(msg, 15000)
+            self.statusBar().setStyleSheet("QStatusBar { background: #7a5a00; color: white; }")
+            QTimer.singleShot(4000, lambda: self.statusBar().setStyleSheet(""))
+
+    def _open_review(self, headline: Optional[str] = None, since: float = 0.0) -> None:
+        if self._review_dialog is not None:
+            self._review_dialog.close()
+        dlg = ReviewDialog(self._detections, self._change_store, self._shared_view,
+                           headline=headline, since=since, parent=self)
+        dlg.setModal(False)
+        dlg.finished.connect(lambda _r: self._detections_dock.refresh(force=True))
+        self._review_dialog = dlg
+        dlg.show()
 
     # ── Self-recovery (desktop/nav/recovery.py) ──────────────────────
 
