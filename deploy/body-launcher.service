@@ -16,6 +16,8 @@ Environment=PYTHONPATH=/home/bruce/Body
 # Pi processes reach each other and the desktop through the local zenohd router
 # (connect_endpoints in config.json); multicast scouting only adds stray peer links.
 Environment=ZENOH_MULTICAST_SCOUTING=0
+# PipeWire (USB sound card) lives in bruce's user session; linger is enabled so it runs at boot.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 # Opt-in: route every Pi process strictly through zenohd (see deploy/NETWORK.md).
 #Environment=ZENOH_MODE=client
 ExecStartPre=+/bin/sh /home/bruce/Body/deploy/prepare-pwm-sysfs.sh
