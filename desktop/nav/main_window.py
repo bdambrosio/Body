@@ -39,6 +39,7 @@ from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
 )
 from .health import LivenessWatcher
+from .voice_client import VoiceAnnouncer
 from .hierarchical_drive import (
     HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
 )
@@ -151,6 +152,9 @@ class NavMainWindow(QMainWindow):
         # hold/pause the drive; "log" only records + shows it; "off" disables.
         self._vlm_worker: Optional[VlmWorker] = None
         self._block_adj: Optional[BlockAdjudicator] = None
+        # Robot voice: announcements go to body/voice/say on the chassis
+        # session; the desktop voice service (python -m desktop.voice) speaks them.
+        self._voice = VoiceAnnouncer(self._voice_send)
         if vlm_advisor != "off":
             self._vlm_worker = VlmWorker()
             self._vlm_worker.start()
@@ -345,6 +349,16 @@ class NavMainWindow(QMainWindow):
         )
         self._stream_rgb_act.toggled.connect(self._on_toggle_stream_rgb)
         self._map_toolbar.addAction(self._stream_rgb_act)
+
+        self._voice_act = QAction("Voice", self)
+        self._voice_act.setCheckable(True)
+        self._voice_act.setChecked(True)
+        self._voice_act.setToolTip(
+            "Robot announcements on its speaker (sightings, stuck, e-stop, "
+            "end of run). Needs the voice service: python -m desktop.voice."
+        )
+        self._voice_act.toggled.connect(lambda on: setattr(self._voice, "muted", not on))
+        self._map_toolbar.addAction(self._voice_act)
 
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._map_toolbar)
@@ -746,6 +760,20 @@ class NavMainWindow(QMainWindow):
             except Exception:
                 logger.exception("cancel on teleop arm failed")
         self._live_was_on = live
+        hd = self._hier_drive
+        try:
+            self._voice.on_tick(
+                hd.state().value if hd is not None else None,
+                hd.block_reason() if hd is not None else None,
+                hd.fail_reason() if hd is not None else None,
+                self._estop_active(), time.monotonic())
+        except Exception:
+            logger.exception("voice tick failed")
+
+    def _voice_send(self, msg: dict) -> None:
+        session = getattr(self.chassis, "_session", None)
+        if session is not None:
+            session.put("body/voice/say", json.dumps(msg))
 
     def _on_redraw_tick(self) -> None:
         self._safety_toolbar.refresh()
@@ -1902,6 +1930,7 @@ class NavMainWindow(QMainWindow):
             except OSError:
                 logger.exception("explore: summary write failed")
         logger.info("explore: %s — %s", why, summary.get("headline"))
+        self._voice.on_task_finished(why)
         try:
             self.statusBar().showMessage(f"Explore {why}: {summary.get('headline')}")
         except Exception:
@@ -1918,6 +1947,7 @@ class NavMainWindow(QMainWindow):
     def _on_detection_record(self, rec: dict) -> None:
         d = self._detections.ingest(rec)
         self._detections_dock.refresh()
+        self._voice.on_detection(d)
         if d is not None and d.alert and d.change_id not in self._detections_alerted:
             self._detections_alerted.add(d.change_id)
             what = d.label or d.kind

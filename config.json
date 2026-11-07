@@ -334,7 +334,23 @@
       "imu_driver": {"topic": "body/imu", "timeout_ms": 12000},
       "oakd_driver": {"topic": "body/oakd/depth", "timeout_ms": 5000},
       "local_map": {"topic": "body/map/local_2p5d", "timeout_ms": 5000},
-      "local_drive": {"topic": "body/drive/status", "timeout_ms": 3000}
+      "local_drive": {"topic": "body/drive/status", "timeout_ms": 3000},
+      "audio_bridge": {"topic": "body/audio/status", "timeout_ms": 5000}
     }
+  },
+  "audio": {
+    "status_hz": 2.0,
+    "gap_timeout_s": 2.0,
+    "max_queue": 8,
+    "probe_interval_s": 10.0
+  },
+  "voice": {
+    "robot_name": "Inky",
+    "voice": "af_heart",
+    "pitch": 1.0,
+    "speed": 1.0,
+    "gpu_match": "5060",
+    "info_max_age_s": 10.0,
+    "max_queue": 6
   }
 }

@@ -31,6 +31,7 @@ PROCESSES: list[dict[str, Any]] = [
     {"name": "oakd_driver", "cmd": [sys.executable, "-m", "body.oakd_driver"]},
     {"name": "local_map", "cmd": [sys.executable, "-m", "body.local_map"]},
     {"name": "local_drive", "cmd": [sys.executable, "-m", "body.local_drive"]},
+    {"name": "audio_bridge", "cmd": [sys.executable, "-m", "body.audio_bridge"]},
 ]
 
 MOTOR_PROCESS = "motor_controller"
@@ -44,6 +45,7 @@ DEFAULT_LIVENESS: dict[str, dict[str, Any]] = {
     "oakd_driver": {"topic": "body/oakd/depth", "timeout_ms": 5000},
     "local_map": {"topic": "body/map/local_2p5d", "timeout_ms": 5000},
     "local_drive": {"topic": "body/drive/status", "timeout_ms": 3000},
+    "audio_bridge": {"topic": "body/audio/status", "timeout_ms": 5000},
 }
 
 

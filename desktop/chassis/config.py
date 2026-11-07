@@ -57,6 +57,12 @@ class Topics:
     oakd_rgb: str = "body/oakd/rgb"
     local_map: str = "body/map/local_2p5d"
     sweep_cmd: str = "body/sweep/cmd"
+    # Voice (desktop/voice service <-> body/audio_bridge)
+    voice_say: str = "body/voice/say"
+    voice_state: str = "body/voice/state"
+    audio_play: str = "body/audio/play"
+    audio_stop: str = "body/audio/stop"
+    audio_status: str = "body/audio/status"
 
 
 def resolve_router(cli_value: Optional[str]) -> str:

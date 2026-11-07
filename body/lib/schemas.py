@@ -647,3 +647,88 @@ def handoff_t3(
     if gm is not None:
         msg["meta"] = gm
     return msg
+
+
+# ── Audio (body/audio_bridge.py; desktop/voice) ─────────────────────────────
+
+
+def audio_play_chunk(
+    *,
+    utt_id: str,
+    seq: int,
+    final: bool,
+    sample_rate: int,
+    pcm_base64: str,
+    text: str | None = None,
+    ts: float | None = None,
+) -> dict[str, Any]:
+    """body/audio/play — one chunk of an utterance: mono s16le PCM, base64.
+
+    Chunks of one ``utt_id`` are played back-to-back in ``seq`` order (0, 1, ...);
+    ``final`` marks the last one. ``text`` is informational (logs only).
+    """
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "utt_id": str(utt_id),
+        "seq": int(seq),
+        "final": bool(final),
+        "format": "pcm_s16le",
+        "channels": 1,
+        "sample_rate": int(sample_rate),
+        "encoding": "base64",
+        "data": pcm_base64,
+    }
+    if text is not None:
+        msg["text"] = text
+    return msg
+
+
+def audio_status(
+    *,
+    state: str,
+    device_ok: bool,
+    utt_id: str | None = None,
+    queued: int = 0,
+    event: str | None = None,
+    event_utt_id: str | None = None,
+    error: str | None = None,
+    ts: float | None = None,
+) -> dict[str, Any]:
+    """body/audio/status — speaker state ("idle" | "playing"), periodic and on edges.
+
+    ``event`` is "utt_started" | "utt_done" on an edge message (``event_utt_id`` names the
+    utterance; ``error`` is set when it was dropped or cut short).
+    """
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "state": state,
+        "device_ok": bool(device_ok),
+        "utt_id": utt_id,
+        "queued": int(queued),
+    }
+    if event is not None:
+        msg["event"] = event
+        msg["event_utt_id"] = event_utt_id
+    if error is not None:
+        msg["error"] = error
+    return msg
+
+
+def voice_say(
+    text: str,
+    *,
+    kind: str = "info",
+    key: str | None = None,
+    cooldown_s: float = 0.0,
+    ts: float | None = None,
+) -> dict[str, Any]:
+    """body/voice/say — ask the desktop voice service to speak ``text`` on the robot.
+
+    ``kind``: "alert" (interrupts) | "chat" | "info" (dropped if stale). A request whose
+    ``key`` was accepted less than ``cooldown_s`` ago is ignored (desktop/voice/speech_queue.py).
+    """
+    msg: dict[str, Any] = {"ts": now_ts() if ts is None else ts, "text": text, "kind": kind}
+    if key is not None:
+        msg["key"] = key
+        msg["cooldown_s"] = float(cooldown_s)
+    return msg

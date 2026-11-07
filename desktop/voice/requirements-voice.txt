@@ -1,0 +1,13 @@
+# Desktop voice service (python -m desktop.voice). Separate venv: Kokoro/misaki
+# need Python <= 3.12; the main desktop .venv is 3.14. See README.md here.
+kokoro>=0.9,<1
+misaki[en]>=0.9,<1
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+soundfile>=0.12
+torch>=2.7
+numpy>=1.24,<3
+eclipse-zenoh~=1.9.0
+# Speech-to-text (Phase 2): openai/whisper-large-v3-turbo via transformers on the 5060 Ti.
+# Feed it 16 kHz float32 (the mic records 16 kHz) — the pipeline needs torchaudio only to resample.
+transformers>=4.45
+accelerate

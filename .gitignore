@@ -208,3 +208,4 @@ __marimo__/
 
 # Drive-timing / drive-trace measurement artifacts
 drive_timing_*.jsonl
+.venv-voice/
