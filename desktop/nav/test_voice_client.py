@@ -1,11 +1,14 @@
 import unittest
 from types import SimpleNamespace
 
-from desktop.nav.voice_client import STUCK_AFTER_S, VoiceAnnouncer, stuck_phrase
+from desktop.nav.voice_client import (STUCK_AFTER_S, VoiceAnnouncer, explore_summary_phrase,
+                                      is_find, stuck_phrase)
 
 
-def det(cid, label=None, verdict="novel"):
-    return SimpleNamespace(change_id=cid, label=label, verdict=verdict)
+def det(cid, label=None, verdict="novel", kind="new", confidence=0.8, what=None,
+        investigated=None):
+    return SimpleNamespace(change_id=cid, label=label, verdict=verdict, kind=kind,
+                           confidence=confidence, what=what, investigated=investigated)
 
 
 class TestVoiceAnnouncer(unittest.TestCase):
@@ -68,7 +71,68 @@ class TestVoiceAnnouncer(unittest.TestCase):
     def test_task_finished(self):
         self.a.on_task_finished("done")
         self.a.on_task_finished("stopped")
-        self.assertEqual(self.texts(), ["Exploration finished.", "Exploration stopped."])
+        self.assertEqual(self.texts(), ["Exploration finished. I found nothing new.",
+                                        "Exploration stopped."])
+
+    def test_explore_start_leg_and_home(self):
+        self.a.on_explore_start()
+        self.a.on_explore_leg("viewpoint")
+        self.a.on_explore_leg("investigate", det(7, "box or bag"))
+        self.a.on_explore_leg("investigate", det(7, "box or bag"))   # retried leg: once
+        self.a.on_explore_leg("investigate", det(8))
+        self.a.on_explore_leg("home")
+        self.assertEqual(self.texts(), [
+            "Okay, I'm going exploring.",
+            "I'm going to take a closer look at that box.",
+            "Something changed over there. Let me take a closer look.",
+            "Heading home now."])
+
+    def test_found_something_new_only_while_exploring(self):
+        self.a.on_detection(det(1, "other", what="Blue laundry basket"))
+        self.assertEqual(self.sent, [])
+        self.a.on_explore_start()
+        self.sent.clear()
+        self.a.on_detection(det(1, "other", what="Blue laundry basket."))
+        self.a.on_detection(det(2, "other", what="chair", confidence=0.4))   # unsure
+        self.a.on_detection(det(3, "door"))
+        self.a.on_detection(det(4, "other", what="umbrella", verdict="candidate"))
+        self.assertEqual(self.texts(), ["I found something new: a blue laundry basket."])
+        self.a.on_detection(det(5, "other", what="umbrella"))
+        self.assertEqual(self.texts()[-1], "I found something new: an umbrella.")
+        self.assertEqual(self.sent[-1]["key"], "explore_find")
+
+    def test_investigation_results(self):
+        self.a.on_explore_start()
+        self.sent.clear()
+        self.a.on_detection(det(1, "small stuffed animal", investigated="confirmed"))
+        self.a.on_detection(det(1, "small stuffed animal", investigated="confirmed"))
+        self.a.on_detection(det(2, investigated="gone"))
+        self.a.on_detection(det(3, investigated="unseen"))
+        self.assertEqual(self.texts(), [
+            "Yes, there really is a stuffed toy there.",   # result
+            "I found a stuffed toy.",                     # first sighting of #1
+            "Whatever it was, it's gone now."])
+
+    def test_summary_phrase(self):
+        finds = [det(1, "box or bag"), det(2, "box or bag"), det(3, "small stuffed animal"),
+                 det(4, "other", what="laundry basket")]
+        self.assertEqual(explore_summary_phrase("done", 0.724, finds),
+                         "Exploration finished. I looked over 72 percent of the house and found "
+                         "2 boxes, a stuffed toy and a laundry basket.")
+        self.assertEqual(explore_summary_phrase("done", 0.5, []),
+                         "Exploration finished. I looked over 50 percent of the house, and "
+                         "found nothing new.")
+        self.assertEqual(explore_summary_phrase("stopped", 0.5, finds), "Exploration stopped.")
+        self.a.on_explore_start()
+        self.a.on_task_finished("done", 0.6, finds[:1])
+        self.assertFalse(self.a.exploring)
+        self.assertIn("found a box", self.texts()[-1])
+
+    def test_is_find(self):
+        self.assertTrue(is_find(det(1, "pet")))
+        self.assertFalse(is_find(det(1, "pet", investigated="dismissed")))
+        self.assertFalse(is_find(det(1, "nothing there")))
+        self.assertFalse(is_find(det(1, "other", kind="missing")))
 
     def test_stuck_phrase_unknown_reason(self):
         self.assertEqual(stuck_phrase("weird"), "I'm stuck.")

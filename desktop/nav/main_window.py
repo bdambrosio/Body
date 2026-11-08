@@ -39,7 +39,7 @@ from desktop.world_map.map_views import (
     SharedMapView, WorldCostmapView, WorldDriveableView, WorldHeightView,
 )
 from .health import LivenessWatcher
-from .voice_client import VoiceAnnouncer
+from .voice_client import VoiceAnnouncer, is_find
 from .hierarchical_drive import (
     HierarchicalDrive, HierConfig, HierState, PFPoseProvider,
 )
@@ -1878,6 +1878,7 @@ class NavMainWindow(QMainWindow):
                                        on_finished=self._on_task_finished)
         logger.info("explore: start, budget %.0f min", cfg.budget_min)
         self._explore_started_wall = time.time()
+        self._voice.on_explore_start()
         self._task_runner.start(time.time())
 
     def _explore_robot_xy(self):
@@ -1897,6 +1898,11 @@ class NavMainWindow(QMainWindow):
     def _start_task_leg(self, leg: Leg) -> HierarchicalDrive:
         """One leg = a one-waypoint patrol on the usual hierarchical drive
         (route planning, path streaming, recovery, pose doubt)."""
+        try:
+            self._voice.on_explore_leg(
+                leg.purpose, self._detections.get(leg.ref) if leg.purpose == "investigate" else None)
+        except Exception:
+            logger.exception("voice explore leg failed")
         patrol = Patrol(name=f"explore-{leg.purpose}", session_id="", authored_utc="",
                         loop=False, laps=1, waypoints=[Waypoint(
                             x_m=leg.xy[0], y_m=leg.xy[1], face_next=False,
@@ -1930,7 +1936,12 @@ class NavMainWindow(QMainWindow):
             except OSError:
                 logger.exception("explore: summary write failed")
         logger.info("explore: %s — %s", why, summary.get("headline"))
-        self._voice.on_task_finished(why)
+        try:
+            since = self._explore_started_wall or 0.0
+            finds = [d for d in self._detections.rows(show_all=True, since=since) if is_find(d)]
+            self._voice.on_task_finished(why, summary.get("coverage"), finds)
+        except Exception:
+            logger.exception("voice explore summary failed")
         try:
             self.statusBar().showMessage(f"Explore {why}: {summary.get('headline')}")
         except Exception:

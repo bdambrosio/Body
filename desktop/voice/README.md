@@ -35,6 +35,15 @@ Speaker volume is PipeWire's on the Pi: `wpctl set-volume @DEFAULT_AUDIO_SINK@ 0
 
 ## What gets said
 
+During **Explore** (`on_explore_*` in voice_client.py): "Okay, I'm going exploring."; a
+new thing the VLM labelled `other`/`furniture` with confidence ≥ 0.6 → "I found something
+new: a blue laundry basket." (its few-word `what`, at most one per 20 s); before an
+investigate leg "I'm going to take a closer look at that box."; the result ("Yes, there
+really is a box there." / "it's gone now" / "False alarm" / "couldn't get close enough");
+"Heading home now."; and a summary: "Exploration finished. I looked over 72 percent of the
+house and found 2 boxes and a stuffed toy." Places the change store knows recur are never
+announced.
+
 `desktop/nav/voice_client.py`: sightings (person, pet, stuffed toy, box; once per detection,
 60 s per label), "I'm stuck" (BLOCKED for 4 s+), "I couldn't get there" (FAILED), "Emergency
 stop", and end of an Explore run. The nav toolbar's **Voice** toggle mutes it.
