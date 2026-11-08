@@ -63,6 +63,8 @@ class Topics:
     audio_play: str = "body/audio/play"
     audio_stop: str = "body/audio/stop"
     audio_status: str = "body/audio/status"
+    audio_mic: str = "body/audio/mic"
+    voice_heard: str = "body/voice/heard"
 
 
 def resolve_router(cli_value: Optional[str]) -> str:

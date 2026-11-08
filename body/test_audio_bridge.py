@@ -4,7 +4,9 @@ import threading
 import time
 import unittest
 
-from body.audio_bridge import AudioBridge
+import io
+
+from body.audio_bridge import AudioBridge, MicMute, MicStreamer
 from body.lib import schemas
 
 
@@ -144,6 +146,40 @@ class TestAudioBridge(unittest.TestCase):
         time.sleep(0.05)
         self.assertEqual(h.events, [])
         h.bridge.shutdown()
+
+
+class TestMic(unittest.TestCase):
+    def test_mute_while_playing_and_for_tail(self):
+        now = [100.0]
+        m = MicMute(0.4, clock=lambda: now[0])
+        self.assertFalse(m.muted())
+        m.on_event("utt_started")
+        now[0] += 5.0
+        self.assertTrue(m.muted())
+        m.on_event("utt_done")
+        now[0] += 0.3
+        self.assertTrue(m.muted())
+        now[0] += 0.2
+        self.assertFalse(m.muted())
+
+    def test_pump_publishes_whole_blocks_and_mutes(self):
+        out = []
+        mute = MicMute(0.0)
+        mic = MicStreamer(lambda seq, pcm: out.append((seq, pcm)), mute, rate=1000, block_ms=10)
+        # 10 ms at 1 kHz = 10 samples = 20 bytes per block; 50 bytes -> 2 blocks + 10 left over
+        mic.pump(io.BytesIO(bytes(range(50))))
+        self.assertEqual([s for s, _ in out], [0, 1])
+        self.assertEqual(out[0][1], bytes(range(20)))
+        mute.on_event("utt_started")
+        mic.pump(io.BytesIO(bytes(20)))
+        self.assertEqual(out[-1], (2, None))
+
+    def test_mic_chunk_schema(self):
+        m = schemas.audio_mic_chunk(seq=3, sample_rate=16000, pcm_base64="AAA=")
+        self.assertEqual(m["data"], "AAA=")
+        self.assertFalse(m["muted"])
+        m = schemas.audio_mic_chunk(seq=4, sample_rate=16000, pcm_base64=None, muted=True)
+        self.assertNotIn("data", m)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Robot voice (Inky)
 
-The desktop turns text into speech; the Pi only plays it.
+The desktop turns text into speech and listens; the Pi only plays and records.
 
 ```
 nav UI / desktop.voice.say ──body/voice/say──▶ desktop.voice (Kokoro-82M, RTX 5060 Ti)
@@ -42,3 +42,23 @@ stop", and end of an Explore run. The nav toolbar's **Voice** toggle mutes it.
 Queue rules (`speech_queue.py`): alert > chat > info; an alert cuts off anything that isn't an
 alert; info not started within 10 s is dropped. Each utterance's timings are logged to
 `~/body-logs/voice/voice_YYYYMMDD.jsonl`.
+
+## Chat ("Inky, ...")
+
+```
+Pi mic ─pw-record 16 kHz─▶ body/audio/mic (muted while the speaker plays + 0.4 s)
+   ▼ desktop.voice listener
+Silero VAD (CPU) → segment (0.7 s of silence ends it) → Whisper large-v3-turbo (5060 Ti)
+   → wake.py: "Inky" near the start, fuzzy ("Inkie", "Enki", "in key", "Hey Inky")
+   → chat.py: LLM via desktop/vision_service.chat (the vLLM server) → spoken as kind=chat
+```
+
+- Name alone ("Inky?") → "Yes?". After Inky finishes a reply or a "Yes?", anything said
+  within `follow_up_s` (8 s) is answered without the name. History: last 6 exchanges,
+  cleared after 3 min quiet.
+- Half-duplex: the mic is muted while Inky talks, so you can't interrupt it yet.
+- Every transcribed segment (text only, no audio) goes to
+  `~/body-logs/voice/heard_YYYYMMDD.jsonl` and `body/voice/heard`.
+- Settings: `voice.listen` in `config.json` (persona, follow-up window, segment timing);
+  `audio.mic_*` / `mute_tail_s` for the Pi side. `--no-listen` runs speech only.
+- Setup addition: `VIRTUAL_ENV=.venv-voice uv pip install silero-vad`.

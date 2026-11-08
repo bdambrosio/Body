@@ -732,3 +732,31 @@ def voice_say(
         msg["key"] = key
         msg["cooldown_s"] = float(cooldown_s)
     return msg
+
+
+def audio_mic_chunk(
+    *,
+    seq: int,
+    sample_rate: int,
+    pcm_base64: str | None,
+    muted: bool = False,
+    ts: float | None = None,
+) -> dict[str, Any]:
+    """body/audio/mic — one block of microphone audio: mono s16le PCM, base64.
+
+    Sent continuously at the block rate. While the speaker plays (and for a short tail
+    after) the bridge sends ``muted: true`` with no ``data``, so the desktop never hears
+    the robot's own voice and still sees the stream is alive.
+    """
+    msg: dict[str, Any] = {
+        "ts": now_ts() if ts is None else ts,
+        "seq": int(seq),
+        "format": "pcm_s16le",
+        "channels": 1,
+        "sample_rate": int(sample_rate),
+        "muted": bool(muted),
+    }
+    if pcm_base64 is not None and not muted:
+        msg["encoding"] = "base64"
+        msg["data"] = pcm_base64
+    return msg

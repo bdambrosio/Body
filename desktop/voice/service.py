@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from body.lib import schemas
 from desktop.chassis.config import Topics
@@ -51,6 +51,14 @@ class VoiceService:
         self._log_dir = log_dir
         self._thread: Optional[threading.Thread] = None
         self._subs: list[Any] = []
+        self._speaking = False
+        # Called on the worker thread after each utterance: (request, error or None).
+        self.on_done: Optional[Callable[[SpeechRequest, Optional[str]], None]] = None
+
+    @property
+    def speaking(self) -> bool:
+        """True from the moment an utterance is taken off the queue until it's done."""
+        return self._speaking
 
     # ── zenoh inputs ────────────────────────────────────────────────
 
@@ -131,16 +139,24 @@ class VoiceService:
                 if self._stopping:
                     return
                 self._cut = False
+                self._speaking = True
+            error: Optional[str] = "exception"
             try:
-                self._speak(req)
+                error = self._speak(req)
             except Exception:
                 logger.exception("speak failed: %r", req.text)
             finally:
                 with self._cv:
                     self._queue.done()
+                    self._speaking = False
                 self._publish_state("idle")
+                if self.on_done is not None:
+                    try:
+                        self.on_done(req, error)
+                    except Exception:
+                        logger.exception("on_done hook failed")
 
-    def _speak(self, req: SpeechRequest) -> None:
+    def _speak(self, req: SpeechRequest) -> Optional[str]:
         utt_id = uuid.uuid4().hex[:12]
         t0 = time.monotonic()
         # A freshly (re)started bridge may not be subscribed yet: chunks sent
@@ -212,6 +228,7 @@ class VoiceService:
             })
         if error:
             logger.info("utterance %s %r: %s", utt_id, req.text, error)
+        return error
 
     # ── outputs ─────────────────────────────────────────────────────
 

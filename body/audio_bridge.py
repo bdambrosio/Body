@@ -9,6 +9,11 @@ first chunk arrives. Utterances play strictly in arrival order.
   body/audio/play   (sub)  schemas.audio_play_chunk
   body/audio/stop   (sub)  {} — cut the current utterance, drop the queue
   body/audio/status (pub)  schemas.audio_status, 2 Hz + on every edge
+  body/audio/mic    (pub)  schemas.audio_mic_chunk, 16 kHz mono blocks (Phase 2 chat)
+
+The mic is half-duplex: while an utterance plays, and for ``mute_tail_s``
+after it ends, blocks go out as ``muted`` with no audio, so the desktop's
+speech recognizer never hears the robot's own voice.
 
 PipeWire runs in bruce's user session (linger on, XDG_RUNTIME_DIR set in
 deploy/body-launcher.service). With no sound device the bridge keeps running,
@@ -34,6 +39,7 @@ from body.lib import schemas, zenoh_helpers
 PLAY_TOPIC = "body/audio/play"
 STOP_TOPIC = "body/audio/stop"
 STATUS_TOPIC = "body/audio/status"
+MIC_TOPIC = "body/audio/mic"
 
 
 class Player(Protocol):
@@ -266,6 +272,99 @@ class AudioBridge:
             self._emit("utt_done", u.utt_id, error)
 
 
+class MicMute:
+    """Half-duplex gate: muted while playing and for ``tail_s`` after."""
+
+    def __init__(self, tail_s: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self._tail_s = tail_s
+        self._clock = clock
+        self._playing = False
+        self._until = 0.0
+        self._lock = threading.Lock()
+
+    def on_event(self, event: str) -> None:
+        with self._lock:
+            if event == "utt_started":
+                self._playing = True
+            elif event == "utt_done":
+                self._playing = False
+                self._until = self._clock() + self._tail_s
+
+    def muted(self) -> bool:
+        with self._lock:
+            return self._playing or self._clock() < self._until
+
+
+class MicStreamer:
+    """``pw-record`` → fixed-size blocks → ``publish(seq, pcm | None)``.
+
+    ``pcm`` is None for a muted block. Restarts the recorder if it exits.
+    """
+
+    def __init__(self, publish: Callable[[int, Optional[bytes]], None], mute: MicMute,
+                 *, rate: int = 16000, block_ms: int = 100) -> None:
+        self._publish = publish
+        self._mute = mute
+        self.rate = int(rate)
+        self._block_bytes = int(self.rate * block_ms / 1000) * 2
+        self._stop = threading.Event()
+        self._proc: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._seq = 0
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="audio-mic", daemon=True)
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._proc = subprocess.Popen(
+                    ["pw-record", "--raw", "--rate", str(self.rate), "--channels", "1",
+                     "--format", "s16", "-"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            except OSError as e:
+                print(f"[audio_bridge] mic: pw-record failed to start: {e}", flush=True)
+                self._stop.wait(10.0)
+                continue
+            self.pump(self._proc.stdout)
+            try:
+                self._proc.kill()
+                self._proc.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if not self._stop.is_set():
+                print("[audio_bridge] mic: recorder exited; restarting in 2 s", flush=True)
+                self._stop.wait(2.0)
+
+    def pump(self, stream: Any) -> None:
+        """Read blocks from ``stream`` until EOF/stop and publish them."""
+        buf = b""
+        while not self._stop.is_set():
+            data = stream.read(self._block_bytes - len(buf))
+            if not data:
+                return
+            buf += data
+            if len(buf) < self._block_bytes:
+                continue
+            block, buf = buf, b""
+            try:
+                self._publish(self._seq, None if self._mute.muted() else block)
+            except Exception as e:  # transport hiccup: drop the block
+                print(f"[audio_bridge] mic publish failed: {e}", flush=True)
+            self._seq += 1
+
+
 def main() -> None:
     body_cfg = zenoh_helpers.load_body_config()
     cfg = body_cfg.get("audio", {})
@@ -286,7 +385,10 @@ def main() -> None:
         with pub_lock:
             zenoh_helpers.publish_json(session, STATUS_TOPIC, msg)
 
+    mute = MicMute(float(cfg.get("mute_tail_s", 0.4)))
+
     def emit(event: str, utt_id: str, error: Optional[str]) -> None:
+        mute.on_event(event)
         if error and error != "stopped":
             print(f"[audio_bridge] {event} {utt_id}: {error}", flush=True)
         publish_status(event, utt_id, error)
@@ -303,6 +405,21 @@ def main() -> None:
     zenoh_helpers.declare_subscriber_json(session, PLAY_TOPIC, lambda _k, m: bridge.on_chunk(m))
     zenoh_helpers.declare_subscriber_json(session, STOP_TOPIC, lambda _k, _m: bridge.stop_all())
     bridge.start()
+
+    mic: Optional[MicStreamer] = None
+    if cfg.get("mic_enabled", True) and shutil.which("pw-record") is not None:
+        mic_rate = int(cfg.get("mic_rate", 16000))
+
+        def publish_mic(seq: int, pcm: Optional[bytes]) -> None:
+            msg = schemas.audio_mic_chunk(
+                seq=seq, sample_rate=mic_rate, muted=pcm is None,
+                pcm_base64=None if pcm is None else base64.standard_b64encode(pcm).decode("ascii"))
+            with pub_lock:
+                zenoh_helpers.publish_json(session, MIC_TOPIC, msg)
+
+        mic = MicStreamer(publish_mic, mute, rate=mic_rate, block_ms=int(cfg.get("mic_block_ms", 100)))
+        mic.start()
+        print(f"[audio_bridge] mic streaming {mic_rate} Hz on {MIC_TOPIC}", flush=True)
 
     stop = threading.Event()
 
@@ -329,6 +446,8 @@ def main() -> None:
             print(f"[audio_bridge] status publish failed: {e}", flush=True)
         stop.wait(period)
 
+    if mic is not None:
+        mic.shutdown()
     bridge.shutdown()
     session.close()
 

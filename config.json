@@ -342,7 +342,11 @@
     "status_hz": 2.0,
     "gap_timeout_s": 2.0,
     "max_queue": 8,
-    "probe_interval_s": 10.0
+    "probe_interval_s": 10.0,
+    "mic_enabled": true,
+    "mic_rate": 16000,
+    "mic_block_ms": 100,
+    "mute_tail_s": 0.4
   },
   "voice": {
     "robot_name": "Inky",
@@ -351,6 +355,16 @@
     "speed": 1.0,
     "gpu_match": "5060",
     "info_max_age_s": 10.0,
-    "max_queue": 6
+    "max_queue": 6,
+    "listen": {
+      "enabled": true,
+      "follow_up_s": 8.0,
+      "end_silence_s": 0.7,
+      "min_speech_s": 0.3,
+      "max_segment_s": 15.0,
+      "ack_text": "Yes?",
+      "max_tokens": 160,
+      "temperature": 0.6
+    }
   }
 }

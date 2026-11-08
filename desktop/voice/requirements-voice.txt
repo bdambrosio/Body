@@ -11,3 +11,4 @@ eclipse-zenoh~=1.9.0
 # Feed it 16 kHz float32 (the mic records 16 kHz) — the pipeline needs torchaudio only to resample.
 transformers>=4.45
 accelerate
+silero-vad>=5.1
