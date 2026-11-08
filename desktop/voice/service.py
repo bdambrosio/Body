@@ -32,6 +32,18 @@ LOG_DIR = Path.home() / "body-logs" / "voice"
 DONE_TIMEOUT_PAD_S = 5.0
 BRIDGE_STALE_S = 3.0
 BRIDGE_WAIT_S = 5.0     # hold an utterance this long for a silent bridge to appear
+LEAD_S = 1.0            # send audio at most this far ahead of real-time playback
+CHUNK_S = 0.5           # max audio per body/audio/play message: an 8 s sentence in one
+                        # 515 KB message never reached the Pi (11-08); ~24 KB pieces do
+
+
+def _block_put_kwargs() -> dict:
+    """Audio chunks must not be dropped: a burst of DROP-QoS chunks lost pieces (11-08)."""
+    try:
+        import zenoh
+        return {"congestion_control": zenoh.CongestionControl.BLOCK}
+    except Exception:
+        return {}
 
 
 class VoiceService:
@@ -52,6 +64,7 @@ class VoiceService:
         self._thread: Optional[threading.Thread] = None
         self._subs: list[Any] = []
         self._speaking = False
+        self._put_kw = _block_put_kwargs()
         # Called on the worker thread after each utterance: (request, error or None).
         self.on_done: Optional[Callable[[SpeechRequest, Optional[str]], None]] = None
 
@@ -175,27 +188,39 @@ class VoiceService:
         t_first: Optional[float] = None
         pending: Optional[bytes] = None
 
+        sent_s = 0.0
+
         def send(pcm: bytes, final: bool) -> None:
-            nonlocal seq, t_first
+            nonlocal seq, t_first, sent_s
             msg = schemas.audio_play_chunk(
                 utt_id=utt_id, seq=seq, final=final, sample_rate=rate,
                 pcm_base64=base64.standard_b64encode(pcm).decode("ascii"),
                 text=req.text if seq == 0 else None)
-            self._session.put(self._topics.audio_play, json.dumps(msg))
             if t_first is None:
                 t_first = time.monotonic()
+            else:  # pace: stay at most LEAD_S ahead of playback
+                ahead = sent_s - (time.monotonic() - t_first) - LEAD_S
+                if ahead > 0:
+                    time.sleep(ahead)
+            self._session.put(self._topics.audio_play, json.dumps(msg), **self._put_kw)
+            sent_s += len(pcm) / 2 / rate
             seq += 1
 
         cut = False
-        for pcm in self._tts.synth(req.text):
-            with self._cv:
-                cut = self._cut or self._stopping
+        max_bytes = max(2, int(rate * CHUNK_S)) * 2
+        for seg_pcm in self._tts.synth(req.text):
+            for i in range(0, len(seg_pcm), max_bytes):
+                pcm = seg_pcm[i:i + max_bytes]
+                with self._cv:
+                    cut = self._cut or self._stopping
+                if cut:
+                    break
+                total_bytes += len(pcm)
+                if pending is not None:
+                    send(pending, final=False)
+                pending = pcm
             if cut:
                 break
-            total_bytes += len(pcm)
-            if pending is not None:
-                send(pending, final=False)
-            pending = pcm
         if pending is not None and not cut:
             send(pending, final=True)
 

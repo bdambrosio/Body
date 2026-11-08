@@ -141,7 +141,7 @@ class TestListener(unittest.TestCase):
         conv = Conversation(name="Inky", llm=lambda m: "I'm fine.")
         self.lis = Listener(FakeSession(), self.svc, conv, stt=lambda a: text, vad=FakeVad(),
                             segmenter=Segmenter(end_silence_s=0.2, min_speech_s=0.1), log_dir=None)
-        self.lis.start()
+        self.lis.start(worker=False)
         return conv
 
     def tearDown(self):

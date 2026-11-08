@@ -55,7 +55,7 @@ class Listener:
         self._sub: Any = None
         self.last_mic = 0.0
 
-    def start(self) -> None:
+    def start(self, *, worker: bool = True) -> None:
         prev = self._svc.on_done
 
         def on_done(req: SpeechRequest, error: Optional[str]) -> None:
@@ -65,8 +65,9 @@ class Listener:
                 self._conv.open_window(self._clock())
 
         self._svc.on_done = on_done
-        self._thread = threading.Thread(target=self._work, name="listen", daemon=True)
-        self._thread.start()
+        if worker:  # tests drain the job queue themselves
+            self._thread = threading.Thread(target=self._work, name="listen", daemon=True)
+            self._thread.start()
         self._sub = self._session.declare_subscriber(self._topics.audio_mic, self._on_mic)
 
     def shutdown(self) -> None:
